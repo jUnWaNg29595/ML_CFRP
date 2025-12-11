@@ -132,7 +132,16 @@ def show_robust_feature_selection():
     else:
         st.warning("⚠️ 请先上传数据")
         return
+    if current_df.columns.duplicated().any():
+        # 找出重复的列名（可选：打印出来提示用户）
+        dup_cols = current_df.columns[current_df.columns.duplicated()].tolist()
+        st.warning(f"⚠️ 检测到数据包含重复列名，系统已自动保留首个出现的值。")
 
+        # 保留第一次出现的列，删除后续重复的
+        current_df = current_df.loc[:, ~current_df.columns.duplicated()]
+
+        # 将修复后的数据同步回 session_state，防止其他页面也报错
+        st.session_state.processed_data = current_df
     all_columns = current_df.columns.tolist()
 
     # 目标变量选择

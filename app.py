@@ -890,16 +890,37 @@ def page_molecular_features():
                 features_df, valid_indices = extractor.smiles_to_graph_features(smiles_list)
             
             progress_bar.progress(100)
-            
+
             if len(features_df) > 0:
                 st.session_state.molecular_features = features_df
-                
-                # 合并到原始数据
+
+                # [核心修改 1] 为特征列添加前缀，区分来源
+                # 例如：如果当前选择的列是 'resin_smiles'，特征就会变成 'resin_smiles_MolWt'
+                # 这样即使对多个列分别提取，特征名也不会重复！
+                prefix = f"{smiles_col}_"
+                features_df = features_df.add_prefix(prefix)
+
+                # [核心修改 2] 准备合并数据
                 df_valid = df.iloc[valid_indices].reset_index(drop=True)
-                merged_df = pd.concat([df_valid, features_df.reset_index(drop=True)], axis=1)
+                features_df = features_df.reset_index(drop=True)
+
+                # [核心修改 3] 智能合并逻辑
+                # 虽然加了前缀，但为了防止用户对"同一列"重复点击提取按钮导致堆叠
+                # 我们还是要检查一下是否已经存在完全相同的列名（带前缀的）
+                cols_to_drop = [col for col in features_df.columns if col in df_valid.columns]
+                if cols_to_drop:
+                    # 如果这些带前缀的列已经存在，说明用户是重复操作，我们先删除旧的，用新的覆盖
+                    df_valid = df_valid.drop(columns=cols_to_drop)
+
+                # 安全合并
+                merged_df = pd.concat([df_valid, features_df], axis=1)
+                # [双重保险] 全局去重，防止任何意外的重复列
+                merged_df = merged_df.loc[:, ~merged_df.columns.duplicated()]
+                # 更新状态
                 st.session_state.processed_data = merged_df
-                
+
                 st.success(f"✅ 成功提取 {len(features_df)} 个样本的 {features_df.shape[1]} 个分子特征")
+                st.info(f"ℹ️ 特征列已自动添加前缀: '{prefix}...' 以区分不同来源")
                 
                 # 结果统计
                 col1, col2, col3 = st.columns(3)
