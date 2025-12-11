@@ -2,7 +2,7 @@
 """配置文件"""
 
 APP_NAME = "碳纤维复合材料智能预测平台"
-VERSION = "2.0.0"
+VERSION = "1.2.0"
 
 DATA_DIR = "datasets"
 MODEL_DIR = "models"
