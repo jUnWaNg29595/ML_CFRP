@@ -145,7 +145,8 @@ class EnhancedModelTrainer:
         train_time = time.time() - start_time
 
         # 预测和评估
-        y_pred = model.predict(X_test_scaled)
+        y_pred = model.predict(X_test_scaled)  # 测试集预测 (红点)
+        y_pred_train = model.predict(X_train_scaled)  # 训练集预测 (蓝点) - [新增]
 
         return {
             'model': model,
@@ -156,7 +157,9 @@ class EnhancedModelTrainer:
             'X_test': pd.DataFrame(X_test_scaled),
             'y_train': y_train,
             'y_test': y_test,
-            'y_pred': y_pred,
+            'y_pred': y_pred,  # 保持兼容性，指向测试集预测
+            'y_pred_test': y_pred,  # 显式命名
+            'y_pred_train': y_pred_train,  # [新增] 返回训练集预测结果
             'r2': r2_score(y_test, y_pred),
             'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
             'mae': mean_absolute_error(y_test, y_pred),

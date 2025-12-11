@@ -1197,12 +1197,27 @@ def page_model_training():
                 
                 # 可视化
                 visualizer = Visualizer()
-                fig, export_df = visualizer.plot_predictions_vs_true(
-                    result['y_test'],
-                    result['y_pred'],
-                    selected_model
-                )
-                st.pyplot(fig)
+
+                # 优先使用新风格绘图
+                if 'y_pred_train' in result:
+                    st.markdown("### 📈 实验值 vs 预测值")
+                    fig = visualizer.plot_parity_train_test(
+                        y_train=result['y_train'],
+                        y_pred_train=result['y_pred_train'],
+                        y_test=result['y_test'],
+                        y_pred_test=result['y_pred'],
+                        target_name=target_col
+                    )
+                    st.pyplot(fig)
+                else:
+                    # 回退旧版（防止未更新 trainer 导致报错）
+                    fig, export_df = visualizer.plot_predictions_vs_true(
+                        result['y_test'],
+                        result['y_pred'],
+                        selected_model
+                    )
+                    st.pyplot(fig)
+
                 plt.close()
                 
         except Exception as e:

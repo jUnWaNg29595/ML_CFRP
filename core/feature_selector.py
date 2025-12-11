@@ -160,7 +160,18 @@ def show_robust_feature_selection():
         numeric_df = numeric_df.drop(columns=[target_col])
 
     feature_candidates = numeric_df.columns.tolist()
-
+    # 自动清洗已选特征：移除那些不在当前候选列表中的特征
+    # 这能防止因数据更新导致的 StreamlitAPIException
+    if 'feature_cols' in st.session_state and st.session_state.feature_cols:
+        valid_features = [
+            f for f in st.session_state.feature_cols
+            if f in feature_candidates
+        ]
+        # 如果发现有无效特征，更新 session_state
+        if len(valid_features) != len(st.session_state.feature_cols):
+            st.session_state.feature_cols = valid_features
+            # 可选：提示用户
+            st.toast("已自动移除部分失效的特征选择")
     with col2:
         st.metric("可用数值特征", f"{len(feature_candidates)} 个")
 
