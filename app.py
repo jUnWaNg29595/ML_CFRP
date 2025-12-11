@@ -3,7 +3,11 @@
 碳纤维复合材料智能预测平台 v1.2.0
 
 """
-
+try:
+    import torchani
+    TORCHANI_AVAILABLE = True
+except ImportError:
+    TORCHANI_AVAILABLE = False
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -790,11 +794,12 @@ def page_molecular_features():
             "🚀 RDKit 并行版 (大数据集)",
             "💾 RDKit 内存优化版 (低内存)",
             "🔬 Mordred 描述符 (1600+特征)",
-            "🕸️ 图神经网络特征 (拓扑结构)"
+            "🕸️ 图神经网络特征 (拓扑结构)",
+            "⚛️ ML力场特征 (ANI能量/力)"
         ],
         help="不同方法适用于不同场景"
     )
-    
+
     # 方法说明
     method_info = {
         "🔹 RDKit 标准版 (推荐新手)": {
@@ -826,9 +831,17 @@ def page_molecular_features():
             "features": "~10个",
             "speed": "中等",
             "memory": "中等"
-        }
+
+        },
+        "⚛️ ML力场特征 (ANI能量/力)": {
+        "desc": "基于TorchANI计算分子的3D势能和原子受力，捕捉量子化学性质",
+        "features": "5个 (高价值)",
+        "speed": "慢 (含3D生成)",
+        "memory": "中等 (显存)"
+        },
     }
-    
+
+
     info = method_info[extraction_method]
     col1, col2, col3 = st.columns(3)
     col1.metric("预计特征数", info["features"])
@@ -888,6 +901,18 @@ def page_molecular_features():
                 status_text.text("正在提取图结构特征...")
                 extractor = AdvancedMolecularFeatureExtractor()
                 features_df, valid_indices = extractor.smiles_to_graph_features(smiles_list)
+            elif "ML力场" in extraction_method:
+                from core.molecular_features import MLForceFieldExtractor
+
+                status_text.text("正在生成3D构象并计算ANI力场特征 (可能较慢)...")
+
+                # 实例化提取器
+                extractor = MLForceFieldExtractor()
+                if not extractor.AVAILABLE:
+                    st.error("TorchANI 未安装或初始化失败")
+                    return
+
+                features_df, valid_indices = extractor.smiles_to_ani_features(smiles_list)
             
             progress_bar.progress(100)
 

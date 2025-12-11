@@ -312,3 +312,128 @@ class AdvancedMolecularFeatureExtractor:
                 continue
 
         return self._process_result(all_features, valid_indices)
+
+
+class MLForceFieldExtractor:
+    """
+    机器学习力场特征提取器 (基于 TorchANI)
+    提取特征：
+    1. 势能 (Potential Energy)
+    2. 原子平均受力 (Mean Atomic Force)
+    3. 分子稳定性指标
+    """
+
+    def __init__(self, device=None):
+        try:
+            import torchani
+            import torch
+            self.torch = torch
+            self.torchani = torchani
+            self.AVAILABLE = True
+        except ImportError:
+            self.AVAILABLE = False
+            self.feature_names = []
+            return
+
+        # 自动选择设备
+        if device is None:
+            self.device = self.torch.device('cuda' if self.torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = device
+
+        # 加载预训练模型 ANI-2x (支持 H, C, N, O, S, F, Cl)
+        # periodic=False 表示非周期性边界条件（气相分子）
+        self.model = self.torchani.models.ANI2x().to(self.device)
+        self.feature_names = ['ani_energy', 'ani_energy_per_atom', 'ani_max_force', 'ani_mean_force', 'ani_force_std']
+
+    def _generate_3d_mol(self, smiles):
+        """将SMILES转换为包含3D坐标的RDKit分子"""
+        try:
+            if not RDKIT_AVAILABLE:
+                return None
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None: return None
+            mol = Chem.AddHs(mol)  # 力场计算必须加氢
+
+            # 生成3D构象
+            params = Chem.AllChem.ETKDGv3()
+            params.useRandomCoords = True
+            res = Chem.AllChem.EmbedMolecule(mol, params)
+
+            if res != 0:  # 尝试备用方法
+                res = Chem.AllChem.EmbedMolecule(mol, useRandomCoords=True)
+                if res != 0: return None
+
+            # 简单的力场优化，确保构象合理
+            try:
+                Chem.AllChem.MMFFOptimizeMolecule(mol)
+            except:
+                pass  # 如果MMFF失败，使用原始嵌入坐标
+
+            return mol
+        except:
+            return None
+
+    def smiles_to_ani_features(self, smiles_list):
+        if not self.AVAILABLE:
+            raise ImportError("请先安装 torchani: pip install torchani")
+
+        features_list = []
+        valid_indices = []
+
+        # 元素映射 ANI-2x: {H:1, C:6, N:7, O:8, S:16, F:9, Cl:17}
+        supported_species = {1, 6, 7, 8, 16, 9, 17}
+
+        print(f"\n⚛️ 机器学习力场(ANI)特征提取 (Device: {self.device})...")
+
+        for idx, smiles in enumerate(tqdm(smiles_list, desc="ANI Inference")):
+            mol = self._generate_3d_mol(smiles)
+
+            if mol is None:
+                continue
+
+            # 检查是否包含不支持的元素
+            atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
+            if not set(atoms).issubset(supported_species):
+                # 如果包含 B, P, Si 等 ANI 不支持的元素，跳过
+                continue
+
+            try:
+                # 准备输入数据
+                coordinates = mol.GetConformer().GetPositions()
+                coordinates = self.torch.tensor([coordinates], requires_grad=True, device=self.device,
+                                                dtype=self.torch.float32)
+                species = self.torch.tensor([atoms], device=self.device)
+
+                # 计算能量
+                energy = self.model((species, coordinates)).energies
+
+                # 计算力 (能量对坐标的负梯度)
+                derivative = self.torch.autograd.grad(energy.sum(), coordinates)[0]
+                forces = -derivative
+
+                # 提取标量特征 (转换为 numpy)
+                energy_val = energy.item()  # Hartree
+                forces_norm = self.torch.norm(forces, dim=2).detach().cpu().numpy()[0]  # [n_atoms]
+
+                features = {
+                    'ani_energy': energy_val,  # 总能量
+                    'ani_energy_per_atom': energy_val / len(atoms),  # 平均原子能量
+                    'ani_max_force': np.max(forces_norm),  # 最大受力点 (通常是不稳定点)
+                    'ani_mean_force': np.mean(forces_norm),  # 平均受力
+                    'ani_force_std': np.std(forces_norm)  # 受力分布方差
+                }
+
+                features_list.append(features)
+                valid_indices.append(idx)
+
+            except Exception as e:
+                # print(f"Error processing {smiles}: {e}")
+                continue
+
+        if not features_list:
+            return pd.DataFrame(), []
+
+        # 整理结果
+        df = pd.DataFrame(features_list)
+        return df, valid_indices
