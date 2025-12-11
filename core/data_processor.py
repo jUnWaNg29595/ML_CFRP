@@ -183,3 +183,76 @@ class AdvancedDataCleaner:
     def remove_duplicates(self):
         self.cleaned_data = self.cleaned_data.drop_duplicates()
         return self.cleaned_data
+
+    def detect_high_repetition_columns(self, threshold=0.8):
+        """检测高重复率列"""
+        high_rep_cols = {}
+        for col in self.cleaned_data.columns:
+            if len(self.cleaned_data) == 0: continue
+            # 计算众数出现的频率
+            try:
+                value_counts = self.cleaned_data[col].value_counts(normalize=True)
+                if not value_counts.empty:
+                    max_freq = value_counts.iloc[0]
+                    if max_freq >= threshold:
+                        high_rep_cols[col] = {
+                            'most_frequent_value': value_counts.index[0],
+                            'frequency': max_freq
+                        }
+            except:
+                pass
+        return high_rep_cols
+
+    def reduce_feature_repetition(self, column, target_rate=0.5):
+        """降低特定特征的重复率（通过删除众数样本）"""
+        if column not in self.cleaned_data.columns:
+            return self.cleaned_data
+
+        df = self.cleaned_data
+        value_counts = df[column].value_counts()
+        if value_counts.empty:
+            return df
+
+        most_freq_val = value_counts.index[0]
+        current_count = value_counts.iloc[0]
+        total_count = len(df)
+        other_count = total_count - current_count
+
+        # 目标：让 most_freq_val / (other_count + new_most_freq_count) = target_rate
+        # 推导：new_most_freq_count = target_rate * other_count / (1 - target_rate)
+
+        if target_rate >= 1.0 or target_rate <= 0:
+            return df
+
+        if other_count == 0:
+            # 如果全是重复值，为了达到比例，只能直接采样保留一定比例的行
+            return df.sample(frac=target_rate, random_state=42).reset_index(drop=True)
+
+        desired_count = int(target_rate * other_count / (1 - target_rate))
+
+        if desired_count >= current_count:
+            # 当前比例已经低于目标，无需操作
+            return df
+
+        # 1. 找出众数行的索引
+        # 处理 NaN 的情况
+        if pd.isna(most_freq_val):
+            mask_most_freq = df[column].isna()
+        else:
+            mask_most_freq = df[column] == most_freq_val
+
+        most_freq_indices = df[mask_most_freq].index
+
+        # 2. 找出非众数行的索引
+        other_indices = df[~mask_most_freq].index
+
+        # 3. 对众数行进行随机降采样
+        keep_indices = np.random.choice(most_freq_indices, size=desired_count, replace=False)
+
+        # 4. 合并索引并重构数据
+        final_indices = np.concatenate([other_indices, keep_indices])
+        # 保持原有顺序（可选）
+        final_indices.sort()
+
+        self.cleaned_data = df.loc[final_indices].reset_index(drop=True)
+        return self.cleaned_data

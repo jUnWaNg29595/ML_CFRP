@@ -625,21 +625,75 @@ def page_data_cleaning():
             cleaned_df = cleaner.handle_outliers(method=handle_method, threshold=threshold)
             st.session_state.processed_data = cleaned_df
             st.success("✅ 异常值处理完成")
-    
+
     with tab3:
-        st.markdown("### 重复数据处理")
-        
-        dup_count = df.duplicated().sum()
-        st.metric("重复行数", dup_count)
-        
-        if dup_count > 0:
-            if st.button("🗑️ 删除重复行", type="primary"):
-                cleaned_df = cleaner.remove_duplicates()
-                st.session_state.processed_data = cleaned_df
-                st.success(f"✅ 已删除 {dup_count} 行重复数据")
-                st.rerun()
-        else:
-            st.success("✅ 无重复数据")
+        st.markdown("### 🔄 数据去重与分布优化")
+
+        col_clean_1, col_clean_2 = st.columns(2)
+
+        with col_clean_1:
+            st.markdown("#### 1. 行去重")
+            st.caption("删除完全重复的样本行")
+            dup_count = df.duplicated().sum()
+            st.metric("完全重复行数", dup_count)
+
+            if dup_count > 0:
+                if st.button("🗑️ 删除重复行", type="primary"):
+                    cleaned_df = cleaner.remove_duplicates()
+                    st.session_state.processed_data = cleaned_df
+                    st.success(f"✅ 已删除 {dup_count} 行重复数据")
+                    st.rerun()
+            else:
+                st.info("✅ 无重复行")
+
+        st.markdown("---")
+
+        with col_clean_2:
+            st.markdown("#### 2. 特征分布优化 (针对高重复值)")
+            st.caption("降低某一特征中众数（出现最多的值）的比例，平衡数据分布")
+
+            # 检测阈值设置
+            rep_threshold = st.slider("高重复率检测阈值", 0.5, 0.99, 0.8, 0.05,
+                                      help="检测众数占比超过此比例的特征")
+
+            high_rep_cols = cleaner.detect_high_repetition_columns(rep_threshold)
+
+            if high_rep_cols:
+                st.warning(f"⚠️ 检测到 {len(high_rep_cols)} 个特征存在高重复值")
+
+                # 显示详情
+                rep_data = []
+                for col, info in high_rep_cols.items():
+                    rep_data.append({
+                        "特征": col,
+                        "众数": str(info['most_frequent_value']),
+                        "当前占比": f"{info['frequency'] * 100:.1f}%"
+                    })
+                st.dataframe(pd.DataFrame(rep_data), use_container_width=True, hide_index=True)
+
+                # 操作区
+                st.markdown("##### 🔧 执行优化")
+                target_col = st.selectbox("选择要优化的特征", list(high_rep_cols.keys()))
+
+                # 智能计算滑块范围：不能比当前占比还高，也不能太低（如0%）
+                current_freq = high_rep_cols[target_col]['frequency']
+                target_rate = st.slider(
+                    f"目标占比 (针对 {target_col})",
+                    0.1, float(current_freq), 0.5, 0.05,
+                    help="通过随机删除包含众数的样本，使其占比降低到此值"
+                )
+
+                if st.button(f"📉 降低 '{target_col}' 的重复率", type="primary"):
+                    original_len = len(df)
+                    cleaned_df = cleaner.reduce_feature_repetition(target_col, target_rate)
+                    new_len = len(cleaned_df)
+                    st.session_state.processed_data = cleaned_df
+
+                    st.success(f"✅ 优化完成！删除了 {original_len - new_len} 个样本")
+                    st.info(f"📊 当前行数: {new_len}，'{target_col}' 的众数占比已调整至 {target_rate * 100:.1f}%")
+                    st.rerun()
+            else:
+                st.success("✅ 未检测到高重复率特征")
     
     with tab4:
         st.markdown("### 数据类型诊断")

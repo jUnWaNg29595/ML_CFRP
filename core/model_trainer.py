@@ -13,9 +13,17 @@ from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import (RandomForestRegressor, ExtraTreesRegressor,
-                               GradientBoostingRegressor, AdaBoostRegressor)
+                              GradientBoostingRegressor, AdaBoostRegressor)
 from sklearn.svm import SVR
 from sklearn.neural_network import MLPRegressor
+
+# [修复] 导入自定义 ANN 模型
+try:
+    from .ann_model import ANNRegressor
+
+    ANN_AVAILABLE = True
+except ImportError:
+    ANN_AVAILABLE = False
 
 
 def _safe_import(module_name, class_name):
@@ -33,6 +41,7 @@ TabPFNRegressor, TABPFN_AVAILABLE = _safe_import('tabpfn', 'TabPFNRegressor')
 
 try:
     from autogluon.tabular import TabularPredictor
+
     AUTOGLUON_AVAILABLE = True
 except ImportError:
     AUTOGLUON_AVAILABLE = False
@@ -52,6 +61,8 @@ class EnhancedModelTrainer:
         if CATBOOST_AVAILABLE: models.append("CatBoost")
         if TABPFN_AVAILABLE: models.append("TabPFN")
         if AUTOGLUON_AVAILABLE: models.append("AutoGluon")
+        # [修复] 注册人工神经网络
+        if ANN_AVAILABLE: models.append("人工神经网络")
         return models
 
     def get_available_models(self):
@@ -71,7 +82,7 @@ class EnhancedModelTrainer:
             "SVR": SVR,
             "多层感知器": MLPRegressor,
         }
-        
+
         if name == "XGBoost" and XGBOOST_AVAILABLE:
             return XGBRegressor(**params)
         elif name == "LightGBM" and LIGHTGBM_AVAILABLE:
@@ -82,6 +93,9 @@ class EnhancedModelTrainer:
             return CatBoostRegressor(**params)
         elif name == "TabPFN" and TABPFN_AVAILABLE:
             return TabPFNRegressor(**params)
+        # [修复] 实例化人工神经网络
+        elif name == "人工神经网络" and ANN_AVAILABLE:
+            return ANNRegressor(**params)
         elif name in models:
             return models[name](**params)
         else:
@@ -111,7 +125,8 @@ class EnhancedModelTrainer:
         X_train_scaled = scaler.fit_transform(X_train_imputed)
         X_test_imputed = imputer.transform(X_test)
         X_test_scaled = scaler.transform(X_test_imputed)
-        # [新增修复] 智能注入 random_state 到模型参数
+
+        # 智能注入 random_state 到模型参数
         # 排除不支持 random_state 的模型，防止二次报错
         NO_SEED_MODELS = ["线性回归", "SVR", "TabPFN", "AutoGluon"]
 
@@ -121,7 +136,11 @@ class EnhancedModelTrainer:
 
         # 训练模型
         start_time = time.time()
-        model = self._get_model(model_name, **params)
+
+        # [修复] 这里原本错误地使用了 **params，导致 random_state 未生效
+        # 现在改为使用包含 random_state 的 **model_params
+        model = self._get_model(model_name, **model_params)
+
         model.fit(X_train_scaled, y_train)
         train_time = time.time() - start_time
 
