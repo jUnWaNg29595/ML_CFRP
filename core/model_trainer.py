@@ -111,6 +111,13 @@ class EnhancedModelTrainer:
         X_train_scaled = scaler.fit_transform(X_train_imputed)
         X_test_imputed = imputer.transform(X_test)
         X_test_scaled = scaler.transform(X_test_imputed)
+        # [新增修复] 智能注入 random_state 到模型参数
+        # 排除不支持 random_state 的模型，防止二次报错
+        NO_SEED_MODELS = ["线性回归", "SVR", "TabPFN", "AutoGluon"]
+
+        model_params = params.copy()
+        if model_name not in NO_SEED_MODELS:
+            model_params['random_state'] = random_state
 
         # 训练模型
         start_time = time.time()

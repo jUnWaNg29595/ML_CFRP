@@ -234,12 +234,28 @@ class AdvancedMolecularFeatureExtractor:
         return self._process_result(all_features, valid_indices)
 
     def smiles_to_mordred(self, smiles_list):
-        """Mordred描述符提取"""
+        """Mordred描述符提取 - 并行优化版"""
         if not MORDRED_AVAILABLE:
             raise ImportError("需要安装mordred")
 
-        mols, valid_indices = [], []
-        for idx, smiles in enumerate(smiles_list):
+        # 1. 并行化 SMILES -> Mol 转换
+        # 使用 OptimizedRDKitFeatureExtractor 中的 batch 处理逻辑或简单的 map
+        # 这里为了简单直接使用多进程池
+        print(f"\n🔬 Mordred特征提取 (并行模式)")
+
+        n_cpu = mp.cpu_count()
+        mols = []
+        valid_indices = []
+
+        # 分批处理转换以节省内存
+        batch_size = 1000
+        total = len(smiles_list)
+
+        # 定义转换辅助函数 (需放在类外或作为静态方法，这里简化逻辑)
+        # 为避免 pickle 问题，我们在单线程做转换，但通常 Mordred 计算才是瓶颈
+        # 如果 SMILES 转 Mol 很慢，也可以并行，但 Mordred 自带并行计算
+
+        for idx, smiles in enumerate(tqdm(smiles_list, desc="预处理分子结构")):
             mol = self._smiles_to_mol(smiles)
             if mol:
                 mols.append(mol)
@@ -248,10 +264,21 @@ class AdvancedMolecularFeatureExtractor:
         if not mols:
             return pd.DataFrame(), []
 
+        # 2. 使用 Mordred 的并行计算能力
+        # ignore_3D=True 大幅提升速度
         calc = Calculator(descriptors, ignore_3D=True)
-        df = calc.pandas(mols, quiet=True)
+
+        # [优化] 启用 n_proc 进行多进程计算
+        # quiet=False 可以看到进度条
+        try:
+            df = calc.pandas(mols, n_proc=n_cpu, quiet=False)
+        except:
+            # 如果多进程报错（特定系统环境），回退到单进程
+            print("并行计算失败，回退到单进程...")
+            df = calc.pandas(mols, quiet=False)
+
         df = df.apply(pd.to_numeric, errors='coerce')
-        
+
         return self._process_result(df, valid_indices, is_df=True)
 
     def smiles_to_graph_features(self, smiles_list):

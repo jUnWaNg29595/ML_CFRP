@@ -73,6 +73,17 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 
+
+@st.cache_data(ttl=3600, show_spinner="正在读取数据文件...")
+def load_data_file(uploaded_file):
+    """带缓存的数据加载函数，避免每次交互都重新读取文件"""
+    # 必须重置文件指针到开头，因为Streamlit可能会多次读取同一个文件对象
+    uploaded_file.seek(0)
+
+    if uploaded_file.name.endswith('.csv'):
+        return pd.read_csv(uploaded_file)
+    else:
+        return pd.read_excel(uploaded_file)
 # --- 全局常量 ---
 USER_DATA_DB = "datasets/user_data.csv"
 
@@ -197,7 +208,7 @@ def render_sidebar():
         st.title(f"🔬 {APP_NAME}")
         st.caption(f"版本 {VERSION}")
         st.markdown("---")
-        
+
         page = st.radio(
             "📌 功能导航",
             [
@@ -215,30 +226,56 @@ def render_sidebar():
             ],
             label_visibility="collapsed"
         )
-        
+
         st.markdown("---")
         st.markdown("### 📊 数据状态")
-        
-        if st.session_state.data is not None:
-            df = st.session_state.data
-            st.success(f"✅ 已加载: {df.shape[0]}行 × {df.shape[1]}列")
-            
-            if st.session_state.molecular_features is not None:
+
+        # [核心修改]：优先获取 processed_data (清洗/处理后的数据)，如果没有才获取 data (原始数据)
+        current_df = st.session_state.get('processed_data')
+        original_df = st.session_state.get('data')
+
+        # 确定要显示哪个数据的信息
+        display_df = current_df if current_df is not None else original_df
+
+        if display_df is not None:
+            # 1. 显示行/列数
+            # 如果是处理后的数据，显示“处理后”，否则显示“原始”
+            status_label = "✅ 当前数据 (已清洗)" if current_df is not None else "✅ 原始数据"
+            st.success(f"{status_label}\n\n**{display_df.shape[0]} 行 × {display_df.shape[1]} 列**")
+
+            # 2. 显示分子特征状态
+            if st.session_state.get('molecular_features') is not None:
                 mf = st.session_state.molecular_features
-                st.info(f"🧬 分子特征: {mf.shape[1]}个")
+                st.info(f"🧬 分子特征: {mf.shape[1]} 个")
+
+            # 3. [新增] 显示特征选择状态
+            feature_cols = st.session_state.get('feature_cols')
+            target_col = st.session_state.get('target_col')
+
+            if feature_cols:
+                st.info(f"🎯 已选特征 (X): {len(feature_cols)} 个")
+
+            if target_col:
+                # 简单显示一下目标变量，不用info框以免太拥挤
+                st.caption(f"🎯 目标变量 (Y): {target_col}")
+
         else:
             st.warning("⚠️ 未加载数据")
-        
+
         if st.session_state.model is not None:
-            st.success(f"✅ 已训练: {st.session_state.model_name}")
-        
+            st.success(f"🤖 已训练: {st.session_state.model_name}")
+            # 如果有训练结果，也可以显示R2
+            if st.session_state.get('train_result'):
+                r2 = st.session_state.train_result.get('r2', 0)
+                st.caption(f"当前 R²: {r2:.4f}")
+
         st.markdown("---")
         st.markdown("### 🔧 系统信息")
         st.caption(f"CPU核心: {mp.cpu_count()}")
         if PSUTIL_AVAILABLE:
             mem = psutil.virtual_memory()
             st.caption(f"内存使用: {mem.percent}%")
-        
+
         return page
 
 
@@ -349,14 +386,17 @@ def page_data_upload():
             type=['csv', 'xlsx', 'xls'],
             help="支持CSV和Excel格式"
         )
-        
+
         if uploaded_file is not None:
             try:
-                if uploaded_file.name.endswith('.csv'):
-                    df = pd.read_csv(uploaded_file)
-                else:
-                    df = pd.read_excel(uploaded_file)
-                
+                # [修改] 使用我们刚才定义的缓存函数加载数据
+                df = load_data_file(uploaded_file)
+
+                # [建议] 顺便加上去重名列的逻辑，防止后续特征选择报错
+                if df.columns.duplicated().any():
+                    st.warning("⚠️ 检测到重名列，系统已自动重命名处理")
+                    df = df.loc[:, ~df.columns.duplicated()]
+
                 st.session_state.data = df
                 st.session_state.processed_data = df.copy()
                 
@@ -1022,7 +1062,8 @@ def page_model_training():
                             )
                         except:
                             final_params['hidden_layer_sizes'] = (100, 50)
-                
+                if 'random_state' in final_params:
+                    final_params.pop('random_state')
                 # 训练模型
                 result = trainer.train_model(
                     X, y,

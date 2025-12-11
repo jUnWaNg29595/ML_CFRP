@@ -7,7 +7,8 @@ from tqdm import tqdm
 try:
     import torch
     import torch.nn as nn
-    from torch_geometric.data import Data
+    from torch_geometric.data import Data, Batch
+    from torch_geometric.loader import DataLoader
     from torch_geometric.nn import MessagePassing, global_add_pool
     TORCH_GEOMETRIC_AVAILABLE = True
 except ImportError:
@@ -155,31 +156,51 @@ if TORCH_GEOMETRIC_AVAILABLE:
 
 
 class GNNFeaturizer:
-    """GNN特征提取器"""
+    """GNN特征提取器 - 批量推理优化版"""
 
     def __init__(self, model=None):
         self.model = model
         if TORCH_GEOMETRIC_AVAILABLE and model is None:
             self.model = MolecularGNN3D()
 
-    def featurize(self, smiles_list):
+        # 移动模型到评估模式，如果在 GPU 上可用则移动到 GPU
+        if TORCH_GEOMETRIC_AVAILABLE:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.model.to(self.device)
+            self.model.eval()
+
+    def featurize(self, smiles_list, batch_size=32):
         """批量提取特征"""
         if not TORCH_GEOMETRIC_AVAILABLE:
             raise ImportError("需要安装torch_geometric")
 
-        features, valid_indices = [], []
-        for idx, smiles in enumerate(tqdm(smiles_list, desc="GNN特征提取")):
-            graph = smiles_to_pyg_graph(smiles)
-            if graph is None:
-                continue
-            try:
-                self.model.eval()
-                with torch.no_grad():
-                    graph.batch = torch.zeros(graph.x.size(0), dtype=torch.long)
-                    feat = self.model(graph).numpy().flatten()
-                features.append(feat)
-                valid_indices.append(idx)
-            except:
-                continue
+        graph_data_list = []
+        valid_indices = []
 
-        return np.array(features) if features else np.array([]), valid_indices
+        # 1. 预处理：将所有 SMILES 转为 Graph Data 对象
+        # 这步是 CPU 密集型，可以使用多进程加速，但为了代码稳定性，暂保持单线程带进度条
+        for idx, smiles in enumerate(tqdm(smiles_list, desc="图结构生成")):
+            graph = smiles_to_pyg_graph(smiles)
+            if graph is not None:
+                graph_data_list.append(graph)
+                valid_indices.append(idx)
+
+        if not graph_data_list:
+            return np.array([]), []
+
+        # 2. 批量推理
+        loader = DataLoader(graph_data_list, batch_size=batch_size, shuffle=False)
+        features_list = []
+
+        print(f"开始批量推理 (Device: {self.device})...")
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="GNN推理"):
+                batch = batch.to(self.device)
+                # 模型输出
+                out = self.model(batch)
+                features_list.append(out.cpu().numpy())
+
+        # 合并所有批次结果
+        all_features = np.concatenate(features_list, axis=0)
+
+        return all_features, valid_indices

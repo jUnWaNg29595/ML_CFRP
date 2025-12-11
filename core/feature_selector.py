@@ -75,12 +75,26 @@ class SmartSparseDataSelector:
         } for col in self.numeric_cols}
 
     def get_target_analysis(self):
-        analysis = [{
-            '变量名': col,
-            '有效样本数': info['non_null_count'],
-            '有效率': f"{info['non_null_ratio']*100:.1f}%",
-            '缺失数': info['null_count']
-        } for col, info in self.sparsity_info.items()]
+        analysis = []
+        for col, info in self.sparsity_info.items():
+            # [修复] 强制转换为 float，防止因重名列导致的 Series 类型错误
+            try:
+                non_null_ratio = float(info['non_null_ratio'])
+                non_null_count = int(info['non_null_count'])
+                null_count = int(info['null_count'])
+            except TypeError:
+                # 如果遇到无法转换的情况（例如Series），尝试取第一个值或均值
+                non_null_ratio = float(np.mean(info['non_null_ratio']))
+                non_null_count = int(np.mean(info['non_null_count']))
+                null_count = int(np.mean(info['null_count']))
+
+            analysis.append({
+                '变量名': col,
+                '有效样本数': non_null_count,
+                '有效率': f"{non_null_ratio * 100:.1f}%",  # 这里原本报错
+                '缺失数': null_count
+            })
+
         return pd.DataFrame(analysis).sort_values('有效样本数', ascending=False)
 
     def get_valid_samples_for_target(self, target_col):
