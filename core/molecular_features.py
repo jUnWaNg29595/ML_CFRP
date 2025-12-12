@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
+from rdkit.Chem import MACCSkeys
 from tqdm import tqdm
 import warnings
 import torch
@@ -510,7 +511,7 @@ class MLForceFieldExtractor:
 
 
 class EpoxyDomainFeatureExtractor:
-    """环氧树脂领域知识特征提取器"""
+    """环氧树脂领域知识特征提取器 (增强版：加入电子效应模拟)"""
 
     def __init__(self):
         if not RDKIT_AVAILABLE:
@@ -518,21 +519,42 @@ class EpoxyDomainFeatureExtractor:
 
     def _get_epoxide_count(self, mol):
         patt = Chem.MolFromSmarts("[C]1[O][C]1")
-        return len(mol.GetSubstructMatches(patt))
+        matches = mol.GetSubstructMatches(patt)
+        return len(matches)
 
     def _get_active_hydrogen_count(self, mol):
         count = 0
         for atom in mol.GetAtoms():
+            # 计算与氮原子相连的氢原子数 (胺类固化剂)
             if atom.GetAtomicNum() == 7:
                 count += atom.GetTotalNumHs()
         return count
 
-    def _calc_rigidity(self, mol, mw):
-        num_aromatic = Descriptors.NumAromaticRings(mol)
-        aromatic_density = num_aromatic / mw if mw > 0 else 0
-        num_rotatable = Descriptors.NumRotatableBonds(mol)
-        rotatable_density = num_rotatable / mw if mw > 0 else 0
-        return aromatic_density, rotatable_density
+    def _calc_electronic_props(self, mol):
+        """计算电子性质 (作为DFT的低成本替代)"""
+        try:
+            # 计算 Gasteiger 部分电荷
+            AllChem.ComputeGasteigerCharges(mol)
+            charges = []
+            for atom in mol.GetAtoms():
+                # 获取计算出的电荷
+                c = atom.GetProp('_GasteigerCharge')
+                # 有些原子可能无法计算，返回inf或nan
+                if c and not c.lower().startswith('nan') and not c.lower().startswith('inf'):
+                    charges.append(float(c))
+
+            if not charges:
+                return 0.0, 0.0, 0.0
+
+            max_pos_charge = max(charges)  # 亲电性指标
+            max_neg_charge = min(charges)  # 亲核性指标
+
+            # 拓扑极性表面积 (TPSA) - 表征分子极性
+            tpsa = Descriptors.TPSA(mol)
+
+            return max_pos_charge, max_neg_charge, tpsa
+        except Exception:
+            return 0.0, 0.0, 0.0
 
     def extract_features(self, resin_smiles_list, hardener_smiles_list, stoichiometry_list=None):
         features_list = []
@@ -541,6 +563,7 @@ class EpoxyDomainFeatureExtractor:
         if len(resin_smiles_list) != len(hardener_smiles_list):
             return pd.DataFrame(), []
 
+        # 遍历每对样本
         for idx, (smi_r, smi_h) in enumerate(zip(resin_smiles_list, hardener_smiles_list)):
             try:
                 mol_r = Chem.MolFromSmiles(str(smi_r))
@@ -549,34 +572,21 @@ class EpoxyDomainFeatureExtractor:
                 if mol_r is None or mol_h is None:
                     continue
 
+                # 1. 基础化学计量特征 (原有功能)
                 mw_r = Descriptors.MolWt(mol_r)
                 mw_h = Descriptors.MolWt(mol_h)
-
                 f_epoxy = self._get_epoxide_count(mol_r)
                 f_amine = self._get_active_hydrogen_count(mol_h)
 
                 eew = mw_r / f_epoxy if f_epoxy > 0 else mw_r
                 ahew = mw_h / f_amine if f_amine > 0 else mw_h
 
+                # 计算理论配比 (phr)
                 theo_phr = (ahew / eew) * 100 if eew > 0 else 0
 
-                if stoichiometry_list is not None and idx < len(stoichiometry_list):
-                    actual_phr = stoichiometry_list[idx]
-                    stoich_deviation = actual_phr / theo_phr if theo_phr > 0 else 0
-                else:
-                    stoich_deviation = 1.0
-
-                if f_amine > 0 and (mw_r + mw_h) > 0:
-                    mass_unit = mw_r + (mw_h * (f_epoxy / f_amine))
-                    xd_proxy = f_epoxy / mass_unit
-                else:
-                    xd_proxy = 0
-
-                r_aro, r_rot = self._calc_rigidity(mol_r, mw_r)
-                h_aro, h_rot = self._calc_rigidity(mol_h, mw_h)
-
-                total_mass = mw_r + mw_h
-                avg_aromatic_density = (r_aro * mw_r + h_aro * mw_h) / total_mass
+                # 2. 电子性质特征 (新增功能 - 模拟DFT)
+                r_pos_chg, r_neg_chg, r_tpsa = self._calc_electronic_props(mol_r)
+                h_pos_chg, h_neg_chg, h_tpsa = self._calc_electronic_props(mol_h)
 
                 features = {
                     'EEW': eew,
@@ -584,10 +594,12 @@ class EpoxyDomainFeatureExtractor:
                     'Resin_Functionality': f_epoxy,
                     'Hardener_Functionality': f_amine,
                     'Theoretical_PHR': theo_phr,
-                    'Stoich_Deviation': stoich_deviation,
-                    'Crosslink_Density_Proxy': xd_proxy * 1000,
-                    'System_Aromatic_Density': avg_aromatic_density,
-                    'Resin_Rotatable_Density': r_rot
+                    # 新增特征列
+                    'Resin_Max_Pos_Charge': r_pos_chg,
+                    'Resin_Max_Neg_Charge': r_neg_chg,
+                    'Resin_TPSA': r_tpsa,
+                    'Hardener_Max_Pos_Charge': h_pos_chg,
+                    'Hardener_TPSA': h_tpsa
                 }
 
                 features_list.append(features)
@@ -603,49 +615,70 @@ class EpoxyDomainFeatureExtractor:
 
 
 class FingerprintExtractor:
-    """分子指纹提取器：支持 MACCS Keys 和 Morgan Fingerprints"""
+    """分子指纹提取器：支持 MACCS Keys 和 Morgan Fingerprints (支持双组分拼接)"""
 
     def __init__(self):
         if not RDKIT_AVAILABLE:
             raise ImportError("需要安装 rdkit")
 
-    def smiles_to_fingerprints(self, smiles_list, fp_type='MACCS', n_bits=2048, radius=2):
+    def _gen_fp_array(self, mol, fp_type, n_bits, radius):
+        """辅助函数：生成单个分子的指纹数组"""
+        if fp_type == 'MACCS':
+            return np.array(MACCSkeys.GenMACCSKeys(mol))
+        elif fp_type == 'Morgan':
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+            return np.array(fp)
+        return np.array([])
+
+    def smiles_to_fingerprints(self, smiles_list, smiles_list_2=None, fp_type='MACCS', n_bits=2048, radius=2):
         """
-        提取分子指纹
+        提取分子指纹。
+        Args:
+            smiles_list: 树脂/第一组分 SMILES
+            smiles_list_2: (可选) 固化剂/第二组分 SMILES。如果提供，将拼接两个指纹。
         """
         all_fps = []
         valid_indices = []
 
+        # 判断是否需要双组分拼接
+        is_dual = smiles_list_2 is not None and len(smiles_list_2) == len(smiles_list)
+
         desc_str = f"提取 {fp_type} 指纹"
-        if fp_type == 'Morgan':
-            desc_str += f" (r={radius}, b={n_bits})"
+        if is_dual:
+            desc_str += " (双组分拼接: Resin + Hardener)"
 
         print(f"\n👆 {desc_str}")
 
-        for idx, smiles in enumerate(tqdm(smiles_list, desc="Processing")):
+        for idx, smi1 in enumerate(tqdm(smiles_list, desc="指纹提取")):
             try:
-                mol = Chem.MolFromSmiles(str(smiles))
-                if mol is None:
+                # 1. 处理第一个分子
+                mol1 = Chem.MolFromSmiles(str(smi1))
+                if mol1 is None:
                     continue
 
-                fp_array = None
+                feat_dict = {}
 
-                if fp_type == 'MACCS':
-                    # MACCS Keys: 167 bits
-                    fp = MACCSkeys.GenMACCSKeys(mol)
-                    fp_array = np.array(fp)
-                    features = {f"MACCS_{i}": val for i, val in enumerate(fp_array)}
+                # 生成指纹 1
+                fp1_arr = self._gen_fp_array(mol1, fp_type, n_bits, radius)
+                for i, val in enumerate(fp1_arr):
+                    # 特征名加前缀区分
+                    feat_dict[f"Resin_{fp_type}_{i}"] = val
 
-                elif fp_type == 'Morgan':
-                    # Morgan (ECFP like): bit vector
-                    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
-                    fp_array = np.array(fp)
-                    features = {f"Morgan_{i}": val for i, val in enumerate(fp_array)}
+                # 2. 处理第二个分子 (如果有)
+                if is_dual:
+                    smi2 = smiles_list_2[idx]
+                    mol2 = Chem.MolFromSmiles(str(smi2))
+                    if mol2 is None:
+                        # 如果固化剂SMILES无效，您可以选择跳过该样本，或者填0
+                        # 这里选择跳过，保证数据质量
+                        continue
 
-                else:
-                    continue
+                        # 生成指纹 2
+                    fp2_arr = self._gen_fp_array(mol2, fp_type, n_bits, radius)
+                    for i, val in enumerate(fp2_arr):
+                        feat_dict[f"Hardener_{fp_type}_{i}"] = val
 
-                all_fps.append(features)
+                all_fps.append(feat_dict)
                 valid_indices.append(idx)
 
             except Exception as e:
@@ -654,8 +687,11 @@ class FingerprintExtractor:
         if not all_fps:
             return pd.DataFrame(), []
 
+        # 转为 DataFrame 并优化内存
         df = pd.DataFrame(all_fps)
         df = df.astype(np.uint8)
+
+        # 移除全为0的列 (无信息量的位)
         df = df.loc[:, (df != 0).any(axis=0)]
 
         return df, valid_indices

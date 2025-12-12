@@ -854,13 +854,14 @@ def page_data_enhancement():
 # 页面：分子特征提取（完整5种方法）
 # ============================================================
 def page_molecular_features():
-    """分子特征提取页面 - 完整还原5种方法 + 分子指纹"""
+    """分子特征提取页面 - 完整还原5种方法 + 分子指纹 (适配双组分)"""
     st.title("🧬 分子特征提取")
 
     if st.session_state.data is None:
         st.warning("⚠️ 请先上传数据")
         return
 
+    # 优先使用处理后的数据
     df = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
 
     # 检测SMILES列
@@ -879,14 +880,14 @@ def page_molecular_features():
         if smiles_candidates:
             default_idx = text_cols.index(smiles_candidates[0])
 
+        # 这里明确这是第一组分（通常是树脂）
         smiles_col = st.selectbox(
-            "选择包含SMILES的列",
+            "选择包含SMILES的列 (树脂/主体)",
             text_cols,
             index=default_idx
         )
 
     with col2:
-        # 显示SMILES示例
         st.markdown("**示例SMILES:**")
         samples = df[smiles_col].dropna().head(3).tolist()
         for s in samples:
@@ -912,102 +913,46 @@ def page_molecular_features():
         help="不同方法适用于不同场景"
     )
 
-    # 方法说明
-    method_info = {
-        "👆 分子指纹 (MACCS/Morgan) [新]": {
-            "desc": "提取二进制分子指纹 (MACCS Keys 167位 或 Morgan/ECFP)",
-            "features": "167 ~ 2048个",
-            "speed": "极快",
-            "memory": "低"
-        },
-        "🔹 RDKit 标准版 (推荐新手)": {
-            "desc": "使用RDKit计算200+分子描述符，适合中小型数据集",
-            "features": "~200个",
-            "speed": "中等",
-            "memory": "中等"
-        },
-        "🚀 RDKit 并行版 (大数据集)": {
-            "desc": "多进程并行计算，显著加速大数据集处理",
-            "features": "~200个",
-            "speed": "快",
-            "memory": "较高"
-        },
-        "💾 RDKit 内存优化版 (低内存)": {
-            "desc": "分批处理，适合内存受限环境",
-            "features": "~200个",
-            "speed": "慢",
-            "memory": "低"
-        },
-        "🔬 Mordred 描述符 (1600+特征)": {
-            "desc": "使用Mordred库计算1600+分子描述符，特征最全面",
-            "features": "~1600个",
-            "speed": "慢",
-            "memory": "高"
-        },
-        "🕸️ 图神经网络特征 (拓扑结构)": {
-            "desc": "提取分子图的拓扑统计特征，包括节点数、边数、平均度等",
-            "features": "~10个",
-            "speed": "中等",
-            "memory": "中等"
-
-        },
-        "⚛️ ML力场特征 (ANI能量/力)": {
-            "desc": "基于TorchANI计算分子的3D势能和原子受力，捕捉量子化学性质",
-            "features": "5个 (高价值)",
-            "speed": "慢 (含3D生成)",
-            "memory": "中等 (显存)"
-        },
-        "⚗️ 环氧树脂反应特征 (基于领域知识)": {
-            "desc": "基于报告推荐：计算EEW、AHEW、理论交联密度等决定Tg的关键物理量",
-            "features": "~10个 (极高价值)",
-            "speed": "极快",
-            "memory": "低"
-        },
-    }
-
-    info = method_info[extraction_method]
-    col1, col2, col3 = st.columns(3)
-    col1.metric("预计特征数", info["features"])
-    col2.metric("处理速度", info["speed"])
-    col3.metric("内存占用", info["memory"])
-    st.info(info["desc"])
-
-    # ============== [UI] 指纹参数设置 ==============
+    # UI 变量初始化
     fp_type = "MACCS"
     fp_bits = 2048
     fp_radius = 2
+    hardener_col = None  # 初始化固化剂列变量
+    phr_col = None
 
+    # ============== [UI 修改] 指纹参数设置 ==============
     if "分子指纹" in extraction_method:
+        st.info("💡 提示：对于环氧树脂体系，建议同时选择树脂和固化剂列，系统将自动拼接两者的指纹以描述完整网络结构。")
+
         col_fp1, col_fp2, col_fp3 = st.columns(3)
         with col_fp1:
             fp_type = st.selectbox("指纹类型", ["MACCS", "Morgan"])
 
         if fp_type == "Morgan":
             with col_fp2:
-                fp_radius = st.selectbox("半径 (Radius)", [2, 3, 4], index=0, help="ECFP4对应半径2")
+                fp_radius = st.selectbox("半径 (Radius)", [2, 3, 4], index=0)
             with col_fp3:
                 fp_bits = st.selectbox("位长 (Bits)", [1024, 2048, 4096], index=1)
-        else:
-            with col_fp2:
-                st.write("MACCS Keys 固定为 167 位")
 
-    # ============== [新增] 针对环氧树脂方法的特殊 UI ==============
-    hardener_col = None
-    phr_col = None
+        # [新增] 双组分选择 UI
+        st.markdown("#### 双组分设置 (推荐)")
+        col_h1, col_h2 = st.columns(2)
+        with col_h1:
+            # 排除已选的树脂列，避免重复选择
+            candidate_cols = ["无 (仅提取单列)"] + [c for c in text_cols if c != smiles_col]
+            hardener_col_opt = st.selectbox("选择【固化剂】SMILES列", candidate_cols)
 
+            if hardener_col_opt != "无 (仅提取单列)":
+                hardener_col = hardener_col_opt
+
+    # ============== [UI] 环氧树脂特征参数 ==============
     if "环氧树脂反应特征" in extraction_method:
-        st.info("💡 该方法需要同时提供【树脂】和【固化剂】的SMILES结构，以计算固化后的网络性质。")
-        col_r, col_h, col_p = st.columns(3)
-        with col_r:
-            # 这里的 smiles_col 变量即为树脂列
-            st.markdown(f"**树脂列:** `{smiles_col}` (已选)")
+        st.info("💡 该方法需要同时提供【树脂】和【固化剂】的SMILES结构。")
+        col_h, col_p = st.columns(2)
         with col_h:
-            # 排除已选的树脂列
             candidate_cols = [c for c in text_cols if c != smiles_col]
-            hardener_col = st.selectbox("选择【固化剂】SMILES列", candidate_cols,
-                                        help="如果没有固化剂列，可选择'手动输入'模式")
+            hardener_col = st.selectbox("选择【固化剂】SMILES列", candidate_cols)
         with col_p:
-            # 可选：选择比例列
             num_cols = df.select_dtypes(include=np.number).columns.tolist()
             phr_col = st.selectbox("选择【配比/PHR】列 (可选)", ["无 (假设理想配比)"] + num_cols)
 
@@ -1025,11 +970,32 @@ def page_molecular_features():
     if st.button("🚀 开始提取分子特征", type="primary"):
         smiles_list = df[smiles_col].tolist()
 
+        # 准备固化剂列表
+        hardener_list = None
+        if hardener_col:
+            hardener_list = df[hardener_col].tolist()
+
         try:
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            if "标准版" in extraction_method:
+            # --- [逻辑修改] 分发提取任务 ---
+            if "分子指纹" in extraction_method:
+                from core.molecular_features import FingerprintExtractor
+
+                # 提示用户当前模式
+                mode_str = "双组分拼接" if hardener_list else "单组分"
+                status_text.text(f"正在提取 {fp_type} 指纹 ({mode_str}模式)...")
+
+                extractor = FingerprintExtractor()
+                # 传入 smiles_list_2 (固化剂)
+                features_df, valid_indices = extractor.smiles_to_fingerprints(
+                    smiles_list,
+                    smiles_list_2=hardener_list,
+                    fp_type=fp_type, n_bits=fp_bits, radius=fp_radius
+                )
+
+            elif "标准版" in extraction_method:
                 status_text.text("正在使用RDKit标准版提取...")
                 extractor = AdvancedMolecularFeatureExtractor()
                 features_df, valid_indices = extractor.smiles_to_rdkit_features(smiles_list)
@@ -1045,17 +1011,12 @@ def page_molecular_features():
                     features_df, valid_indices = extractor.smiles_to_rdkit_features(smiles_list)
 
             elif "内存优化版" in extraction_method:
-                if OPTIMIZED_EXTRACTOR_AVAILABLE:
-                    status_text.text("正在使用RDKit内存优化版提取...")
-                    extractor = MemoryEfficientRDKitExtractor()
-                    features_df, valid_indices = extractor.smiles_to_rdkit_features(smiles_list)
-                else:
-                    st.warning("内存优化版不可用，回退到标准版")
-                    extractor = AdvancedMolecularFeatureExtractor()
-                    features_df, valid_indices = extractor.smiles_to_rdkit_features(smiles_list)
+                status_text.text("正在使用RDKit内存优化版...")
+                extractor = MemoryEfficientRDKitExtractor()
+                features_df, valid_indices = extractor.smiles_to_rdkit_features(smiles_list)
 
             elif "Mordred" in extraction_method:
-                status_text.text("正在使用Mordred提取描述符...")
+                status_text.text("正在使用Mordred提取...")
                 extractor = AdvancedMolecularFeatureExtractor()
                 features_df, valid_indices = extractor.smiles_to_mordred(smiles_list)
 
@@ -1064,84 +1025,57 @@ def page_molecular_features():
                 extractor = AdvancedMolecularFeatureExtractor()
                 features_df, valid_indices = extractor.smiles_to_graph_features(smiles_list)
 
-            elif "分子指纹" in extraction_method:
-                from core.molecular_features import FingerprintExtractor
-                status_text.text(f"正在提取 {fp_type} 指纹...")
-                extractor = FingerprintExtractor()
-                features_df, valid_indices = extractor.smiles_to_fingerprints(
-                    smiles_list, fp_type=fp_type, n_bits=fp_bits, radius=fp_radius
-                )
-
             elif "ML力场" in extraction_method:
                 from core.molecular_features import MLForceFieldExtractor
-
-                status_text.text("正在生成3D构象并计算ANI力场特征 (可能较慢)...")
-
-                # 实例化提取器
+                status_text.text("正在计算ANI力场特征...")
                 extractor = MLForceFieldExtractor()
                 if not extractor.AVAILABLE:
-                    st.error("TorchANI 未安装或初始化失败")
+                    st.error("TorchANI 未安装")
                     return
                 features_df, valid_indices = extractor.smiles_to_ani_features(smiles_list)
+
             elif "环氧树脂" in extraction_method:
                 from core.molecular_features import EpoxyDomainFeatureExtractor
-
-                status_text.text("正在计算环氧树脂领域物理特征 (EEW, 交联密度...)...")
-
+                status_text.text("正在计算环氧树脂领域特征...")
                 if hardener_col is None:
                     st.error("请选择固化剂列！")
                     return
 
-                resin_list = df[smiles_col].tolist()
-                hardener_list = df[hardener_col].tolist()
-
-                # 处理 PHR (配比)
                 phr_list = None
                 if phr_col and phr_col != "无 (假设理想配比)":
                     phr_list = df[phr_col].tolist()
 
                 extractor = EpoxyDomainFeatureExtractor()
-                features_df, valid_indices = extractor.extract_features(resin_list, hardener_list, phr_list)
+                features_df, valid_indices = extractor.extract_features(smiles_list, hardener_list, phr_list)
+
             progress_bar.progress(100)
 
+            # --- 合并结果逻辑 (保持不变) ---
             if len(features_df) > 0:
                 st.session_state.molecular_features = features_df
-
-                # [核心修改 1] 为特征列添加前缀，区分来源
-                # 例如：如果当前选择的列是 'resin_smiles'，特征就会变成 'resin_smiles_MolWt'
-                # 这样即使对多个列分别提取，特征名也不会重复！
                 prefix = f"{smiles_col}_"
                 features_df = features_df.add_prefix(prefix)
 
-                # [核心修改 2] 准备合并数据
                 df_valid = df.iloc[valid_indices].reset_index(drop=True)
                 features_df = features_df.reset_index(drop=True)
 
-                # [核心修改 3] 智能合并逻辑
-                # 虽然加了前缀，但为了防止用户对"同一列"重复点击提取按钮导致堆叠
-                # 我们还是要检查一下是否已经存在完全相同的列名（带前缀的）
+                # 防止列名冲突：如果新特征名已存在，先删除旧的
                 cols_to_drop = [col for col in features_df.columns if col in df_valid.columns]
                 if cols_to_drop:
-                    # 如果这些带前缀的列已经存在，说明用户是重复操作，我们先删除旧的，用新的覆盖
                     df_valid = df_valid.drop(columns=cols_to_drop)
 
-                # 安全合并
                 merged_df = pd.concat([df_valid, features_df], axis=1)
-                # [双重保险] 全局去重，防止任何意外的重复列
                 merged_df = merged_df.loc[:, ~merged_df.columns.duplicated()]
-                # 更新状态
                 st.session_state.processed_data = merged_df
 
                 st.success(f"✅ 成功提取 {len(features_df)} 个样本的 {features_df.shape[1]} 个分子特征")
-                st.info(f"ℹ️ 特征列已自动添加前缀: '{prefix}...' 以区分不同来源")
 
                 # 结果统计
                 col1, col2, col3 = st.columns(3)
                 col1.metric("有效样本", len(valid_indices))
-                col2.metric("失败样本", len(smiles_list) - len(valid_indices))
-                col3.metric("特征数量", features_df.shape[1])
+                col2.metric("特征数量", features_df.shape[1])
+                col3.metric("双组分模式", "是" if hardener_list else "否")
 
-                # 特征预览
                 st.markdown("### 📋 特征预览")
                 st.dataframe(features_df.head(), use_container_width=True)
             else:
