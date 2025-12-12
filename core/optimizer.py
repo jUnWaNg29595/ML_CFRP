@@ -1,172 +1,188 @@
 # -*- coding: utf-8 -*-
-"""超参数优化模块"""
+"""
+超参数优化模块
+修复说明：
+1. [关键修复] 在优化开始前，自动移除目标变量 y 中的 NaN 值，防止 XGBoost 崩溃。
+2. 增加了数据清洗日志，如果删除了数据会在控制台提示。
+"""
 
 import optuna
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import cross_val_score, KFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import r2_score
 import warnings
 
-warnings.filterwarnings('ignore')
+# 抑制 Optuna 的日志输出，只显示进度条
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+warnings.filterwarnings('ignore')
+
+from core.model_trainer import EnhancedModelTrainer
 
 
 class HyperparameterOptimizer:
-    """Optuna超参数优化器"""
+    """超参数优化器"""
 
     def __init__(self):
-        self.best_params = None
-        self.best_score = None
-        self.study = None
+        self.trainer = EnhancedModelTrainer()
 
-    def _objective(self, trial, model_name, X, y, cv):
-        from .model_trainer import EnhancedModelTrainer
-
-        if pd.isna(y).any():
-            valid_idx = ~pd.isna(y)
-            X, y = X[valid_idx], y[valid_idx]
-
-        if isinstance(y, (pd.DataFrame, pd.Series)):
-            y = y.values.ravel()
-
-        trainer = EnhancedModelTrainer()
+    def get_model_params(self, trial, model_name):
+        """定义各模型的参数搜索空间"""
         params = {}
 
         if model_name == "随机森林":
             params = {
-                'n_estimators': trial.suggest_int('n_estimators', 50, 500, step=50),
-                'max_depth': trial.suggest_int('max_depth', 5, 30),
-                'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
-                'random_state': 42
+                'n_estimators': trial.suggest_int('n_estimators', 50, 300),
+                'max_depth': trial.suggest_int('max_depth', 3, 20),
+                'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+                'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 5),
+                'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None])
             }
+
         elif model_name == "XGBoost":
             params = {
                 'n_estimators': trial.suggest_int('n_estimators', 50, 500),
                 'max_depth': trial.suggest_int('max_depth', 3, 10),
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
                 'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-                'random_state': 42
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True)
             }
+
         elif model_name == "LightGBM":
             params = {
                 'n_estimators': trial.suggest_int('n_estimators', 50, 500),
-                'max_depth': trial.suggest_int('max_depth', 3, 12),
+                'max_depth': trial.suggest_int('max_depth', 3, 15),
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-                'num_leaves': trial.suggest_int('num_leaves', 20, 100),
-                'random_state': 42, 'verbose': -1
+                'num_leaves': trial.suggest_int('num_leaves', 20, 150),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+                'verbose': -1
             }
+
         elif model_name == "CatBoost":
             params = {
                 'iterations': trial.suggest_int('iterations', 50, 500),
-                'depth': trial.suggest_int('depth', 3, 10),
+                'depth': trial.suggest_int('depth', 4, 10),
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-                'random_state': 42, 'verbose': 0
+                'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1e-8, 10.0, log=True),
+                'border_count': trial.suggest_int('border_count', 32, 255),
+                'verbose': 0
             }
+
         elif model_name == "SVR":
             params = {
                 'C': trial.suggest_float('C', 0.1, 1000, log=True),
-                'kernel': trial.suggest_categorical('kernel', ['rbf', 'linear', 'poly']),
-                'epsilon': trial.suggest_float('epsilon', 0.01, 1.0, log=True)
+                'epsilon': trial.suggest_float('epsilon', 0.01, 1.0, log=True),
+                'gamma': trial.suggest_categorical('gamma', ['scale', 'auto']),
+                'kernel': trial.suggest_categorical('kernel', ['linear', 'rbf', 'poly'])
             }
-        elif model_name == "Ridge回归":
-            params = {'alpha': trial.suggest_float('alpha', 0.01, 100, log=True)}
-        elif model_name == "Lasso回归":
-            params = {'alpha': trial.suggest_float('alpha', 0.01, 100, log=True)}
-        elif model_name == "ElasticNet":
+
+        elif model_name in ["Ridge回归", "Lasso回归", "ElasticNet"]:
             params = {
-                'alpha': trial.suggest_float('alpha', 0.01, 100, log=True),
-                'l1_ratio': trial.suggest_float('l1_ratio', 0.0, 1.0)
+                'alpha': trial.suggest_float('alpha', 1e-4, 100.0, log=True)
             }
+            if model_name == "ElasticNet":
+                params['l1_ratio'] = trial.suggest_float('l1_ratio', 0.1, 0.9)
+
         elif model_name == "AdaBoost":
             params = {
                 'n_estimators': trial.suggest_int('n_estimators', 50, 500),
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 2.0, log=True)
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 1.0, log=True)
             }
+
         elif model_name == "梯度提升树":
             params = {
-                'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+                'n_estimators': trial.suggest_int('n_estimators', 50, 300),
                 'max_depth': trial.suggest_int('max_depth', 3, 10),
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-                'random_state': 42
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None])
             }
 
-        try:
-            model = trainer._get_model(model_name, **params)
-            scores = cross_val_score(model, X, y, cv=cv, scoring='r2', n_jobs=-1)
-            return scores.mean()
-        except:
-            return -np.inf
+        return params
 
-    def optimize(self, model_name, X, y, n_trials=50, cv=5):
+    def optimize(self, model_name, X, y, n_trials=50, cv=5, random_state=42):
+        """
+        执行超参数优化
+        """
+
+        # 1. 确保输入是 numpy 数组
         if isinstance(X, pd.DataFrame):
             X = X.values
         if isinstance(y, (pd.DataFrame, pd.Series)):
-            y = y.values.ravel()
+            y = y.values.ravel() if hasattr(y, 'values') else np.array(y).ravel()
 
-        # 处理缺失值
+        # 2. [关键修复] 移除 y 中的 NaN 值
+        # XGBoost 等模型严禁 Label 为空，否则会直接导致底层 C++ 崩溃
         mask = ~np.isnan(y)
-        X, y = X[mask], y[mask]
+        if np.sum(~mask) > 0:
+            print(f"⚠️ 警告: 检测到目标变量 y 中有 {np.sum(~mask)} 个缺失值，已在优化前自动移除对应样本。")
+            X = X[mask]
+            y = y[mask]
 
-        # 填充特征缺失值
-        from sklearn.impute import SimpleImputer
-        from sklearn.preprocessing import StandardScaler
-        imputer = SimpleImputer(strategy='median')
-        scaler = StandardScaler()
-        X = scaler.fit_transform(imputer.fit_transform(X))
+        # 再次检查是否有无穷大
+        mask_inf = ~np.isinf(y)
+        if np.sum(~mask_inf) > 0:
+            print(f"⚠️ 警告: 检测到目标变量 y 中有 {np.sum(~mask_inf)} 个无穷大值，已移除。")
+            X = X[mask_inf]
+            y = y[mask_inf]
 
-        self.study = optuna.create_study(direction='maximize')
-        self.study.optimize(
-            lambda trial: self._objective(trial, model_name, X, y, cv),
-            n_trials=n_trials, show_progress_bar=True
-        )
+        def objective(trial):
+            # 获取建议参数
+            params = self.get_model_params(trial, model_name)
 
-        self.best_params = self.study.best_params
-        self.best_score = self.study.best_value
+            try:
+                # 调用正确的方法名 _get_model
+                base_model = self.trainer._get_model(model_name, **params)
 
-        return self.best_params, self.best_score, self.study
+                # 增加 SimpleImputer 处理特征缺失
+                pipeline = make_pipeline(
+                    SimpleImputer(strategy='median'),
+                    StandardScaler(),
+                    base_model
+                )
+
+                # 定义交叉验证策略
+                cv_strategy = KFold(n_splits=cv, shuffle=True, random_state=random_state)
+
+                # 执行交叉验证
+                scores = cross_val_score(
+                    pipeline, X, y,
+                    cv=cv_strategy,
+                    scoring='r2',
+                    n_jobs=-1,  # 并行计算
+                    error_score='raise'
+                )
+
+                return scores.mean()
+
+            except Exception as e:
+                print(f"❌ Trial {trial.number} failed: {str(e)}")
+                return -float('inf')
+
+        # 创建 Study 对象
+        study = optuna.create_study(direction="maximize")
+
+        # 执行优化
+        study.optimize(objective, n_trials=n_trials)
+
+        return study.best_params, study.best_value, study
 
 
 class InverseDesigner:
-    """逆向设计器"""
+    """反向设计器 (占位，预留未来功能)"""
 
-    def __init__(self, model, scaler, feature_names, target_name):
-        self.model = model
-        self.scaler = scaler
-        self.feature_names = feature_names
-        self.target_name = target_name
-
-    def design(self, target_value, bounds, n_trials=100):
-        best_x = None
-        best_diff = float('inf')
-
-        for _ in range(n_trials):
-            x = np.array([np.random.uniform(bounds[f][0], bounds[f][1]) for f in self.feature_names])
-            x_scaled = self.scaler.transform(x.reshape(1, -1))
-            pred = self.model.predict(x_scaled)[0]
-            diff = abs(pred - target_value)
-            if diff < best_diff:
-                best_diff = diff
-                best_x = x
-
-        return dict(zip(self.feature_names, best_x)), best_diff
+    def __init__(self):
+        pass
 
 
 def generate_tuning_suggestions(model_name, current_score):
-    """生成调优建议"""
-    suggestions = []
-    
-    if model_name in ["随机森林", "Extra Trees"]:
-        suggestions.append("尝试增加n_estimators (200-500)")
-        suggestions.append("调整max_depth防止过拟合")
-    elif model_name in ["XGBoost", "LightGBM", "CatBoost"]:
-        suggestions.append("降低learning_rate并增加n_estimators")
-        suggestions.append("调整正则化参数防止过拟合")
-    elif model_name == "SVR":
-        suggestions.append("尝试不同的kernel")
-        suggestions.append("调整C和epsilon参数")
-    
-    if current_score < 0.7:
-        suggestions.append("考虑增加更多特征")
-        suggestions.append("检查数据质量和异常值")
-    
-    return suggestions
+    """生成调参建议"""
+    return f"建议增加 {model_name} 的搜索空间或增加迭代次数。"

@@ -8,6 +8,7 @@ import multiprocessing as mp
 from tqdm import tqdm
 import warnings
 import torch
+import os  # 新增
 
 warnings.filterwarnings('ignore')
 
@@ -15,7 +16,7 @@ try:
     from rdkit import Chem
     from rdkit.Chem import Descriptors
     from rdkit.Chem import AllChem
-    from rdkit.Chem import MACCSkeys  # 导入MACCS Keys
+    from rdkit.Chem import MACCSkeys
 
     RDKIT_AVAILABLE = True
 except ImportError:
@@ -47,21 +48,20 @@ def _generate_3d_data_worker(smiles):
             return None
         mol = Chem.AddHs(mol)  # 力场计算必须加氢
 
-        # 2. 生成3D构象 (尝试不同参数以提高成功率)
+        # 2. 生成3D构象
         params = AllChem.ETKDGv3()
         params.useRandomCoords = True
-        params.numThreads = 1  # 禁用 RDKit 内部线程，避免与多进程冲突
+        params.numThreads = 1  # 禁用 RDKit 内部线程
 
         res = AllChem.EmbedMolecule(mol, params)
         if res != 0:
-            # 备用方案
             res = AllChem.EmbedMolecule(mol, useRandomCoords=True)
             if res != 0:
                 return None
 
         # 3. 初步力场优化 (MMFF)
         try:
-            AllChem.MMFFOptimizeMolecule(mol, maxIters=50)  # 减少迭代次数以提升速度
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=50)
         except:
             pass
 
@@ -69,7 +69,6 @@ def _generate_3d_data_worker(smiles):
         atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
         coords = mol.GetConformer().GetPositions()
 
-        # 简单过滤：ANI-2x 只支持 H, C, N, O, S, F, Cl
         supported_species = {1, 6, 7, 8, 16, 9, 17}
         if not set(atoms).issubset(supported_species):
             return None
@@ -286,15 +285,19 @@ class AdvancedMolecularFeatureExtractor:
 
         return self._process_result(all_features, valid_indices)
 
-    def smiles_to_mordred(self, smiles_list):
+    def smiles_to_mordred(self, smiles_list, batch_size=1000):
+        """
+        Mordred特征提取 - 优化版
+        增加了分批处理和Windows环境下的稳定性保护
+        """
         if not MORDRED_AVAILABLE:
             raise ImportError("需要安装mordred")
 
-        print(f"\n🔬 Mordred特征提取 (并行模式)")
-        n_cpu = mp.cpu_count()
+        print(f"\n🔬 Mordred特征提取")
+
+        # 1. 预处理分子
         mols = []
         valid_indices = []
-
         for idx, smiles in enumerate(tqdm(smiles_list, desc="预处理分子结构")):
             mol = self._smiles_to_mol(smiles)
             if mol:
@@ -304,15 +307,69 @@ class AdvancedMolecularFeatureExtractor:
         if not mols:
             return pd.DataFrame(), []
 
+        # 2. 初始化计算器
         calc = Calculator(descriptors, ignore_3D=True)
-        try:
-            df = calc.pandas(mols, n_proc=n_cpu, quiet=False)
-        except:
-            print("并行计算失败，回退到单进程...")
-            df = calc.pandas(mols, quiet=False)
 
-        df = df.apply(pd.to_numeric, errors='coerce')
-        return self._process_result(df, valid_indices, is_df=True)
+        # 3. 智能选择进程数
+        # Windows 下多进程极其不稳定，强制使用单进程
+        is_windows = os.name == 'nt'
+        if is_windows:
+            print("⚠️ 检测到 Windows 系统，强制使用单进程模式以确保稳定（可能会慢一些）。")
+            n_proc = 1
+        else:
+            n_proc = mp.cpu_count()
+
+        # 4. 分批计算 (Batch Processing)
+        # 即使是单进程，分批也能让进度条动起来，并防止内存溢出
+        all_dfs = []
+        total_mols = len(mols)
+
+        # 主进度条
+        pbar = tqdm(total=total_mols, desc="计算Mordred描述符")
+
+        for i in range(0, total_mols, batch_size):
+            batch_mols = mols[i: i + batch_size]
+
+            try:
+                # 尝试计算当前批次
+                # quiet=True 是为了防止 mordred 内部再打印一个进度条干扰我们
+                if n_proc > 1:
+                    try:
+                        df_batch = calc.pandas(batch_mols, n_proc=n_proc, quiet=True)
+                    except Exception as e:
+                        # 如果并行失败，降级重试该批次
+                        if i == 0:
+                            print(f"\n⚠️ 并行计算出错 ({str(e)})，自动切换回单进程模式...")
+                        n_proc = 1
+                        df_batch = calc.pandas(batch_mols, n_proc=1, quiet=True)
+                else:
+                    df_batch = calc.pandas(batch_mols, n_proc=1, quiet=True)
+
+                all_dfs.append(df_batch)
+
+            except Exception as e:
+                print(f"\n❌ 批次 {i // batch_size + 1} 计算失败: {str(e)}")
+                # 如果某批次彻底失败，插入全NaN行以保持索引对齐
+                empty_df = pd.DataFrame(index=range(len(batch_mols)), columns=[str(d) for d in calc.descriptors])
+                all_dfs.append(empty_df)
+
+            finally:
+                pbar.update(len(batch_mols))
+
+        pbar.close()
+
+        if not all_dfs:
+            return pd.DataFrame(), []
+
+        # 5. 合并与后处理
+        try:
+            final_df = pd.concat(all_dfs, ignore_index=True)
+            # 强制转为数值，非数值转为 NaN
+            final_df = final_df.apply(pd.to_numeric, errors='coerce')
+            return self._process_result(final_df, valid_indices, is_df=True)
+        except Exception as e:
+            print(f"❌ 结果合并失败: {str(e)}")
+            return pd.DataFrame(), []
 
     def smiles_to_graph_features(self, smiles_list):
         all_features, valid_indices = [], []
@@ -555,11 +612,6 @@ class FingerprintExtractor:
     def smiles_to_fingerprints(self, smiles_list, fp_type='MACCS', n_bits=2048, radius=2):
         """
         提取分子指纹
-        Args:
-            smiles_list: SMILES 字符串列表
-            fp_type: 'MACCS' 或 'Morgan'
-            n_bits: Morgan指纹的位长 (仅对Morgan有效)
-            radius: Morgan指纹的半径 (仅对Morgan有效)
         """
         all_fps = []
         valid_indices = []
@@ -581,18 +633,13 @@ class FingerprintExtractor:
                 if fp_type == 'MACCS':
                     # MACCS Keys: 167 bits
                     fp = MACCSkeys.GenMACCSKeys(mol)
-                    # 转换为 numpy array
-                    fp_array = np.array(fp)  # 0-166
-
-                    # 创建特征名字典 (MACCS_0 ... MACCS_166)
-                    # 注意：MACCS keys 索引从 1 开始有意义，index 0 通常为 0
+                    fp_array = np.array(fp)
                     features = {f"MACCS_{i}": val for i, val in enumerate(fp_array)}
 
                 elif fp_type == 'Morgan':
                     # Morgan (ECFP like): bit vector
                     fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
                     fp_array = np.array(fp)
-
                     features = {f"Morgan_{i}": val for i, val in enumerate(fp_array)}
 
                 else:
@@ -602,19 +649,13 @@ class FingerprintExtractor:
                 valid_indices.append(idx)
 
             except Exception as e:
-                # print(e)
                 continue
 
         if not all_fps:
             return pd.DataFrame(), []
 
-        # 转为 DataFrame
         df = pd.DataFrame(all_fps)
-
-        # 优化内存：指纹是0/1，可以使用 uint8
         df = df.astype(np.uint8)
-
-        # 移除全为0的列 (无信息量的位)
         df = df.loc[:, (df != 0).any(axis=0)]
 
         return df, valid_indices

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-碳纤维复合材料智能预测平台 v1.2.7
+碳纤维复合材料智能预测平台 v1.2.8
 更新内容：
-1. 增加类别平衡功能，解决单体重复过多问题
-2. 增加分子指纹提取功能 (MACCS/Morgan)
+1. 修复数据探索页面不显示最新（处理后）数据的问题
+2. 修复导出功能只导出原始数据的问题
 """
 try:
     import torchani
@@ -244,7 +244,7 @@ def render_sidebar():
         st.markdown("---")
         st.markdown("### 📊 数据状态")
 
-        # [核心修改]：优先获取 processed_data (清洗/处理后的数据)，如果没有才获取 data (原始数据)
+        # 优先获取 processed_data (清洗/处理后的数据)
         current_df = st.session_state.get('processed_data')
         original_df = st.session_state.get('data')
 
@@ -253,7 +253,6 @@ def render_sidebar():
 
         if display_df is not None:
             # 1. 显示行/列数
-            # 如果是处理后的数据，显示“处理后”，否则显示“原始”
             status_label = "✅ 当前数据 (已清洗)" if current_df is not None else "✅ 原始数据"
             st.success(f"{status_label}\n\n**{display_df.shape[0]} 行 × {display_df.shape[1]} 列**")
 
@@ -262,7 +261,7 @@ def render_sidebar():
                 mf = st.session_state.molecular_features
                 st.info(f"🧬 分子特征: {mf.shape[1]} 个")
 
-            # 3. [新增] 显示特征选择状态
+            # 3. 显示特征选择状态
             feature_cols = st.session_state.get('feature_cols')
             target_col = st.session_state.get('target_col')
 
@@ -270,7 +269,6 @@ def render_sidebar():
                 st.info(f"🎯 已选特征 (X): {len(feature_cols)} 个")
 
             if target_col:
-                # 简单显示一下目标变量，不用info框以免太拥挤
                 st.caption(f"🎯 目标变量 (Y): {target_col}")
 
         else:
@@ -401,10 +399,10 @@ def page_data_upload():
 
         if uploaded_file is not None:
             try:
-                # [修改] 使用我们刚才定义的缓存函数加载数据
+                # 使用缓存函数加载数据
                 df = load_data_file(uploaded_file)
 
-                # [建议] 顺便加上去重名列的逻辑，防止后续特征选择报错
+                # 去重名列
                 if df.columns.duplicated().any():
                     st.warning("⚠️ 检测到重名列，系统已自动重命名处理")
                     df = df.loc[:, ~df.columns.duplicated()]
@@ -468,17 +466,20 @@ def page_data_upload():
 
 
 # ============================================================
-# 页面：数据探索
+# 页面：数据探索 (修复版)
 # ============================================================
 def page_data_explore():
-    """数据探索页面"""
+    """数据探索页面 - 修复版"""
     st.title("🔍 数据探索")
 
     if st.session_state.data is None:
         st.warning("⚠️ 请先上传数据")
         return
 
-    df = st.session_state.data
+    # [关键修复] 优先使用处理后的数据(processed_data)
+    # 这样提取特征、清洗后的数据才能显示出来
+    df = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
+
     explorer = EnhancedDataExplorer(df)
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -533,7 +534,7 @@ def page_data_explore():
             st.success("✅ 数据无缺失值")
 
     with tab5:
-        st.markdown("### 导出数据")
+        st.markdown("### 导出数据 (最新)")
         col1, col2 = st.columns(2)
 
         with col1:

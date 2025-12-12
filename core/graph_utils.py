@@ -21,12 +21,14 @@ try:
 except ImportError:
     RDKIT_AVAILABLE = False
 
-ATOM_SYMBOLS = ['C', 'N', 'O', 'S', 'F', 'Si', 'P', 'Cl', 'Br', 'I', 'B', 'H', 'Unknown']
+# 1. 扩展原子列表 (可选，覆盖更多元素)
+ATOM_SYMBOLS = ['C', 'N', 'O', 'S', 'F', 'Si', 'P', 'Cl', 'Br', 'I', 'B', 'H', 'Fe', 'Zn', 'Cu', 'Mn', 'Unknown']
 
 
 def get_atom_features(atom):
-    """提取原子特征"""
+    """提取原子特征 (修正维度和归一化)"""
     features = []
+    # One-hot 原子符号
     symbol = atom.GetSymbol()
     symbol_vec = [0] * len(ATOM_SYMBOLS)
     if symbol in ATOM_SYMBOLS:
@@ -35,11 +37,15 @@ def get_atom_features(atom):
         symbol_vec[-1] = 1
     features.extend(symbol_vec)
 
-    features.append(atom.GetAtomicNum())
-    features.append(atom.GetDegree())
-    features.append(int(atom.GetIsAromatic()))
-    features.append(atom.GetTotalNumHs())
-    features.append(atom.GetTotalValence())
+    # 归一化数值特征 或 使用One-hot (推荐归一化以保持简单)
+    features.append(float(atom.GetAtomicNum()) / 100.0)  # 归一化
+    features.append(float(atom.GetDegree()) / 10.0)  # 归一化
+    features.append(float(atom.GetIsAromatic()))  # 0/1
+    features.append(float(atom.GetTotalNumHs()) / 5.0)  # 归一化
+    features.append(float(atom.GetTotalValence()) / 8.0)  # 归一化
+
+    # 当前总维度: len(ATOM_SYMBOLS) + 5
+    # 如果 ATOM_SYMBOLS 长度为 17，则总维度为 22
     return features
 
 
@@ -51,8 +57,9 @@ def get_bond_features(bond):
     features.append(1.0 if bt == Chem.rdchem.BondType.DOUBLE else 0.0)
     features.append(1.0 if bt == Chem.rdchem.BondType.TRIPLE else 0.0)
     features.append(1.0 if bt == Chem.rdchem.BondType.AROMATIC else 0.0)
-    features.append(int(bond.IsInRing()))
-    features.append(int(bond.GetIsConjugated()))
+    features.append(float(bond.IsInRing()))
+    features.append(float(bond.GetIsConjugated()))
+    # 总维度: 6
     return features
 
 
@@ -108,6 +115,7 @@ if TORCH_GEOMETRIC_AVAILABLE:
 
         def __init__(self, in_dim, edge_dim, out_dim):
             super().__init__(aggr='add')
+            self.edge_dim = edge_dim # 记录 edge_dim
             self.message_mlp = nn.Sequential(
                 nn.Linear(in_dim + edge_dim, out_dim),
                 nn.ReLU(),
@@ -124,8 +132,10 @@ if TORCH_GEOMETRIC_AVAILABLE:
             return self.propagate(edge_index, x=x, edge_attr=edge_attr)
 
         def message(self, x_j, edge_attr):
+            # 修复: 确保 edge_attr 存在且维度正确
             if edge_attr is None:
-                edge_attr = torch.zeros((x_j.size(0), 8), device=x_j.device)
+                # 使用 self.edge_dim 而不是硬编码的 8
+                edge_attr = torch.zeros((x_j.size(0), self.edge_dim), device=x_j.device)
             return self.message_mlp(torch.cat([x_j, edge_attr], dim=1))
 
         def update(self, aggr_out, x):
@@ -134,8 +144,10 @@ if TORCH_GEOMETRIC_AVAILABLE:
 
     class MolecularGNN3D(nn.Module):
         """分子GNN模型"""
-
-        def __init__(self, node_dim=29, edge_dim=8, hidden_dim=64, output_dim=128, num_layers=3):
+        # 修复: 默认维度与特征提取函数对齐
+        # ATOM_SYMBOLS(17) + 5 = 22
+        # Bond feats = 6
+        def __init__(self, node_dim=22, edge_dim=6, hidden_dim=64, output_dim=128, num_layers=3):
             super().__init__()
             self.embedding = nn.Linear(node_dim, hidden_dim)
             self.layers = nn.ModuleList([
