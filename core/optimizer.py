@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 超参数优化模块
-修复说明：
-1. [关键修复] 在优化开始前，自动移除目标变量 y 中的 NaN 值，防止 XGBoost 崩溃。
-2. 增加了数据清洗日志，如果删除了数据会在控制台提示。
+更新内容：
+1. optimize 方法增加 progress_callback 参数，支持实时进度条。
+2. 保持了之前的自动数据清洗逻辑。
 """
 
 import optuna
@@ -108,9 +108,11 @@ class HyperparameterOptimizer:
 
         return params
 
-    def optimize(self, model_name, X, y, n_trials=50, cv=5, random_state=42):
+    def optimize(self, model_name, X, y, n_trials=50, cv=5, random_state=42, progress_callback=None):
         """
         执行超参数优化
+        Args:
+            progress_callback: 回调函数，接收一个 0-1 之间的浮点数表示进度
         """
 
         # 1. 确保输入是 numpy 数组
@@ -119,8 +121,7 @@ class HyperparameterOptimizer:
         if isinstance(y, (pd.DataFrame, pd.Series)):
             y = y.values.ravel() if hasattr(y, 'values') else np.array(y).ravel()
 
-        # 2. [关键修复] 移除 y 中的 NaN 值
-        # XGBoost 等模型严禁 Label 为空，否则会直接导致底层 C++ 崩溃
+        # 2. 移除 y 中的 NaN 值
         mask = ~np.isnan(y)
         if np.sum(~mask) > 0:
             print(f"⚠️ 警告: 检测到目标变量 y 中有 {np.sum(~mask)} 个缺失值，已在优化前自动移除对应样本。")
@@ -135,6 +136,10 @@ class HyperparameterOptimizer:
             y = y[mask_inf]
 
         def objective(trial):
+            # 更新进度条
+            if progress_callback:
+                progress_callback((trial.number + 1) / n_trials)
+
             # 获取建议参数
             params = self.get_model_params(trial, model_name)
 
@@ -172,6 +177,10 @@ class HyperparameterOptimizer:
 
         # 执行优化
         study.optimize(objective, n_trials=n_trials)
+
+        # 确保进度条走完
+        if progress_callback:
+            progress_callback(1.0)
 
         return study.best_params, study.best_value, study
 
