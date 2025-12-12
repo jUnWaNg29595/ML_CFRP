@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""分子特征工程模块 - 完整5种提取方法 (高性能优化版)"""
+"""分子特征工程模块 - 完整5种提取方法 + 分子指纹 (高性能优化版)"""
 
 import pandas as pd
 import numpy as np
@@ -15,6 +15,7 @@ try:
     from rdkit import Chem
     from rdkit.Chem import Descriptors
     from rdkit.Chem import AllChem
+    from rdkit.Chem import MACCSkeys  # 导入MACCS Keys
 
     RDKIT_AVAILABLE = True
 except ImportError:
@@ -30,7 +31,6 @@ except ImportError:
 
 # =============================================================================
 # 辅助函数：3D 构象生成 (用于多进程)
-# 必须定义在类外部，以便 ProcessPoolExecutor 进行 Pickle 序列化
 # =============================================================================
 def _generate_3d_data_worker(smiles):
     """
@@ -347,12 +347,7 @@ class AdvancedMolecularFeatureExtractor:
 
 
 class MLForceFieldExtractor:
-    """
-    机器学习力场特征提取器 (基于 TorchANI) - [速度优化版]
-    优化点：
-    1. 并行 3D 构象生成 (ProcessPoolExecutor)
-    2. Batch 批量推理
-    """
+    """机器学习力场特征提取器"""
 
     def __init__(self, device=None):
         try:
@@ -372,7 +367,6 @@ class MLForceFieldExtractor:
             self.device = device
 
         try:
-            # 自动加载 ANI-2x 模型 (内置 SpeciesConverter)
             self.model = self.torchani.models.ANI2x().to(self.device)
         except Exception as e:
             print(f"ANI Model load error: {e}")
@@ -384,17 +378,12 @@ class MLForceFieldExtractor:
         if not self.AVAILABLE:
             raise ImportError("请先安装 torchani: pip install torchani")
 
-        # ---------------------------------------------------------------------
-        # 1. 并行生成 3D 数据 (CPU 密集型)
-        # ---------------------------------------------------------------------
         print(f"\n⚛️ 正在并行生成 3D 构象 (这可能需要一些时间)...")
 
         valid_indices = []
-        data_list = []  # 存储 (atoms, coords)
+        data_list = []
 
-        # 使用 max_workers=None (自动设为 CPU 核心数)
         with ProcessPoolExecutor() as executor:
-            # map 保证顺序，方便追踪 index
             results = list(tqdm(executor.map(_generate_3d_data_worker, smiles_list),
                                 total=len(smiles_list),
                                 desc="3D Generation"))
@@ -407,98 +396,40 @@ class MLForceFieldExtractor:
         if not data_list:
             return pd.DataFrame(), []
 
-        # ---------------------------------------------------------------------
-        # 2. 批量推理 (GPU/CPU 密集型)
-        # ---------------------------------------------------------------------
         print(f"⚛️ 开始 ANI 批量推理 (Batch Size: {batch_size}, Device: {self.device})...")
-
         features_list = []
 
-        # 分批处理
         for i in tqdm(range(0, len(data_list), batch_size), desc="Inference"):
             batch_data = data_list[i: i + batch_size]
-
-            # 准备 Batch Tensors
             species_list = [self.torch.tensor(d[0], dtype=self.torch.long) for d in batch_data]
             coords_list = [self.torch.tensor(d[1], dtype=self.torch.float32) for d in batch_data]
-
-            # Pad 处理 (ANI 需要对齐原子数)
-            # 使用 torch.nn.utils.rnn.pad_sequence
-            # species 填充 -1 (假设 SpeciesConverter 会处理，或后面 Mask 掉)
-            # coords 填充 0
 
             species_padded = self.torch.nn.utils.rnn.pad_sequence(species_list, batch_first=True, padding_value=-1).to(
                 self.device)
             coords_padded = self.torch.nn.utils.rnn.pad_sequence(coords_list, batch_first=True, padding_value=0.0).to(
                 self.device)
             coords_padded.requires_grad_(True)
-
-            # 创建 Mask (标记非填充位置)
-            # species >= 0 的位置是真实的原子
             mask = (species_padded >= 0)
 
             try:
-                # 前向传播 (计算能量)
-                # ANI2x 内置 SpeciesConverter，通常能处理填充数据(如果填充键值不在字典中会报错)
-                # 安全起见，我们将 padding_value -1 临时替换为 0 (氢)，计算完再 mask 掉
                 species_safe = species_padded.clone()
-                species_safe[~mask] = 0  # 临时填充为 H，避免 Embedding 越界
+                species_safe[~mask] = 0
 
-                # 计算能量 (Hartree) -> (batch_size,)
                 energy = self.model((species_safe, coords_padded)).energies
-
-                # 反向传播 (计算力)
-                # create_graph=False 节省显存
                 forces = -self.torch.autograd.grad(energy.sum(), coords_padded, create_graph=False, retain_graph=False)[
                     0]
 
-                # -----------------------
-                # 特征提取
-                # -----------------------
-                energy_np = energy.detach().cpu().numpy()  # (batch,)
-                forces_np = forces.detach().cpu().numpy()  # (batch, max_atoms, 3)
-                mask_np = mask.cpu().numpy()  # (batch, max_atoms)
+                energy_np = energy.detach().cpu().numpy()
+                forces_np = forces.detach().cpu().numpy()
+
+                _, atomic_energies = self.model((species_safe, coords_padded))
+                real_energy = (atomic_energies * mask.float()).sum(dim=1).detach().cpu().numpy()
 
                 for j in range(len(batch_data)):
-                    # 获取当前分子的真实原子数
                     n_atoms = len(batch_data[j][0])
-
-                    # 1. 能量
-                    # 注意：如果我们用 H 填充了 padding，能量值可能包含了多余 H 的能量
-                    # 但 TorchANI 的 energy 也就是 atomic energies 的 sum。
-                    # 如果 SpeciesConverter 输出正确的 padding mask，结果是对的。
-                    # 这里为了绝对安全，ANI 通常输出 atomic energies，我们可以重新求和?
-                    # ANI2x().energies 输出的是总能量。
-                    # *修正策略*：ANI 的总能量 = Sum(原子能量)。多余的 H 会增加能量。
-                    # 这意味着 batch padding 可能会污染 'ani_energy'。
-                    # 如果为了精度，Batching 需要更复杂的 TorchANI 专用 padding (torchani.utils.pad_atomic_properties)
-                    # 鉴于此，为保证数值绝对正确，我们采用 '伪Batch' 或 '单次计算' 策略?
-                    # 不，我们使用上面计算的力（forces）是局部的，受 padding 影响极小（如果距离远）。
-                    # 但是总能量 energy 会受影响。
-
-                    # === 补救措施：重新计算单分子能量 (仅能量，这很快)，力使用 Batch 结果 ===
-                    # 实际上，力计算最耗时。能量计算是前向，很快。
-                    # 或者，我们可以减去填充 H 的能量? 不，太麻烦。
-                    # 让我们在提取特征时，对能量做个简单的单分子修正 pass，或者就在这里接受一点点误差? 不行。
-
-                    # *最佳方案*: 使用 torchani 提供的 padding 工具，或者手动处理
-                    # 鉴于代码复杂性，这里为了这种通用性，我们在提取特征时，
-                    # 仅利用 Batch 计算出的 "Force"，而 "Energy" 我们用非 Padding 的数据快速跑一遍 Forward?
-                    # 或者：
-                    # 对于能量：我们取 atomic_energies (model.species_energies) 然后 mask 求和
-
-                    # 重新运行一次 forward 获取 atomic energies (Shape: batch, atoms)
-                    _, atomic_energies = self.model((species_safe, coords_padded))
-                    # atomic_energies 形状通常是 (batch, atoms) 或类似
-                    # 只要把 padding 部分 mask 掉再求和即可
-                    real_energy = (atomic_energies * mask.float()).sum(dim=1).detach().cpu().numpy()
-
                     e_val = real_energy[j]
-
-                    # 2. 力 (Forces)
-                    # 取出当前分子的有效力矩阵
-                    f_vec = forces_np[j][:n_atoms]  # (n_atoms, 3)
-                    f_norm = np.linalg.norm(f_vec, axis=1)  # (n_atoms,)
+                    f_vec = forces_np[j][:n_atoms]
+                    f_norm = np.linalg.norm(f_vec, axis=1)
 
                     feats = {
                         'ani_energy': e_val,
@@ -510,10 +441,8 @@ class MLForceFieldExtractor:
                     features_list.append(feats)
 
             except Exception as e:
-                # 遇到 Batch 错误，回退到单分子处理 (容错)
                 print(f"Batch error: {e}, processing individually...")
                 for d in batch_data:
-                    # ... 单分子逻辑 (略，为保持代码简短，跳过该分子)
                     features_list.append({k: np.nan for k in self.feature_names})
 
         if not features_list:
@@ -524,9 +453,7 @@ class MLForceFieldExtractor:
 
 
 class EpoxyDomainFeatureExtractor:
-    """
-    环氧树脂领域知识特征提取器 (基于报告推荐的物理化学特征)
-    """
+    """环氧树脂领域知识特征提取器"""
 
     def __init__(self):
         if not RDKIT_AVAILABLE:
@@ -616,3 +543,78 @@ class EpoxyDomainFeatureExtractor:
             return pd.DataFrame(), []
 
         return pd.DataFrame(features_list), valid_indices
+
+
+class FingerprintExtractor:
+    """分子指纹提取器：支持 MACCS Keys 和 Morgan Fingerprints"""
+
+    def __init__(self):
+        if not RDKIT_AVAILABLE:
+            raise ImportError("需要安装 rdkit")
+
+    def smiles_to_fingerprints(self, smiles_list, fp_type='MACCS', n_bits=2048, radius=2):
+        """
+        提取分子指纹
+        Args:
+            smiles_list: SMILES 字符串列表
+            fp_type: 'MACCS' 或 'Morgan'
+            n_bits: Morgan指纹的位长 (仅对Morgan有效)
+            radius: Morgan指纹的半径 (仅对Morgan有效)
+        """
+        all_fps = []
+        valid_indices = []
+
+        desc_str = f"提取 {fp_type} 指纹"
+        if fp_type == 'Morgan':
+            desc_str += f" (r={radius}, b={n_bits})"
+
+        print(f"\n👆 {desc_str}")
+
+        for idx, smiles in enumerate(tqdm(smiles_list, desc="Processing")):
+            try:
+                mol = Chem.MolFromSmiles(str(smiles))
+                if mol is None:
+                    continue
+
+                fp_array = None
+
+                if fp_type == 'MACCS':
+                    # MACCS Keys: 167 bits
+                    fp = MACCSkeys.GenMACCSKeys(mol)
+                    # 转换为 numpy array
+                    fp_array = np.array(fp)  # 0-166
+
+                    # 创建特征名字典 (MACCS_0 ... MACCS_166)
+                    # 注意：MACCS keys 索引从 1 开始有意义，index 0 通常为 0
+                    features = {f"MACCS_{i}": val for i, val in enumerate(fp_array)}
+
+                elif fp_type == 'Morgan':
+                    # Morgan (ECFP like): bit vector
+                    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+                    fp_array = np.array(fp)
+
+                    features = {f"Morgan_{i}": val for i, val in enumerate(fp_array)}
+
+                else:
+                    continue
+
+                all_fps.append(features)
+                valid_indices.append(idx)
+
+            except Exception as e:
+                # print(e)
+                continue
+
+        if not all_fps:
+            return pd.DataFrame(), []
+
+        # 转为 DataFrame
+        df = pd.DataFrame(all_fps)
+
+        # 优化内存：指纹是0/1，可以使用 uint8
+        df = df.astype(np.uint8)
+
+        # 移除全为0的列 (无信息量的位)
+        df = df.loc[:, (df != 0).any(axis=0)]
+
+        return df, valid_indices

@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-碳纤维复合材料智能预测平台 v1.2.6
-
+碳纤维复合材料智能预测平台 v1.2.7
+更新内容：
+1. 增加类别平衡功能，解决单体重复过多问题
+2. 增加分子指纹提取功能 (MACCS/Morgan)
 """
 try:
     import torchani
@@ -55,7 +57,8 @@ from generate_sample_data import generate_hybrid_dataset, generate_pure_numeric_
 
 # 可选模块导入
 try:
-    from core.molecular_features import OptimizedRDKitFeatureExtractor, MemoryEfficientRDKitExtractor
+    from core.molecular_features import OptimizedRDKitFeatureExtractor, MemoryEfficientRDKitExtractor, \
+        FingerprintExtractor
 
     OPTIMIZED_EXTRACTOR_AVAILABLE = True
 except ImportError:
@@ -308,7 +311,7 @@ def page_home():
         <div class="metric-card">
             <div class="metric-label">数据处理</div>
             <div class="metric-value">📊</div>
-            <p>智能清洗 · VAE增强 · KNN填充</p>
+            <p>智能清洗 · VAE增强 · 类别平衡</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -317,7 +320,7 @@ def page_home():
         <div class="metric-card metric-card-success">
             <div class="metric-label">分子特征</div>
             <div class="metric-value">🧬</div>
-            <p>RDKit · Mordred · 图特征</p>
+            <p>RDKit · 指纹(MACCS) · 图特征</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -342,14 +345,13 @@ def page_home():
         ### 📊 数据处理
         - **智能数据清洗**: 缺失值处理、异常值检测、数据类型修复
         - **VAE数据增强**: 基于变分自编码器的表格数据生成
-        - **KNN智能填充**: 基于K近邻的缺失值预测
+        - **类别平衡**: **(新)** 解决化学单体样本不平衡问题
 
         ### 🧬 分子特征提取
+        - **分子指纹**: **(新)** MACCS Keys, Morgan (ECFP) 指纹
         - **RDKit标准版**: 200+分子描述符
-        - **RDKit并行版**: 多进程加速提取
-        - **RDKit内存优化版**: 低内存占用
-        - **Mordred描述符**: 1600+分子特征
         - **图神经网络特征**: 分子拓扑结构特征
+        - **ML力场特征**: ANI-2x 高精度能量/力
         """)
 
     with col2:
@@ -373,12 +375,11 @@ def page_home():
     st.markdown("## ⚡ 快速开始")
     st.info("""
     1. **上传数据** → 支持CSV、Excel格式
-    2. **数据探索** → 查看统计信息和分布
-    3. **分子特征** → 从SMILES提取分子描述符
+    2. **数据清洗** → 使用“类别平衡”处理高频单体
+    3. **分子特征** → 提取SMILES指纹或描述符
     4. **特征选择** → 选择目标变量和输入特征
     5. **模型训练** → 选择模型并调整参数
     6. **模型解释** → SHAP分析和性能评估
-    7. **预测应用** → 对新样本进行预测
     """)
 
 
@@ -569,8 +570,8 @@ def page_data_cleaning():
     df = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
     cleaner = AdvancedDataCleaner(df)
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "❓ 缺失值处理", "📊 异常值检测", "🔄 重复数据", "🔧 数据类型"
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "❓ 缺失值处理", "📊 异常值检测", "🔄 重复数据", "🔧 数据类型", "⚖️ 类别平衡"
     ])
 
     with tab1:
@@ -656,7 +657,7 @@ def page_data_cleaning():
         st.markdown("---")
 
         with col_clean_2:
-            st.markdown("#### 2. 特征分布优化 (针对高重复值)")
+            st.markdown("#### 2. 特征分布优化 (针对数值)")
             st.caption("降低某一特征中众数（出现最多的值）的比例，平衡数据分布")
 
             # 检测阈值设置
@@ -717,6 +718,53 @@ def page_data_cleaning():
                 st.success("✅ 数据类型修复完成")
         else:
             st.success("✅ 数据类型正常")
+
+    with tab5:
+        st.markdown("### ⚖️ 类别平衡 (针对化学结构)")
+        st.info(
+            "💡 解决特定单体/分子重复次数过多的问题。通过限制每个类别的最大样本数，强制数据分布更均匀，避免模型偏向常见分子。")
+
+        # 1. 选择分类列
+        # 默认尝试找 'smiles' 相关列
+        text_cols = df.select_dtypes(include=['object']).columns.tolist()
+        if text_cols:
+            cat_col = st.selectbox("选择要平衡的类别列 (通常是SMILES)", text_cols)
+
+            # 2. 分析当前分布
+            counts = df[cat_col].value_counts()
+            n_unique = len(counts)
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("唯一类别数", n_unique)
+            col2.metric("最大样本数", counts.max())
+            col3.metric("中位数样本数", int(counts.median()))
+
+            st.markdown("#### Top 10 出现最频繁的分子")
+            st.bar_chart(counts.head(10))
+
+            # 3. 设置平衡参数
+            st.markdown("#### 🔧 平衡设置")
+
+            limit_val = st.slider(
+                "每个类别的最大样本数 (Max Samples per Category)",
+                min_value=1,
+                max_value=int(counts.max()),
+                value=int(counts.median()) if n_unique > 0 else 10,
+                help="如果某分子的出现次数超过此值，多余的样本将被随机丢弃。"
+            )
+
+            if st.button(f"⚖️ 执行平衡 (限制为 {limit_val} 个)", type="primary"):
+                old_len = len(df)
+                cleaned_df = cleaner.balance_category_counts(cat_col, max_samples=limit_val)
+                new_len = len(cleaned_df)
+
+                st.session_state.processed_data = cleaned_df
+
+                st.success(f"✅ 平衡完成！")
+                st.info(f"📊 总样本数从 {old_len} 减少到 {new_len} (删除了 {old_len - new_len} 个过度重复样本)")
+                st.rerun()
+        else:
+            st.warning("⚠️ 没有找到文本列，无法执行类别平衡")
 
 
 # ============================================================
@@ -805,7 +853,7 @@ def page_data_enhancement():
 # 页面：分子特征提取（完整5种方法）
 # ============================================================
 def page_molecular_features():
-    """分子特征提取页面 - 完整还原5种方法"""
+    """分子特征提取页面 - 完整还原5种方法 + 分子指纹"""
     st.title("🧬 分子特征提取")
 
     if st.session_state.data is None:
@@ -851,6 +899,7 @@ def page_molecular_features():
     extraction_method = st.radio(
         "选择分子特征提取方法",
         [
+            "👆 分子指纹 (MACCS/Morgan) [新]",
             "🔹 RDKit 标准版 (推荐新手)",
             "🚀 RDKit 并行版 (大数据集)",
             "💾 RDKit 内存优化版 (低内存)",
@@ -864,6 +913,12 @@ def page_molecular_features():
 
     # 方法说明
     method_info = {
+        "👆 分子指纹 (MACCS/Morgan) [新]": {
+            "desc": "提取二进制分子指纹 (MACCS Keys 167位 或 Morgan/ECFP)",
+            "features": "167 ~ 2048个",
+            "speed": "极快",
+            "memory": "低"
+        },
         "🔹 RDKit 标准版 (推荐新手)": {
             "desc": "使用RDKit计算200+分子描述符，适合中小型数据集",
             "features": "~200个",
@@ -915,6 +970,26 @@ def page_molecular_features():
     col2.metric("处理速度", info["speed"])
     col3.metric("内存占用", info["memory"])
     st.info(info["desc"])
+
+    # ============== [UI] 指纹参数设置 ==============
+    fp_type = "MACCS"
+    fp_bits = 2048
+    fp_radius = 2
+
+    if "分子指纹" in extraction_method:
+        col_fp1, col_fp2, col_fp3 = st.columns(3)
+        with col_fp1:
+            fp_type = st.selectbox("指纹类型", ["MACCS", "Morgan"])
+
+        if fp_type == "Morgan":
+            with col_fp2:
+                fp_radius = st.selectbox("半径 (Radius)", [2, 3, 4], index=0, help="ECFP4对应半径2")
+            with col_fp3:
+                fp_bits = st.selectbox("位长 (Bits)", [1024, 2048, 4096], index=1)
+        else:
+            with col_fp2:
+                st.write("MACCS Keys 固定为 167 位")
+
     # ============== [新增] 针对环氧树脂方法的特殊 UI ==============
     hardener_col = None
     phr_col = None
@@ -987,11 +1062,19 @@ def page_molecular_features():
                 status_text.text("正在提取图结构特征...")
                 extractor = AdvancedMolecularFeatureExtractor()
                 features_df, valid_indices = extractor.smiles_to_graph_features(smiles_list)
+
+            elif "分子指纹" in extraction_method:
+                from core.molecular_features import FingerprintExtractor
+                status_text.text(f"正在提取 {fp_type} 指纹...")
+                extractor = FingerprintExtractor()
+                features_df, valid_indices = extractor.smiles_to_fingerprints(
+                    smiles_list, fp_type=fp_type, n_bits=fp_bits, radius=fp_radius
+                )
+
             elif "ML力场" in extraction_method:
                 from core.molecular_features import MLForceFieldExtractor
 
                 status_text.text("正在生成3D构象并计算ANI力场特征 (可能较慢)...")
-
 
                 # 实例化提取器
                 extractor = MLForceFieldExtractor()

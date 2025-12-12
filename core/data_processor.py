@@ -19,6 +19,7 @@ warnings.filterwarnings('ignore')
 
 class VAE(nn.Module):
     """变分自编码器"""
+
     def __init__(self, input_dim, latent_dim=16, h_dim=128):
         super(VAE, self).__init__()
         self.encoder = nn.Sequential(
@@ -46,6 +47,7 @@ class VAE(nn.Module):
 
 class DataEnhancer:
     """数据增强器"""
+
     def __init__(self, data: pd.DataFrame):
         self.original_data = data
         self.numeric_cols = data.select_dtypes(include=np.number).columns.tolist()
@@ -76,7 +78,8 @@ class DataEnhancer:
             for (data,) in loader:
                 optimizer.zero_grad()
                 recon, mu, logvar = model(data)
-                loss = nn.functional.mse_loss(recon, data, reduction='sum') - 0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                loss = nn.functional.mse_loss(recon, data, reduction='sum') - 0.5 * torch.sum(
+                    1 + logvar - mu.pow(2) - logvar.exp())
                 loss.backward()
                 optimizer.step()
 
@@ -102,6 +105,7 @@ class DataEnhancer:
 
 class SparseDataHandler:
     """稀疏数据处理器"""
+
     def __init__(self, data: pd.DataFrame, threshold=0.3):
         self.data = data
         self.threshold = threshold
@@ -113,6 +117,7 @@ class SparseDataHandler:
 
 class AdvancedDataCleaner:
     """数据清洗器"""
+
     def __init__(self, data: pd.DataFrame):
         self.original_data = data.copy()
         self.cleaned_data = data.copy()
@@ -137,9 +142,11 @@ class AdvancedDataCleaner:
     def handle_missing_values(self, strategy='median', fill_value=None):
         numeric_cols = self.cleaned_data.select_dtypes(include=np.number).columns
         if strategy == 'median':
-            self.cleaned_data[numeric_cols] = self.cleaned_data[numeric_cols].fillna(self.cleaned_data[numeric_cols].median())
+            self.cleaned_data[numeric_cols] = self.cleaned_data[numeric_cols].fillna(
+                self.cleaned_data[numeric_cols].median())
         elif strategy == 'mean':
-            self.cleaned_data[numeric_cols] = self.cleaned_data[numeric_cols].fillna(self.cleaned_data[numeric_cols].mean())
+            self.cleaned_data[numeric_cols] = self.cleaned_data[numeric_cols].fillna(
+                self.cleaned_data[numeric_cols].mean())
         elif strategy == 'knn':
             imputer = KNNImputer(n_neighbors=5)
             self.cleaned_data[numeric_cols] = imputer.fit_transform(self.cleaned_data[numeric_cols])
@@ -158,7 +165,8 @@ class AdvancedDataCleaner:
             if method == 'iqr':
                 Q1, Q3 = data.quantile(0.25), data.quantile(0.75)
                 IQR = Q3 - Q1
-                count = ((self.cleaned_data[col] < Q1 - threshold * IQR) | (self.cleaned_data[col] > Q3 + threshold * IQR)).sum()
+                count = ((self.cleaned_data[col] < Q1 - threshold * IQR) | (
+                            self.cleaned_data[col] > Q3 + threshold * IQR)).sum()
             else:
                 count = (np.abs(stats.zscore(data)) > threshold).sum()
             if count > 0:
@@ -255,4 +263,49 @@ class AdvancedDataCleaner:
         final_indices.sort()
 
         self.cleaned_data = df.loc[final_indices].reset_index(drop=True)
+        return self.cleaned_data
+
+    def balance_category_counts(self, column, max_samples=None):
+        """
+        平衡类别计数：强制限制某一列（如SMILES）中每个类别的最大样本数。
+        这有助于解决数据集中某些单体重复次数过多，导致模型过拟合的问题。
+
+        Args:
+            column: 要平衡的列名
+            max_samples: 每个类别的最大样本数。如果为None，则不做处理。
+        """
+        if column not in self.cleaned_data.columns or max_samples is None:
+            return self.cleaned_data
+
+        df = self.cleaned_data
+
+        # 获取该列的所有值计数
+        value_counts = df[column].value_counts()
+
+        indices_to_keep = []
+
+        # 遍历每个唯一的类别值
+        for val, count in value_counts.items():
+            # 处理 NaN 值
+            if pd.isna(val):
+                mask = df[column].isna()
+            else:
+                mask = df[column] == val
+
+            # 获取该类别所有的索引
+            group_indices = df[mask].index.tolist()
+
+            # 如果该类别的样本数超过最大限制，则随机抽样
+            if count > max_samples:
+                selected_indices = np.random.choice(group_indices, size=max_samples, replace=False)
+                indices_to_keep.extend(selected_indices)
+            else:
+                # 否则保留所有样本
+                indices_to_keep.extend(group_indices)
+
+        # 排序索引以保持原始数据的相对顺序（如果重要）
+        indices_to_keep = sorted(indices_to_keep)
+
+        # 更新数据
+        self.cleaned_data = df.loc[indices_to_keep].reset_index(drop=True)
         return self.cleaned_data
