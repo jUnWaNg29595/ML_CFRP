@@ -191,82 +191,21 @@ if __name__ == "__main__":
 USER_DATA_DB = "datasets/user_data.csv"
 
 # --- 自定义 CSS 样式 ---
+# --- 自定义 CSS 样式 (含图片防抖) ---
 CUSTOM_CSS = """
 <style>
-    :root {
-        --primary-color: #4F46E5;
-        --success-color: #10B981;
-        --warning-color: #F59E0B;
-        --error-color: #EF4444;
-        --bg-card: #F8FAFC;
-        --border-color: #E2E8F0;
-    }
-
+    :root { --primary-color: #4F46E5; }
     .metric-card {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 12px;
-        padding: 20px;
-        color: white;
-        text-align: center;
-        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        border-radius: 12px; padding: 20px; color: white; text-align: center;
         margin: 8px 0;
     }
-
-    .metric-card-success {
-        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
-    }
-
-    .metric-card-warning {
-        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-    }
-
-    .metric-value {
-        font-size: 2.2rem;
-        font-weight: 700;
-        margin: 8px 0;
-    }
-
-    .metric-label {
-        font-size: 0.9rem;
-        opacity: 0.9;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-
-    .result-panel {
-        background: var(--bg-card);
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        padding: 16px;
-        margin: 8px 0;
-    }
-
-    .feature-badge {
-        display: inline-block;
-        background: #E0E7FF;
-        color: #4338CA;
-        padding: 4px 12px;
-        border-radius: 16px;
-        font-size: 0.85rem;
-        margin: 2px;
-    }
-
-    .status-success {
-        color: var(--success-color);
-        font-weight: 600;
-    }
-
-    .status-warning {
-        color: var(--warning-color);
-        font-weight: 600;
-    }
-
-    .status-error {
-        color: var(--error-color);
-        font-weight: 600;
-    }
+    /* 图片容器高度固定，防止页面抖动 */
+    div[data-testid="stImage"] { min-height: 400px; display: flex; align-items: center; justify-content: center; }
+    .stPlotlyChart { min-height: 400px; }
 </style>
 """
+
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
@@ -1185,8 +1124,11 @@ def page_feature_selection():
 # ============================================================
 # 页面：模型训练（完整手动调参）
 # ============================================================
+# ============================================================
+# 页面：模型训练（更新版：含表格、一键输出、图片防抖）
+# ============================================================
 def page_model_training():
-    """模型训练页面 - 修复参数应用报错版"""
+    """模型训练页面"""
     st.title("🤖 模型训练")
 
     if st.session_state.data is None:
@@ -1201,187 +1143,121 @@ def page_model_training():
     feature_cols = st.session_state.feature_cols
     target_col = st.session_state.target_col
 
-    # 准备数据
     X = df[feature_cols]
     y = df[target_col]
 
-    # 显示当前配置
-    col1, col2, col3 = st.columns(3)
-    col1.metric("特征数量", len(feature_cols))
-    col2.metric("样本数量", len(df))
-    col3.metric("目标变量", target_col)
-
-    st.markdown("---")
-
-    # 模型选择
     trainer = EnhancedModelTrainer()
-    available_models = trainer.get_available_models()
-
-    # 添加人工神经网络选项
-    if ANN_AVAILABLE and "人工神经网络" not in available_models:
-        available_models.append("人工神经网络")
 
     col1, col2 = st.columns([1, 2])
-
     with col1:
         st.markdown("### 📦 模型选择")
-        selected_model = st.selectbox(
-            "选择模型",
-            available_models,
-            help="选择要训练的机器学习模型"
-        )
-
+        selected_model = st.selectbox("选择模型", trainer.get_available_models())
         st.markdown("### ⚙️ 训练设置")
         test_size = st.slider("测试集比例", 0.1, 0.4, DEFAULT_TEST_SIZE)
         random_state = st.number_input("随机种子", 0, 1000, DEFAULT_RANDOM_STATE)
 
     with col2:
         st.markdown("### 🎛️ 手动调参")
-
-        # --- 应用最佳参数逻辑 ---
+        # 应用优化参数逻辑
         if st.session_state.best_params and st.session_state.get('optimized_model_name') == selected_model:
-            st.info(
-                f"💡 检测到 **{selected_model}** 的优化结果 (Best Score: {st.session_state.get('best_score', 0):.4f})")
-            if st.button("🔄 一键应用优化后的参数"):
+            if st.button("🔄 应用最佳参数"):
                 for k, v in st.session_state.best_params.items():
                     widget_key = f"param_{selected_model}_{k}"
                     st.session_state[widget_key] = v
-                st.success("✅ 参数已更新！")
                 st.rerun()
 
-        # --- 动态生成手动调参界面 (修复版) ---
+        # 参数控件生成 (修复 SessionState 冲突)
         manual_params = {}
-
         if selected_model in MANUAL_TUNING_PARAMS:
             param_configs = MANUAL_TUNING_PARAMS[selected_model]
-
             if param_configs:
-                param_cols = st.columns(2)
-
+                p_cols = st.columns(2)
                 for i, config in enumerate(param_configs):
-                    with param_cols[i % 2]:
-                        param_name = config['name']
-                        widget_type = config['widget']
-                        args = config.get('args', {})
-
-                        # 生成唯一的 key
-                        key = f"param_{selected_model}_{param_name}"
-
-                        # [关键修复步骤]
-                        # 1. 检查 session_state 是否已有该 key (可能是应用优化参数写入的，也可能是上次交互留下的)
-                        # 2. 如果没有，则初始化为默认值
+                    with p_cols[i % 2]:
+                        # 核心修复：优先使用 session_state，且不传 value 参数
+                        key = f"param_{selected_model}_{config['name']}"
                         if key not in st.session_state:
                             st.session_state[key] = config['default']
 
-                        # 3. 创建组件时，**不要** 传递 value 或 index 参数
-                        #    只传递 key，Streamlit 会自动从 session_state 读取值显示
-
-                        if widget_type == 'slider':
-                            manual_params[param_name] = st.slider(
-                                config['label'],
-                                key=key,  # 不传 value=...
-                                **args
-                            )
-                        elif widget_type == 'number_input':
-                            manual_params[param_name] = st.number_input(
-                                config['label'],
-                                key=key,  # 不传 value=...
-                                **args
-                            )
-                        elif widget_type == 'selectbox':
-                            options = args.get('options', [])
-                            manual_params[param_name] = st.selectbox(
-                                config['label'],
-                                options=options,
-                                key=key  # 不传 index=...
-                            )
-                        elif widget_type == 'text_input':
-                            manual_params[param_name] = st.text_input(
-                                config['label'],
-                                key=key  # 不传 value=...
-                            )
+                        if config['widget'] == 'slider':
+                            manual_params[config['name']] = st.slider(config['label'], key=key, **config.get('args', {}))
+                        elif config['widget'] == 'number_input':
+                            manual_params[config['name']] = st.number_input(config['label'], key=key, **config.get('args', {}))
+                        elif config['widget'] == 'selectbox':
+                            manual_params[config['name']] = st.selectbox(config['label'], options=config['args']['options'], key=key)
+                        elif config['widget'] == 'text_input':
+                            manual_params[config['name']] = st.text_input(config['label'], key=key)
             else:
-                st.info(f"**{selected_model}** 无需配置参数")
+                st.info("无需配置参数")
 
     st.markdown("---")
 
-    # 训练按钮区
     col_btn1, col_btn2 = st.columns(2)
 
     with col_btn1:
         if st.button("🚀 开始训练模型", type="primary"):
             try:
                 with st.spinner(f"正在训练 {selected_model}..."):
-                    # 合并默认参数和手动参数
+                    # 合并参数
                     final_params = MODEL_PARAMETERS.get(selected_model, {}).copy()
                     final_params.update(manual_params)
+                    if 'random_state' in final_params: final_params.pop('random_state')
 
-                    # 处理特殊参数
-                    if selected_model == "多层感知器" and 'hidden_layer_sizes' in final_params:
-                        if isinstance(final_params['hidden_layer_sizes'], str):
-                            try:
-                                final_params['hidden_layer_sizes'] = tuple(
-                                    int(x.strip()) for x in final_params['hidden_layer_sizes'].split(',')
-                                )
-                            except:
-                                final_params['hidden_layer_sizes'] = (100, 50)
-                    if 'random_state' in final_params:
-                        final_params.pop('random_state')
-
-                    # 训练模型
+                    # 训练
                     result = trainer.train_model(
-                        X, y,
-                        model_name=selected_model,
-                        test_size=test_size,
-                        random_state=random_state,
+                        X, y, 
+                        model_name=selected_model, 
+                        test_size=test_size, 
+                        random_state=random_state, 
                         **final_params
                     )
 
-                    # 保存结果
+                    # 保存状态
                     st.session_state.model = result['model']
                     st.session_state.model_name = selected_model
                     st.session_state.train_result = result
                     st.session_state.scaler = result.get('scaler')
                     st.session_state.pipeline = result.get('pipeline')
-                    st.session_state.X_train = result['X_train']
-                    st.session_state.X_test = result['X_test']
-                    st.session_state.y_train = result['y_train']
-                    st.session_state.y_test = result['y_test']
+                    st.session_state.X_train = result['X_train']; st.session_state.X_test = result['X_test']
+                    st.session_state.y_train = result['y_train']; st.session_state.y_test = result['y_test']
+                    st.session_state.manual_params = manual_params # 保存用于导出脚本
 
-                    st.success(f"✅ 模型训练完成！")
+                    st.success("✅ 训练完成！")
 
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("R² 分数", f"{result['r2']:.4f}")
-                    col2.metric("RMSE", f"{result['rmse']:.4f}")
-                    col3.metric("MAE", f"{result['mae']:.4f}")
-                    col4.metric("训练时间", f"{result['train_time']:.2f}秒")
+                    # 指标显示
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("R²", f"{result['r2']:.4f}")
+                    c2.metric("RMSE", f"{result['rmse']:.4f}")
+                    c3.metric("MAE", f"{result['mae']:.4f}")
 
-                    # 可视化 (图片已限制大小 + 支持导出)
+                    # --- [新增] 结果表格展示 ---
+                    st.markdown("### 📈 预测详情")
+                    res_df = pd.DataFrame({
+                        "真实值": result['y_test'],
+                        "预测值": result['y_pred'],
+                        "残差": result['y_test'] - result['y_pred']
+                    })
+                    st.dataframe(res_df, use_container_width=True, height=200)
+
+                    # --- [新增] 一键导出结果 ---
+                    csv = res_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 导出预测结果 (CSV)", csv, "predictions.csv", "text/csv")
+
+                    # 可视化 (限制图片大小)
                     visualizer = Visualizer()
                     col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
-
                     with col_img2:
                         if 'y_pred_train' in result:
-                            fig, df_export = visualizer.plot_parity_train_test(
-                                result['y_train'], result['y_pred_train'],
-                                result['y_test'], result['y_pred_test'],
+                            fig, _ = visualizer.plot_parity_train_test(
+                                result['y_train'], result['y_pred_train'], 
+                                result['y_test'], result['y_pred_test'], 
                                 target_name=target_col
                             )
-                            st.pyplot(fig, use_container_width=True)
-
-                            # 下载按钮
-                            csv = df_export.to_csv(index=False).encode('utf-8')
-                            st.download_button("📥 下载图表数据 (CSV)", csv, "plot_data.csv", "text/csv")
                         else:
-                            fig, df_export = visualizer.plot_predictions_vs_true(
+                            fig, _ = visualizer.plot_predictions_vs_true(
                                 result['y_test'], result['y_pred'], selected_model
                             )
-                            st.pyplot(fig, use_container_width=True)
-
-                            # 下载按钮
-                            csv = df_export.to_csv(index=False).encode('utf-8')
-                            st.download_button("📥 下载图表数据 (CSV)", csv, "plot_data.csv", "text/csv")
-
+                        st.pyplot(fig, use_container_width=True)
                     plt.close()
 
             except Exception as e:
@@ -1390,27 +1266,14 @@ def page_model_training():
 
     with col_btn2:
         # 导出脚本按钮
-        if st.session_state.model is not None and st.session_state.model_name == selected_model:
-            script_code = generate_training_script_code(
-                selected_model,
-                manual_params,
-                feature_cols,
-                target_col
-            )
-            st.download_button(
-                label="💾 导出 Python 训练脚本 (.py)",
-                data=script_code,
-                file_name=f"train_{selected_model}_{datetime.now().strftime('%Y%m%d')}.py",
-                mime="text/x-python",
-                help="下载一个可以独立运行的 Python 脚本，用于在其他环境复现此训练过程。"
-            )
-        else:
-            st.info("💡 训练完成后即可导出独立 Python 脚本")
+        if st.session_state.model and st.session_state.model_name == selected_model:
+            # 尝试调用脚本生成函数 (如果存在)
+            if 'generate_training_script_code' in globals():
+                script = generate_training_script_code(selected_model, manual_params, feature_cols, target_col)
+                st.download_button("💾 导出 Python 训练脚本", script, "train_script.py")
+            else:
+                st.info("💡 脚本导出功能需在顶部定义函数")
 
-
-# ============================================================
-# 页面：模型解释（完整版）
-# ============================================================
 def page_model_interpretation():
     """模型解释页面"""
     st.title("📊 模型解释")
@@ -1421,178 +1284,97 @@ def page_model_interpretation():
 
     model = st.session_state.model
     model_name = st.session_state.model_name
-    result = st.session_state.train_result
-
-    # 获取数据和特征名
     X_train = st.session_state.X_train
     y_train = st.session_state.y_train
     X_test = st.session_state.X_test
     y_test = st.session_state.y_test
-    feature_names = st.session_state.feature_cols  # [关键] 获取真实特征名
+    feature_names = st.session_state.feature_cols
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🔍 SHAP分析", "📈 预测性能", "📉 学习曲线", "🎯 特征重要性", "💾 数据导出"
-    ])
+    tab1, tab2, tab3 = st.tabs(["🔍 SHAP分析", "📈 预测性能", "🎯 特征重要性"])
 
     with tab1:
         st.markdown("### SHAP特征重要性分析")
 
-        try:
-            interpreter = EnhancedModelInterpreter(
-                model, X_train, y_train, X_test, y_test,
-                model_name, feature_names=feature_names
-            )
+        # [恢复] SHAP 选项
+        col_opt1, col_opt2 = st.columns(2)
+        with col_opt1:
+            plot_type = st.selectbox("图表类型", ["bar", "beeswarm"], index=0)
+        with col_opt2:
+            max_display = st.slider("显示特征数", 5, 50, 20)
 
-            col1, col2 = st.columns(2)
-            with col1:
-                plot_type = st.selectbox("图表类型", ["bar", "beeswarm"])
-            with col2:
-                max_display = st.slider("显示特征数", 5, 30, 15)
+        if st.button("🔍 计算SHAP值"):
+            with st.spinner("正在计算SHAP值..."):
+                try:
+                    # 初始化解释器
+                    interpreter = EnhancedModelInterpreter(
+                        model, X_train, y_train, X_test, y_test, 
+                        model_name, feature_names=feature_names
+                    )
 
-            if st.button("🔍 计算SHAP值"):
-                with st.spinner("正在计算SHAP值..."):
-                    # fig = interpreter.plot_summary(X_sample, plot_type=plot_type, max_display=max_display)
+                    # 绘图
                     fig, df_shap = interpreter.plot_summary(plot_type=plot_type, max_display=max_display)
+
                     if fig:
-                        # [限制图片大小]
-                        col_img1, col_img2, col_img3 = st.columns([1, 6, 1])
-                        with col_img2:
+                        # 限制图片宽度
+                        c1, c2, c3 = st.columns([1, 6, 1])
+                        with c2:
                             st.pyplot(fig, use_container_width=True)
 
-                            # [数据导出]
+                            # 导出数据
                             if df_shap is not None:
                                 csv = df_shap.to_csv(index=False).encode('utf-8')
-                                st.download_button("📥 下载SHAP数据 (CSV)", csv, "shap_values.csv", "text/csv")
-                        plt.close()
-        except Exception as e:
-            st.error(f"SHAP分析失败: {str(e)}")
+                                st.download_button("📥 导出 SHAP 数据 (CSV)", csv, "shap_values.csv", "text/csv")
+                    else:
+                        st.warning("未能生成 SHAP 图，请检查模型兼容性")
+                except Exception as e:
+                    st.error(f"SHAP分析出错: {str(e)}")
 
     with tab2:
         st.markdown("### 预测性能可视化")
-
         visualizer = Visualizer()
 
-        # 预测值 vs 真实值
-        # fig1, export_df = visualizer.plot_predictions_vs_true(...) # 已经在训练页面展示过了，这里展示残差
-
-        # [限制图片大小]
-        col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
-        with col_img2:
-            fig, df_export = visualizer.plot_predictions_vs_true(
-                result['y_test'],
-                result['y_pred'],
-                model_name
-            )
+        c1, c2, c3 = st.columns([1, 2, 1])
+        with c2:
+            # 绘制残差图
+            fig, df_resid = visualizer.plot_residuals(y_test, st.session_state.train_result['y_pred'], model_name)
             st.pyplot(fig, use_container_width=True)
-            csv = df_export.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 下载预测数据 (CSV)", csv, "predictions.csv", "text/csv")
-        plt.close()
 
-        # 残差分析
-        col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
-        with col_img2:
-            fig2, df_resid = visualizer.plot_residuals(
-                result['y_test'],
-                result['y_pred'],
-                model_name
-            )
-            st.pyplot(fig2, use_container_width=True)
+            # 导出残差
             csv = df_resid.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 下载残差数据 (CSV)", csv, "residuals.csv", "text/csv")
-        plt.close()
+            st.download_button("📥 导出残差数据", csv, "residuals.csv")
 
     with tab3:
-        st.markdown("### 学习曲线")
-
-        try:
-            from sklearn.model_selection import learning_curve
-
-            # X = st.session_state.X_train # 使用原始X可能更好，这里沿用逻辑
-            X = st.session_state.X_train
-            y = st.session_state.y_train
-
-            if st.button("📉 生成学习曲线"):
-                with st.spinner("正在计算学习曲线..."):
-                    train_sizes, train_scores, test_scores = learning_curve(
-                        model, X, y,
-                        cv=5,
-                        n_jobs=-1,
-                        train_sizes=np.linspace(0.1, 1.0, 10),
-                        scoring='r2'
-                    )
-
-                    fig, ax = plt.subplots(figsize=(10, 6))
-
-                    train_mean = train_scores.mean(axis=1)
-                    train_std = train_scores.std(axis=1)
-                    test_mean = test_scores.mean(axis=1)
-                    test_std = test_scores.std(axis=1)
-
-                    ax.plot(train_sizes, train_mean, 'o-', label='训练集')
-                    ax.fill_between(train_sizes, train_mean - train_std, train_mean + train_std, alpha=0.1)
-
-                    ax.plot(train_sizes, test_mean, 'o-', label='验证集')
-                    ax.fill_between(train_sizes, test_mean - test_std, test_mean + test_std, alpha=0.1)
-
-                    ax.set_xlabel('训练样本数')
-                    ax.set_ylabel('R² 分数')
-                    ax.set_title('学习曲线')
-                    ax.legend()
-                    ax.grid(True, alpha=0.3)
-
-                    st.pyplot(fig)
-                    plt.close()
-        except Exception as e:
-            st.error(f"学习曲线生成失败: {str(e)}")
-
-    with tab4:
         st.markdown("### 特征重要性")
-
-        # 尝试获取特征重要性
         try:
             if hasattr(model, 'feature_importances_'):
-                importances = model.feature_importances_
-
                 visualizer = Visualizer()
 
-                # [限制图片大小]
-                col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
-                with col_img2:
-                    fig, df_imp = visualizer.plot_feature_importance(importances, feature_names, model_name)
+                c1, c2, c3 = st.columns([1, 2, 1])
+                with c2:
+                    fig, df_imp = visualizer.plot_feature_importance(model.feature_importances_, feature_names, model_name)
                     st.pyplot(fig, use_container_width=True)
-
                     csv = df_imp.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 下载重要性数据 (CSV)", csv, "feature_importance.csv", "text/csv")
+                    st.download_button("📥 导出重要性数据", csv, "importance.csv")
 
-                plt.close()
-
-                st.dataframe(df_imp, use_container_width=True)
+                # [保留] MACCS 解释功能
+                st.markdown("#### 🧬 核心特征解析")
+                explanations = []
+                for feat in df_imp.head(10)['Feature']:
+                    desc = "数值特征"
+                    if "MACCS" in feat:
+                        try:
+                            from core.molecular_features import get_maccs_description
+                            idx = int(feat.split('_')[-1])
+                            desc = get_maccs_description(idx)
+                        except: desc = "MACCS 指纹片段"
+                    elif "Morgan" in feat: desc = "Morgan 指纹位点"
+                    explanations.append({"特征": feat, "含义": desc})
+                st.table(pd.DataFrame(explanations))
             else:
-                st.info("该模型不支持直接获取特征重要性，请使用SHAP分析")
+                st.info("该模型无原生特征重要性，请使用SHAP分析")
         except Exception as e:
-            st.error(f"特征重要性获取失败: {str(e)}")
+            st.error(str(e))
 
-    with tab5:
-        st.markdown("### 导出预测结果")
-
-        export_df = pd.DataFrame({
-            '真实值': result['y_test'],
-            '预测值': result['y_pred'],
-            '残差': result['y_test'] - result['y_pred']
-        })
-
-        csv = export_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            "📥 下载预测结果CSV",
-            csv,
-            f"predictions_{model_name}.csv",
-            "text/csv"
-        )
-
-
-# ============================================================
-# 页面：预测应用
-# ============================================================
 def page_prediction():
     """预测应用页面"""
     st.title("🔮 预测应用")

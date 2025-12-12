@@ -695,3 +695,48 @@ class FingerprintExtractor:
         df = df.loc[:, (df != 0).any(axis=0)]
 
         return df, valid_indices
+
+# =============================================================================
+# [新增] MACCS 键定义字典 (用于解释器)
+# =============================================================================
+MACCS_DEFINITIONS = {
+    1: "ISOTOPE", 2: "Atomic no > 103", 3: "Group IVa,Va,VIa Rows 4-6", 4: "Actinides", 
+    5: "Group IIIA,IVA", 6: "Lanthanides", 7: "Group VA,VIA Rows 4-6", 8: "QAAA@1", 
+    9: "Group VIII (Fe...)", 10: "Group IIA", 11: "4M Ring", 12: "Group IB,IIB", 
+    13: "ON(C)C", 14: "S-S", 15: "OC(O)O", 16: "Q:Q", 17: "C#C", 18: "Group IIIA", 
+    19: "7M Ring", 20: "Si", 21: "C=C(Q)Q", 22: "3M Ring", 23: "NC(O)O", 24: "N-O", 
+    25: "NC(N)N", 26: "C$=C($)C($)C", 27: "I", 28: "QCH2Q", 29: "P", 30: "CQ(C)(C)A", 
+    31: "QX", 32: "CSN", 33: "NS", 34: "CH2=A", 35: "Group IA", 36: "S Heterocycle", 
+    37: "NC(O)N", 38: "NC(C)N", 39: "OS(O)O", 40: "S-O", 41: "C#N", 42: "F", 43: "QHAQH", 
+    44: "Other", 45: "C=CN", 46: "Br", 47: "SAN", 48: "OQ(O)O", 49: "C=C", 50: "C=C(C)C", 
+    51: "CSO", 52: "NN", 53: "CN(C)C", 54: "C=C(O)C", 55: "OSO", 56: "ON(O)C", 
+    57: "O Heterocycle", 58: "QSQ", 59: "Snot%A%A", 60: "S=O", 61: "AS(A)A", 
+    62: "A$A!A$A", 63: "N=O", 64: "A-S", 65: "C%N", 66: "CC(C)(C)C", 67: "QSQ", 
+    68: "QHQH (&...)", 69: "QQH", 70: "Q-N-Q", 71: "NO", 72: "O-A", 73: "S=A", 
+    74: "CH3ACH3", 75: "A!N$A", 76: "C=C(O)O", 77: "NAN", 78: "C=N", 79: "N$A$N", 
+    80: "NAAAN", 81: "SA(A)A", 82: "ACH2QA", 83: "QAA@1", 84: "NH2", 85: "CN(C)Q", 
+    86: "CH2QCH2", 87: "X!A$A", 88: "S", 89: "OAAAO", 90: "QHAAQH", 91: "QHAAQH", 
+    92: "OC(N)C", 93: "QCH3", 94: "QN", 95: "NAAO", 96: "5M Ring", 97: "N A A O", 
+    98: "QAAAA@1", 99: "C=C", 100: "ACH2N", 101: "8M Ring", 102: "QO", 103: "Cl", 
+    104: "QA(Q)Q", 105: "A$A($)A", 106: "QA(Q)Q", 107: "X (Halogen)", 108: "CH3AAACH2", 
+    109: "ACH2O", 110: "NCO", 111: "NAAOH", 112: "AA(A)(A)A", 113: "Onot%A%A", 
+    114: "CH3CH2A", 115: "CH3ACH2", 116: "CH3AAO", 117: "NAO", 118: "ACH2CH2A > 1", 
+    119: "N=A", 120: "Heterocyclic atom > 1", 121: "N Heterocycle", 122: "AN(A)A", 
+    123: "OCO", 124: "QQ", 125: "Aromatic Ring > 1", 126: "A!O!A", 127: "A$A!O > 1", 
+    128: "ACH2A > 1", 129: "ACH2A", 130: "QQ > 1", 131: "QH > 1", 132: "OH > 1", 
+    133: "A@A!A", 134: "X (Halogen)", 135: "Nnot%A%A", 136: "O=A > 1", 137: "Heterocycle", 
+    138: "QCH2Q > 1", 139: "OH", 140: "O > 3", 141: "CH3 > 2", 142: "N > 1", 
+    143: "A$A!A$A", 144: "Anot%A%A", 145: "6M ring > 1", 146: "O > 2", 147: "ACH2CH2A", 
+    148: "AQ(A)A", 149: "CH3 > 1", 150: "A!A$A!A", 151: "NH", 152: "OC(C)C", 
+    153: "QCH2Q", 154: "C=O", 155: "A!CH2!A", 156: "NA(A)A", 157: "C-O", 158: "C-N", 
+    159: "O > 1", 160: "CH3", 161: "N", 162: "Aromatic", 163: "6M Ring", 164: "O", 
+    165: "Ring", 166: "Fragments"
+}
+
+def get_maccs_description(key_idx):
+    """根据键索引获取 MACCS 描述"""
+    try:
+        idx = int(key_idx)
+        return MACCS_DEFINITIONS.get(idx, "Unknown Fragment")
+    except:
+        return "Invalid Key"
