@@ -898,6 +898,56 @@ def page_molecular_features():
 
     st.markdown("### 🔬 SMILES列选择")
 
+    # -----------------------------
+    # 多组分/混合物 SMILES 处理
+    # 说明：
+    # 1) 单列里可能用 ";" 等分隔符表示多个组分（RDKit 不能直接解析 ";"，但能解析 "."）
+    # 2) 也可能每个组分单独占一列（如 resin_smiles_1, resin_smiles_2 ...）
+    # 这里把多个组分统一转换为“多片段 SMILES”（用 "." 连接），再交给 RDKit/指纹提取器。
+    # -----------------------------
+    import re
+
+    def _split_smiles_cell(x):
+        """把单元格里的 SMILES 拆成组分列表。
+
+        仅把常见“列表分隔符”当作组分边界：;、；、|、以及带空格的 +
+        注意：不把“/”当分隔符（它是 SMILES 立体化学的一部分）。
+        """
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return []
+        s = str(x).strip()
+        if not s or s.lower() == 'nan':
+            return []
+        # 统一中文分号
+        s = s.replace('；', ';')
+
+        # 先按 ; 或 | 分割
+        parts = re.split(r"\s*[;|]\s*", s)
+
+        # 再按“带空格的 +”分割（避免误伤 [N+] 这类带电荷写法）
+        final = []
+        for p in parts:
+            final.extend(re.split(r"\s+\+\s+", p))
+
+        # 清理空串
+        final = [p.strip() for p in final if p and p.strip()]
+        return final
+
+    def _combine_components(df_in: pd.DataFrame, cols: list[str]):
+        """把多列/单列 SMILES 合并成多片段 SMILES，并返回(合并后的Series, 组分数量Series)"""
+        if not cols:
+            return pd.Series([np.nan] * len(df_in)), pd.Series([0] * len(df_in))
+
+        combined = []
+        counts = []
+        for _, row in df_in[cols].iterrows():
+            comps = []
+            for c in cols:
+                comps.extend(_split_smiles_cell(row[c]))
+            counts.append(len(comps))
+            combined.append('.'.join(comps) if comps else np.nan)
+        return pd.Series(combined), pd.Series(counts)
+
     col1, col2 = st.columns(2)
     with col1:
         default_idx = 0
@@ -916,6 +966,51 @@ def page_molecular_features():
         samples = df[smiles_col].dropna().head(3).tolist()
         for s in samples:
             st.code(s[:50] + "..." if len(str(s)) > 50 else s)
+
+    # --- 多组分设置（树脂侧） ---
+    st.markdown("#### 🧩 多组分/混合物设置 (可选)")
+    resin_mix_mode = st.checkbox(
+        "树脂为多组分（或单元格内包含多个SMILES）",
+        value=False,
+        help="如果你的树脂列里出现 'A;B' 这种写法，或有 resin_smiles_1/resin_smiles_2 这种多列组分，请开启。"
+    )
+
+    resin_component_cols = [smiles_col]
+    resin_mix_layout = "单列"  # 仅用于 UI 记录
+    add_component_count_features = False
+
+    if resin_mix_mode:
+        resin_mix_layout = st.radio(
+            "树脂组分在表格中的组织方式",
+            ["单列（同一单元格用分隔符表示多个组分，如 A;B）", "多列（每列一个组分，如 resin_smiles_1/resin_smiles_2…）"],
+            index=0
+        )
+
+        if resin_mix_layout.startswith("多列"):
+            # 自动推荐：与所选列同前缀、且以 _数字 结尾的列
+            pattern = re.compile(rf"^{re.escape(smiles_col)}_\d+$")
+            auto_cols = [c for c in text_cols if pattern.match(c)]
+            # 按末尾数字排序
+            def _tail_num(colname: str):
+                try:
+                    return int(colname.split('_')[-1])
+                except:
+                    return 0
+            auto_cols = sorted(auto_cols, key=_tail_num)
+            resin_component_cols = st.multiselect(
+                "选择树脂组分列",
+                options=text_cols,
+                default=auto_cols if auto_cols else [smiles_col],
+                help="系统会把这些列的所有非空组分合并为一个多片段SMILES（用 '.' 连接）"
+            )
+        else:
+            st.caption("将自动把 ';'、'；'、'|'、以及带空格的 ' + ' 转换为多组分分隔，并用 '.' 连接。")
+
+        add_component_count_features = st.checkbox(
+            "额外加入组分数量特征（resin_n_components / hardener_n_components）",
+            value=True,
+            help="对很多混配体系，组分数量本身也会影响性能；此选项会把组分数作为额外数值特征并入数据集。"
+        )
 
     st.markdown("---")
 
@@ -992,12 +1087,38 @@ def page_molecular_features():
 
     # 执行提取
     if st.button("🚀 开始提取分子特征", type="primary"):
-        smiles_list = df[smiles_col].tolist()
+        # -----------------------------
+        # 1) 生成“可被 RDKit 解析”的 SMILES 列表
+        #    - 单列多组分：将 ';' 等分隔符转换为 '.'
+        #    - 多列多组分：合并多列为 '.' 连接的多片段 SMILES
+        # -----------------------------
+        resin_smiles_series, resin_ncomp = _combine_components(df, resin_component_cols)
+        smiles_list = resin_smiles_series.tolist()
 
-        # 准备固化剂列表
+        # 2) 固化剂（可选）——同样支持多组分
         hardener_list = None
+        hardener_ncomp = None
         if hardener_col:
-            hardener_list = df[hardener_col].tolist()
+            # 如果用户选择了 curing_agent_smiles 这类列，同时存在 curing_agent_smiles_1/2/…，则给出多列模式
+            hardener_component_cols = [hardener_col]
+            if resin_mix_mode:
+                # 仅在启用多组分模式时才展示/使用固化剂多列合并逻辑，避免 UI 过复杂
+                st.caption("（提示）固化剂也支持多组分：如果有 hardener_col_1/2/… 可在下方自动合并。")
+
+            # 自动合并：如果存在 hardener_col_\d 列，则优先使用它们（用户未显式多选时）
+            pattern_h = re.compile(rf"^{re.escape(hardener_col)}_\d+$")
+            auto_h_cols = [c for c in text_cols if pattern_h.match(c)]
+            if auto_h_cols:
+                def _tail_num_h(colname: str):
+                    try:
+                        return int(colname.split('_')[-1])
+                    except:
+                        return 0
+                auto_h_cols = sorted(auto_h_cols, key=_tail_num_h)
+                hardener_component_cols = auto_h_cols
+
+            hardener_smiles_series, hardener_ncomp = _combine_components(df, hardener_component_cols)
+            hardener_list = hardener_smiles_series.tolist()
 
         try:
             progress_bar = st.progress(0)
@@ -1089,6 +1210,13 @@ def page_molecular_features():
                     df_valid = df_valid.drop(columns=cols_to_drop)
 
                 merged_df = pd.concat([df_valid, features_df], axis=1)
+
+                # 可选：追加组分数量特征
+                if resin_mix_mode and add_component_count_features:
+                    merged_df[f"{smiles_col}_resin_n_components"] = resin_ncomp.iloc[valid_indices].reset_index(drop=True)
+                    if hardener_ncomp is not None:
+                        merged_df[f"{smiles_col}_hardener_n_components"] = hardener_ncomp.iloc[valid_indices].reset_index(drop=True)
+
                 merged_df = merged_df.loc[:, ~merged_df.columns.duplicated()]
                 st.session_state.processed_data = merged_df
 
@@ -1121,9 +1249,7 @@ def page_feature_selection():
     show_robust_feature_selection()
 
 
-# ============================================================
-# 页面：模型训练（完整手动调参）
-# ============================================================
+
 # ============================================================
 # 页面：模型训练（更新版：含表格、一键输出、图片防抖）
 # ============================================================
@@ -1135,144 +1261,123 @@ def page_model_training():
         st.warning("⚠️ 请先上传数据")
         return
 
-    if not st.session_state.feature_cols or not st.session_state.target_col:
-        st.warning("⚠️ 请先在特征选择页面选择特征和目标变量")
+    if not st.session_state.feature_cols:
+        st.warning("⚠️ 请先在特征选择页面选择特征")
         return
 
     df = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
-    feature_cols = st.session_state.feature_cols
-    target_col = st.session_state.target_col
-
-    X = df[feature_cols]
-    y = df[target_col]
-
+    X = df[st.session_state.feature_cols]
+    y = df[st.session_state.target_col]
     trainer = EnhancedModelTrainer()
 
     col1, col2 = st.columns([1, 2])
     with col1:
         st.markdown("### 📦 模型选择")
-        selected_model = st.selectbox("选择模型", trainer.get_available_models())
+        model_name = st.selectbox("选择模型", trainer.get_available_models())
         st.markdown("### ⚙️ 训练设置")
-        test_size = st.slider("测试集比例", 0.1, 0.4, DEFAULT_TEST_SIZE)
-        random_state = st.number_input("随机种子", 0, 1000, DEFAULT_RANDOM_STATE)
+        test_size = st.slider("测试集比例", 0.1, 0.4, 0.2)
+        random_state = st.number_input("随机种子", 0, 1000, 42)
 
     with col2:
         st.markdown("### 🎛️ 手动调参")
-        # 应用优化参数逻辑
-        if st.session_state.best_params and st.session_state.get('optimized_model_name') == selected_model:
+        # 应用优化参数
+        if st.session_state.best_params and st.session_state.get('optimized_model_name') == model_name:
+            st.info(f"💡 检测到优化参数 (R²: {st.session_state.get('best_score', 0):.4f})")
             if st.button("🔄 应用最佳参数"):
                 for k, v in st.session_state.best_params.items():
-                    widget_key = f"param_{selected_model}_{k}"
-                    st.session_state[widget_key] = v
+                    st.session_state[f"param_{model_name}_{k}"] = v
                 st.rerun()
 
-        # 参数控件生成 (修复 SessionState 冲突)
+        # 生成参数控件 (修复状态冲突)
         manual_params = {}
-        if selected_model in MANUAL_TUNING_PARAMS:
-            param_configs = MANUAL_TUNING_PARAMS[selected_model]
-            if param_configs:
-                p_cols = st.columns(2)
-                for i, config in enumerate(param_configs):
-                    with p_cols[i % 2]:
-                        # 核心修复：优先使用 session_state，且不传 value 参数
-                        key = f"param_{selected_model}_{config['name']}"
-                        if key not in st.session_state:
-                            st.session_state[key] = config['default']
+        if model_name in MANUAL_TUNING_PARAMS:
+            configs = MANUAL_TUNING_PARAMS[model_name]
+            p_cols = st.columns(2)
+            for i, config in enumerate(configs):
+                with p_cols[i % 2]:
+                    key = f"param_{model_name}_{config['name']}"
+                    # 优先初始化
+                    if key not in st.session_state: st.session_state[key] = config['default']
 
-                        if config['widget'] == 'slider':
-                            manual_params[config['name']] = st.slider(config['label'], key=key, **config.get('args', {}))
-                        elif config['widget'] == 'number_input':
-                            manual_params[config['name']] = st.number_input(config['label'], key=key, **config.get('args', {}))
-                        elif config['widget'] == 'selectbox':
-                            manual_params[config['name']] = st.selectbox(config['label'], options=config['args']['options'], key=key)
-                        elif config['widget'] == 'text_input':
-                            manual_params[config['name']] = st.text_input(config['label'], key=key)
-            else:
-                st.info("无需配置参数")
+                    if config['widget'] == 'slider':
+                        manual_params[config['name']] = st.slider(config['label'], key=key, **config.get('args', {}))
+                    elif config['widget'] == 'number_input':
+                        manual_params[config['name']] = st.number_input(config['label'], key=key,
+                                                                        **config.get('args', {}))
+                    elif config['widget'] == 'selectbox':
+                        manual_params[config['name']] = st.selectbox(config['label'], options=config['args']['options'],
+                                                                     key=key)
+                    elif config['widget'] == 'text_input':
+                        manual_params[config['name']] = st.text_input(config['label'], key=key)
 
     st.markdown("---")
 
-    col_btn1, col_btn2 = st.columns(2)
+    # 按钮区
+    c_btn1, c_btn2 = st.columns(2)
+    with c_btn1:
+        if st.button("🚀 开始训练", type="primary"):
+            with st.spinner("训练中..."):
+                # 准备参数
+                params = manual_params.copy()
+                if 'random_state' in params: params.pop('random_state')
 
-    with col_btn1:
-        if st.button("🚀 开始训练模型", type="primary"):
-            try:
-                with st.spinner(f"正在训练 {selected_model}..."):
-                    # 合并参数
-                    final_params = MODEL_PARAMETERS.get(selected_model, {}).copy()
-                    final_params.update(manual_params)
-                    if 'random_state' in final_params: final_params.pop('random_state')
+                # 训练
+                res = trainer.train_model(X, y, model_name, test_size, random_state, **params)
 
-                    # 训练
-                    result = trainer.train_model(
-                        X, y, 
-                        model_name=selected_model, 
-                        test_size=test_size, 
-                        random_state=random_state, 
-                        **final_params
-                    )
+                # 保存结果
+                st.session_state.model = res['model']
+                st.session_state.train_result = res
+                st.session_state.scaler = res['scaler']
+                st.session_state.X_train = res['X_train'];
+                st.session_state.X_test = res['X_test']
+                st.session_state.y_train = res['y_train'];
+                st.session_state.y_test = res['y_test']
+                st.session_state.model_name = model_name
+                st.session_state.manual_params = params  # 用于脚本导出
 
-                    # 保存状态
-                    st.session_state.model = result['model']
-                    st.session_state.model_name = selected_model
-                    st.session_state.train_result = result
-                    st.session_state.scaler = result.get('scaler')
-                    st.session_state.pipeline = result.get('pipeline')
-                    st.session_state.X_train = result['X_train']; st.session_state.X_test = result['X_test']
-                    st.session_state.y_train = result['y_train']; st.session_state.y_test = result['y_test']
-                    st.session_state.manual_params = manual_params # 保存用于导出脚本
+                st.success("✅ 训练完成")
 
-                    st.success("✅ 训练完成！")
+                # 指标
+                m1, m2, m3 = st.columns(3)
+                m1.metric("R²", f"{res['r2']:.4f}")
+                m2.metric("RMSE", f"{res['rmse']:.4f}")
+                m3.metric("MAE", f"{res['mae']:.4f}")
 
-                    # 指标显示
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("R²", f"{result['r2']:.4f}")
-                    c2.metric("RMSE", f"{result['rmse']:.4f}")
-                    c3.metric("MAE", f"{result['mae']:.4f}")
+                # --- 新增：结果表格与导出 ---
+                st.markdown("### 📈 预测结果详情")
+                res_df = pd.DataFrame({"真实值": res['y_test'], "预测值": res['y_pred']})
+                res_df['残差'] = res_df['真实值'] - res_df['预测值']
 
-                    # --- [新增] 结果表格展示 ---
-                    st.markdown("### 📈 预测详情")
-                    res_df = pd.DataFrame({
-                        "真实值": result['y_test'],
-                        "预测值": result['y_pred'],
-                        "残差": result['y_test'] - result['y_pred']
-                    })
+                t1, t2 = st.columns([3, 1])
+                with t1:
                     st.dataframe(res_df, use_container_width=True, height=200)
-
-                    # --- [新增] 一键导出结果 ---
+                with t2:
                     csv = res_df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 导出预测结果 (CSV)", csv, "predictions.csv", "text/csv")
+                    st.download_button("📥 导出结果 CSV", csv, "predictions.csv", "text/csv")
 
-                    # 可视化 (限制图片大小)
-                    visualizer = Visualizer()
-                    col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
-                    with col_img2:
-                        if 'y_pred_train' in result:
-                            fig, _ = visualizer.plot_parity_train_test(
-                                result['y_train'], result['y_pred_train'], 
-                                result['y_test'], result['y_pred_test'], 
-                                target_name=target_col
-                            )
-                        else:
-                            fig, _ = visualizer.plot_predictions_vs_true(
-                                result['y_test'], result['y_pred'], selected_model
-                            )
-                        st.pyplot(fig, use_container_width=True)
-                    plt.close()
+                # --- 优化：图片居中 ---
+                visualizer = Visualizer()
+                col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
+                with col_img2:
+                    if 'y_pred_train' in res:
+                        fig, _ = visualizer.plot_parity_train_test(
+                            res['y_train'], res['y_pred_train'],
+                            res['y_test'], res['y_pred_test'],
+                            target_name=st.session_state.target_col
+                        )
+                    else:
+                        fig, _ = visualizer.plot_predictions_vs_true(res['y_test'], res['y_pred'], model_name)
+                    st.pyplot(fig, use_container_width=True)
 
-            except Exception as e:
-                st.error(f"❌ 训练失败: {str(e)}")
-                st.code(traceback.format_exc())
-
-    with col_btn2:
-        # 导出脚本按钮
-        if st.session_state.model and st.session_state.model_name == selected_model:
-            # 尝试调用脚本生成函数 (如果存在)
+    with c_btn2:
+        # 脚本导出按钮
+        if st.session_state.model and st.session_state.model_name == model_name:
+            # 检查是否有脚本生成函数
             if 'generate_training_script_code' in globals():
-                script = generate_training_script_code(selected_model, manual_params, feature_cols, target_col)
+                script = generate_training_script_code(model_name, manual_params, st.session_state.feature_cols,
+                                                       st.session_state.target_col)
                 st.download_button("💾 导出 Python 训练脚本", script, "train_script.py")
-            else:
-                st.info("💡 脚本导出功能需在顶部定义函数")
+
 
 def page_model_interpretation():
     """模型解释页面"""
@@ -1292,27 +1397,26 @@ def page_model_interpretation():
 
     tab1, tab2, tab3 = st.tabs(["🔍 SHAP分析", "📈 预测性能", "🎯 特征重要性"])
 
+    # --- 1. SHAP 分析 (恢复选项) ---
     with tab1:
-        st.markdown("### SHAP特征重要性分析")
+        st.markdown("### SHAP特征重要性")
 
-        # [恢复] SHAP 选项
-        col_opt1, col_opt2 = st.columns(2)
-        with col_opt1:
+        # 恢复这两个选项控件
+        c_opt1, c_opt2 = st.columns(2)
+        with c_opt1:
             plot_type = st.selectbox("图表类型", ["bar", "beeswarm"], index=0)
-        with col_opt2:
-            max_display = st.slider("显示特征数", 5, 50, 20)
+        with c_opt2:
+            max_display = st.slider("显示特征数量", 5, 50, 20)
 
         if st.button("🔍 计算SHAP值"):
-            with st.spinner("正在计算SHAP值..."):
+            with st.spinner("正在计算 SHAP 值 (可能较慢)..."):
                 try:
-                    # 初始化解释器
-                    interpreter = EnhancedModelInterpreter(
-                        model, X_train, y_train, X_test, y_test, 
+                    interp = EnhancedModelInterpreter(
+                        model, X_train, y_train, X_test, y_test,
                         model_name, feature_names=feature_names
                     )
-
-                    # 绘图
-                    fig, df_shap = interpreter.plot_summary(plot_type=plot_type, max_display=max_display)
+                    # 调用修改后的 plot_summary，获取图和数据
+                    fig, df_shap = interp.plot_summary(plot_type=plot_type, max_display=max_display)
 
                     if fig:
                         # 限制图片宽度
@@ -1320,60 +1424,55 @@ def page_model_interpretation():
                         with c2:
                             st.pyplot(fig, use_container_width=True)
 
-                            # 导出数据
+                            # SHAP 数据导出
                             if df_shap is not None:
                                 csv = df_shap.to_csv(index=False).encode('utf-8')
                                 st.download_button("📥 导出 SHAP 数据 (CSV)", csv, "shap_values.csv", "text/csv")
                     else:
-                        st.warning("未能生成 SHAP 图，请检查模型兼容性")
+                        st.error("无法生成 SHAP 图，请检查模型是否支持。")
                 except Exception as e:
-                    st.error(f"SHAP分析出错: {str(e)}")
+                    st.error(f"计算出错: {str(e)}")
 
+    # --- 2. 预测性能 ---
     with tab2:
-        st.markdown("### 预测性能可视化")
+        st.markdown("### 预测性能")
         visualizer = Visualizer()
-
         c1, c2, c3 = st.columns([1, 2, 1])
         with c2:
-            # 绘制残差图
-            fig, df_resid = visualizer.plot_residuals(y_test, st.session_state.train_result['y_pred'], model_name)
+            fig, df_res = visualizer.plot_residuals(y_test, st.session_state.train_result['y_pred'], model_name)
             st.pyplot(fig, use_container_width=True)
-
-            # 导出残差
-            csv = df_resid.to_csv(index=False).encode('utf-8')
+            csv = df_res.to_csv(index=False).encode('utf-8')
             st.download_button("📥 导出残差数据", csv, "residuals.csv")
 
+    # --- 3. 特征重要性 (含 MACCS 解释) ---
     with tab3:
         st.markdown("### 特征重要性")
-        try:
-            if hasattr(model, 'feature_importances_'):
-                visualizer = Visualizer()
+        if hasattr(model, 'feature_importances_'):
+            visualizer = Visualizer()
+            c1, c2, c3 = st.columns([1, 2, 1])
+            with c2:
+                fig, df_imp = visualizer.plot_feature_importance(model.feature_importances_, feature_names, model_name)
+                st.pyplot(fig, use_container_width=True)
+                csv = df_imp.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 导出重要性数据", csv, "importance.csv")
 
-                c1, c2, c3 = st.columns([1, 2, 1])
-                with c2:
-                    fig, df_imp = visualizer.plot_feature_importance(model.feature_importances_, feature_names, model_name)
-                    st.pyplot(fig, use_container_width=True)
-                    csv = df_imp.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 导出重要性数据", csv, "importance.csv")
-
-                # [保留] MACCS 解释功能
-                st.markdown("#### 🧬 核心特征解析")
-                explanations = []
-                for feat in df_imp.head(10)['Feature']:
-                    desc = "数值特征"
-                    if "MACCS" in feat:
-                        try:
-                            from core.molecular_features import get_maccs_description
-                            idx = int(feat.split('_')[-1])
-                            desc = get_maccs_description(idx)
-                        except: desc = "MACCS 指纹片段"
-                    elif "Morgan" in feat: desc = "Morgan 指纹位点"
-                    explanations.append({"特征": feat, "含义": desc})
-                st.table(pd.DataFrame(explanations))
-            else:
-                st.info("该模型无原生特征重要性，请使用SHAP分析")
-        except Exception as e:
-            st.error(str(e))
+            # MACCS 解释表
+            st.markdown("#### 🧬 特征含义解析")
+            exps = []
+            for f in df_imp.head(15)['Feature']:
+                desc = "数值特征"
+                if "MACCS" in f:
+                    try:
+                        # 动态导入防止报错
+                        from core.molecular_features import get_maccs_description
+                        idx = int(f.split('_')[-1])
+                        desc = get_maccs_description(idx)
+                    except:
+                        desc = "MACCS 指纹片段"
+                exps.append({"特征名": f, "含义": desc})
+            st.table(pd.DataFrame(exps))
+        else:
+            st.info("该模型不支持原生特征重要性，请使用 SHAP 分析。")
 
 def page_prediction():
     """预测应用页面"""
