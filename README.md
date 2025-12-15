@@ -1,4 +1,12 @@
-# 碳纤维复合材料智能预测平台 v1.2.10
+# 碳纤维复合材料智能预测平台 v1.3.1 (优化版)
+
+## ✅ 本次优化（v1.3.1）
+
+- **修复 TorchANI 力场特征全 0**：改为“同原子数分组批推理（无 padding）+ 片段独立计算再聚合”，并增加 `ani_n_atoms/ani_n_fragments/ani_success` 诊断列。
+- **新增：SMILES 组分自动分列**：在“数据清洗 → SMILES组分分列”可一键把 `curing_agent_smiles` / `resin_smiles` 等列拆成 `*_1/*_2/*_key`，便于统计与类别平衡。
+- **新增：3D 构象描述符**
+- **新增（可选）：预训练 SMILES Transformer Embedding**：支持 ChemBERTa 等模型（需要安装 `transformers`，首次运行需下载权重）。：在“分子特征工程”中加入 `🧊 3D构象描述符 (RDKit3D+Coulomb)`，补充几何/构象层面的前沿表征。
+- **增强：双组分（树脂+固化剂）融合**：除指纹/反应特征外，也可选择“拼接SMILES (Resin.Hardener)”让 RDKit/Mordred/3D/ANI/Transformer 等方法共同表征固化剂贡献。
 
 ## 🚀 项目简介
 

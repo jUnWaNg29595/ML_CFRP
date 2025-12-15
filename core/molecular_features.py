@@ -10,6 +10,8 @@ from tqdm import tqdm
 import warnings
 import torch
 import os  # 新增
+import re  # 新增: 用于分割多组分 SMILES
+from functools import partial  # 新增
 
 warnings.filterwarnings('ignore')
 
@@ -17,6 +19,7 @@ try:
     from rdkit import Chem
     from rdkit.Chem import Descriptors
     from rdkit.Chem import AllChem
+    from rdkit.Chem import Descriptors3D, rdMolDescriptors
     from rdkit.Chem import MACCSkeys
 
     RDKIT_AVAILABLE = True
@@ -36,49 +39,395 @@ except ImportError:
 # =============================================================================
 def _generate_3d_data_worker(smiles):
     """
-    单个分子的3D生成工作函数
-    返回: (atomic_numbers, coordinates) 或 None
+    单个样本的 3D 构象生成工作函数（供多进程调用）
+
+    - 支持多组分/多片段 SMILES：会自动按 ';'、'；'、'|'、带空格的 ' + '、以及 '.' 进行分割
+    - 对每个片段分别生成 3D（ETKDGv3）并做轻量优化（MMFF / UFF）
+    - 仅保留 ANI2x 支持的元素：H,C,N,O,F,S,Cl
+
+    返回:
+        list[tuple[list[int], np.ndarray]]  # [(atomic_numbers, coordinates), ...]
+        或 None（任一片段失败则返回 None，保证数据质量）
     """
     if not RDKIT_AVAILABLE:
         return None
 
     try:
-        # 1. 基础转换
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
+        if smiles is None or (isinstance(smiles, float) and np.isnan(smiles)):
             return None
-        mol = Chem.AddHs(mol)  # 力场计算必须加氢
+        s = str(smiles).strip()
+        if not s:
+            return None
 
-        # 2. 生成3D构象
-        params = AllChem.ETKDGv3()
-        params.useRandomCoords = True
-        params.numThreads = 1  # 禁用 RDKit 内部线程
+        # 1) 智能分割多组分
+        # 先按 ; / ； / | 分割
+        parts = re.split(r"\s*[;；|]\s*", s)
 
-        res = AllChem.EmbedMolecule(mol, params)
-        if res != 0:
-            res = AllChem.EmbedMolecule(mol, useRandomCoords=True)
-            if res != 0:
+        # 再按“带空格的 +”分割（避免误伤 [N+] 这类带电荷写法）
+        final = []
+        for p in parts:
+            final.extend(re.split(r"\s+\+\s+", p))
+
+        # 再按 '.' 分割（SMILES 规范的多片段分隔）
+        frags = []
+        for p in final:
+            frags.extend([x.strip() for x in str(p).split('.') if x and str(x).strip()])
+
+        frags = [f for f in frags if f]
+        if not frags:
+            return None
+
+        frag_data = []
+
+        supported_species = {1, 6, 7, 8, 9, 16, 17}  # H,C,N,O,F,S,Cl (ANI2x)
+
+        for frag in frags:
+            mol = Chem.MolFromSmiles(frag)
+            if mol is None:
                 return None
 
-        # 3. 初步力场优化 (MMFF)
-        try:
-            AllChem.MMFFOptimizeMolecule(mol, maxIters=50)
-        except:
-            pass
+            mol = Chem.AddHs(mol)  # 力场/ANI 计算建议加氢
 
-        # 4. 提取数据
-        atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
-        coords = mol.GetConformer().GetPositions()
+            # 2) 生成 3D 构象（ETKDGv3）
+            params = AllChem.ETKDGv3()
+            params.useRandomCoords = True
+            params.numThreads = 1  # 禁用 RDKit 内部线程，避免与多进程冲突
 
-        supported_species = {1, 6, 7, 8, 16, 9, 17}
-        if not set(atoms).issubset(supported_species):
-            return None
+            res = AllChem.EmbedMolecule(mol, params)
+            if res != 0:
+                # 兜底：再试一次
+                res = AllChem.EmbedMolecule(mol, useRandomCoords=True)
+                if res != 0:
+                    return None
 
-        return (atoms, coords)
+            # 3) 快速几何优化：优先 MMFF，否则 UFF
+            try:
+                AllChem.MMFFOptimizeMolecule(mol, maxIters=80)
+            except Exception:
+                try:
+                    AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+                except Exception:
+                    pass
+
+            # 4) 提取数据
+            atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
+            if not set(atoms).issubset(supported_species):
+                return None
+
+            coords = mol.GetConformer().GetPositions().astype(np.float32)
+
+            frag_data.append((atoms, coords))
+
+        return frag_data if frag_data else None
 
     except Exception:
         return None
 
+
+
+# =============================================================================
+# 3D 描述符：RDKit3D + Coulomb Matrix (可选更前沿的构象表征)
+# =============================================================================
+def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
+    """
+    计算单个样本的 3D 构象描述符（供多进程调用）
+    - 支持多组分/多片段：按片段分别生成 3D 并加权聚合
+    返回 dict 或 None
+    """
+    if not RDKIT_AVAILABLE:
+        return None
+
+    try:
+        if smiles is None or (isinstance(smiles, float) and np.isnan(smiles)):
+            return None
+        s = str(smiles).strip()
+        if not s:
+            return None
+
+        # 分割多组分（规则同 _generate_3d_data_worker）
+        parts = re.split(r"\s*[;；|]\s*", s)
+        final = []
+        for p in parts:
+            final.extend(re.split(r"\s+\+\s+", p))
+        frags = []
+        for p in final:
+            frags.extend([x.strip() for x in str(p).split('.') if x and str(x).strip()])
+        frags = [f for f in frags if f]
+        if not frags:
+            return None
+
+        total_atoms = 0
+        n_frags = 0
+
+        # 3D descriptors: 按原子数加权平均
+        d3_weighted = {}
+
+        eig_all = []
+
+        for frag in frags:
+            mol = Chem.MolFromSmiles(frag)
+            if mol is None:
+                return None
+            mol = Chem.AddHs(mol)
+
+            # 生成 3D
+            params = AllChem.ETKDGv3()
+            params.useRandomCoords = True
+            params.numThreads = 1
+            res = AllChem.EmbedMolecule(mol, params)
+            if res != 0:
+                res = AllChem.EmbedMolecule(mol, useRandomCoords=True)
+                if res != 0:
+                    return None
+
+            # 优化
+            try:
+                AllChem.MMFFOptimizeMolecule(mol, maxIters=80)
+            except Exception:
+                try:
+                    AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+                except Exception:
+                    pass
+
+            n_atoms = int(mol.GetNumAtoms())
+            if n_atoms <= 0:
+                return None
+
+            n_frags += 1
+            total_atoms += n_atoms
+
+            # RDKit 3D descriptors
+            d3 = Descriptors3D.CalcMolDescriptors3D(mol)  # dict
+            for k, v in d3.items():
+                try:
+                    d3_weighted[k] = d3_weighted.get(k, 0.0) + float(v) * n_atoms
+                except Exception:
+                    continue
+
+            # Coulomb matrix eigenvalues
+            try:
+                cm = rdMolDescriptors.CalcCoulombMat(mol)
+                cm_arr = np.array([list(row) for row in cm], dtype=float)
+                eig = np.linalg.eigvalsh(cm_arr)
+                eig_all.append(eig)
+            except Exception:
+                pass
+
+        if total_atoms <= 0:
+            return None
+
+        out = {
+            "rdkit3d_n_atoms": int(total_atoms),
+            "rdkit3d_n_fragments": int(n_frags),
+        }
+
+        for k, v in d3_weighted.items():
+            out[f"rdkit3d_{k}"] = float(v) / float(total_atoms)
+
+        if eig_all:
+            eig_concat = np.concatenate(eig_all).astype(float)
+            if eig_concat.size > 0:
+                eig_sorted = np.sort(eig_concat)[::-1]  # desc
+                for i in range(int(coulomb_top_k)):
+                    out[f"coulomb_eig_{i+1}"] = float(eig_sorted[i]) if i < len(eig_sorted) else 0.0
+                out["coulomb_eig_mean"] = float(np.mean(eig_concat))
+                out["coulomb_eig_std"] = float(np.std(eig_concat))
+                out["coulomb_eig_max"] = float(np.max(eig_concat))
+                out["coulomb_eig_min"] = float(np.min(eig_concat))
+            else:
+                for i in range(int(coulomb_top_k)):
+                    out[f"coulomb_eig_{i+1}"] = np.nan
+                out["coulomb_eig_mean"] = np.nan
+                out["coulomb_eig_std"] = np.nan
+                out["coulomb_eig_max"] = np.nan
+                out["coulomb_eig_min"] = np.nan
+        else:
+            for i in range(int(coulomb_top_k)):
+                out[f"coulomb_eig_{i+1}"] = np.nan
+            out["coulomb_eig_mean"] = np.nan
+            out["coulomb_eig_std"] = np.nan
+            out["coulomb_eig_max"] = np.nan
+            out["coulomb_eig_min"] = np.nan
+
+        return out
+
+    except Exception:
+        return None
+
+
+class RDKit3DDescriptorExtractor:
+    """RDKit 3D 构象描述符提取器（可选更前沿的几何表征）"""
+
+    def __init__(self, coulomb_top_k: int = 10):
+        self.coulomb_top_k = int(coulomb_top_k)
+        self.feature_names = []  # 运行后才知道完整列名
+
+    def smiles_to_3d_descriptors(self, smiles_list, n_jobs: int | None = None):
+        if not RDKIT_AVAILABLE:
+            raise ImportError("需要安装 RDKit 才能使用 3D 描述符。")
+
+        if n_jobs is None:
+            n_jobs = 1 if os.name == 'nt' else mp.cpu_count()
+
+        feats = []
+        valid_indices = []
+
+        print(f"\n🧊 3D 构象描述符提取 (n_jobs={n_jobs}, coulomb_top_k={self.coulomb_top_k})")
+
+        worker = partial(_rdkit3d_feature_worker, coulomb_top_k=self.coulomb_top_k)
+
+        if n_jobs == 1:
+            for idx, s in enumerate(tqdm(smiles_list, desc="3D Descriptors")):
+                out = worker(s)
+                if out is not None:
+                    feats.append(out)
+                    valid_indices.append(idx)
+        else:
+            try:
+                with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+                    for idx, out in enumerate(tqdm(executor.map(worker, smiles_list),
+                                                   total=len(smiles_list),
+                                                   desc=f"3D Descriptors ({n_jobs} workers)")):
+                        if out is not None:
+                            feats.append(out)
+                            valid_indices.append(idx)
+            except Exception as e:
+                print(f"⚠️ 3D 并行提取失败，回退单进程：{e}")
+                for idx, s in enumerate(tqdm(smiles_list, desc="3D Descriptors (fallback)")):
+                    out = worker(s)
+                    if out is not None:
+                        feats.append(out)
+                        valid_indices.append(idx)
+
+        if not feats:
+            return pd.DataFrame(), []
+
+        df = pd.DataFrame(feats)
+        df = df.apply(pd.to_numeric, errors='coerce')
+        self.feature_names = df.columns.tolist()
+
+        return df, valid_indices
+
+
+
+# =============================================================================
+# 预训练 SMILES Transformer Embedding（可选：需要 transformers）
+# =============================================================================
+class SmilesTransformerEmbeddingExtractor:
+    """
+    预训练 SMILES Transformer 表征（例如 ChemBERTa 等）
+
+    - 适合做“前沿特征工程”：不依赖手工描述符，能学习到更抽象的分子语义表示
+    - 注意：首次运行会从 HuggingFace 下载模型权重（需要联网）
+    """
+
+    _CACHE = {}  # (model_name, device_str) -> (tokenizer, model, hidden_size)
+
+    def __init__(
+        self,
+        model_name: str = "seyonec/ChemBERTa-zinc-base-v1",
+        pooling: str = "cls",
+        max_length: int = 128,
+        device=None
+    ):
+        self.model_name = model_name
+        self.pooling = (pooling or "cls").lower()
+        self.max_length = int(max_length)
+
+        try:
+            import torch
+            from transformers import AutoTokenizer, AutoModel
+            self.torch = torch
+            self.AutoTokenizer = AutoTokenizer
+            self.AutoModel = AutoModel
+            self.AVAILABLE = True
+        except Exception:
+            self.AVAILABLE = False
+            self.feature_names = []
+            return
+
+        if device is None:
+            self.device = self.torch.device('cuda' if self.torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = device
+
+        cache_key = (self.model_name, str(self.device))
+        if cache_key in self._CACHE:
+            self.tokenizer, self.model, self.hidden_size = self._CACHE[cache_key]
+        else:
+            self.tokenizer = self.AutoTokenizer.from_pretrained(self.model_name)
+            # 某些 tokenizer 可能没有 pad_token，做个兜底
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.cls_token
+
+            self.model = self.AutoModel.from_pretrained(self.model_name)
+            self.model.to(self.device)
+            self.model.eval()
+
+            # hidden size
+            self.hidden_size = int(getattr(self.model.config, "hidden_size", 0) or 0)
+
+            self._CACHE[cache_key] = (self.tokenizer, self.model, self.hidden_size)
+
+        # feature names 运行后根据 hidden_size 生成
+        self.feature_names = [f"lm_emb_{i}" for i in range(self.hidden_size)] if self.hidden_size else []
+
+    def _pool(self, last_hidden_state, attention_mask):
+        # last_hidden_state: (B, L, H)
+        if self.pooling == "mean":
+            # mean pooling with mask
+            mask = attention_mask.unsqueeze(-1).float()  # (B, L, 1)
+            summed = (last_hidden_state * mask).sum(dim=1)
+            denom = mask.sum(dim=1).clamp(min=1.0)
+            return summed / denom
+        # default: cls pooling (take first token)
+        return last_hidden_state[:, 0, :]
+
+    def smiles_to_embeddings(self, smiles_list, batch_size: int = 32):
+        if not self.AVAILABLE:
+            raise ImportError("需要 transformers：pip install transformers")
+
+        # 过滤空值
+        valid_indices = []
+        texts = []
+        for i, s in enumerate(smiles_list):
+            if s is None or (isinstance(s, float) and np.isnan(s)):
+                continue
+            ss = str(s).strip()
+            if not ss:
+                continue
+            valid_indices.append(i)
+            texts.append(ss)
+
+        if not texts:
+            return pd.DataFrame(), []
+
+        embs = []
+
+        for start in tqdm(range(0, len(texts), batch_size), desc="Transformer Embedding"):
+            batch = texts[start:start + batch_size]
+            inputs = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_length
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with self.torch.no_grad():
+                outputs = self.model(**inputs)
+                last_hidden = outputs.last_hidden_state
+                pooled = self._pool(last_hidden, inputs.get("attention_mask"))
+                embs.append(pooled.detach().cpu().numpy().astype(np.float32))
+
+        emb_mat = np.vstack(embs)
+        # 生成列名
+        if not self.feature_names or len(self.feature_names) != emb_mat.shape[1]:
+            self.feature_names = [f"lm_emb_{i}" for i in range(emb_mat.shape[1])]
+
+        df = pd.DataFrame(emb_mat, columns=self.feature_names)
+        return df, valid_indices
 
 class RDKitFeatureExtractor:
     """RDKit基础提取器"""
@@ -334,17 +683,30 @@ class AdvancedMolecularFeatureExtractor:
             try:
                 # 尝试计算当前批次
                 # quiet=True 是为了防止 mordred 内部再打印一个进度条干扰我们
+                # 修改开始：修复 n_proc 参数导致的 TypeError
                 if n_proc > 1:
                     try:
+                        # 尝试并行
                         df_batch = calc.pandas(batch_mols, n_proc=n_proc, quiet=True)
+                    except TypeError:
+                        # 如果不支持 n_proc 参数，回退到默认调用
+                        if i == 0:
+                            print(f"\n⚠️ Mordred版本不支持并行参数，切换至默认模式...")
+                        n_proc = 1
+                        df_batch = calc.pandas(batch_mols, quiet=True)
                     except Exception as e:
-                        # 如果并行失败，降级重试该批次
+                        # 其他并行错误，回退到单进程
                         if i == 0:
                             print(f"\n⚠️ 并行计算出错 ({str(e)})，自动切换回单进程模式...")
                         n_proc = 1
-                        df_batch = calc.pandas(batch_mols, n_proc=1, quiet=True)
+                        # 单进程模式下不传 n_proc 参数
+                        df_batch = calc.pandas(batch_mols, quiet=True)
                 else:
-                    df_batch = calc.pandas(batch_mols, n_proc=1, quiet=True)
+                    # 单进程模式：直接不传 n_proc 参数，兼容所有版本
+                    df_batch = calc.pandas(batch_mols, quiet=True)
+                # 修改结束
+                if type(df_batch).__name__ == 'MordredDataFrame':
+                    df_batch = pd.DataFrame(df_batch)
 
                 all_dfs.append(df_batch)
 
@@ -405,9 +767,32 @@ class AdvancedMolecularFeatureExtractor:
 
 
 class MLForceFieldExtractor:
-    """机器学习力场特征提取器"""
+    """
+    机器学习力场特征提取器（TorchANI / ANI2x）
 
-    def __init__(self, device=None):
+    ✅ 修复点（对应“力场特征总是 0”的常见原因）：
+    1) 旧版在 batch padding 后尝试用“拆包”获取 atomic_energies，易与 TorchANI 输出结构不匹配，
+       导致能量被错误计算为接近 0（甚至变成全 0）。
+    2) 旧版将 padding 原子当作真实原子（或错误 mask），会污染能量/力。
+    3) 多组分/多片段 SMILES（A.B 或 A;B）若直接作为一个体系计算，片段间非物理近距离会导致异常。
+
+    本实现策略：
+    - 先多进程生成 3D 构象（每个片段独立）
+    - 按 “原子数相同” 分组做 batch 推理（无需 padding）
+    - 对每个样本把各片段的结果聚合为一个特征向量
+    """
+
+    SUPPORTED_SPECIES = {1, 6, 7, 8, 9, 16, 17}  # H,C,N,O,F,S,Cl (ANI2x)
+
+    _HARTREE_TO_KJ_MOL = 2625.499638
+    _HARTREE_TO_KCAL_MOL = 627.509474
+
+    def __init__(self, device=None, energy_unit: str = "hartree"):
+        """
+        Args:
+            device: torch.device 或 None（自动选择 cuda/cpu）
+            energy_unit: 'hartree' | 'kJ/mol' | 'kcal/mol'
+        """
         try:
             import torchani
             import torch
@@ -424,91 +809,218 @@ class MLForceFieldExtractor:
         else:
             self.device = device
 
+        self.energy_unit = (energy_unit or "hartree").lower()
+
         try:
             self.model = self.torchani.models.ANI2x().to(self.device)
         except Exception as e:
             print(f"ANI Model load error: {e}")
             self.AVAILABLE = False
+            self.feature_names = []
+            return
 
-        self.feature_names = ['ani_energy', 'ani_energy_per_atom', 'ani_max_force', 'ani_mean_force', 'ani_force_std']
+        # 保留旧列名，避免下游逻辑/历史模型不兼容
+        self.feature_names = [
+            'ani_energy',
+            'ani_energy_per_atom',
+            'ani_max_force',
+            'ani_mean_force',
+            'ani_force_std',
+            # 新增诊断/结构信息
+            'ani_n_atoms',
+            'ani_n_fragments',
+            'ani_success'
+        ]
 
-    def smiles_to_ani_features(self, smiles_list, batch_size=32):
+    def _convert_energy(self, e_hartree: float) -> float:
+        if e_hartree is None or (isinstance(e_hartree, float) and (np.isnan(e_hartree) or np.isinf(e_hartree))):
+            return np.nan
+        if self.energy_unit in ["hartree", "ha"]:
+            return float(e_hartree)
+        if self.energy_unit in ["kj/mol", "kjmol", "kj"]:
+            return float(e_hartree) * self._HARTREE_TO_KJ_MOL
+        if self.energy_unit in ["kcal/mol", "kcalmol", "kcal"]:
+            return float(e_hartree) * self._HARTREE_TO_KCAL_MOL
+        # 未知单位：不转换
+        return float(e_hartree)
+
+    def _infer_batch(self, species_np: np.ndarray, coords_np: np.ndarray):
+        """
+        对同原子数的一组分子做 batch 推理（无 padding）
+        species_np: (B, N) int64 原子序数
+        coords_np: (B, N, 3) float32 3D 坐标
+        返回:
+            energies: (B,) float
+            forces: (B, N, 3) float
+        """
+        species = self.torch.tensor(species_np, dtype=self.torch.long, device=self.device)
+        coords = self.torch.tensor(coords_np, dtype=self.torch.float32, device=self.device)
+        coords.requires_grad_(True)
+
+        energy = self.model((species, coords)).energies  # (B,)
+        forces = -self.torch.autograd.grad(
+            energy.sum(), coords, create_graph=False, retain_graph=False
+        )[0]  # (B, N, 3)
+
+        return (
+            energy.detach().cpu().numpy().astype(np.float64),
+            forces.detach().cpu().numpy().astype(np.float64)
+        )
+
+    def smiles_to_ani_features(self, smiles_list, batch_size: int = 32, n_jobs: int | None = None):
         if not self.AVAILABLE:
             raise ImportError("请先安装 torchani: pip install torchani")
 
-        print(f"\n⚛️ 正在并行生成 3D 构象 (这可能需要一些时间)...")
+        # -------- 1) 多进程生成 3D 构象（每个样本可能含多个片段）--------
+        print(f"\n⚛️ 正在生成 3D 构象（多组分将按片段分别生成）...")
+
+        # Windows 下多进程可能不稳定，默认降为单进程
+        if n_jobs is None:
+            n_jobs = 1 if os.name == 'nt' else mp.cpu_count()
 
         valid_indices = []
-        data_list = []
+        sample_frags = []  # list[list[(atoms, coords)]]
 
-        with ProcessPoolExecutor() as executor:
-            results = list(tqdm(executor.map(_generate_3d_data_worker, smiles_list),
-                                total=len(smiles_list),
-                                desc="3D Generation"))
+        try:
+            if n_jobs == 1:
+                # 单进程（更稳）
+                for i, s in enumerate(tqdm(smiles_list, desc="3D Generation")):
+                    res = _generate_3d_data_worker(s)
+                    if res is not None:
+                        valid_indices.append(i)
+                        sample_frags.append(res)
+            else:
+                with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+                    for i, res in enumerate(tqdm(executor.map(_generate_3d_data_worker, smiles_list),
+                                                 total=len(smiles_list),
+                                                 desc=f"3D Generation ({n_jobs} workers)")):
+                        if res is not None:
+                            valid_indices.append(i)
+                            sample_frags.append(res)
+        except Exception as e:
+            print(f"⚠️ 3D 并行生成失败，回退到单进程：{e}")
+            valid_indices = []
+            sample_frags = []
+            for i, s in enumerate(tqdm(smiles_list, desc="3D Generation (fallback)")):
+                res = _generate_3d_data_worker(s)
+                if res is not None:
+                    valid_indices.append(i)
+                    sample_frags.append(res)
 
-        for i, res in enumerate(results):
-            if res is not None:
-                valid_indices.append(i)
-                data_list.append(res)
-
-        if not data_list:
+        if not sample_frags:
             return pd.DataFrame(), []
 
-        print(f"⚛️ 开始 ANI 批量推理 (Batch Size: {batch_size}, Device: {self.device})...")
+        # -------- 2) 展平片段，按原子数分组 batch 推理（无 padding）--------
+        from collections import defaultdict
+
+        frag_records = []  # 每个元素对应一个片段
+        for orig_i, frags in zip(valid_indices, sample_frags):
+            for atoms, coords in frags:
+                frag_records.append({
+                    'orig_index': orig_i,
+                    'n_atoms': int(len(atoms)),
+                    'atoms': atoms,
+                    'coords': coords,
+                    'energy': np.nan,
+                    'forces': None,
+                    'failed': False
+                })
+
+        groups = defaultdict(list)
+        for r in frag_records:
+            groups[r['n_atoms']].append(r)
+
+        print(f"⚛️ 开始 ANI 推理（按原子数分组批处理，Batch Size={batch_size}, Device={self.device}）...")
+
+        for n_atoms, recs in groups.items():
+            for start in tqdm(range(0, len(recs), batch_size), desc=f"Inference (N={n_atoms})"):
+                batch = recs[start:start + batch_size]
+                try:
+                    species_np = np.asarray([b['atoms'] for b in batch], dtype=np.int64)
+                    coords_np = np.stack([b['coords'] for b in batch]).astype(np.float32)
+
+                    energies, forces = self._infer_batch(species_np, coords_np)
+                    for k, b in enumerate(batch):
+                        b['energy'] = float(energies[k])
+                        b['forces'] = forces[k]
+                except Exception as e:
+                    # 兜底：逐个推理，尽量不让整个批次失败
+                    for b in batch:
+                        try:
+                            species_np = np.asarray([b['atoms']], dtype=np.int64)
+                            coords_np = np.asarray([b['coords']], dtype=np.float32)
+                            energies, forces = self._infer_batch(species_np, coords_np)
+                            b['energy'] = float(energies[0])
+                            b['forces'] = forces[0]
+                        except Exception:
+                            b['failed'] = True
+                            b['energy'] = np.nan
+                            b['forces'] = None
+
+        # -------- 3) 按样本聚合片段结果，生成特征 --------
+        sample_acc = {}
+        for idx in valid_indices:
+            sample_acc[idx] = {
+                'energies': [],
+                'force_norms': [],
+                'n_atoms': 0,
+                'n_frags': 0,
+                'failed': False
+            }
+
+        for r in frag_records:
+            acc = sample_acc.get(r['orig_index'])
+            if acc is None:
+                continue
+
+            if r.get('failed') or r.get('forces') is None or (not np.isfinite(r.get('energy', np.nan))):
+                acc['failed'] = True
+                continue
+
+            acc['energies'].append(float(r['energy']))
+            norms = np.linalg.norm(np.asarray(r['forces'], dtype=np.float64), axis=1)
+            acc['force_norms'].append(norms)
+            acc['n_atoms'] += int(r['n_atoms'])
+            acc['n_frags'] += 1
+
         features_list = []
+        final_indices = []
 
-        for i in tqdm(range(0, len(data_list), batch_size), desc="Inference"):
-            batch_data = data_list[i: i + batch_size]
-            species_list = [self.torch.tensor(d[0], dtype=self.torch.long) for d in batch_data]
-            coords_list = [self.torch.tensor(d[1], dtype=self.torch.float32) for d in batch_data]
+        for idx in valid_indices:
+            acc = sample_acc[idx]
+            if acc['failed'] or acc['n_atoms'] <= 0 or len(acc['energies']) == 0:
+                continue
 
-            species_padded = self.torch.nn.utils.rnn.pad_sequence(species_list, batch_first=True, padding_value=-1).to(
-                self.device)
-            coords_padded = self.torch.nn.utils.rnn.pad_sequence(coords_list, batch_first=True, padding_value=0.0).to(
-                self.device)
-            coords_padded.requires_grad_(True)
-            mask = (species_padded >= 0)
+            e_total = float(np.sum(acc['energies']))
+            e_total_conv = self._convert_energy(e_total)
+            e_per_atom = e_total_conv / acc['n_atoms'] if acc['n_atoms'] > 0 else np.nan
 
-            try:
-                species_safe = species_padded.clone()
-                species_safe[~mask] = 0
+            if acc['force_norms']:
+                fn = np.concatenate(acc['force_norms'])
+                f_max = float(np.max(fn)) if fn.size else np.nan
+                f_mean = float(np.mean(fn)) if fn.size else np.nan
+                f_std = float(np.std(fn)) if fn.size else np.nan
+            else:
+                f_max = f_mean = f_std = np.nan
 
-                energy = self.model((species_safe, coords_padded)).energies
-                forces = -self.torch.autograd.grad(energy.sum(), coords_padded, create_graph=False, retain_graph=False)[
-                    0]
-
-                energy_np = energy.detach().cpu().numpy()
-                forces_np = forces.detach().cpu().numpy()
-
-                _, atomic_energies = self.model((species_safe, coords_padded))
-                real_energy = (atomic_energies * mask.float()).sum(dim=1).detach().cpu().numpy()
-
-                for j in range(len(batch_data)):
-                    n_atoms = len(batch_data[j][0])
-                    e_val = real_energy[j]
-                    f_vec = forces_np[j][:n_atoms]
-                    f_norm = np.linalg.norm(f_vec, axis=1)
-
-                    feats = {
-                        'ani_energy': e_val,
-                        'ani_energy_per_atom': e_val / n_atoms,
-                        'ani_max_force': np.max(f_norm),
-                        'ani_mean_force': np.mean(f_norm),
-                        'ani_force_std': np.std(f_norm)
-                    }
-                    features_list.append(feats)
-
-            except Exception as e:
-                print(f"Batch error: {e}, processing individually...")
-                for d in batch_data:
-                    features_list.append({k: np.nan for k in self.feature_names})
+            feats = {
+                'ani_energy': e_total_conv,
+                'ani_energy_per_atom': e_per_atom,
+                'ani_max_force': f_max,
+                'ani_mean_force': f_mean,
+                'ani_force_std': f_std,
+                'ani_n_atoms': int(acc['n_atoms']),
+                'ani_n_fragments': int(acc['n_frags']),
+                'ani_success': 1
+            }
+            features_list.append(feats)
+            final_indices.append(idx)
 
         if not features_list:
             return pd.DataFrame(), []
 
         df = pd.DataFrame(features_list)
-        return df, valid_indices
-
+        return df, final_indices
 
 class EpoxyDomainFeatureExtractor:
     """环氧树脂领域知识特征提取器 (增强版：加入电子效应模拟)"""

@@ -82,3 +82,102 @@ class ApplicabilityDomainAnalyzer:
 
         plt.tight_layout()
         return is_in_domain, fig
+# ============================================================
+# [新增] 指纹相似度适用域（Tanimoto）
+# ============================================================
+
+def _binarize_fingerprint_matrix(X):
+    """将指纹矩阵二值化（>0 视为 1）并转为 uint8"""
+    if isinstance(X, pd.DataFrame):
+        Xv = X.values
+    else:
+        Xv = np.asarray(X)
+    # NaN -> 0
+    Xv = np.nan_to_num(Xv, nan=0.0, posinf=0.0, neginf=0.0)
+    return (Xv > 0).astype(np.uint8)
+
+
+def _tanimoto_sim_vector(train_bin: np.ndarray, query_bin: np.ndarray):
+    """计算 query 与 train 每行的 Tanimoto 相似度向量"""
+    # intersection: dot product for binary vectors
+    inter = np.dot(train_bin.astype(np.uint16), query_bin.astype(np.uint16))
+    a = train_bin.sum(axis=1).astype(np.int32)
+    b = int(query_bin.sum())
+    union = a + b - inter
+    # avoid zero division
+    sim = np.zeros(train_bin.shape[0], dtype=float)
+    mask = union > 0
+    sim[mask] = inter[mask] / union[mask]
+    return sim
+
+
+class TanimotoADAnalyzer:
+    """基于 Tanimoto 相似度的适用域分析（适用于 MACCS/Morgan 指纹位向量）"""
+
+    def __init__(self, X_train_fp, threshold: float = 0.25, max_train_samples=None, random_state: int = 42):
+        self.threshold = float(threshold)
+        self.random_state = int(random_state)
+        self.X_train_bin_full = _binarize_fingerprint_matrix(X_train_fp)
+
+        # 可选：采样训练集，避免大数据下计算过慢
+        if max_train_samples is not None and self.X_train_bin_full.shape[0] > int(max_train_samples):
+            rng = np.random.default_rng(self.random_state)
+            idx = rng.choice(self.X_train_bin_full.shape[0], size=int(max_train_samples), replace=False)
+            self.train_indices_ = np.sort(idx)
+            self.X_train_bin = self.X_train_bin_full[self.train_indices_]
+        else:
+            self.train_indices_ = None
+            self.X_train_bin = self.X_train_bin_full
+
+    def analyze_single(self, x_fp_row, top_k: int = 5, threshold=None):
+        """分析单个样本，返回 (is_in_domain, sim_max, top_k_df, fig)"""
+        thr = self.threshold if threshold is None else float(threshold)
+
+        query_bin = _binarize_fingerprint_matrix(np.asarray(x_fp_row).reshape(1, -1))[0]
+        sims = _tanimoto_sim_vector(self.X_train_bin, query_bin)
+        sim_max = float(np.max(sims)) if sims.size else 0.0
+
+        # top-k
+        k = int(max(1, top_k))
+        top_idx = np.argsort(sims)[::-1][:k]
+        top_sims = sims[top_idx]
+
+        # 原始训练索引（如发生采样）
+        if self.train_indices_ is not None:
+            top_train_index = self.train_indices_[top_idx]
+        else:
+            top_train_index = top_idx
+
+        top_df = pd.DataFrame({
+            'train_index': top_train_index,
+            'similarity': top_sims
+        })
+
+        is_in_domain = sim_max >= thr
+
+        # 可视化：相似度分布直方图 + sim_max
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.hist(sims, bins=30, edgecolor='black', alpha=0.7)
+        ax.axvline(sim_max, linestyle='--', linewidth=2)
+        ax.axvline(thr, linestyle=':', linewidth=2)
+        ax.set_xlabel('Tanimoto Similarity')
+        ax.set_ylabel('Count')
+        ax.set_title('Tanimoto Similarity to Training Set')
+        ax.grid(True, linestyle='--', alpha=0.4)
+        plt.tight_layout()
+
+        return is_in_domain, sim_max, top_df, fig
+
+    def compute_batch_max_similarity(self, X_query_fp, batch_size: int = 256):
+        """批量计算每个 query 的最大相似度（支持分批，避免内存峰值）"""
+        Xq = _binarize_fingerprint_matrix(X_query_fp)
+        n = Xq.shape[0]
+        sim_max = np.zeros(n, dtype=float)
+
+        bs = int(max(1, batch_size))
+        for start in range(0, n, bs):
+            end = min(n, start + bs)
+            for i in range(start, end):
+                sims = _tanimoto_sim_vector(self.X_train_bin, Xq[i])
+                sim_max[i] = float(np.max(sims)) if sims.size else 0.0
+        return sim_max

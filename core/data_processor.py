@@ -8,42 +8,59 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.decomposition import PCA
 from scipy import stats
 import plotly.graph_objects as go
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    TORCH_AVAILABLE = True
+except Exception:
+    # 在某些环境（尤其是缺少 CUDA 运行库或内存受限）torch 可能导入失败。
+    # 本平台除非使用 VAE 等深度学习增强功能，否则不依赖 torch。
+    TORCH_AVAILABLE = False
+    torch = None
+    nn = None
+    DataLoader = None
+    TensorDataset = None
 from tqdm import tqdm
 import warnings
 
 warnings.filterwarnings('ignore')
 
 
-class VAE(nn.Module):
-    """变分自编码器"""
+if TORCH_AVAILABLE:
+    class VAE(nn.Module):
+        """变分自编码器"""
 
-    def __init__(self, input_dim, latent_dim=16, h_dim=128):
-        super(VAE, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, h_dim), nn.ReLU(),
-            nn.Linear(h_dim, h_dim // 2), nn.ReLU(),
-        )
-        self.fc_mu = nn.Linear(h_dim // 2, latent_dim)
-        self.fc_logvar = nn.Linear(h_dim // 2, latent_dim)
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, h_dim // 2), nn.ReLU(),
-            nn.Linear(h_dim // 2, h_dim), nn.ReLU(),
-            nn.Linear(h_dim, input_dim), nn.Sigmoid()
-        )
+        def __init__(self, input_dim, latent_dim=16, h_dim=128):
+            super(VAE, self).__init__()
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, h_dim), nn.ReLU(),
+                nn.Linear(h_dim, h_dim // 2), nn.ReLU(),
+            )
+            self.fc_mu = nn.Linear(h_dim // 2, latent_dim)
+            self.fc_logvar = nn.Linear(h_dim // 2, latent_dim)
+            self.decoder = nn.Sequential(
+                nn.Linear(latent_dim, h_dim // 2), nn.ReLU(),
+                nn.Linear(h_dim // 2, h_dim), nn.ReLU(),
+                nn.Linear(h_dim, input_dim), nn.Sigmoid()
+            )
 
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        return mu + torch.randn_like(std) * std
+        def reparameterize(self, mu, logvar):
+            std = torch.exp(0.5 * logvar)
+            return mu + torch.randn_like(std) * std
 
-    def forward(self, x):
-        h = self.encoder(x)
-        mu, logvar = self.fc_mu(h), self.fc_logvar(h)
-        z = self.reparameterize(mu, logvar)
-        return self.decoder(z), mu, logvar
+        def forward(self, x):
+            h = self.encoder(x)
+            mu, logvar = self.fc_mu(h), self.fc_logvar(h)
+            z = self.reparameterize(mu, logvar)
+            return self.decoder(z), mu, logvar
 
+else:
+    class VAE:
+        """torch 不可用时的占位 VAE"""
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError("torch 不可用，无法使用 VAE 数据增强功能。请安装/修复 torch，或关闭相关功能。")
 
 class DataEnhancer:
     """数据增强器"""
@@ -141,19 +158,35 @@ class AdvancedDataCleaner:
 
     def handle_missing_values(self, strategy='median', fill_value=None):
         numeric_cols = self.cleaned_data.select_dtypes(include=np.number).columns
+
         if strategy == 'median':
             self.cleaned_data[numeric_cols] = self.cleaned_data[numeric_cols].fillna(
                 self.cleaned_data[numeric_cols].median())
+
         elif strategy == 'mean':
             self.cleaned_data[numeric_cols] = self.cleaned_data[numeric_cols].fillna(
                 self.cleaned_data[numeric_cols].mean())
+
+        elif strategy == 'mode':
+            # 使用众数填充（对离散型数值/计数特征更友好）
+            try:
+                mode_vals = self.cleaned_data[numeric_cols].mode().iloc[0]
+                self.cleaned_data[numeric_cols] = self.cleaned_data[numeric_cols].fillna(mode_vals)
+            except Exception:
+                # 如果 mode 计算失败，回退到中位数
+                self.cleaned_data[numeric_cols] = self.cleaned_data[numeric_cols].fillna(
+                    self.cleaned_data[numeric_cols].median())
+
         elif strategy == 'knn':
             imputer = KNNImputer(n_neighbors=5)
             self.cleaned_data[numeric_cols] = imputer.fit_transform(self.cleaned_data[numeric_cols])
+
         elif strategy == 'drop_rows':
             self.cleaned_data = self.cleaned_data.dropna()
+
         elif strategy == 'constant':
             self.cleaned_data[numeric_cols] = self.cleaned_data[numeric_cols].fillna(fill_value or 0)
+
         return self.cleaned_data
 
     def detect_outliers(self, method='iqr', threshold=1.5):
@@ -308,4 +341,120 @@ class AdvancedDataCleaner:
 
         # 更新数据
         self.cleaned_data = df.loc[indices_to_keep].reset_index(drop=True)
+        return self.cleaned_data
+    def aggregate_by_keys(self, keys, target_col, agg: str = 'median', dropna_target: bool = True):
+        """按配方/键聚合重复记录（用于 Tg/力学等性质的稳健建模）
+
+        - 默认对 target_col 做 median 聚合，抗异常值更强
+        - 同时生成重复次数与标准差：{prefix}_rep_n / {prefix}_rep_std
+        - 其他列默认取每组第一条记录（适合“同配方重复测量”场景）
+
+        Args:
+            keys: 分组键列名列表
+            target_col: 需要聚合的目标列名
+            agg: 聚合方法：median/mean/min/max
+            dropna_target: 是否删除聚合后 target 仍为 NaN 的组
+
+        Returns:
+            聚合后的 DataFrame
+        """
+        df = self.cleaned_data.copy()
+
+        # 1) 参数检查
+        if not isinstance(keys, (list, tuple)):
+            raise ValueError("keys 必须是列名列表")
+        keys = [k for k in keys if k in df.columns]
+        if len(keys) == 0:
+            raise ValueError("聚合键 keys 为空或不在数据列中")
+
+        if target_col not in df.columns:
+            raise ValueError(f"目标列 '{target_col}' 不在数据中")
+
+        # 2) 强制目标列转数值（无法转换的变 NaN）
+        df[target_col] = pd.to_numeric(df[target_col], errors='coerce')
+
+        # 3) 分组
+        grouped = df.groupby(keys, dropna=False, sort=False)
+
+        # 4) 聚合目标
+        agg = (agg or 'median').lower()
+        if agg == 'median':
+            target_agg = grouped[target_col].median()
+        elif agg == 'mean':
+            target_agg = grouped[target_col].mean()
+        elif agg == 'min':
+            target_agg = grouped[target_col].min()
+        elif agg == 'max':
+            target_agg = grouped[target_col].max()
+        else:
+            raise ValueError("agg 仅支持 median/mean/min/max")
+
+        rep_n = grouped[target_col].count()
+        rep_std = grouped[target_col].std()  # ddof=1
+
+        # 5) 取每组第一条记录作为骨架（保留其它列）
+        base = grouped.first().reset_index()
+
+        # 6) 写回聚合后的目标与统计量
+        base[target_col] = target_agg.values
+
+        # column name: tg_c -> tg_rep_n / tg_rep_std；其他目标用 <target>_rep_n / _rep_std
+        target_lower = str(target_col).lower()
+        prefix = 'tg' if target_lower in ['tg', 'tg_c'] or target_lower.startswith('tg') else str(target_col)
+        rep_n_col = f"{prefix}_rep_n"
+        rep_std_col = f"{prefix}_rep_std"
+
+        # 避免覆盖已有列
+        if rep_n_col in base.columns:
+            rep_n_col = rep_n_col + "_agg"
+        if rep_std_col in base.columns:
+            rep_std_col = rep_std_col + "_agg"
+
+        base[rep_n_col] = rep_n.values.astype(int)
+        base[rep_std_col] = rep_std.values
+
+        # 7) 可选：删除 target 为 NaN 的组
+        if dropna_target:
+            base = base[base[target_col].notna()].reset_index(drop=True)
+
+        # 8) 更新状态
+        before = len(self.cleaned_data)
+        after = len(base)
+        self.cleaned_data = base
+        self.cleaning_log.append({
+            'action': 'aggregate_by_keys',
+            'keys': keys,
+            'target_col': target_col,
+            'agg': agg,
+            'rows_before': int(before),
+            'rows_after': int(after)
+        })
+        return self.cleaned_data
+
+    def one_hot_encode(self, cols, drop_first: bool = False, dummy_na: bool = False):
+        """对类别列做 one-hot 编码，生成数值特征列"""
+        df = self.cleaned_data.copy()
+        if not isinstance(cols, (list, tuple)):
+            raise ValueError("cols 必须是列名列表")
+        cols = [c for c in cols if c in df.columns]
+        if len(cols) == 0:
+            return df
+
+        before_cols = df.shape[1]
+        df_encoded = pd.get_dummies(
+            df,
+            columns=list(cols),
+            drop_first=drop_first,
+            dummy_na=dummy_na,
+            prefix=list(cols),
+            prefix_sep='_'
+        )
+
+        self.cleaned_data = df_encoded
+        self.cleaning_log.append({
+            'action': 'one_hot_encode',
+            'cols': cols,
+            'cols_before': int(before_cols),
+            'cols_after': int(df_encoded.shape[1])
+        })
         return self.cleaned_data
