@@ -25,7 +25,12 @@ from tqdm import tqdm
 import warnings
 
 warnings.filterwarnings('ignore')
-
+try:
+    from core.smiles_utils import smart_repair_smiles, canonicalize_smiles
+except ImportError:
+    # 简单的 fallback，防止导入错误导致整个模块崩溃
+    smart_repair_smiles = lambda x, k: x
+    canonicalize_smiles = lambda x: x
 
 if TORCH_AVAILABLE:
     class VAE(nn.Module):
@@ -457,4 +462,61 @@ class AdvancedDataCleaner:
             'cols_before': int(before_cols),
             'cols_after': int(df_encoded.shape[1])
         })
+        return self.cleaned_data
+
+    def clean_smiles_columns(self, columns: list, strategy: str = 'standard', drop_invalid: bool = False):
+        """
+        清洗指定的 SMILES 列。
+
+        Args:
+            columns: 需要清洗的列名列表
+            strategy: 清洗策略
+                - 'standard': 仅进行标准 RDKit canonicalize，无效变 NaN
+                - 'repair': 尝试智能修复（去除立体信息、取最大片段等）
+                - 'strict': 严格模式，任何解析失败直接 NaN
+            drop_invalid: 是否删除清洗后 SMILES 为 NaN 的行
+
+        Returns:
+            cleaned_data DataFrame
+        """
+        if not columns:
+            return self.cleaned_data
+
+        df = self.cleaned_data.copy()
+
+        for col in columns:
+            if col not in df.columns:
+                continue
+
+            original_valid_count = df[col].notna().sum()
+
+            if strategy == 'repair':
+                # 使用智能修复
+                df[col] = df[col].apply(lambda x: smart_repair_smiles(x, keep_largest_frag=True))
+            else:
+                # 标准模式
+                df[col] = df[col].apply(canonicalize_smiles)
+
+            new_valid_count = df[col].notna().sum()
+            lost = original_valid_count - new_valid_count
+
+            self.cleaning_log.append({
+                'action': 'clean_smiles',
+                'column': col,
+                'strategy': strategy,
+                'valid_before': int(original_valid_count),
+                'valid_after': int(new_valid_count),
+                'lost_samples': int(lost)
+            })
+
+        if drop_invalid:
+            before_len = len(df)
+            df = df.dropna(subset=columns).reset_index(drop=True)
+            self.cleaning_log.append({
+                'action': 'drop_invalid_smiles_rows',
+                'columns': columns,
+                'rows_dropped': int(before_len - len(df))
+            })
+
+        self.cleaned_data = df
         return self.cleaned_data

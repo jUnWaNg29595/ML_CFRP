@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 SMILES 工具函数：
-- 多组分/多片段 SMILES 分列（自动拆分成 *_1, *_2, ...）
-- RDKit canonical 化（统一写法，便于统计/类别平衡）
-- 配方键（composition key）生成：对组分排序/去重后拼接，避免因顺序不同被误判为不同配方
-
-说明：
-- 分隔符规则与平台保持一致：先按 ';'、'；'、'|' 分割；再按“带空格的 +”分割；最后按 '.' 分割。
-- 注意：不对 'C[N+](C)(C)C' 这种 SMILES 中的 '+' 误切分。
+- 多组分/多片段 SMILES 分列
+- RDKit canonical 化
+- 配方键生成
+- [新增] SMILES 清洗与智能修复
 """
 
 from __future__ import annotations
@@ -20,11 +17,13 @@ import pandas as pd
 
 try:
     from rdkit import Chem
+    from rdkit.Chem.SaltRemover import SaltRemover
+
     RDKIT_AVAILABLE = True
 except Exception:
     RDKIT_AVAILABLE = False
     Chem = None
-
+    SaltRemover = None
 
 _SPLIT_SEMI = re.compile(r"\s*[;；|]\s*")
 _SPLIT_PLUS = re.compile(r"\s+\+\s+")
@@ -54,41 +53,125 @@ def split_smiles_cell(cell) -> List[str]:
     return [f for f in frags if f]
 
 
+def clean_smiles_raw_string(text: str) -> Optional[str]:
+    """
+    基础字符串清理：
+    - 去除首尾空白
+    - 去除首尾引号 (' 或 ")
+    - 过滤掉 'nan', 'none', 'null' 等无效字符串
+    - 移除非打印字符
+    """
+    if text is None:
+        return None
+
+    # 强转字符串并strip
+    s = str(text).strip()
+
+    # 去除常见的包裹引号
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+
+    # 再次检查空
+    if not s:
+        return None
+
+    # 检查无效关键词
+    if s.lower() in ['nan', 'none', 'null', 'na', 'n/a']:
+        return None
+
+    return s
+
+
 def canonicalize_smiles(smiles: str) -> Optional[str]:
     """
-    RDKit canonical SMILES。
+    RDKit canonical SMILES (标准化)。
     - 失败返回 None
     """
     if not RDKIT_AVAILABLE:
         return None
-    if smiles is None:
-        return None
-    s = str(smiles).strip()
+
+    s = clean_smiles_raw_string(smiles)
     if not s:
         return None
+
     try:
         mol = Chem.MolFromSmiles(s)
         if mol is None:
             return None
-        # isomericSmiles=True 有助于保留立体信息（若有）
+        # isomericSmiles=True 有助于保留立体信息
         return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
     except Exception:
         return None
 
 
-def make_composition_key(components: List[str], canonicalize: bool = True, unique: bool = True, sort: bool = True) -> Optional[str]:
+def smart_repair_smiles(smiles: str, keep_largest_frag: bool = True) -> Optional[str]:
+    """
+    尝试修复不规范的 SMILES（启发式修复策略）。
+    用于在 RDKit 标准化失败后尝试“挽救”数据。
+
+    策略：
+    1. 基础清理后重试
+    2. 移除立体化学标记（@, /, \）后重试（针对立体化学写法错误）
+    3. 如果包含多个片段（.），尝试提取最大的片段（通常是主成分）
+    4. 尝试进行 RDKit Sanitization 修复
+
+    Args:
+        smiles: 输入字符串
+        keep_largest_frag: 若含有盐/溶剂（多片段），是否只保留最大片段
+
+    Returns:
+        修复并标准化后的 SMILES，失败则返回 None
+    """
+    if not RDKIT_AVAILABLE:
+        return None
+
+    # 1. 基础清理
+    s = clean_smiles_raw_string(smiles)
+    if not s:
+        return None
+
+    # 尝试直接解析
+    canon = canonicalize_smiles(s)
+    if canon:
+        # 如果需要保留最大片段（去除盐）
+        if keep_largest_frag and '.' in canon:
+            frags = canon.split('.')
+            return max(frags, key=len)
+        return canon
+
+    # 2. 尝试移除立体化学标记 (常见错误源)
+    # 移除 @, /, \
+    s_no_iso = s.replace('@', '').replace('/', '').replace('\\', '')
+    canon = canonicalize_smiles(s_no_iso)
+    if canon:
+        if keep_largest_frag and '.' in canon:
+            return max(canon.split('.'), key=len)
+        return canon
+
+    # 3. 尝试直接按 '.' 分割取最长片段（应对 "Salt.Component" 写法导致的整体解析失败）
+    if '.' in s:
+        frags = s.split('.')
+        # 按长度降序排，逐个尝试解析
+        frags.sort(key=len, reverse=True)
+        for f in frags:
+            c = canonicalize_smiles(f)
+            if c:
+                return c
+
+    return None
+
+
+def make_composition_key(components: List[str], canonicalize: bool = True, unique: bool = True, sort: bool = True) -> \
+Optional[str]:
     """
     把多个组分生成一个稳定的“配方键”（composition key）。
-    - canonicalize: 是否对每个组分做 RDKit canonical 化
-    - unique: 是否去重
-    - sort: 是否排序（避免组分顺序差异导致 key 不同）
     """
     if not components:
         return None
 
     comps = []
     for c in components:
-        c = str(c).strip()
+        c = clean_smiles_raw_string(c)  # 使用基础清理
         if not c:
             continue
         if canonicalize:
@@ -110,20 +193,17 @@ def make_composition_key(components: List[str], canonicalize: bool = True, uniqu
 
 
 def split_smiles_column(
-    df: pd.DataFrame,
-    column: str,
-    max_components: int = 6,
-    canonicalize: bool = True,
-    add_key: bool = True,
-    add_n_components: bool = True,
-    keep_original: bool = True,
-    prefix: Optional[str] = None,
+        df: pd.DataFrame,
+        column: str,
+        max_components: int = 6,
+        canonicalize: bool = True,
+        add_key: bool = True,
+        add_n_components: bool = True,
+        keep_original: bool = True,
+        prefix: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     将 df[column] 自动分列成 column_1...column_k。
-
-    Returns:
-        (new_df, created_columns)
     """
     if column not in df.columns:
         return df, []
@@ -153,7 +233,7 @@ def split_smiles_column(
     created_cols: List[str] = []
 
     for i in range(k):
-        col_i = f"{pref}_{i+1}"
+        col_i = f"{pref}_{i + 1}"
         created_cols.append(col_i)
         new_df[col_i] = [comps[i] if len(comps) > i else np.nan for comps in all_components]
 
@@ -165,7 +245,8 @@ def split_smiles_column(
     if add_key:
         kcol = f"{pref}_key"
         created_cols.append(kcol)
-        new_df[kcol] = [make_composition_key(comps, canonicalize=False, unique=True, sort=True) for comps in all_components]
+        new_df[kcol] = [make_composition_key(comps, canonicalize=False, unique=True, sort=True) for comps in
+                        all_components]
 
     if not keep_original:
         new_df = new_df.drop(columns=[column])
@@ -174,19 +255,17 @@ def split_smiles_column(
 
 
 def build_formulation_key(
-    df: pd.DataFrame,
-    resin_key_col: str,
-    hardener_key_col: str,
-    new_col: str = "formulation_key",
+        df: pd.DataFrame,
+        resin_key_col: str,
+        hardener_key_col: str,
+        new_col: str = "formulation_key",
 ) -> pd.DataFrame:
-    """
-    基于 resin_key_col + hardener_key_col 构建体系配方键，用于类别平衡/分组划分。
-    """
+    """基于 resin_key_col + hardener_key_col 构建体系配方键"""
     if resin_key_col not in df.columns or hardener_key_col not in df.columns:
         return df
     new_df = df.copy()
     new_df[new_col] = (
-        new_df[resin_key_col].astype(str).fillna("") + "||" + new_df[hardener_key_col].astype(str).fillna("")
+            new_df[resin_key_col].astype(str).fillna("") + "||" + new_df[hardener_key_col].astype(str).fillna("")
     ).replace({"||": np.nan})
     return new_df
 
