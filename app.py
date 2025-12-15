@@ -933,7 +933,7 @@ def page_data_cleaning():
                         help="将超高频的单体/配方下采样到指定上限，减少数据中“单种分子单体过多”的偏置。"
                     )
                     if st.button("⚖️ 立即对该列执行平衡", key=f"quick_balance_{prev_col}"):
-                        from core.data_processor import AdvancedDataCleaner
+                        # NOTE: 不要在函数内部再次 import AdvancedDataCleaner，否则会触发作用域(UnboundLocalError)
                         cleaner_tmp = AdvancedDataCleaner(df)
                         balanced_df = cleaner_tmp.balance_category_counts(prev_col, max_samples=int(cap))
                         st.session_state.processed_data = balanced_df
