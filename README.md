@@ -7,6 +7,8 @@
 - **新增：3D 构象描述符**
 - **新增（可选）：预训练 SMILES Transformer Embedding**：支持 ChemBERTa 等模型（需要安装 `transformers`，首次运行需下载权重）。：在“分子特征工程”中加入 `🧊 3D构象描述符 (RDKit3D+Coulomb)`，补充几何/构象层面的前沿表征。
 - **增强：双组分（树脂+固化剂）融合**：除指纹/反应特征外，也可选择“拼接SMILES (Resin.Hardener)”让 RDKit/Mordred/3D/ANI/Transformer 等方法共同表征固化剂贡献。
+- **新增：TDA 拓扑特征（持续同调 / Betti0-2）**：可将 3D 构象点云转为拓扑统计特征，用于表征网络孔洞/环路等结构信息。
+- **新增：主动学习（Active Learning）页面**：基于不确定性 / EI / UCB 推荐下一批实验/模拟样本，形成数据-模型-实验闭环。
 
 ## 🚀 项目简介
 

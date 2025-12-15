@@ -235,7 +235,11 @@ def init_session_state():
         'optimization_history': [],
         'best_params': None,
         'molecular_feature_names': [],
-        'optimized_model_name': None  # 新增：记录优化的模型名
+        'optimized_model_name': None,  # 新增：记录优化的模型名
+
+        # --- [新增] Active Learning ---
+        'al_pool_data': None,
+        'al_recommendations': None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -269,6 +273,7 @@ def render_sidebar():
                 "📊 模型解释",
                 "🔮 预测应用",
                 "⚙️ 超参优化",
+                "🧠 主动学习",
             ],
             label_visibility="collapsed"
         )
@@ -1225,6 +1230,7 @@ def page_molecular_features():
             "💾 RDKit 内存优化版 (低内存)",
             "🔬 Mordred 描述符 (1600+特征)",
             "🧊 3D构象描述符 (RDKit3D+Coulomb) [新]",
+            "🧩 TDA拓扑特征 (持续同调PH) [新]",
             "🧠 预训练SMILES Transformer Embedding (ChemBERTa等) [可选]",
             "🕸️ 图神经网络特征 (拓扑结构)",
             "⚛️ ML力场特征 (ANI能量/力)",
@@ -1240,6 +1246,12 @@ def page_molecular_features():
     hardener_col = None
     hardener_fusion_mode = "仅用于指纹/反应特征（当前默认）"  # 初始化固化剂列变量
     phr_col = None
+
+    # [新增] TDA 参数默认值
+    tda_maxdim = 2
+    tda_use_pim = False
+    tda_pim_pixels = 10
+    tda_pim_spread = 1.0
 
     # ============== [修改] 指纹参数设置 ==============
     if "分子指纹" in extraction_method:
@@ -1307,6 +1319,23 @@ def page_molecular_features():
         with col_p:
             num_cols = df.select_dtypes(include=np.number).columns.tolist()
             phr_col = st.selectbox("选择【配比/PHR】列 (可选)", ["无 (假设理想配比)"] + num_cols)
+
+
+    # ============== [新增 UI] TDA 参数 ==============
+    if "TDA拓扑特征" in extraction_method:
+        st.markdown("#### 🧩 TDA(持续同调) 参数")
+        st.info("需要安装 ripser/persim：pip install ripser persim。TDA 将把 3D 构象点云转为 Betti0/1/2 的拓扑统计特征。")
+
+        col_t1, col_t2, col_t3, col_t4 = st.columns(4)
+        with col_t1:
+            tda_maxdim = st.selectbox("maxdim (0/1/2)", [0, 1, 2], index=2)
+        with col_t2:
+            tda_use_pim = st.checkbox("使用 Persistence Image（高维）", value=False)
+        with col_t3:
+            tda_pim_pixels = st.selectbox("PIM 像素边长", [8, 10, 16, 20], index=1, disabled=(not tda_use_pim))
+        with col_t4:
+            tda_pim_spread = st.number_input("PIM spread", min_value=0.1, max_value=5.0, value=1.0, step=0.1,
+                                             disabled=(not tda_use_pim))
 
     # 并行版参数
     if "并行版" in extraction_method and OPTIMIZED_EXTRACTOR_AVAILABLE:
@@ -1458,6 +1487,23 @@ def page_molecular_features():
                 status_text.text("正在提取RDKit 3D构象描述符...")
                 extractor = RDKit3DDescriptorExtractor()
                 features_df, valid_indices = extractor.smiles_to_3d_descriptors(smiles_list_input)
+
+            elif "TDA拓扑特征" in extraction_method:
+                from core.tda_features import PersistentHomologyFeatureExtractor, TDAConfig
+                status_text.text("正在提取 TDA 拓扑特征（持续同调）...")
+
+                config = TDAConfig(
+                    maxdim=int(tda_maxdim),
+                    use_persistence_image=bool(tda_use_pim),
+                    pim_size=(int(tda_pim_pixels), int(tda_pim_pixels)),
+                    pim_spread=float(tda_pim_spread),
+                )
+                extractor = PersistentHomologyFeatureExtractor(config)
+                if not getattr(extractor, "AVAILABLE", False):
+                    st.error("❌ 未检测到 ripser/persim，请先安装：pip install ripser persim")
+                    return
+
+                features_df, valid_indices = extractor.smiles_to_tda_features(smiles_list_input)
 
             elif "Transformer Embedding" in extraction_method:
                 from core.molecular_features import SmilesTransformerEmbeddingExtractor
@@ -2377,6 +2423,206 @@ def page_hyperparameter_optimization():
 
 
 # ============================================================
+# 页面：主动学习（Active Learning）
+# ============================================================
+def page_active_learning():
+    """主动学习页面：基于不确定性推荐下一批实验/模拟样本"""
+    st.title("🧠 主动学习 (Active Learning)")
+
+    st.markdown(
+        """
+主动学习适用于 **高分子/环氧树脂/复材** 这类“小样本 + 单次实验/模拟成本高”的场景。
+
+典型闭环：
+1) 用少量已标注数据训练代理模型（surrogate）
+2) 在候选池中用采集函数选择“最值得做”的下一批样本（不确定性/期望提升）
+3) 做实验或 MD 模拟得到真实标签
+4) 回填数据，重复 1-3
+        """
+    )
+
+    if st.session_state.data is None:
+        st.warning("⚠️ 请先上传数据")
+        return
+
+    df = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
+    if df is None or df.empty:
+        st.warning("⚠️ 当前数据为空")
+        return
+
+    # ---- 选择目标与特征 ----
+    st.markdown("### 1) 选择目标变量与特征")
+
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not num_cols:
+        st.error("❌ 当前数据没有数值列；主动学习需要数值特征 X 和数值目标 y")
+        return
+
+    # 默认目标：优先使用 session_state.target_col
+    default_target = st.session_state.get('target_col')
+    if default_target not in num_cols:
+        default_target = num_cols[-1]
+    target_col = st.selectbox("目标变量 (y)", options=num_cols, index=num_cols.index(default_target))
+
+    # 默认特征：优先使用 session_state.feature_cols
+    default_features = [c for c in (st.session_state.get('feature_cols') or []) if c in df.columns and c != target_col]
+    if not default_features:
+        default_features = [c for c in num_cols if c != target_col]
+
+    feature_cols = st.multiselect(
+        "特征列 (X)",
+        options=[c for c in df.columns if c != target_col],
+        default=default_features,
+        help="建议使用‘特征选择’页面筛过的特征；也可以在这里手动指定。"
+    )
+
+    if not feature_cols:
+        st.warning("⚠️ 请至少选择 1 个特征列")
+        return
+
+    # ---- 构建 labeled/pool ----
+    y_all = pd.to_numeric(df[target_col], errors='coerce')
+    df_labeled = df.loc[y_all.notna()].copy()
+
+    st.markdown("### 2) 选择候选池（unlabeled pool）")
+
+    pool_mode = st.radio(
+        "候选池来源",
+        [
+            "使用当前数据中目标缺失的行（推荐：先导入候选配方，再逐步补实验）",
+            "上传候选池文件（CSV/Excel，需包含相同特征列）",
+        ],
+        index=0
+    )
+
+    df_pool = None
+    if pool_mode.startswith("使用当前数据"):
+        df_pool = df.loc[y_all.isna()].copy()
+        st.caption(f"当前候选池大小: {0 if df_pool is None else len(df_pool)}")
+    else:
+        up = st.file_uploader("上传候选池文件", type=["csv", "xlsx", "xls"], key="al_pool_upload")
+        if up is not None:
+            try:
+                df_pool = load_data_file(up)
+                st.success(f"✅ 已加载候选池: {df_pool.shape}")
+            except Exception as e:
+                st.error(f"❌ 候选池文件读取失败: {e}")
+                return
+
+    if df_pool is None or df_pool.empty:
+        st.warning("⚠️ 候选池为空：请在数据中准备一些目标缺失的候选样本，或上传候选池文件")
+        return
+
+    # 检查列
+    missing_in_pool = [c for c in feature_cols if c not in df_pool.columns]
+    if missing_in_pool:
+        st.error(f"❌ 候选池缺少特征列: {missing_in_pool}\n请确保候选池与训练数据的特征列一致。")
+        return
+
+    # ---- 选择模型与采集策略 ----
+    st.markdown("### 3) 选择不确定性模型与采集策略")
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        model_ui = st.selectbox(
+            "不确定性模型",
+            [
+                "Gaussian Process (GPR, 小样本推荐)",
+                "随机森林 (RF, 适合强非线性)",
+                "Extra Trees (ETR, 更强随机性)",
+            ],
+            index=0
+        )
+    with col_b:
+        acq_ui = st.selectbox(
+            "采集策略",
+            [
+                "最大不确定性 (Uncertainty)",
+                "UCB 上置信界 (Exploration+Exploitation)",
+                "EI 期望提升 (Expected Improvement)",
+            ],
+            index=0
+        )
+    with col_c:
+        batch_size = st.slider("推荐数量", 1, 50, 10)
+
+    minimize = st.checkbox(
+        "目标是【最小化】（例如：黏度/成本/收缩率）",
+        value=False,
+        help="若目标是越大越好（例如 Tg/模量/强度），请保持不勾选。"
+    )
+
+    # EI/UCB 参数
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        xi = st.number_input("EI 参数 xi", min_value=0.0, max_value=1.0, value=0.01, step=0.01,
+                             disabled=("EI" not in acq_ui))
+    with col_p2:
+        kappa = st.number_input("UCB 参数 kappa", min_value=0.0, max_value=10.0, value=2.0, step=0.5,
+                                disabled=("UCB" not in acq_ui))
+
+    if st.button("🚀 生成下一批实验/模拟建议", type="primary"):
+        try:
+            from core.active_learning import recommend_from_dataframes
+
+            model_kind = "gpr"
+            if model_ui.startswith("随机森林"):
+                model_kind = "rf"
+            elif model_ui.startswith("Extra Trees"):
+                model_kind = "etr"
+
+            acq_kind = "uncertainty"
+            if acq_ui.startswith("UCB"):
+                acq_kind = "ucb"
+            elif acq_ui.startswith("EI"):
+                acq_kind = "ei"
+
+            rec_df = recommend_from_dataframes(
+                df_labeled=df_labeled,
+                df_pool=df_pool,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                model_kind=model_kind,
+                acq_kind=acq_kind,
+                batch_size=int(batch_size),
+                minimize=bool(minimize),
+                xi=float(xi),
+                kappa=float(kappa),
+                random_state=DEFAULT_RANDOM_STATE,
+            )
+
+            st.session_state.al_recommendations = rec_df
+            st.success(f"✅ 已生成推荐列表（Top-{len(rec_df)}）")
+        except Exception as e:
+            st.error(f"❌ 主动学习计算失败: {e}")
+            st.code(traceback.format_exc())
+
+    # ---- 展示结果 ----
+    if st.session_state.get('al_recommendations') is not None:
+        rec_df = st.session_state.al_recommendations
+        st.markdown("### 4) 推荐结果")
+        st.dataframe(rec_df, use_container_width=True)
+
+        # 导出
+        csv_bytes = rec_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            "⬇️ 下载推荐列表（CSV）",
+            data=csv_bytes,
+            file_name="active_learning_recommendations.csv",
+            mime="text/csv"
+        )
+
+        st.markdown(
+            """
+**下一步怎么做？**
+- 对表中 Top-N 候选配方进行实验合成/固化/测试（或 MD 虚拟固化 + 性能计算）。
+- 把测得的目标值回填到数据表对应行（填到你选择的目标列里）。
+- 重新运行本页面，即可进入下一轮主动学习。
+            """
+        )
+
+
+# ============================================================
 # 主函数
 # ============================================================
 def main():
@@ -2405,6 +2651,8 @@ def main():
         page_prediction()
     elif page == "⚙️ 超参优化":
         page_hyperparameter_optimization()
+    elif page == "🧠 主动学习":
+        page_active_learning()
 
 
 if __name__ == "__main__":

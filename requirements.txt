@@ -41,6 +41,11 @@ tqdm>=4.66.1
 psutil>=5.9.0
 scipy>=1.10.0
 
+# === TDA（拓扑数据分析，可选） ===
+# 用于持续同调（Persistent Homology）特征
+ripser>=0.6.12
+persim>=0.3.8
+
 # === 可选依赖 ===
 # ydata-profiling>=4.6.1  # 数据探索报告
 # tabpfn>=2.0.9           # TabPFN模型
