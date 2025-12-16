@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from functools import lru_cache
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -63,6 +64,83 @@ except Exception:
     AllChem = None
     RDKIT_AVAILABLE = False
 
+
+# ----------------------------
+# Force-field 安全门（减少 UFFTYPER 警告 + 加速）
+# ----------------------------
+# UFF 对 dummy atom(*)、金属/无机离子、以及多数带电体系支持较差，
+# 会打印类似 “UFFTYPER: Unrecognized atom type/charge state ...” 的警告。
+# 这里仅在“常见中性有机体系”上才允许回退到 UFF；其他情况直接跳过优化。
+_ORGANIC_ATOMIC_NUMS = {1, 5, 6, 7, 8, 9, 14, 15, 16, 17, 35, 53}  # H,B,C,N,O,F,Si,P,S,Cl,Br,I
+
+def _is_uff_safe_mol(mol) -> bool:
+    """仅用于决定是否可以尝试 UFFOptimize（避免 UFFTYPER 警告）。"""
+    if mol is None:
+        return False
+    for a in mol.GetAtoms():
+        z = int(a.GetAtomicNum())
+        if z == 0:  # '*' / dummy atom
+            return False
+        if z not in _ORGANIC_ATOMIC_NUMS:
+            return False
+        if int(a.GetFormalCharge()) != 0:
+            return False
+    return True
+
+
+@lru_cache(maxsize=4096)
+def _frag_to_3d_points_cached(frag: str, add_hs: bool, seed: int) -> Optional[np.ndarray]:
+    """单片段 SMILES -> 3D 点云（带缓存）。
+
+    - 缓存可以显著加速：同一片段在数据集中多次出现时无需重复 3D/优化。
+    - 默认只输出 heavy atoms 坐标（即便 add_hs=True），以加速后续 ripser(TDA)。
+    """
+
+    if not RDKIT_AVAILABLE:
+        return None
+
+    mol = Chem.MolFromSmiles(frag)
+    if mol is None:
+        return None
+
+    if add_hs:
+        mol = Chem.AddHs(mol)
+
+    # 1) 生成 3D 构象（ETKDGv3）
+    params = AllChem.ETKDGv3()
+    params.useRandomCoords = True
+    params.randomSeed = int(seed)
+    # tda_features 默认是单进程：允许 RDKit 内部多线程加速（0=自动）
+    params.numThreads = 0
+
+    res = AllChem.EmbedMolecule(mol, params)
+    if res != 0:
+        # 兜底：再试一次
+        res = AllChem.EmbedMolecule(mol, useRandomCoords=True, randomSeed=int(seed))
+        if res != 0:
+            return None
+
+    # 2) 轻量优化（只在可用时执行；避免无谓的异常与 UFFTYPER 警告）
+    try:
+        if AllChem.MMFFHasAllMoleculeParams(mol):
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=50)
+        elif _is_uff_safe_mol(mol):
+            AllChem.UFFOptimizeMolecule(mol, maxIters=80)
+    except Exception:
+        pass
+
+    conf = mol.GetConformer()
+    pts = np.asarray(conf.GetPositions(), dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 2:
+        return None
+
+    # 3) 为了加速 TDA：默认只保留重原子坐标（避免 H 使点云规模膨胀）
+    heavy_idx = [a.GetIdx() for a in mol.GetAtoms() if int(a.GetAtomicNum()) > 1]
+    if len(heavy_idx) >= 2:
+        pts = pts[heavy_idx]
+
+    pts.setflags(write=False)
+    return pts
 
 def _split_multi_component_smiles(smiles: str) -> List[str]:
     """把单元格里的多组分 SMILES 拆分成列表。
@@ -117,42 +195,11 @@ def _smiles_to_3d_points(smiles: str, *, add_hs: bool = True, seed: int = 42) ->
     all_points: List[np.ndarray] = []
 
     for frag in frags:
-        mol = Chem.MolFromSmiles(frag)
-        if mol is None:
-            return None
-
-        if add_hs:
-            mol = Chem.AddHs(mol)
-
-        # 生成 3D 构象
-        params = AllChem.ETKDGv3()
-        params.useRandomCoords = True
-        params.randomSeed = int(seed)
-        params.numThreads = 1
-
-        res = AllChem.EmbedMolecule(mol, params)
-        if res != 0:
-            # 兜底：再试一次
-            res = AllChem.EmbedMolecule(mol, useRandomCoords=True, randomSeed=int(seed))
-            if res != 0:
-                return None
-
-        # 简单优化（失败也没关系）
-        try:
-            AllChem.MMFFOptimizeMolecule(mol, maxIters=80)
-        except Exception:
-            try:
-                AllChem.UFFOptimizeMolecule(mol, maxIters=200)
-            except Exception:
-                pass
-
-        conf = mol.GetConformer()
-        pts = conf.GetPositions().astype(np.float32)
-        if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 2:
-            return None
-
-        all_points.append(pts)
-
+        pts = _frag_to_3d_points_cached(str(frag), bool(add_hs), int(seed))
+        if pts is None:
+            # 允许单个片段失败（例如对离子/金属盐/含 * 等），不影响整条样本
+            continue
+        all_points.append(np.asarray(pts, dtype=np.float32))
     if not all_points:
         return None
 
