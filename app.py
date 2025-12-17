@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-碳纤维复合材料智能预测平台 v1.3.0
+碳纤维复合材料智能预测平台 v1.3.4
 更新内容：
 1. 修复SHAP图表显示和特征名缺失问题
 2. 优化所有图表布局，防止缩放变形
@@ -1360,23 +1360,23 @@ def page_molecular_features():
                 fp_bits = st.selectbox("位长 (Bits)", [1024, 2048, 4096], index=1)
 
 
-        # ---- 预训练 SMILES Transformer Embedding 参数（可选）----
-        lm_model_name = "seyonec/ChemBERTa-zinc-base-v1"
-        lm_pooling = "cls"
-        lm_max_length = 128
-        lm_batch_size = 16
+    # ---- 预训练 SMILES Transformer Embedding 参数（可选）----
+    lm_model_name = "seyonec/ChemBERTa-zinc-base-v1"
+    lm_pooling = "cls"
+    lm_max_length = 128
+    lm_batch_size = 16
 
-        if "Transformer Embedding" in extraction_method:
-            st.markdown("#### 🧠 预训练SMILES Transformer Embedding 参数")
-            st.info("需要先安装 transformers；首次运行会下载模型权重（需要联网）。模型输出维度通常为 768，可配合后续特征选择/降维使用。")
-            lm_model_name = st.text_input("HuggingFace 模型名", value=lm_model_name)
-            col_lm1, col_lm2, col_lm3 = st.columns(3)
-            with col_lm1:
-                lm_pooling = st.selectbox("Pooling", ["cls", "mean"], index=0)
-            with col_lm2:
-                lm_max_length = st.selectbox("Max Length", [64, 128, 256], index=1)
-            with col_lm3:
-                lm_batch_size = st.selectbox("Batch Size", [4, 8, 16, 32], index=2)
+    if "Transformer Embedding" in extraction_method:
+        st.markdown("#### 🧠 预训练SMILES Transformer Embedding 参数")
+        st.info("需要先安装 transformers；首次运行会下载模型权重（需要联网）。模型输出维度通常为 768，可配合后续特征选择/降维使用。")
+        lm_model_name = st.text_input("HuggingFace 模型名", value=lm_model_name)
+        col_lm1, col_lm2, col_lm3 = st.columns(3)
+        with col_lm1:
+            lm_pooling = st.selectbox("Pooling", ["cls", "mean"], index=0)
+        with col_lm2:
+            lm_max_length = st.selectbox("Max Length", [64, 128, 256], index=1)
+        with col_lm3:
+            lm_batch_size = st.selectbox("Batch Size", [4, 8, 16, 32], index=2)
 
         # [新增] 双组分选择 UI
         st.markdown("#### 双组分设置 (推荐)")

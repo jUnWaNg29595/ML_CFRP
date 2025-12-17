@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""特征选择模块 - 完整版 (含PCA降维优化)"""
+"""特征选择模块 - 完整修复版 (含 SmartFeatureSelector 类及回调修复)"""
 
 import pandas as pd
 import numpy as np
@@ -12,8 +12,121 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+# ==========================================
+# 1. 回调函数定义区 (必须在组件渲染前定义)
+# ==========================================
+
+def _update_selection_state(new_selection):
+    """通用回调：更新特征选择状态"""
+    st.session_state.feature_cols = new_selection
+    st.session_state.multiselect_features = new_selection
+
+
+def _apply_variance_filter_callback(df, candidates, threshold_key):
+    """方差筛选回调"""
+    try:
+        threshold = st.session_state[threshold_key]
+        selector = VarianceThreshold(threshold=threshold)
+        selector.fit(df.fillna(0))
+        selected = [candidates[i] for i in selector.get_support(indices=True)]
+        _update_selection_state(selected)
+        st.session_state['feature_selector_msg'] = f"✅ 方差筛选完成：剩余 {len(selected)} 个特征"
+    except Exception as e:
+        st.session_state['feature_selector_error'] = str(e)
+
+
+def _apply_correlation_filter_callback(df, target_series, k_key):
+    """相关性筛选回调"""
+    try:
+        k = st.session_state[k_key]
+        corrs = df.corrwith(target_series).abs().sort_values(ascending=False)
+        selected = corrs.head(int(k)).index.tolist()
+        _update_selection_state(selected)
+        st.session_state['feature_selector_msg'] = f"✅ 相关性筛选完成：已选 Top-{k} 特征"
+    except Exception as e:
+        st.session_state['feature_selector_error'] = str(e)
+
+
+def _apply_smart_rec_callback(feature_analysis):
+    """智能推荐回调"""
+    try:
+        recommended = feature_analysis[feature_analysis['推荐'] == '✓']['特征'].tolist()
+        _update_selection_state(recommended)
+        st.session_state['feature_selector_msg'] = f"✅ 智能推荐完成：已选 {len(recommended)} 个特征"
+    except Exception as e:
+        st.session_state['feature_selector_error'] = str(e)
+
+
+def _apply_importance_filter_callback(top_features, candidates):
+    """模型重要性筛选回调 (底层逻辑)"""
+    try:
+        valid_selected = [f for f in top_features if f in candidates]
+        ignored = len(top_features) - len(valid_selected)
+        _update_selection_state(valid_selected)
+
+        msg = f"✅ 模型筛选完成：已选 {len(valid_selected)} 个特征"
+        if ignored > 0:
+            msg += f" (忽略了 {ignored} 个缺失特征)"
+        st.session_state['feature_selector_msg'] = msg
+    except Exception as e:
+        st.session_state['feature_selector_error'] = str(e)
+
+
+def _apply_importance_filter_callback_v2(sorted_features, candidates, k_key):
+    """模型重要性筛选回调 (全局版，读取 Session State)"""
+    try:
+        # 动态从 session_state 获取当前的 Top-K 值
+        if k_key in st.session_state:
+            k = st.session_state[k_key]
+        else:
+            k = 20  # 默认兜底
+
+        # 截取前 K 个特征
+        top_f = sorted_features[:int(k)]
+
+        # 复用已有的筛选逻辑
+        _apply_importance_filter_callback(top_f, candidates)
+    except Exception as e:
+        st.session_state['feature_selector_error'] = str(e)
+
+
+def _apply_pca_callback(pca, scaler, numeric_df, current_df, feature_candidates):
+    """PCA应用回调"""
+    try:
+        # 执行转换
+        X = numeric_df.copy().fillna(numeric_df.mean())
+        X_scaled = scaler.transform(X)
+        X_pca = pca.transform(X_scaled)
+
+        # 构建新 DataFrame
+        pc_names = [f"PC{i + 1}" for i in range(pca.n_components_)]
+        df_pca = pd.DataFrame(X_pca, columns=pc_names, index=current_df.index)
+
+        # 合并
+        df_rest = current_df.drop(columns=feature_candidates)
+        df_new = pd.concat([df_rest, df_pca], axis=1)
+
+        # 更新全局数据状态
+        st.session_state.processed_data = df_new
+        # 更新特征选择状态
+        _update_selection_state(pc_names)
+
+        # 清理临时状态
+        st.session_state.pop('_pca_model', None)
+        st.session_state.pop('_pca_scaler', None)
+        st.session_state.pop('_pca_ready', None)
+
+        st.session_state['feature_selector_msg'] = "✅ PCA 转换已应用！数据集已更新。"
+    except Exception as e:
+        st.session_state['feature_selector_error'] = str(e)
+
+
+# ==========================================
+# 2. 类定义区 (SmartFeatureSelector & SmartSparseDataSelector)
+# ==========================================
+
 class SmartFeatureSelector:
-    """智能特征选择器"""
+    """智能特征选择器 (补回缺失的类)"""
 
     MISSING_VALUE_TOLERANT_MODELS = {'XGBoost', 'LightGBM', 'CatBoost', '随机森林', 'ExtraTrees'}
 
@@ -94,7 +207,6 @@ class SmartSparseDataSelector:
                 '有效率': f"{non_null_ratio * 100:.1f}%",
                 '缺失数': null_count
             })
-
         return pd.DataFrame(analysis).sort_values('有效样本数', ascending=False)
 
     def get_valid_samples_for_target(self, target_col):
@@ -103,7 +215,6 @@ class SmartSparseDataSelector:
     def analyze_features_for_target(self, target_col, min_valid_ratio=0.5):
         valid_data = self.get_valid_samples_for_target(target_col)
         n = len(valid_data)
-
         analysis = []
         for col in self.numeric_cols:
             if col == target_col:
@@ -115,13 +226,22 @@ class SmartSparseDataSelector:
                 '有效率': f"{valid_count / n * 100:.1f}%" if n > 0 else "0%",
                 '推荐': '✓' if valid_count / n >= min_valid_ratio else '✗'
             })
-
         return pd.DataFrame(analysis).sort_values('有效数', ascending=False)
 
 
+# ==========================================
+# 3. 界面渲染函数 (show_robust_feature_selection)
+# ==========================================
+
 def show_robust_feature_selection():
-    """完整的特征选择界面（含 PCA 降维）"""
+    """完整的特征选择界面（含 PCA 降维及模型重要性反馈，已修复状态同步问题）"""
     st.markdown("### 🛠️ 特征选择与数据集构建")
+
+    # 显示回调消息（如果有）
+    if 'feature_selector_msg' in st.session_state:
+        st.success(st.session_state.pop('feature_selector_msg'))
+    if 'feature_selector_error' in st.session_state:
+        st.error(st.session_state.pop('feature_selector_error'))
 
     # 数据源回退机制
     if st.session_state.get('processed_data') is not None:
@@ -183,21 +303,23 @@ def show_robust_feature_selection():
 
     st.markdown("---")
 
-    # 统一使用 Tabs 布局，无论特征多少都提供所有工具
-    # 这样用户在少量特征时也能使用 PCA
-    tabs = st.tabs(["👆 手动选择", "📉 方差筛选", "🔗 相关性筛选", "🧩 PCA降维", "🤖 智能推荐"])
+    # 统一使用 Tabs 布局
+    tabs = st.tabs(["👆 手动选择", "📉 方差筛选", "🔗 相关性筛选", "🧩 PCA降维", "🤖 智能推荐", "⭐ 模型重要性"])
 
     # --- Tab 1: 手动选择 ---
     with tabs[0]:
         st.markdown("#### 手动选择特征")
         col_m1, col_m2 = st.columns(2)
         with col_m1:
-            if st.button("全选", key="btn_all_features"):
-                st.session_state.feature_cols = feature_candidates
+            # 使用 on_click 回调
+            st.button("全选", key="btn_all_features",
+                      on_click=_update_selection_state, args=(feature_candidates,))
         with col_m2:
-            if st.button("清空", key="btn_clear_features"):
-                st.session_state.feature_cols = []
+            # 使用 on_click 回调
+            st.button("清空", key="btn_clear_features",
+                      on_click=_update_selection_state, args=([],))
 
+        # 多选框：依赖 session_state 自动同步
         selected_features = st.multiselect(
             "选择特征",
             options=feature_candidates,
@@ -210,31 +332,28 @@ def show_robust_feature_selection():
     with tabs[1]:
         st.markdown("#### 方差阈值筛选")
         st.caption("移除变化很小（包含信息量少）的特征。")
-        threshold = st.slider("方差阈值", 0.0, 1.0, 0.0, 0.01, key="var_threshold")
-        if st.button("应用方差筛选", key="btn_var_filter"):
-            selector = VarianceThreshold(threshold=threshold)
-            selector.fit(numeric_df.fillna(0))
-            selected = [feature_candidates[i] for i in selector.get_support(indices=True)]
-            st.session_state.feature_cols = selected
-            st.success(f"✅ 筛选后剩余 {len(selected)} 个特征")
+        st.slider("方差阈值", 0.0, 1.0, 0.0, 0.01, key="var_threshold")
+
+        # 使用回调
+        st.button("应用方差筛选", key="btn_var_filter",
+                  on_click=_apply_variance_filter_callback,
+                  args=(numeric_df, feature_candidates, "var_threshold"))
 
     # --- Tab 3: 相关性筛选 ---
     with tabs[2]:
         st.markdown("#### 相关性筛选")
         st.caption("保留与目标变量相关性最高的 Top-K 特征。")
-        k = st.number_input("保留相关性最高的K个", 1, len(feature_candidates), min(20, len(feature_candidates)),
-                            key="corr_k")
-        if st.button("应用相关性筛选", key="btn_corr_filter"):
-            corrs = numeric_df.corrwith(current_df[target_col]).abs().sort_values(ascending=False)
-            selected = corrs.head(int(k)).index.tolist()
-            st.session_state.feature_cols = selected
-            st.success(f"✅ 已选择 {len(selected)} 个特征")
+        st.number_input("保留相关性最高的K个", 1, len(feature_candidates), min(20, len(feature_candidates)),
+                        key="corr_k")
 
-    # --- Tab 4: PCA 降维 (新增) ---
+        # 使用回调
+        st.button("应用相关性筛选", key="btn_corr_filter",
+                  on_click=_apply_correlation_filter_callback,
+                  args=(numeric_df, current_df[target_col], "corr_k"))
+
+    # --- Tab 4: PCA 降维 ---
     with tabs[3]:
         st.markdown("#### 🧩 主成分分析 (PCA) 降维")
-        st.info(
-            "通过线性变换将原始特征映射到低维空间，生成互不相关的主成分 (PC)。\n\n**注意：** 应用PCA转换后，原始数值特征将被替换为 PC1, PC2...，这会丢失物理含义的可解释性，但能有效消除共线性并压缩维度。")
 
         if len(feature_candidates) < 2:
             st.warning("⚠️ 可用数值特征少于2个，无法进行PCA分析。")
@@ -251,28 +370,22 @@ def show_robust_feature_selection():
                     n_comp = st.slider("目标维度 (N Components)", 1, max_comp, min(5, max_comp), key="pca_n")
                     pca_args = {'n_components': n_comp}
 
-            # 预览/分析按钮
+            # 预览按钮 (不修改状态，可以用常规 button)
             if st.button("📊 预览 PCA 分析结果", key="btn_pca_preview"):
                 try:
-                    # 准备数据：PCA不支持NaN，这里用均值填充（假设已经做过基本清洗）
-                    X = numeric_df.copy()
-                    X = X.fillna(X.mean())
-
-                    # 标准化是 PCA 的前置必要步骤
+                    X = numeric_df.copy().fillna(numeric_df.mean())
                     scaler = StandardScaler()
                     X_scaled = scaler.fit_transform(X)
 
                     pca = PCA(**pca_args)
                     pca.fit(X_scaled)
 
-                    # 指标计算
                     n_pc = pca.n_components_
                     explained = pca.explained_variance_ratio_
                     cum_explained = np.cumsum(explained)
 
                     st.success(f"✅ 计算完成：生成了 {n_pc} 个主成分，累计解释方差 {cum_explained[-1]:.4f}")
 
-                    # 可视化：Scree Plot
                     st.markdown("##### 解释方差分布 (Scree Plot)")
                     chart_df = pd.DataFrame({
                         "Component": [f"PC{i + 1}" for i in range(n_pc)],
@@ -281,7 +394,6 @@ def show_robust_feature_selection():
                     })
                     st.line_chart(chart_df.set_index("Component")[["Individual Variance", "Cumulative Variance"]])
 
-                    # 保存模型到 session 以便应用
                     st.session_state['_pca_model'] = pca
                     st.session_state['_pca_scaler'] = scaler
                     st.session_state['_pca_ready'] = True
@@ -289,56 +401,100 @@ def show_robust_feature_selection():
                 except Exception as e:
                     st.error(f"PCA 分析出错: {e}")
 
-            # 应用按钮
+            # 应用按钮 (修改 DataFrame 和 Selectbox，必须用回调)
             if st.session_state.get('_pca_ready', False):
                 st.markdown("---")
-                st.warning(
-                    "⚠️ **确认操作**：点击下方按钮将创建新的数据集。所有原始数值特征将被 PC1, PC2... 替换。此操作不可逆（除非重新加载文件）。")
+                st.warning("⚠️ **确认操作**：点击下方按钮将创建新的数据集。所有原始数值特征将被 PC1, PC2... 替换。")
 
-                if st.button("🚀 应用 PCA 转换并更新数据集", type="primary", key="btn_pca_apply"):
-                    pca = st.session_state['_pca_model']
-                    scaler = st.session_state['_pca_scaler']
-
-                    # 执行转换
-                    X = numeric_df.copy().fillna(numeric_df.mean())
-                    X_scaled = scaler.transform(X)
-                    X_pca = pca.transform(X_scaled)
-
-                    # 构建新 DataFrame
-                    pc_names = [f"PC{i + 1}" for i in range(pca.n_components_)]
-                    df_pca = pd.DataFrame(X_pca, columns=pc_names, index=current_df.index)
-
-                    # 合并：删除旧特征，保留目标列和其他非数值列（如文本、元数据）
-                    df_rest = current_df.drop(columns=feature_candidates)
-                    df_new = pd.concat([df_rest, df_pca], axis=1)
-
-                    # 更新全局状态
-                    st.session_state.processed_data = df_new
-                    st.session_state.feature_cols = pc_names
-
-                    # 清理临时状态
-                    st.session_state.pop('_pca_model', None)
-                    st.session_state.pop('_pca_scaler', None)
-                    st.session_state.pop('_pca_ready', None)
-
-                    st.success(f"✅ 数据集已更新！当前特征集: {pc_names}")
-                    st.rerun()
+                st.button("🚀 应用 PCA 转换并更新数据集", type="primary", key="btn_pca_apply",
+                          on_click=_apply_pca_callback,
+                          args=(st.session_state['_pca_model'],
+                                st.session_state['_pca_scaler'],
+                                numeric_df, current_df, feature_candidates))
 
     # --- Tab 5: 智能推荐 ---
     with tabs[4]:
-        # 智能稀疏数据分析
         sparse_selector = SmartSparseDataSelector(current_df)
 
         st.markdown("#### 目标变量有效性分析")
         target_analysis = sparse_selector.get_target_analysis()
         st.dataframe(target_analysis.head(10), use_container_width=True)
 
-        if st.button("🎯 智能推荐特征", key="btn_smart_rec"):
-            feature_analysis = sparse_selector.analyze_features_for_target(target_col)
-            recommended = feature_analysis[feature_analysis['推荐'] == '✓']['特征'].tolist()
-            st.session_state.feature_cols = recommended
-            st.success(f"✅ 推荐 {len(recommended)} 个特征")
-            st.dataframe(feature_analysis, use_container_width=True)
+        feature_analysis = sparse_selector.analyze_features_for_target(target_col)
+
+        st.dataframe(feature_analysis, use_container_width=True)
+
+        # 使用回调
+        st.button("🎯 智能推荐特征", key="btn_smart_rec",
+                  on_click=_apply_smart_rec_callback, args=(feature_analysis,))
+
+    # --- Tab 6: 模型重要性 (新增) ---
+    with tabs[5]:
+        st.markdown("#### ⭐ 基于已训练模型的重要性筛选")
+        st.caption("利用上一轮【模型训练】得到的特征重要性（或系数）来反向优化特征集。这对于剔除噪声特征非常有效。")
+
+        model = st.session_state.get('model')
+        if model is None:
+            st.info("⚠️ 暂无模型记录。请先前往【🤖 模型训练】页面训练一个模型（如随机森林、XGBoost），然后再返回此处。")
+        else:
+            trained_model_name = st.session_state.get('model_name', 'Unknown')
+            st.success(f"当前参考模型: **{trained_model_name}**")
+
+            # 1. 尝试获取特征名
+            feature_names = None
+            if hasattr(model, 'feature_names_in_'):
+                feature_names = model.feature_names_in_
+            elif 'feature_cols' in st.session_state and len(st.session_state.feature_cols) > 0:
+                feature_names = np.array(st.session_state.feature_cols)
+
+            # 2. 尝试获取重要性
+            importances = None
+            if hasattr(model, 'feature_importances_'):
+                importances = model.feature_importances_
+            elif hasattr(model, 'coef_'):
+                importances = np.abs(model.coef_)
+                if importances.ndim > 1:
+                    importances = importances.mean(axis=0)
+
+            # 3. 展示与操作
+            if importances is not None and feature_names is not None:
+                if len(importances) != len(feature_names):
+                    st.warning(
+                        f"⚠️ 特征名与重要性维度不匹配 ({len(feature_names)} vs {len(importances)})，无法精确对应。")
+                else:
+                    imp_df = pd.DataFrame({
+                        'Feature': feature_names,
+                        'Importance': importances
+                    }).sort_values(by='Importance', ascending=False).reset_index(drop=True)
+
+                    max_imp = imp_df['Importance'].max()
+                    if max_imp > 0:
+                        imp_df['Importance'] = imp_df['Importance'] / max_imp
+
+                    col_imp1, col_imp2 = st.columns([2, 1])
+
+                    with col_imp1:
+                        st.markdown("##### 特征重要性排序 (Top 20)")
+                        st.bar_chart(imp_df.set_index('Feature').head(20))
+
+                    with col_imp2:
+                        st.markdown("##### ✂️ 筛选设置")
+                        max_k = len(feature_names)
+                        # key="imp_top_k" 供回调读取
+                        st.number_input("保留 Top-K", 1, max_k, min(20, max_k), key="imp_top_k")
+
+                        sorted_features = imp_df['Feature'].tolist()
+
+                        # 使用全局回调函数 _apply_importance_filter_callback_v2
+                        st.button(
+                            "✅ 应用筛选",
+                            type="primary",
+                            key="btn_imp_apply",
+                            on_click=_apply_importance_filter_callback_v2,
+                            args=(sorted_features, feature_candidates, "imp_top_k")
+                        )
+            else:
+                st.warning("❌ 当前模型不支持直接提取特征重要性（或者未记录特征名），请尝试使用 SHAP 分析或手动筛选。")
 
     # 显示已选特征摘要
     if st.session_state.get('feature_cols'):
@@ -357,10 +513,8 @@ def show_robust_feature_selection():
 
         # 数据预览
         st.markdown("#### 📋 数据预览")
-        # 确保 preview cols 存在于 current_df 中
         available_preview = [c for c in st.session_state.feature_cols if c in current_df.columns]
-        preview_cols = available_preview[:5] + [target_col]
-        # 过滤掉不存在的列（防止PCA转换后引用旧列名报错）
-        preview_cols = [c for c in preview_cols if c in current_df.columns]
-
-        st.dataframe(current_df[preview_cols].head(), use_container_width=True)
+        if available_preview:
+            preview_cols = available_preview[:5] + [
+                target_col] if target_col in current_df.columns else available_preview[:5]
+            st.dataframe(current_df[preview_cols].head(), use_container_width=True)
