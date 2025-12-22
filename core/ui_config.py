@@ -23,7 +23,21 @@ MODEL_PARAMETERS = {
     "CatBoost": {"iterations": 100, "depth": 6, "random_state": 42, "verbose": 0},
     "人工神经网络": {"hidden_layer_sizes": "100,50", "epochs": 100},
     "TabPFN": {},
-    "AutoGluon": {}
+    "AutoGluon": {},
+    "TensorFlow Sequential": {
+        "hidden_layers": "128,64,32",
+        "activation": "relu",
+        "dropout_rate": 0.2,
+        "l2_reg": 0.001,
+        "optimizer": "adam",
+        "learning_rate": 0.001,
+        "batch_size": 32,
+        "epochs": 200,
+        "early_stopping": True,
+        "patience": 20,
+        "validation_split": 0.1,
+        "random_state": 42
+    }
 }
 
 # 完整的手动调参配置
@@ -153,5 +167,95 @@ MANUAL_TUNING_PARAMS = {
     ],
     
     "TabPFN": [],
-    "AutoGluon": []
+    "AutoGluon": [],
+"TensorFlow Sequential": [
+        {
+            'name': 'hidden_layers',
+            'widget': 'text_input',
+            'label': '🏗️ 隐藏层结构 (逗号分隔，如: 128,64,32)',
+            'default': "128,64,32",
+            'args': {},
+            'help': '定义神经网络的隐藏层结构，每个数字代表一层的神经元数量'
+        },
+        {
+            'name': 'activation',
+            'widget': 'selectbox',
+            'label': '⚡ 激活函数',
+            'default': 'relu',
+            'args': {'options': ['relu', 'leaky_relu', 'elu', 'tanh', 'swish', 'selu', 'gelu']},
+            'help': 'relu: 最常用 | leaky_relu: 解决死神经元 | swish: 平滑性更好'
+        },
+        {
+            'name': 'dropout_rate',
+            'widget': 'slider',
+            'label': '💧 Dropout 比率',
+            'default': 0.2,
+            'args': {'min_value': 0.0, 'max_value': 0.5, 'step': 0.05},
+            'help': '防止过拟合，建议值 0.1-0.3'
+        },
+        {
+            'name': 'l2_reg',
+            'widget': 'number_input',
+            'label': '🎯 L2 正则化系数',
+            'default': 0.001,
+            'args': {'min_value': 0.0, 'max_value': 0.1, 'step': 0.001, 'format': "%.4f"},
+            'help': '权重衰减，防止过拟合'
+        },
+        {
+            'name': 'optimizer',
+            'widget': 'selectbox',
+            'label': '🔧 优化器',
+            'default': 'adam',
+            'args': {'options': ['adam', 'adamw', 'sgd', 'rmsprop', 'nadam']},
+            'help': 'adam: 自适应学习率，最常用 | adamw: 带权重衰减 | sgd: 传统方法'
+        },
+        {
+            'name': 'learning_rate',
+            'widget': 'number_input',
+            'label': '📈 学习率',
+            'default': 0.001,
+            'args': {'min_value': 0.0001, 'max_value': 0.1, 'step': 0.0001, 'format': "%.4f"},
+            'help': '建议范围: 0.0001 - 0.01'
+        },
+        {
+            'name': 'batch_size',
+            'widget': 'selectbox',
+            'label': '📦 批次大小',
+            'default': 32,
+            'args': {'options': [8, 16, 32, 64, 128, 256]},
+            'help': '小批次: 泛化好但慢 | 大批次: 训练快但可能欠拟合'
+        },
+        {
+            'name': 'epochs',
+            'widget': 'slider',
+            'label': '🔄 最大训练轮数',
+            'default': 200,
+            'args': {'min_value': 50, 'max_value': 1000, 'step': 50},
+            'help': '配合早停使用，一般 100-500 足够'
+        },
+        {
+            'name': 'early_stopping',
+            'widget': 'checkbox',
+            'label': '⏹️ 启用早停 (推荐)',
+            'default': True,
+            'args': {},
+            'help': '验证损失不再下降时自动停止训练'
+        },
+        {
+            'name': 'patience',
+            'widget': 'slider',
+            'label': '⏳ 早停耐心值',
+            'default': 20,
+            'args': {'min_value': 5, 'max_value': 50, 'step': 5},
+            'help': '验证损失不下降的轮数阈值'
+        },
+        {
+            'name': 'validation_split',
+            'widget': 'slider',
+            'label': '📊 验证集比例',
+            'default': 0.1,
+            'args': {'min_value': 0.0, 'max_value': 0.3, 'step': 0.05},
+            'help': '从训练集中划分用于验证，建议 0.1-0.2'
+        }
+    ]
 }

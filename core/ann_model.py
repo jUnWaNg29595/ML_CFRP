@@ -52,7 +52,7 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
 
     def __init__(self, hidden_layer_sizes="100,50", activation="relu", dropout_rate=0.2,
                  optimizer_name="Adam", learning_rate=1e-3, epochs=100, batch_size=32,
-                 verbose=0, random_state=42):
+                 verbose=0, random_state=42, external_preprocess: bool = False):
         self.hidden_layer_sizes = hidden_layer_sizes
         self.activation = activation
         self.dropout_rate = dropout_rate
@@ -62,11 +62,19 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
         self.batch_size = batch_size
         self.verbose = verbose
         self.random_state = random_state
+        # 若外部 Pipeline 已做缺失填充 + 标准化，可开启此项避免重复预处理
+        self.external_preprocess = external_preprocess
 
         self.model = None
         self.imputer = SimpleImputer(strategy='mean')
         self.scaler = StandardScaler()
         self.train_losses = []
+
+        # 训练曲线（与系统其它模型统一：Train/Test 的 MAE/MSE）
+        self.train_mse_curve = []
+        self.test_mse_curve = []
+        self.train_mae_curve = []
+        self.test_mae_curve = []
 
     def fit(self, X, y):
         torch.manual_seed(self.random_state)
@@ -79,8 +87,14 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
         else:
             y_values = np.array(y).ravel()
 
-        X_imputed = self.imputer.fit_transform(X)
-        X_scaled = self.scaler.fit_transform(X_imputed)
+        y_values = np.asarray(y_values, dtype=np.float32).ravel()
+
+        # 预处理：若外部已处理，则跳过内部 imputer/scaler
+        if self.external_preprocess:
+            X_scaled = np.nan_to_num(np.asarray(X), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        else:
+            X_imputed = self.imputer.fit_transform(X)
+            X_scaled = self.scaler.fit_transform(X_imputed)
 
         X_tensor = torch.FloatTensor(X_scaled)
         y_tensor = torch.FloatTensor(y_values).view(-1, 1)
@@ -99,6 +113,29 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
         self.model.train()
         self.train_losses = []
 
+        # reset metric curves
+        self.train_mse_curve = []
+        self.test_mse_curve = []
+        self.train_mae_curve = []
+        self.test_mae_curve = []
+
+        # optional external validation (usually the held-out test set)
+        val_X_tensor = None
+        val_y = None
+        if hasattr(self, 'validation_data') and self.validation_data is not None:
+            try:
+                Xv, yv = self.validation_data
+                yv = np.asarray(yv).ravel().astype(np.float32)
+                if self.external_preprocess:
+                    Xv_scaled = np.nan_to_num(np.asarray(Xv), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                else:
+                    Xv_scaled = self.scaler.transform(self.imputer.transform(Xv))
+                val_X_tensor = torch.FloatTensor(Xv_scaled)
+                val_y = yv
+            except Exception:
+                val_X_tensor = None
+                val_y = None
+
         epoch_iter = range(self.epochs)
         if self.verbose > 0:
             epoch_iter = tqdm(epoch_iter, desc="ANN Training")
@@ -114,12 +151,36 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
                 epoch_loss += loss.item()
             self.train_losses.append(epoch_loss / len(loader))
 
+            # ---- per-epoch metrics (Train/Test MAE & MSE) ----
+            self.model.eval()
+            with torch.no_grad():
+                pred_tr = self.model(X_tensor).cpu().numpy().ravel()
+            self.model.train()
+
+            tr_mse = float(np.mean((pred_tr - y_values) ** 2))
+            tr_mae = float(np.mean(np.abs(pred_tr - y_values)))
+            self.train_mse_curve.append(tr_mse)
+            self.train_mae_curve.append(tr_mae)
+
+            if val_X_tensor is not None and val_y is not None:
+                self.model.eval()
+                with torch.no_grad():
+                    pred_te = self.model(val_X_tensor).cpu().numpy().ravel()
+                self.model.train()
+                te_mse = float(np.mean((pred_te - val_y) ** 2))
+                te_mae = float(np.mean(np.abs(pred_te - val_y)))
+                self.test_mse_curve.append(te_mse)
+                self.test_mae_curve.append(te_mae)
+
         return self
 
     def predict(self, X):
         self.model.eval()
-        X_imputed = self.imputer.transform(X)
-        X_scaled = self.scaler.transform(X_imputed)
+        if self.external_preprocess:
+            X_scaled = np.nan_to_num(np.asarray(X), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        else:
+            X_imputed = self.imputer.transform(X)
+            X_scaled = self.scaler.transform(X_imputed)
         X_tensor = torch.FloatTensor(X_scaled)
 
         with torch.no_grad():

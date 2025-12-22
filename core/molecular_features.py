@@ -130,9 +130,7 @@ def _generate_3d_data_worker(smiles):
 # =============================================================================
 def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
     """
-    计算单个样本的 3D 构象描述符（供多进程调用）
-    - 支持多组分/多片段：按片段分别生成 3D 并加权聚合
-    返回 dict 或 None
+    计算单个样本的 3D 构象描述符（修复版）
     """
     if not RDKIT_AVAILABLE:
         return None
@@ -144,7 +142,12 @@ def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
         if not s:
             return None
 
-        # 分割多组分（规则同 _generate_3d_data_worker）
+        # --- 预处理：处理聚合物中的 * 号 ---
+        # 3D 构象生成不支持 *，将其替换为 C (甲基) 以模拟占位
+        if '*' in s:
+            s = s.replace('*', 'C')
+
+        # 分割多组分
         parts = re.split(r"\s*[;；|]\s*", s)
         final = []
         for p in parts:
@@ -158,53 +161,61 @@ def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
 
         total_atoms = 0
         n_frags = 0
-
-        # 3D descriptors: 按原子数加权平均
         d3_weighted = {}
-
         eig_all = []
 
         for frag in frags:
             mol = Chem.MolFromSmiles(frag)
             if mol is None:
-                return None
+                continue  # 解析失败跳过该片段，不要直接返回 None
+
+            # 过滤掉单原子或太小的碎片（通常是离子或杂质），它们很难生成有意义的 3D
+            if mol.GetNumAtoms() < 2:
+                continue
+
             mol = Chem.AddHs(mol)
 
-            # 生成 3D
+            # --- 生成 3D 构象 (放宽参数) ---
             params = AllChem.ETKDGv3()
             params.useRandomCoords = True
             params.numThreads = 1
-            res = AllChem.EmbedMolecule(mol, params)
-            if res != 0:
-                res = AllChem.EmbedMolecule(mol, useRandomCoords=True)
-                if res != 0:
-                    return None
+            params.maxAttempts = 50  # [修改] 增加尝试次数
 
-            # 优化
+            # 尝试嵌入
+            res = AllChem.EmbedMolecule(mol, params)
+
+            # 如果失败，尝试更激进的随机坐标
+            if res != 0:
+                res = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=100)
+                if res != 0:
+                    # [修改] 如果该片段生成失败，仅跳过该片段，不放弃整个样本
+                    # print(f"⚠️ 3D生成失败 (跳过片段): {frag}")
+                    continue
+
+                    # 优化
             try:
-                AllChem.MMFFOptimizeMolecule(mol, maxIters=80)
+                AllChem.MMFFOptimizeMolecule(mol, maxIters=100)
             except Exception:
-                try:
-                    AllChem.UFFOptimizeMolecule(mol, maxIters=200)
-                except Exception:
-                    pass
+                pass
 
             n_atoms = int(mol.GetNumAtoms())
             if n_atoms <= 0:
-                return None
+                continue
 
             n_frags += 1
             total_atoms += n_atoms
 
             # RDKit 3D descriptors
-            d3 = Descriptors3D.CalcMolDescriptors3D(mol)  # dict
-            for k, v in d3.items():
-                try:
-                    d3_weighted[k] = d3_weighted.get(k, 0.0) + float(v) * n_atoms
-                except Exception:
-                    continue
+            try:
+                d3 = Descriptors3D.CalcMolDescriptors3D(mol)  # dict
+                for k, v in d3.items():
+                    val = float(v)
+                    if np.isfinite(val):
+                        d3_weighted[k] = d3_weighted.get(k, 0.0) + val * n_atoms
+            except Exception:
+                pass
 
-            # Coulomb matrix eigenvalues
+            # Coulomb matrix
             try:
                 cm = rdMolDescriptors.CalcCoulombMat(mol)
                 cm_arr = np.array([list(row) for row in cm], dtype=float)
@@ -213,7 +224,10 @@ def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
             except Exception:
                 pass
 
+        # [修改] 如果所有片段都失败了，才返回 None
         if total_atoms <= 0:
+            # 打开下面的注释可以调试具体是哪个 SMILES 失败了
+            # print(f"❌ 所有片段3D生成均失败: {s}")
             return None
 
         out = {
@@ -221,38 +235,40 @@ def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
             "rdkit3d_n_fragments": int(n_frags),
         }
 
+        # 加权平均
         for k, v in d3_weighted.items():
             out[f"rdkit3d_{k}"] = float(v) / float(total_atoms)
 
+        # Coulomb Matrix 处理
         if eig_all:
             eig_concat = np.concatenate(eig_all).astype(float)
             if eig_concat.size > 0:
                 eig_sorted = np.sort(eig_concat)[::-1]  # desc
                 for i in range(int(coulomb_top_k)):
-                    out[f"coulomb_eig_{i+1}"] = float(eig_sorted[i]) if i < len(eig_sorted) else 0.0
+                    out[f"coulomb_eig_{i + 1}"] = float(eig_sorted[i]) if i < len(eig_sorted) else 0.0
                 out["coulomb_eig_mean"] = float(np.mean(eig_concat))
                 out["coulomb_eig_std"] = float(np.std(eig_concat))
                 out["coulomb_eig_max"] = float(np.max(eig_concat))
                 out["coulomb_eig_min"] = float(np.min(eig_concat))
             else:
-                for i in range(int(coulomb_top_k)):
-                    out[f"coulomb_eig_{i+1}"] = np.nan
-                out["coulomb_eig_mean"] = np.nan
-                out["coulomb_eig_std"] = np.nan
-                out["coulomb_eig_max"] = np.nan
-                out["coulomb_eig_min"] = np.nan
+                _fill_nan(out, coulomb_top_k)
         else:
-            for i in range(int(coulomb_top_k)):
-                out[f"coulomb_eig_{i+1}"] = np.nan
-            out["coulomb_eig_mean"] = np.nan
-            out["coulomb_eig_std"] = np.nan
-            out["coulomb_eig_max"] = np.nan
-            out["coulomb_eig_min"] = np.nan
+            _fill_nan(out, coulomb_top_k)
 
         return out
 
-    except Exception:
+    except Exception as e:
+        # print(f"❌ 3D Worker 异常: {e}") # 调试用
         return None
+
+
+def _fill_nan(out, k):
+    for i in range(int(k)):
+        out[f"coulomb_eig_{i + 1}"] = np.nan
+    out["coulomb_eig_mean"] = np.nan
+    out["coulomb_eig_std"] = np.nan
+    out["coulomb_eig_max"] = np.nan
+    out["coulomb_eig_min"] = np.nan
 
 
 class RDKit3DDescriptorExtractor:
@@ -1252,3 +1268,119 @@ def get_maccs_description(key_idx):
         return MACCS_DEFINITIONS.get(idx, "Unknown Fragment")
     except:
         return "Invalid Key"
+
+
+class FGDFeatureExtractor:
+    """
+    [增强版] FGD (Functional Group Distinction) 特征提取器
+    针对用户数据集进行了定制优化：增加了硫醇、酰肼、二苯甲酮等识别规则。
+    """
+
+    def __init__(self):
+        if not RDKIT_AVAILABLE:
+            raise ImportError("FGD 提取需要 RDKit 支持。")
+
+        # 1. 定义骨架 (Substrates) - 优先级：结构越特异，越靠前
+        self.substrates = {
+            # --- [新增] 针对您数据中的二苯甲酮环氧 ---
+            "Benzophenone": "c1ccc(cc1)C(=O)c2ccc(cc2)",
+
+            "DGEBA": "c1ccc(cc1)C(C)(C)c2ccc(cc2)",  # 双酚A型
+            "DGEBF": "c1ccc(cc1)Cc2ccc(cc2)",  # 双酚F型 (也匹配 DDM 固化剂骨架)
+            "Novolac": "c1ccc(O)c(c1)Cc2ccccc2",  # 酚醛骨架
+            "TDE-85 (Ester)": "C(=O)OC",  # 酯环族/通用酯键
+            "Cycloaliphatic": "C1CCCCC1",  # 脂环族 (六元环)
+            "Isocyanurate": "N1C(=O)NC(=O)NC1=O",  # 异氰尿酸酯 (TGIC等)
+            "Aliphatic Chain": "[CX4,CX3]~[CX4,CX3]~[CX4,CX3]~[CX4,CX3]",  # 长链脂肪族
+            "Benzene Ring": "c1ccccc1"  # 简单苯环 (兜底)
+        }
+
+        # 2. 定义官能团 (Groups) - 决定反应机理
+        self.groups = {
+            "Epoxide": "C1OC1",  # 环氧基
+            "Anhydride": "C(=O)OC(=O)",  # 酸酐 (如 MTHPA)
+
+            # --- [新增] 针对您数据中的 NNC(=O) ---
+            "Hydrazide": "[NX3][NX3]C(=O)",  # 酰肼 (潜伏性固化剂)
+
+            # --- [新增] 针对您数据中的 SCC... ---
+            "Thiol": "[#16X2H]",  # 巯基/硫醇 (-SH)
+
+            "Methacrylate": "CC(=C)C(=O)O",  # 甲基丙烯酸酯
+            "Acrylate": "C=CC(=O)O",  # 丙烯酸酯
+            "Amine (Primary)": "[NX3;H2]",  # 伯胺 (如 DDM)
+            "Amine (Secondary)": "[NX3;H1]",  # 仲胺
+            "Hydroxyl": "[OX2H]",  # 羟基
+            "Vinyl": "C=C",  # 乙烯基 (兜底)
+        }
+
+        # 预编译 pattern
+        self._sub_pats = {}
+        for k, v in self.substrates.items():
+            try:
+                self._sub_pats[k] = Chem.MolFromSmarts(v)
+            except:
+                pass
+
+        self._grp_pats = {}
+        for k, v in self.groups.items():
+            try:
+                self._grp_pats[k] = Chem.MolFromSmarts(v)
+            except:
+                pass
+
+    def _clean_smiles(self, text):
+        """清洗混合物SMILES，处理分号等非标准分隔符"""
+        if pd.isna(text): return None
+        s = str(text).strip()
+        # 将分号替换为 RDKit 可识别的点号 (表示非键连混合物)
+        s = s.replace(';', '.').replace('；', '.')
+        return s
+
+    def categorize_smiles(self, smiles_list):
+        """
+        输入 SMILES 列表，返回 DataFrame 包含 'FGD_Substrate' 和 'FGD_Group'
+        """
+        results = []
+        valid_indices = []
+
+        print(f"\n📑 正在执行 FGD 官能团分类 (增强版)...")
+
+        for idx, raw_smi in enumerate(tqdm(smiles_list, desc="FGD Classification")):
+            try:
+                smi = self._clean_smiles(raw_smi)
+                if not smi:
+                    continue
+
+                mol = Chem.MolFromSmiles(smi)
+                if mol is None:
+                    continue
+
+                # 匹配骨架
+                sub_type = "Other_Substrate"
+                for name, pat in self._sub_pats.items():
+                    if pat and mol.HasSubstructMatch(pat):
+                        sub_type = name
+                        break
+
+                        # 匹配官能团
+                func_group = "Other_Group"
+                for name, pat in self._grp_pats.items():
+                    if pat and mol.HasSubstructMatch(pat):
+                        func_group = name
+                        break
+
+                results.append({
+                    "FGD_Substrate": sub_type,
+                    "FGD_Group": func_group
+                })
+                valid_indices.append(idx)
+
+            except Exception:
+                continue
+
+        if not results:
+            return pd.DataFrame(), []
+
+        df = pd.DataFrame(results)
+        return df, valid_indices

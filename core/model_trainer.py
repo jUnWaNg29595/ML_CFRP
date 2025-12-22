@@ -45,6 +45,19 @@ except Exception:
     ANN_AVAILABLE = False
     ANNRegressor = None
 
+try:
+    from .tf_model import TFSequentialRegressor, TENSORFLOW_AVAILABLE
+except Exception:
+    TENSORFLOW_AVAILABLE = False
+    TFSequentialRegressor = None
+
+# 训练曲线工具（尽量不影响核心训练流程）
+from .training_curves import (
+    extract_history_from_fitted_model,
+    build_holdout_learning_curve,
+    history_to_frame,
+)
+
 
 def _safe_import(module_name, class_name):
     try:
@@ -67,7 +80,7 @@ except Exception:
 
 
 def _make_y_bins(y: np.ndarray, n_bins: int = 10):
-    """把连续 y 分箱用于“回归分层划分”。
+    """把连续 y 分箱用于"回归分层划分"。
 
     返回:
         bins (np.ndarray[int]) 或 None（表示无法分箱，需回退随机划分）
@@ -77,7 +90,6 @@ def _make_y_bins(y: np.ndarray, n_bins: int = 10):
         return None
 
     n_bins = int(max(2, n_bins))
-    # qcut 在重复值多时会自动 drop bins（duplicates='drop'）
     try:
         bins = pd.qcut(pd.Series(y), q=n_bins, labels=False, duplicates='drop')
         bins = np.asarray(bins)
@@ -85,14 +97,12 @@ def _make_y_bins(y: np.ndarray, n_bins: int = 10):
             return None
         return bins
     except Exception:
-        # 兜底：用分位数手动构箱
         try:
             qs = np.linspace(0, 1, n_bins + 1)
             edges = np.quantile(y, qs)
             edges = np.unique(edges)
             if len(edges) < 3:
                 return None
-            # digitize 生成 1..len(edges)-1
             bins = np.digitize(y, edges[1:-1], right=True)
             if np.unique(bins).size < 2:
                 return None
@@ -101,7 +111,7 @@ def _make_y_bins(y: np.ndarray, n_bins: int = 10):
             return None
 
 
-# --- [新增] AutoGluon 适配器 ---
+# --- AutoGluon 适配器 ---
 class AutoGluonWrapper(BaseEstimator, RegressorMixin):
     """将 AutoGluon 封装为 Scikit-Learn 风格的 Estimator"""
 
@@ -148,11 +158,6 @@ class AutoGluonWrapper(BaseEstimator, RegressorMixin):
         return self.predictor.predict(test_data).values
 
     def __del__(self):
-        # (可选) 清理临时模型文件，防止磁盘占满
-        # try:
-        #     shutil.rmtree(self.save_path)
-        # except:
-        #     pass
         pass
 
 
@@ -160,64 +165,197 @@ class EnhancedModelTrainer:
     """增强版模型训练器"""
 
     def __init__(self):
-        self.available_models = self._get_available_models()
+        # 统一用 catalog 维护“是否可用 + 缺失原因”，避免 UI 侧难以解释
+        self.model_catalog = self._get_model_catalog()
+        self.available_models = [m for m, meta in self.model_catalog.items() if meta.get('available', True)]
 
-    def _get_available_models(self):
-        models = [
+    def _get_model_catalog(self):
+        """返回模型目录：{model_name: {available: bool, reason: str}}。
+
+        设计目标：
+        - UI 可以“始终显示入口”，即使依赖未安装也能给出明确原因
+        - 保持核心训练逻辑不变（缺依赖时在 _get_model 中抛更清晰错误）
+        """
+        catalog = {}
+
+        # --- 基础 sklearn 模型（默认可用） ---
+        base_models = [
             "线性回归", "Ridge回归", "Lasso回归", "ElasticNet",
-            "决策树", "随机森林", "Extra Trees", "梯度提升树", "AdaBoost", "SVR", "多层感知器"
+            "决策树", "随机森林", "Extra Trees", "梯度提升树",
+            "AdaBoost", "SVR", "多层感知器",
         ]
-        if XGBOOST_AVAILABLE:
-            models.append("XGBoost")
-        if LIGHTGBM_AVAILABLE:
-            models.append("LightGBM")
-        if CATBOOST_AVAILABLE:
-            models.append("CatBoost")
-        if TABPFN_AVAILABLE:
-            models.append("TabPFN")
-        if AUTOGLUON_AVAILABLE:
-            models.append("AutoGluon")
-        if ANN_AVAILABLE:
-            models.append("人工神经网络")
-        return models
+        for m in base_models:
+            catalog[m] = {"available": True, "reason": ""}
 
-    def get_available_models(self):
-        return self.available_models.copy()
-
-    def _get_model(self, name, **params):
-        models = {
-            "线性回归": LinearRegression,
-            "Ridge回归": Ridge,
-            "Lasso回归": Lasso,
-            "ElasticNet": ElasticNet,
-            "决策树": DecisionTreeRegressor,
-            "随机森林": RandomForestRegressor,
-            "Extra Trees": ExtraTreesRegressor,
-            "梯度提升树": GradientBoostingRegressor,
-            "AdaBoost": AdaBoostRegressor,
-            "SVR": SVR,
-            "多层感知器": MLPRegressor,
+        # --- 可选依赖模型 ---
+        catalog["XGBoost"] = {
+            "available": bool(XGBOOST_AVAILABLE),
+            "reason": "" if XGBOOST_AVAILABLE else "未安装 xgboost（pip install xgboost）",
+        }
+        catalog["LightGBM"] = {
+            "available": bool(LIGHTGBM_AVAILABLE),
+            "reason": "" if LIGHTGBM_AVAILABLE else "未安装 lightgbm（pip install lightgbm）",
+        }
+        catalog["CatBoost"] = {
+            "available": bool(CATBOOST_AVAILABLE),
+            "reason": "" if CATBOOST_AVAILABLE else "未安装 catboost（pip install catboost）",
         }
 
-        if name == "XGBoost" and XGBOOST_AVAILABLE:
-            return XGBRegressor(**params)
-        elif name == "LightGBM" and LIGHTGBM_AVAILABLE:
-            params.setdefault('verbose', -1)
-            return LGBMRegressor(**params)
-        elif name == "CatBoost" and CATBOOST_AVAILABLE:
-            params.setdefault('verbose', 0)
-            return CatBoostRegressor(**params)
-        elif name == "TabPFN" and TABPFN_AVAILABLE:
-            return TabPFNRegressor(**params)
-        elif name == "AutoGluon" and AUTOGLUON_AVAILABLE:
-            params.setdefault('time_limit', 30)
-            return AutoGluonWrapper(**params)
-        elif name == "人工神经网络" and ANN_AVAILABLE:
-            return ANNRegressor(**params)
-        elif name in models:
-            return models[name](**params)
+        # TensorFlow Sequential (TFS)
+        catalog["TensorFlow Sequential"] = {
+            "available": bool(TENSORFLOW_AVAILABLE),
+            "reason": "" if TENSORFLOW_AVAILABLE else "未安装 TensorFlow（pip install tensorflow）",
+        }
+
+        # 自定义 ANN
+        catalog["人工神经网络"] = {
+            "available": bool(ANN_AVAILABLE),
+            "reason": "" if ANN_AVAILABLE else "ANNRegressor 不可用（检查 core/ann_model.py 依赖）",
+        }
+
+        # TabPFN / AutoGluon
+        catalog["TabPFN"] = {
+            "available": bool(TABPFN_AVAILABLE),
+            "reason": "" if TABPFN_AVAILABLE else "未安装 tabpfn（pip install tabpfn）",
+        }
+        catalog["AutoGluon"] = {
+            "available": bool(AUTOGLUON_AVAILABLE),
+            "reason": "" if AUTOGLUON_AVAILABLE else "未安装 autogluon.tabular（pip install autogluon.tabular）",
+        }
+
+        # 过滤掉不可用但用户可能不需要的项：这里不做过滤，交给 UI 决定
+        return catalog
+
+    def get_model_catalog(self):
+        """获取模型目录（包含可用性与缺失依赖原因）。"""
+        return dict(self.model_catalog)
+
+    def get_available_models(self, include_unavailable: bool = False):
+        """返回模型列表。
+
+        Parameters
+        ----------
+        include_unavailable : bool
+            True: 返回所有模型（含不可用项，便于 UI 显示入口）
+            False: 仅返回可用模型
+        """
+        if include_unavailable:
+            return list(self.model_catalog.keys())
+        return self.available_models.copy()
+
+    def _get_model(self, model_name: str, random_state: int = 42, **params):
+        """
+        根据模型名称返回模型实例（内部方法）
+        
+        Parameters
+        ----------
+        model_name : str
+            模型名称
+        random_state : int
+            随机种子
+        **params : dict
+            模型参数
+            
+        Returns
+        -------
+        model : estimator
+            sklearn 兼容的模型实例
+        """
+        # 清理参数中的 random_state（避免重复传递）
+        params_clean = {k: v for k, v in params.items() if k != 'random_state'}
+
+        if model_name == "线性回归":
+            return LinearRegression()
+
+        elif model_name == "Ridge回归":
+            return Ridge(random_state=random_state, **params_clean)
+
+        elif model_name == "Lasso回归":
+            return Lasso(random_state=random_state, **params_clean)
+
+        elif model_name == "ElasticNet":
+            return ElasticNet(random_state=random_state, **params_clean)
+
+        elif model_name == "决策树":
+            return DecisionTreeRegressor(random_state=random_state, **params_clean)
+
+        elif model_name == "随机森林":
+            return RandomForestRegressor(random_state=random_state, n_jobs=-1, **params_clean)
+
+        elif model_name == "Extra Trees":
+            return ExtraTreesRegressor(random_state=random_state, n_jobs=-1, **params_clean)
+
+        elif model_name == "梯度提升树":
+            return GradientBoostingRegressor(random_state=random_state, **params_clean)
+
+        elif model_name == "AdaBoost":
+            return AdaBoostRegressor(random_state=random_state, **params_clean)
+
+        elif model_name == "SVR":
+            return SVR(**params_clean)
+
+        elif model_name == "多层感知器":
+            return MLPRegressor(random_state=random_state, max_iter=1000, **params_clean)
+
+        elif model_name == "XGBoost":
+            if not XGBOOST_AVAILABLE:
+                raise ImportError("XGBoost 未安装，请运行: pip install xgboost")
+            return XGBRegressor(random_state=random_state, n_jobs=-1, **params_clean)
+
+        elif model_name == "LightGBM":
+            if not LIGHTGBM_AVAILABLE:
+                raise ImportError("LightGBM 未安装，请运行: pip install lightgbm")
+            params_clean.setdefault('verbose', -1)
+            return LGBMRegressor(random_state=random_state, n_jobs=-1, **params_clean)
+
+        elif model_name == "CatBoost":
+            if not CATBOOST_AVAILABLE:
+                raise ImportError("CatBoost 未安装，请运行: pip install catboost")
+            params_clean.setdefault('verbose', 0)
+            return CatBoostRegressor(random_state=random_state, **params_clean)
+
+        elif model_name == "人工神经网络":
+            if not ANN_AVAILABLE:
+                raise ImportError("ANN 模块不可用")
+            # 训练器内部已用 Pipeline 做缺失填充 + 标准化，避免 ANN 内部重复预处理
+            params_clean.setdefault('external_preprocess', True)
+            return ANNRegressor(random_state=random_state, **params_clean)
+
+        elif model_name == "TensorFlow Sequential":
+            # 训练器内部已用 Pipeline 做缺失填充 + 标准化，避免 TFS 内部重复预处理
+            # 若未安装 TensorFlow，训练时给出明确提示（模型仍可在 UI 中选择）
+            if not TENSORFLOW_AVAILABLE:
+                raise ImportError("TensorFlow 未安装，请运行: pip install tensorflow")
+            params_clean.setdefault('external_preprocess', True)
+            return TFSequentialRegressor(random_state=random_state, **params_clean)
+
+        elif model_name == "TabPFN":
+            if not TABPFN_AVAILABLE:
+                raise ImportError("TabPFN 未安装，请运行: pip install tabpfn")
+            return TabPFNRegressor(**params_clean)
+
+        elif model_name == "AutoGluon":
+            if not AUTOGLUON_AVAILABLE:
+                raise ImportError("AutoGluon 未安装")
+            return AutoGluonWrapper(**params_clean)
+
         else:
-            raise ValueError(f"Unknown model: {name}")
+            raise ValueError(f"未知模型: {model_name}")
+
+    def get_model(self, model_name: str, random_state: int = 42, **params):
+        """
+        公开的获取模型方法
+        
+        Parameters
+        ----------
+        model_name : str
+            模型名称
+        random_state : int
+            随机种子
+        **params : dict
+            模型参数
+        """
+        return self._get_model(model_name, random_state, **params)
 
     def _resolve_split(self, X, y, test_size, random_state, split_strategy='random', n_bins=10, groups=None):
         """根据 split_strategy 生成 train/test 索引"""
@@ -319,29 +457,106 @@ class EnhancedModelTrainer:
 
         base_model = self._get_model(model_name, **model_params)
 
-        # 4) Pipeline：imputer + scaler + model
-        pipeline = Pipeline(steps=[
-            ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler()),
-            ('model', base_model)
-        ])
+        # 4) 预处理：imputer + scaler（先拟合，再训练模型）
+        #    这样可以在部分模型中传入 eval_set，获得 per-iter 训练曲线。
+        imputer = SimpleImputer(strategy='median')
+        scaler = StandardScaler()
 
+        X_train_imputed = imputer.fit_transform(X_train_raw)
+        X_test_imputed = imputer.transform(X_test_raw)
+        X_train_scaled = scaler.fit_transform(X_train_imputed)
+        X_test_scaled = scaler.transform(X_test_imputed)
+
+        # 5) 训练模型（对可提供迭代日志的模型，尽量注入 eval_set）
         start_time = time.time()
-        pipeline.fit(X_train_raw, y_train)
+
+        fit_kwargs = {}
+        try:
+            if model_name == "XGBoost" and XGBOOST_AVAILABLE:
+                # XGBoost: 支持 eval_set + eval_metric，训练后可读取 evals_result
+                fit_kwargs = {
+                    "eval_set": [(X_train_scaled, y_train), (X_test_scaled, y_test)],
+                    # 同时记录 RMSE/MAE，便于生成多指标训练曲线
+                    "eval_metric": ["rmse", "mae"],
+                    "verbose": False,
+                }
+            elif model_name == "LightGBM" and LIGHTGBM_AVAILABLE:
+                fit_kwargs = {
+                    "eval_set": [(X_test_scaled, y_test)],
+                    "eval_metric": ["rmse", "mae"],
+                    "verbose": -1,
+                }
+            elif model_name == "CatBoost" and CATBOOST_AVAILABLE:
+                # CatBoost: eval_set 可提供验证曲线
+                fit_kwargs = {
+                    "eval_set": (X_test_scaled, y_test),
+                    "verbose": False,
+                }
+        except Exception:
+            fit_kwargs = {}
+
+        # 有些模型不接受额外 kwargs，做一次安全回退
+        # 对神经网络类模型：把测试集作为 validation_data，便于记录 Test 的 MAE/MSE 曲线
+        try:
+            if model_name in {"人工神经网络", "TensorFlow Sequential"}:
+                setattr(base_model, "validation_data", (X_test_scaled, y_test))
+                # TF 模型内部若使用 validation_split，会导致 Test 曲线不是同一批数据；这里优先用外部 validation_data
+                if model_name == "TensorFlow Sequential" and hasattr(base_model, "validation_split"):
+                    base_model.validation_split = 0.0
+        except Exception:
+            pass
+
+        try:
+            base_model.fit(X_train_scaled, y_train, **(fit_kwargs or {}))
+        except TypeError:
+            base_model.fit(X_train_scaled, y_train)
+
         train_time = time.time() - start_time
 
-        # 5) 取出拟合后的组件
-        imputer = pipeline.named_steps['imputer']
-        scaler = pipeline.named_steps['scaler']
-        model = pipeline.named_steps['model']
+        model = base_model
 
-        # 6) 生成“缩放后”的训练/测试特征（用于解释器/可视化）
-        X_train_scaled = scaler.transform(imputer.transform(X_train_raw))
-        X_test_scaled = scaler.transform(imputer.transform(X_test_raw))
+        # 6) 组装 Pipeline（不再重新 fit，用于后续 predict 保持一致）
+        pipeline = Pipeline(steps=[
+            ('imputer', imputer),
+            ('scaler', scaler),
+            ('model', model)
+        ])
 
         # 7) 预测与评估（用 pipeline 预测，保证一致）
         y_pred_test = pipeline.predict(X_test_raw)
         y_pred_train = pipeline.predict(X_train_raw)
+
+        # 8) 训练曲线提取（尽量不额外训练）
+        training_history = extract_history_from_fitted_model(
+            model_name=model_name,
+            model=model,
+            X_train_scaled=X_train_scaled,
+            y_train=y_train,
+            X_test_scaled=X_test_scaled,
+            y_test=y_test,
+        )
+
+        # 9) holdout-learning-curve（Train size -> Train/Test 指标）
+        # - 对 XGBoost/LightGBM/CatBoost：强制用 learning-curve，保证可以输出 R^2 / MAE / MSE 曲线
+        # - 对其它“一次性拟合”模型：作为回退（避免 UI 卡死，AutoGluon/TabPFN 默认跳过）
+        FORCE_LC = {"XGBoost", "LightGBM", "CatBoost", "多层感知器"}
+        EXCLUDE = {"AutoGluon", "TabPFN"}
+        if (model_name in FORCE_LC) or (not training_history):
+            if model_name not in EXCLUDE:
+                try:
+                    training_history = build_holdout_learning_curve(
+                        make_model=lambda: self._get_model(model_name, **model_params),
+                        X_train_raw=X_train_raw,
+                        y_train=y_train,
+                        X_test_raw=X_test_raw,
+                        y_test=y_test,
+                        imputer_factory=lambda: SimpleImputer(strategy='median'),
+                        scaler_factory=lambda: StandardScaler(),
+                        random_state=random_state,
+                    )
+                except Exception:
+                    # 若学习曲线构建失败，则保留原始 history（或空）
+                    pass
 
         return {
             'model': model,
@@ -365,6 +580,9 @@ class EnhancedModelTrainer:
             'n_bins': int(n_bins),
             'train_indices': train_idx,
             'test_indices': test_idx,
+            # 训练曲线/记录
+            'training_history': training_history,
+            'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
         }
 
     def cross_validate_model(
@@ -447,12 +665,15 @@ class EnhancedModelTrainer:
         if model_name not in NO_SEED_MODELS:
             model_params.setdefault('random_state', random_state)
 
-        # 使用与 train_model 相同的预处理流程
-        for fold_i, (tr_idx, va_idx) in enumerate(
-            splitter.split(X_arr, y_bins if y_bins is not None else y_arr, groups)
-            if groups is not None and isinstance(splitter, GroupKFold)
-            else splitter.split(X_arr, y_bins if y_bins is not None else y_arr)
-        ):
+        # 根据 splitter 类型选择正确的 split 调用方式
+        if isinstance(splitter, GroupKFold):
+            split_iter = splitter.split(X_arr, y_arr, groups)
+        elif y_bins is not None:
+            split_iter = splitter.split(X_arr, y_bins)
+        else:
+            split_iter = splitter.split(X_arr, y_arr)
+
+        for fold_i, (tr_idx, va_idx) in enumerate(split_iter):
             base_model = self._get_model(model_name, **model_params)
 
             pipe = Pipeline(steps=[

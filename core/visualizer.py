@@ -9,9 +9,10 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score
 
-# 设置中文字体，防止乱码
-plt.rcParams["font.sans-serif"] = ["SimHei", "Arial Unicode MS", "DejaVu Sans"]
-plt.rcParams["axes.unicode_minus"] = False
+# 统一全局图表风格
+from .plot_style import apply_global_style, style_axes
+
+apply_global_style()
 
 
 class Visualizer:
@@ -38,9 +39,7 @@ class Visualizer:
             ax.fill_between(y_sorted, y_pred_lower[sorted_idx], y_pred_upper[sorted_idx],
                             color='gray', alpha=0.2, label='90% CI')
 
-        ax.set_xlabel("真实值", fontsize=12)
-        ax.set_ylabel("预测值", fontsize=12)
-        ax.set_title(f"{model_name} - 预测性能", fontsize=14, weight='bold')
+        style_axes(ax, title=f"{model_name} - 预测性能", xlabel="真实值", ylabel="预测值")
         ax.legend()
         ax.grid(True, linestyle='--', alpha=0.5)
 
@@ -70,17 +69,13 @@ class Visualizer:
         # 残差 vs 预测值
         axes[0].scatter(y_pred, residuals, alpha=0.6, s=50, edgecolors="k", linewidth=0.5, c='#87CEFA')
         axes[0].axhline(y=0, color='r', linestyle='--', lw=2)
-        axes[0].set_xlabel("预测值")
-        axes[0].set_ylabel("残差")
-        axes[0].set_title("残差 vs 预测值")
+        style_axes(axes[0], title="残差 vs 预测值", xlabel="预测值", ylabel="残差")
         axes[0].grid(True, linestyle='--', alpha=0.5)
 
         # 残差分布
         axes[1].hist(residuals, bins=30, edgecolor='black', alpha=0.7, color='#87CEFA')
         axes[1].axvline(x=0, color='r', linestyle='--', lw=2)
-        axes[1].set_xlabel("残差")
-        axes[1].set_ylabel("频率")
-        axes[1].set_title("残差分布")
+        style_axes(axes[1], title="残差分布", xlabel="残差", ylabel="频率")
         axes[1].grid(True, linestyle='--', alpha=0.5)
 
         plt.tight_layout()
@@ -114,8 +109,7 @@ class Visualizer:
         ax.barh(range(top_n), top_features['Importance'].values[::-1], color='#87CEFA', edgecolor='k', alpha=0.8)
         ax.set_yticks(range(top_n))
         ax.set_yticklabels(top_features['Feature'].values[::-1], fontsize=10)
-        ax.set_xlabel('重要性')
-        ax.set_title(f'{model_name} - 特征重要性 (Top {top_n})')
+        style_axes(ax, title=f'{model_name} - 特征重要性 (Top {top_n})', xlabel='重要性', ylabel=None)
         ax.grid(axis='x', linestyle='--', alpha=0.5)
 
         plt.tight_layout()
@@ -160,8 +154,7 @@ class Visualizer:
         # 4. 标签
         unit = "/°C" if "Tg" in target_name or "temp" in target_name.lower() else ""
         label_name = target_name.split('_')[0]
-        ax.set_xlabel(f"Experimental {label_name}{unit}", fontsize=12)
-        ax.set_ylabel(f"Predicted {label_name}{unit}", fontsize=12)
+        style_axes(ax, title=None, xlabel=f"Experimental {label_name}{unit}", ylabel=f"Predicted {label_name}{unit}")
 
         ax.set_xlim(limit_min, limit_max)
         ax.set_ylim(limit_min, limit_max)

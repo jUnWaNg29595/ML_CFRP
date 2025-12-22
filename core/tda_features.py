@@ -1,45 +1,24 @@
 # -*- coding: utf-8 -*-
-"""TDA (Topological Data Analysis) 特征提取模块
-
-本模块将“持续同调（Persistent Homology）”作为一种结构表征方式，
-把 3D 点云/分子构象中的连通性、环与孔洞信息编码为固定长度的数值特征。
-
-典型用途（高分子/热固性网络）：
-    - 交联网络的孔洞/自由体积（Betti-2）
-    - 环/隧道结构（Betti-1）
-    - 连通分量演化（Betti-0）
-
-⚠️ 依赖说明
-    - 计算持久同调推荐使用 ripser：
-        pip install ripser persim
-    - 本模块在依赖缺失时不会让系统崩溃；但当你真正调用 TDA 提取时会给出明确报错。
-
-接口设计
-    - PersistentHomologyFeatureExtractor.smiles_to_tda_features(smiles_list)
-        从 SMILES -> RDKit 3D 构象 -> 点云 -> PH -> 特征
-    - PersistentHomologyFeatureExtractor.point_clouds_to_tda_features(point_clouds)
-        直接从点云列表提取（用于 MD/CT/网络节点坐标）
-"""
+"""TDA (Topological Data Analysis) 特征提取模块 (高性能并行版)"""
 
 from __future__ import annotations
-
-import re
 import warnings
-from functools import lru_cache
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
+from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
+import multiprocessing as mp
+from functools import partial  # [新增] 用于固定函数参数
 
 warnings.filterwarnings("ignore")
 
-
 # ----------------------------
-# Optional dependencies
+# 依赖检查
 # ----------------------------
 try:
-    from ripser import ripser  # type: ignore
+    from ripser import ripser
 
     RIPSER_AVAILABLE = True
 except Exception:
@@ -47,7 +26,7 @@ except Exception:
     RIPSER_AVAILABLE = False
 
 try:
-    from persim import PersImage  # type: ignore
+    from persim import PersImage
 
     PERSIM_AVAILABLE = True
 except Exception:
@@ -55,8 +34,9 @@ except Exception:
     PERSIM_AVAILABLE = False
 
 try:
-    from rdkit import Chem  # type: ignore
-    from rdkit.Chem import AllChem  # type: ignore
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from rdkit import RDLogger
 
     RDKIT_AVAILABLE = True
 except Exception:
@@ -64,378 +44,237 @@ except Exception:
     AllChem = None
     RDKIT_AVAILABLE = False
 
-
-# ----------------------------
-# Force-field 安全门（减少 UFFTYPER 警告 + 加速）
-# ----------------------------
-# UFF 对 dummy atom(*)、金属/无机离子、以及多数带电体系支持较差，
-# 会打印类似 “UFFTYPER: Unrecognized atom type/charge state ...” 的警告。
-# 这里仅在“常见中性有机体系”上才允许回退到 UFF；其他情况直接跳过优化。
-_ORGANIC_ATOMIC_NUMS = {1, 5, 6, 7, 8, 9, 14, 15, 16, 17, 35, 53}  # H,B,C,N,O,F,Si,P,S,Cl,Br,I
-
-def _is_uff_safe_mol(mol) -> bool:
-    """仅用于决定是否可以尝试 UFFOptimize（避免 UFFTYPER 警告）。"""
-    if mol is None:
-        return False
-    for a in mol.GetAtoms():
-        z = int(a.GetAtomicNum())
-        if z == 0:  # '*' / dummy atom
-            return False
-        if z not in _ORGANIC_ATOMIC_NUMS:
-            return False
-        if int(a.GetFormalCharge()) != 0:
-            return False
-    return True
-
-
-@lru_cache(maxsize=4096)
-def _frag_to_3d_points_cached(frag: str, add_hs: bool, seed: int) -> Optional[np.ndarray]:
-    """单片段 SMILES -> 3D 点云（带缓存）。
-
-    - 缓存可以显著加速：同一片段在数据集中多次出现时无需重复 3D/优化。
-    - 默认只输出 heavy atoms 坐标（即便 add_hs=True），以加速后续 ripser(TDA)。
-    """
-
-    if not RDKIT_AVAILABLE:
-        return None
-
-    mol = Chem.MolFromSmiles(frag)
-    if mol is None:
-        return None
-
-    if add_hs:
-        mol = Chem.AddHs(mol)
-
-    # 1) 生成 3D 构象（ETKDGv3）
-    params = AllChem.ETKDGv3()
-    params.useRandomCoords = True
-    params.randomSeed = int(seed)
-    # tda_features 默认是单进程：允许 RDKit 内部多线程加速（0=自动）
-    params.numThreads = 0
-
-    res = AllChem.EmbedMolecule(mol, params)
-    if res != 0:
-        # 兜底：再试一次
-        res = AllChem.EmbedMolecule(mol, useRandomCoords=True, randomSeed=int(seed))
-        if res != 0:
-            return None
-
-    # 2) 轻量优化（只在可用时执行；避免无谓的异常与 UFFTYPER 警告）
-    try:
-        if AllChem.MMFFHasAllMoleculeParams(mol):
-            AllChem.MMFFOptimizeMolecule(mol, maxIters=50)
-        elif _is_uff_safe_mol(mol):
-            AllChem.UFFOptimizeMolecule(mol, maxIters=80)
-    except Exception:
-        pass
-
-    conf = mol.GetConformer()
-    pts = np.asarray(conf.GetPositions(), dtype=np.float32)
-    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 2:
-        return None
-
-    # 3) 为了加速 TDA：默认只保留重原子坐标（避免 H 使点云规模膨胀）
-    heavy_idx = [a.GetIdx() for a in mol.GetAtoms() if int(a.GetAtomicNum()) > 1]
-    if len(heavy_idx) >= 2:
-        pts = pts[heavy_idx]
-
-    pts.setflags(write=False)
-    return pts
-
-def _split_multi_component_smiles(smiles: str) -> List[str]:
-    """把单元格里的多组分 SMILES 拆分成列表。
-
-    支持的分隔符：;、；、|、以及“带空格的 +”（避免误伤 [N+]）。
-    另外会进一步按 '.' 进行碎片拆分（SMILES 标准多片段分隔）。
-    """
-
-    if smiles is None:
-        return []
-
-    s = str(smiles).strip()
-    if not s or s.lower() == "nan":
-        return []
-
-    s = s.replace("；", ";")
-
-    # 先按 ; 或 | 分割
-    parts = re.split(r"\s*[;|]\s*", s)
-
-    # 再按“带空格的 +”分割（避免误伤 [N+]）
-    final: List[str] = []
-    for p in parts:
-        final.extend(re.split(r"\s+\+\s+", p))
-
-    # 再按 '.' 分割（SMILES 规范的多片段分隔）
-    frags: List[str] = []
-    for p in final:
-        frags.extend([x.strip() for x in str(p).split(".") if x and str(x).strip()])
-
-    frags = [f for f in frags if f]
-    return frags
-
-
-def _smiles_to_3d_points(smiles: str, *, add_hs: bool = True, seed: int = 42) -> Optional[np.ndarray]:
-    """SMILES -> 3D 点云（Nx3）。
-
-    - 支持多组分：各片段分别生成 3D，再把坐标拼接成一个点云。
-    - 生成策略：ETKDGv3 + (可选) MMFF/UFF 轻量优化
-
-    Returns:
-        points: (N, 3) float32 或 None
-    """
-
-    if not RDKIT_AVAILABLE:
-        return None
-
-    frags = _split_multi_component_smiles(smiles)
-    if not frags:
-        return None
-
-    all_points: List[np.ndarray] = []
-
-    for frag in frags:
-        pts = _frag_to_3d_points_cached(str(frag), bool(add_hs), int(seed))
-        if pts is None:
-            # 允许单个片段失败（例如对离子/金属盐/含 * 等），不影响整条样本
-            continue
-        all_points.append(np.asarray(pts, dtype=np.float32))
-    if not all_points:
-        return None
-
-    return np.vstack(all_points).astype(np.float32)
-
-
-def _persistence_entropy(pers: np.ndarray, eps: float = 1e-12) -> float:
-    """持久性熵（Persistence Entropy）。"""
-    pers = np.asarray(pers, dtype=float)
-    pers = pers[np.isfinite(pers)]
-    pers = pers[pers > 0]
-    if pers.size == 0:
-        return 0.0
-    p = pers / (pers.sum() + eps)
-    return float(-(p * np.log(p + eps)).sum())
-
-
-def _diagram_summary(diag: np.ndarray) -> Dict[str, float]:
-    """把单个维度的持久图 (k,2) 转成统计特征。"""
-    if diag is None or len(diag) == 0:
-        return {
-            "count": 0.0,
-            "pers_sum": 0.0,
-            "pers_mean": 0.0,
-            "pers_std": 0.0,
-            "pers_max": 0.0,
-            "pers_q50": 0.0,
-            "pers_q90": 0.0,
-            "birth_mean": 0.0,
-            "death_mean": 0.0,
-            "entropy": 0.0,
-        }
-
-    diag = np.asarray(diag, dtype=float)
-    if diag.ndim != 2 or diag.shape[1] != 2:
-        return {
-            "count": 0.0,
-            "pers_sum": 0.0,
-            "pers_mean": 0.0,
-            "pers_std": 0.0,
-            "pers_max": 0.0,
-            "pers_q50": 0.0,
-            "pers_q90": 0.0,
-            "birth_mean": 0.0,
-            "death_mean": 0.0,
-            "entropy": 0.0,
-        }
-
-    births = diag[:, 0]
-    deaths = diag[:, 1]
-    mask = np.isfinite(births) & np.isfinite(deaths)
-    births = births[mask]
-    deaths = deaths[mask]
-
-    # ripser 会给 dim0 最后一条 death=inf，直接剔除
-    mask_inf = np.isfinite(deaths)
-    births = births[mask_inf]
-    deaths = deaths[mask_inf]
-
-    if births.size == 0:
-        return {
-            "count": 0.0,
-            "pers_sum": 0.0,
-            "pers_mean": 0.0,
-            "pers_std": 0.0,
-            "pers_max": 0.0,
-            "pers_q50": 0.0,
-            "pers_q90": 0.0,
-            "birth_mean": 0.0,
-            "death_mean": 0.0,
-            "entropy": 0.0,
-        }
-
-    pers = deaths - births
-    pers = pers[np.isfinite(pers)]
-    pers = pers[pers > 0]
-    if pers.size == 0:
-        pers = np.asarray([0.0])
-
-    return {
-        "count": float(len(pers)),
-        "pers_sum": float(np.sum(pers)),
-        "pers_mean": float(np.mean(pers)),
-        "pers_std": float(np.std(pers)),
-        "pers_max": float(np.max(pers)),
-        "pers_q50": float(np.quantile(pers, 0.5)),
-        "pers_q90": float(np.quantile(pers, 0.9)),
-        "birth_mean": float(np.mean(births)) if births.size else 0.0,
-        "death_mean": float(np.mean(deaths)) if deaths.size else 0.0,
-        "entropy": float(_persistence_entropy(pers)),
-    }
+# 关闭 RDKit 繁杂的日志
+if RDKIT_AVAILABLE:
+    RDLogger.DisableLog('rdApp.*')
 
 
 @dataclass
 class TDAConfig:
-    """TDA 特征配置。"""
-
+    """TDA 特征配置"""
     maxdim: int = 2
     thresh: Optional[float] = None
     metric: str = "euclidean"
-    # 可选：把持久图转为 Persistence Image（维度会比较大，默认关闭）
+    max_points: Optional[int] = 200  # 限制最大原子数，加速 Ripser
+    downsample_seed: int = 42
+    do_optimize: bool = False  # 默认关闭力场优化，大幅提速
     use_persistence_image: bool = False
     pim_size: Tuple[int, int] = (10, 10)
     pim_spread: float = 1.0
 
 
-class PersistentHomologyFeatureExtractor:
-    """持续同调特征提取器。
+# ----------------------------
+# 核心工作函数 (放在类外以支持多进程 pickle)
+# ----------------------------
 
-    说明：
-        - 如果 ripser 未安装，AVAILABLE=False。
-        - 如果使用 smiles_to_tda_features，则需要 RDKit。
-    """
+def _generate_point_cloud_worker(smiles: str, add_hs: bool = False, optimize: bool = False, seed: int = 42) -> Optional[
+    np.ndarray]:
+    """单样本 3D 生成函数 (Worker)"""
+    if not RDKIT_AVAILABLE or not smiles:
+        return None
+
+    # 简单的多组分拆分逻辑
+    frags = str(smiles).replace(';', '.').replace('|', '.').split('.')
+    all_pts = []
+
+    for frag in frags:
+        frag = frag.strip()
+        if not frag:
+            continue
+
+        mol = Chem.MolFromSmiles(frag)
+        if mol is None:
+            continue
+
+        # 处理 Dummy Atoms: 将 * 替换为 Carbon，防止 3D 生成崩溃
+        for atom in mol.GetAtoms():
+            if atom.GetAtomicNum() == 0:
+                atom.SetAtomicNum(6)
+
+        if add_hs:
+            mol = Chem.AddHs(mol)
+
+        # 尝试生成 3D (ETKDGv3)
+        params = AllChem.ETKDGv3()
+        params.useRandomCoords = True
+        params.randomSeed = seed
+        params.numThreads = 1  # Worker 内单线程
+
+        res = AllChem.EmbedMolecule(mol, params)
+
+        # 失败兜底 1: 随机坐标
+        if res != 0:
+            res = AllChem.EmbedMolecule(mol, useRandomCoords=True, randomSeed=seed)
+
+        # 失败兜底 2: 2D 坐标 (Z=0) -> 保证 TDA 不挂
+        if res != 0:
+            AllChem.Compute2DCoords(mol)
+
+        # 可选: 力场优化 (极慢，慎用)
+        if optimize and res == 0:
+            try:
+                AllChem.MMFFOptimizeMolecule(mol, maxIters=50)
+            except:
+                pass
+
+        conf = mol.GetConformer()
+        pts = np.asarray(conf.GetPositions(), dtype=np.float32)
+
+        # 仅保留重原子以减少点数 (除非指定 add_hs)
+        if not add_hs:
+            heavy_indices = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
+            if len(heavy_indices) >= 3:  # 至少3个点才能构成面
+                pts = pts[heavy_indices]
+
+        all_pts.append(pts)
+
+    if not all_pts:
+        return None
+
+    # 堆叠所有片段的点云
+    return np.vstack(all_pts)
+
+
+class PersistentHomologyFeatureExtractor:
+    """并行 TDA 特征提取器"""
 
     def __init__(self, config: Optional[TDAConfig] = None):
         self.config = config or TDAConfig()
         self.AVAILABLE = bool(RIPSER_AVAILABLE)
-        self.RDKIT_AVAILABLE = bool(RDKIT_AVAILABLE)
         self.feature_names: List[str] = []
 
-    @staticmethod
-    def _ensure_available():
-        if not RIPSER_AVAILABLE:
-            raise ImportError(
-                "未检测到 ripser/persim。请先安装：pip install ripser persim\n"
-                "（建议在你的虚拟环境中执行）"
-            )
-
     def _point_cloud_to_features(self, points: np.ndarray) -> Dict[str, float]:
-        self._ensure_available()
+        """Ripser 计算核心"""
+        # 下采样保护
+        if self.config.max_points and points.shape[0] > self.config.max_points:
+            idx = np.random.RandomState(self.config.downsample_seed).choice(
+                points.shape[0], self.config.max_points, replace=False
+            )
+            points = points[idx]
 
-        points = np.asarray(points, dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] < 2:
-            raise ValueError("points 必须是 (N,3) 且 N>=2")
+        # 运行 Ripser
+        try:
+            out = ripser(points, maxdim=self.config.maxdim, thresh=self.config.thresh, metric=self.config.metric)
+            dgms = out.get("dgms", [])
+        except Exception:
+            # 极少数情况 (如共线点) ripser 可能失败，返回零特征
+            dgms = []
 
-        # ripser 返回：{'dgms': [D0, D1, ...], ...}
-        out = ripser(points, maxdim=int(self.config.maxdim), thresh=self.config.thresh, metric=self.config.metric)
-        dgms = out.get("dgms", [])
-
-        feat: Dict[str, float] = {}
-
-        # 1) 统计型特征（固定长度，推荐默认）
-        for dim in range(int(self.config.maxdim) + 1):
+        feat = {}
+        # 统计特征提取
+        for dim in range(self.config.maxdim + 1):
             diag = dgms[dim] if dim < len(dgms) else np.zeros((0, 2))
-            stats = _diagram_summary(diag)
-            for k, v in stats.items():
-                feat[f"tda_dim{dim}_{k}"] = float(v)
 
-        # 2) 可选：Persistence Image（维度较大，适合下游再做特征选择/降维）
-        if self.config.use_persistence_image:
-            if not PERSIM_AVAILABLE:
-                raise ImportError("use_persistence_image=True 需要安装 persim：pip install persim")
-            pim = PersImage(pixels=self.config.pim_size, spread=self.config.pim_spread)
-            for dim in range(min(int(self.config.maxdim) + 1, len(dgms))):
-                diag = np.asarray(dgms[dim], dtype=float)
-                if diag.size == 0:
-                    img = np.zeros(self.config.pim_size, dtype=float)
+            # 清洗 inf
+            if len(diag) > 0:
+                diag = diag[np.isfinite(diag[:, 1])]
+
+            if len(diag) == 0:
+                lifetimes = np.array([0.0])
+            else:
+                lifetimes = diag[:, 1] - diag[:, 0]
+
+            feat[f"tda_dim{dim}_count"] = float(len(lifetimes))
+            feat[f"tda_dim{dim}_max"] = float(np.max(lifetimes)) if len(lifetimes) > 0 else 0.0
+            feat[f"tda_dim{dim}_mean"] = float(np.mean(lifetimes)) if len(lifetimes) > 0 else 0.0
+            feat[f"tda_dim{dim}_sum"] = float(np.sum(lifetimes))
+            feat[f"tda_dim{dim}_std"] = float(np.std(lifetimes)) if len(lifetimes) > 0 else 0.0
+
+            # 简单的 Persistence Entropy
+            if np.sum(lifetimes) > 0:
+                probs = lifetimes / np.sum(lifetimes)
+                entropy = -np.sum(probs * np.log(probs + 1e-10))
+            else:
+                entropy = 0.0
+            feat[f"tda_dim{dim}_entropy"] = float(entropy)
+
+        # Persistence Image (可选)
+        if self.config.use_persistence_image and PERSIM_AVAILABLE:
+            pim = PersImage(pixels=self.config.pim_size, spread=self.config.pim_spread, verbose=False)
+            for dim in range(min(self.config.maxdim + 1, len(dgms))):
+                diag = dgms[dim]
+                # PersIm 需要有限值
+                if len(diag) > 0:
+                    diag = diag[np.isfinite(diag[:, 1])]
+
+                if len(diag) == 0:
+                    img_vec = np.zeros(self.config.pim_size[0] * self.config.pim_size[1])
                 else:
-                    # persim 期望有限 death
-                    mask = np.isfinite(diag[:, 1]) & np.isfinite(diag[:, 0])
-                    diag2 = diag[mask]
-                    img = pim.transform(diag2) if diag2.size else np.zeros(self.config.pim_size, dtype=float)
+                    try:
+                        img = pim.transform(diag)
+                        img_vec = img.flatten()
+                    except:
+                        img_vec = np.zeros(self.config.pim_size[0] * self.config.pim_size[1])
 
-                # 展平写入特征
-                flat = img.reshape(-1)
-                for i, val in enumerate(flat):
-                    feat[f"tda_pim_dim{dim}_{i}"] = float(val)
+                for i, val in enumerate(img_vec):
+                    feat[f"tda_pim_dim{dim}_{i}"] = val
 
         return feat
 
-    def point_clouds_to_tda_features(self, point_clouds: Sequence[np.ndarray]) -> Tuple[pd.DataFrame, List[int]]:
-        """从点云列表批量提取特征。
-
-        Args:
-            point_clouds: list/tuple，每个元素为 (N,3)
-
-        Returns:
-            features_df: DataFrame
-            valid_indices: 成功的样本索引
-        """
-        self._ensure_available()
-
-        rows: List[Dict[str, float]] = []
-        valid_indices: List[int] = []
-
-        for i, pts in enumerate(point_clouds):
-            try:
-                if pts is None:
-                    continue
-                feat = self._point_cloud_to_features(pts)
-                rows.append(feat)
-                valid_indices.append(i)
-            except Exception:
-                continue
-
-        if not rows:
+    # ----------------------------
+    # [修复] 显式添加参数以匹配 app.py 的调用
+    # ----------------------------
+    def smiles_to_tda_features(
+            self,
+            smiles_list: Sequence[str],
+            n_jobs: int = -1,
+            add_hs: bool = False,
+            optimize: Optional[bool] = None,
+            seed: int = 42
+    ) -> Tuple[pd.DataFrame, List[int]]:
+        """并行提取入口"""
+        if not self.AVAILABLE:
+            print("❌ Error: ripser not installed.")
             return pd.DataFrame(), []
 
-        df = pd.DataFrame(rows)
-        df = df.select_dtypes(include=[np.number])
-        df = df.fillna(0.0)
+        # 确定并行核数
+        if n_jobs < 1:
+            n_jobs = max(1, mp.cpu_count() - 2)  # 留2个核给系统
 
+        # 确定 optimize 参数
+        do_optimize = self.config.do_optimize if optimize is None else bool(optimize)
+
+        print(f"\n🧩 TDA 提取中 (n_jobs={n_jobs}, max_points={self.config.max_points}, add_hs={add_hs})...")
+
+        valid_indices = []
+        features_list = []
+
+        # 1. 并行生成点云 (CPU密集型)
+        point_clouds = []
+
+        # 使用 partial 固定 worker 需要的参数
+        worker_func = partial(
+            _generate_point_cloud_worker,
+            add_hs=add_hs,
+            optimize=do_optimize,
+            seed=seed
+        )
+
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            # executor.map 只需要传递 smiles_list，其他参数已通过 partial 绑定
+            results = list(tqdm(
+                executor.map(worker_func, smiles_list),
+                total=len(smiles_list),
+                desc="生成 3D 点云"
+            ))
+
+        # 2. 串行/并行计算 TDA (Ripser 释放 GIL 较好，且通常很快，简单循环即可)
+        for idx, pts in enumerate(tqdm(results, desc="计算拓扑特征")):
+            if pts is None or pts.shape[0] < 3:
+                continue
+
+            try:
+                feats = self._point_cloud_to_features(pts)
+                features_list.append(feats)
+                valid_indices.append(idx)
+            except Exception as e:
+                continue
+
+        if not features_list:
+            return pd.DataFrame(), []
+
+        df = pd.DataFrame(features_list)
+        # 填充 NaN
+        df = df.fillna(0.0)
         self.feature_names = df.columns.tolist()
         return df, valid_indices
-
-    def smiles_to_tda_features(
-        self,
-        smiles_list: Sequence[str],
-        *,
-        add_hs: bool = True,
-        seed: int = 42,
-    ) -> Tuple[pd.DataFrame, List[int]]:
-        """从 SMILES 列表生成 3D 构象并提取 TDA 特征。"""
-        self._ensure_available()
-        if not self.RDKIT_AVAILABLE:
-            raise ImportError("smiles_to_tda_features 需要 RDKit。")
-
-        point_clouds: List[np.ndarray] = []
-        valid_indices: List[int] = []
-
-        for i, smi in enumerate(smiles_list):
-            try:
-                if smi is None or (isinstance(smi, float) and np.isnan(smi)):
-                    continue
-                pts = _smiles_to_3d_points(str(smi), add_hs=add_hs, seed=seed)
-                if pts is None:
-                    continue
-                point_clouds.append(pts)
-                valid_indices.append(i)
-            except Exception:
-                continue
-
-        if not point_clouds:
-            return pd.DataFrame(), []
-
-        df, inner_valid = self.point_clouds_to_tda_features(point_clouds)
-        # inner_valid 是 point_clouds 内部索引，需要映射回原 smiles_list 索引
-        mapped_valid = [valid_indices[j] for j in inner_valid]
-        return df, mapped_valid

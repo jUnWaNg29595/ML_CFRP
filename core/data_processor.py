@@ -464,6 +464,90 @@ class AdvancedDataCleaner:
         })
         return self.cleaned_data
 
+    def apply_kmeans_clustering(self, feature_cols, n_clusters=None, auto_tune=True):
+        """
+        [修复版] 使用 K-Means 对数据进行聚类，生成 Cluster_Label 特征。
+        修复了 ValueError: Number of labels is 1 的问题。
+        """
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import silhouette_score
+
+        df = self.cleaned_data.copy()
+        # 确保只选取数值列并去除空值
+        X = df[feature_cols].dropna()
+
+        # [安全检查 1] 样本量太少无法聚类
+        if len(X) < 2:
+            print("⚠️ 样本数量不足 2 个，无法执行聚类。")
+            return df, 0
+
+        # 标准化数据用于聚类
+        scaler = MinMaxScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        best_n = n_clusters if n_clusters else 2
+        best_score = -1.0
+        best_model = None
+
+        # 自动寻找最佳聚类数
+        if auto_tune and n_clusters is None:
+            # 搜索范围 2 到 15
+            # [安全检查 2] 簇数量不能超过样本数
+            max_k = min(16, len(X))
+            search_range = range(2, max_k)
+
+            for k in search_range:
+                try:
+                    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+                    labels = kmeans.fit_predict(X_scaled)
+
+                    # [关键修复] Silhouette Score 需要至少 2 个唯一的聚类标签
+                    unique_labels = np.unique(labels)
+                    if len(unique_labels) < 2:
+                        score = -1.0  # 无效分数
+                    else:
+                        score = silhouette_score(X_scaled, labels)
+
+                    if score > best_score:
+                        best_score = score
+                        best_n = k
+                        best_model = kmeans
+                except Exception as e:
+                    continue
+
+            # 如果自动搜索失败（例如所有结果都只有1类），兜底使用 k=2
+            if best_model is None:
+                best_n = 2
+                best_model = KMeans(n_clusters=2, random_state=42, n_init=10)
+                best_model.fit(X_scaled)
+
+        else:
+            # 手动模式
+            k_manual = min(n_clusters if n_clusters else 2, len(X) - 1)
+            if k_manual < 2: k_manual = 2  # 最小为2
+
+            best_n = k_manual
+            best_model = KMeans(n_clusters=best_n, random_state=42, n_init=10)
+            best_model.fit(X_scaled)
+
+        # 预测并赋值
+        if best_model is not None:
+            labels = best_model.predict(X_scaled)
+
+            # 将 Cluster_Label 拼回原数据 (注意索引对齐)
+            df.loc[X.index, 'Cluster_Label'] = labels
+            # 填充未参与聚类的行（如果有）为 -1
+            df['Cluster_Label'] = df['Cluster_Label'].fillna(-1).astype(int)
+
+            self.cleaning_log.append({
+                'action': 'kmeans_clustering',
+                'n_clusters': best_n,
+                'silhouette_score': float(best_score) if auto_tune else 'N/A'
+            })
+            self.cleaned_data = df
+
+        return self.cleaned_data, best_n
+
     def clean_smiles_columns(self, columns: list, strategy: str = 'standard', drop_invalid: bool = False):
         """
         清洗指定的 SMILES 列。
@@ -511,7 +595,7 @@ class AdvancedDataCleaner:
 
         if drop_invalid:
             before_len = len(df)
-            df = df.dropna(subset=columns).reset_index(drop=True)
+            df = df.dropna(subset=columns, how='all').reset_index(drop=True)
             self.cleaning_log.append({
                 'action': 'drop_invalid_smiles_rows',
                 'columns': columns,

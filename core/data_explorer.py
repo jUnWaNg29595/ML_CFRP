@@ -29,10 +29,19 @@ class EnhancedDataExplorer:
             'missing_by_column': self.data.isnull().sum().to_dict()
         }
 
-    def plot_correlation_matrix(self, width=1200, height=800):
-        if len(self.numeric_cols) < 2:
+    def plot_correlation_matrix(self, cols=None, width=1200, height=800):
+        """绘制相关性热图（支持自定义列子集）"""
+        # 默认使用全部数值列
+        if cols is None:
+            cols = self.numeric_cols
+        else:
+            # 仅保留存在且为数值型的列，避免报错
+            cols = [c for c in cols if (c in self.data.columns) and (c in self.numeric_cols)]
+
+        if len(cols) < 2:
             return None
-        corr = self.data[self.numeric_cols].corr()
+
+        corr = self.data[cols].corr()
         fig = go.Figure(data=go.Heatmap(
             z=corr.values, x=corr.columns, y=corr.columns,
             colorscale='RdBu', zmid=0,
@@ -77,10 +86,17 @@ class EnhancedDataExplorer:
         fig.update_layout(title='箱线图', width=width, height=height)
         return fig
 
-    def get_high_correlation_pairs(self, threshold=0.8):
-        if len(self.numeric_cols) < 2:
+    def get_high_correlation_pairs(self, cols=None, threshold=0.8):
+        """返回高相关性特征对（支持自定义列子集）"""
+        if cols is None:
+            cols = self.numeric_cols
+        else:
+            cols = [c for c in cols if (c in self.data.columns) and (c in self.numeric_cols)]
+
+        if len(cols) < 2:
             return []
-        corr = self.data[self.numeric_cols].corr()
+
+        corr = self.data[cols].corr()
         pairs = []
         for i in range(len(corr.columns)):
             for j in range(i + 1, len(corr.columns)):
@@ -91,3 +107,4 @@ class EnhancedDataExplorer:
                         'correlation': corr.iloc[i, j]
                     })
         return sorted(pairs, key=lambda x: abs(x['correlation']), reverse=True)
+

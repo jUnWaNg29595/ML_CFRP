@@ -10,8 +10,13 @@ import matplotlib
 
 matplotlib.use('Agg')
 
-plt.rcParams["font.sans-serif"] = ["SimHei", "Arial Unicode MS", "DejaVu Sans"]
-plt.rcParams["axes.unicode_minus"] = False
+# 统一图表风格
+try:
+    from .plot_style import apply_global_style
+    apply_global_style()
+except Exception:
+    # 解释模块不应因样式失败而中断
+    pass
 warnings.filterwarnings('ignore')
 
 

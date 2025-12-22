@@ -8,6 +8,34 @@
 4. 增加双组分分子指纹拼接功能
 5. 增加训练脚本一键导出功能
 """
+# [新增] TensorFlow Sequential (TFS) 模型支持（即使未安装 TF 也要显示入口）
+try:
+    from core.tf_model import (
+        TFSequentialRegressor,
+        TENSORFLOW_AVAILABLE,
+        TFS_TUNING_PARAMS,
+        TENSORFLOW_IMPORT_ERROR,
+        get_tensorflow_version
+    )
+except Exception as e:
+    # 任何异常都不应阻止应用启动
+    TENSORFLOW_AVAILABLE = False
+    TFSequentialRegressor = None
+    TFS_TUNING_PARAMS = []
+    TENSORFLOW_IMPORT_ERROR = repr(e)
+
+    def get_tensorflow_version():
+        return None
+
+# [新增] 特征工程状态追踪器
+from core.fe_tracker import (
+    FeatureEngineeringTracker,
+    render_status_sidebar,
+    render_status_panel,
+    render_data_export_panel,
+    create_quick_export_button
+)
+
 try:
     import torchani
 
@@ -29,6 +57,13 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+# 统一 matplotlib 风格（全站图表一致）
+try:
+    from core.plot_style import apply_global_style
+    apply_global_style()
+except Exception:
+    pass
+
 # 设置页面配置
 st.set_page_config(
     page_title="碳纤维复合材料智能预测平台",
@@ -46,6 +81,8 @@ from core.molecular_features import AdvancedMolecularFeatureExtractor, RDKitFeat
 from core.feature_selector import SmartFeatureSelector, SmartSparseDataSelector, show_robust_feature_selection
 from core.optimizer import HyperparameterOptimizer, InverseDesigner, generate_tuning_suggestions
 from core.visualizer import Visualizer
+from core.training_curves import plot_history
+from core.training_runs import TrainingRunManager
 from core.applicability_domain import ApplicabilityDomainAnalyzer, TanimotoADAnalyzer
 from core.ui_config import (
     MANUAL_TUNING_PARAMS,
@@ -128,6 +165,78 @@ except ImportError: pass
 try: from catboost import CatBoostRegressor
 except ImportError: pass
 
+
+
+# === TensorFlow (for TFS model) ===
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers, callbacks, regularizers
+    tf.get_logger().setLevel('ERROR')
+    TENSORFLOW_AVAILABLE = True
+except Exception:
+    TENSORFLOW_AVAILABLE = False
+    tf = None
+    keras = None
+    layers = None
+    callbacks = None
+    regularizers = None
+
+
+def build_tfs_model(input_dim, params):
+    # Parse hidden layers like "128,64,32"
+    hidden_layers_str = str(params.get('hidden_layers', '128,64,32'))
+    try:
+        hidden = [int(x.strip()) for x in hidden_layers_str.split(',') if x.strip()]
+    except Exception:
+        hidden = [128, 64, 32]
+
+    activation = str(params.get('activation', 'relu'))
+    dropout_rate = float(params.get('dropout_rate', 0.2))
+    l2_reg = float(params.get('l2_reg', 0.001))
+    learning_rate = float(params.get('learning_rate', 0.001))
+    opt_name = str(params.get('optimizer', 'adam')).lower()
+
+    if TENSORFLOW_AVAILABLE:
+        try:
+            tf.random.set_seed(42)
+        except Exception:
+            pass
+
+    model = keras.Sequential(name='TFS_Regressor')
+    model.add(layers.Input(shape=(int(input_dim),)))
+
+    reg = None
+    try:
+        if l2_reg and l2_reg > 0:
+            reg = regularizers.l2(l2_reg)
+    except Exception:
+        reg = None
+
+    for units in hidden:
+        units = int(units)
+        if activation == 'leaky_relu':
+            model.add(layers.Dense(units, kernel_regularizer=reg))
+            model.add(layers.LeakyReLU())
+        else:
+            model.add(layers.Dense(units, activation=activation, kernel_regularizer=reg))
+        if dropout_rate and dropout_rate > 0:
+            model.add(layers.Dropout(dropout_rate))
+
+    model.add(layers.Dense(1))
+
+    # Optimizer
+    if opt_name == 'adamw' and hasattr(keras.optimizers, 'AdamW'):
+        opt = keras.optimizers.AdamW(learning_rate=learning_rate)
+    elif opt_name == 'sgd':
+        opt = keras.optimizers.SGD(learning_rate=learning_rate, momentum=0.9)
+    elif opt_name == 'rmsprop':
+        opt = keras.optimizers.RMSprop(learning_rate=learning_rate)
+    else:
+        opt = keras.optimizers.Adam(learning_rate=learning_rate)
+
+    model.compile(optimizer=opt, loss='mse', metrics=['mae'])
+    return model
 MODEL_NAME = "{model_name}"
 FEATURE_COLS = {json.dumps(feature_cols, ensure_ascii=False)}
 TARGET_COL = "{target_col}"
@@ -171,7 +280,32 @@ def load_and_train():
     elif MODEL_NAME == "线性回归": model = LinearRegression(**HYPERPARAMETERS)
     elif MODEL_NAME == "Ridge回归": model = Ridge(**HYPERPARAMETERS)
     elif MODEL_NAME == "Lasso回归": model = Lasso(**HYPERPARAMETERS)
-    elif MODEL_NAME == "ElasticNet": model = ElasticNet(**HYPERPARAMETERS)
+    elif MODEL_NAME == "TensorFlow Sequential":
+        if not TENSORFLOW_AVAILABLE:
+            print("❌ 错误: TensorFlow 未安装或导入失败，无法训练 TFS。请先安装: pip install tensorflow")
+            return
+        print("开始训练 (TFS)...")
+        model = build_tfs_model(X_train.shape[1], HYPERPARAMETERS)
+        cbs = []
+        if bool(HYPERPARAMETERS.get('early_stopping', True)):
+            try:
+                patience = int(HYPERPARAMETERS.get('patience', 20))
+            except Exception:
+                patience = 20
+            cbs.append(callbacks.EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True))
+
+        model.fit(
+            X_train, y_train,
+            epochs=int(HYPERPARAMETERS.get('epochs', 200)),
+            batch_size=int(HYPERPARAMETERS.get('batch_size', 32)),
+            validation_split=float(HYPERPARAMETERS.get('validation_split', 0.1)),
+            verbose=1,
+            callbacks=cbs
+        )
+        y_pred = model.predict(X_test).ravel()
+        r2 = r2_score(y_test, y_pred)
+        print('训练完成！R² Score: %.4f' % r2)
+        return
 
     if model:
         print("开始训练...")
@@ -248,6 +382,33 @@ def init_session_state():
 
 init_session_state()
 
+if 'fe_tracker' not in st.session_state:
+    st.session_state.fe_tracker = FeatureEngineeringTracker()
+tracker = st.session_state.fe_tracker
+
+
+def log_fe_step(operation: str, description: str, params=None, input_df=None, output_df=None,
+                features_added=None, features_removed=None, status: str = "success", message: str = ""):
+    """记录特征工程/建模关键步骤到状态条（不会影响主流程）。"""
+    tr = st.session_state.get("fe_tracker", None)
+    if tr is None:
+        return
+    try:
+        tr.log_step(
+            operation=operation,
+            description=description,
+            params=params or {},
+            input_df=input_df,
+            output_df=output_df,
+            features_added=features_added or [],
+            features_removed=features_removed or [],
+            status=status,
+            message=message
+        )
+    except Exception:
+        # 日志记录失败不应影响主流程
+        pass
+
 
 # ============================================================
 # 侧边栏渲染
@@ -270,10 +431,12 @@ def render_sidebar():
                 "🧬 分子特征",
                 "🎯 特征选择",
                 "🤖 模型训练",
+                "📈 训练记录",
                 "📊 模型解释",
                 "🔮 预测应用",
                 "⚙️ 超参优化",
                 "🧠 主动学习",
+                "📋 状态条记录",
             ],
             label_visibility="collapsed"
         )
@@ -325,7 +488,72 @@ def render_sidebar():
             mem = psutil.virtual_memory()
             st.caption(f"内存使用: {mem.percent}%")
 
+        # --- [新增] 依赖检测（让 TFS 模型入口更“可见”） ---
+        st.markdown("### 🧩 依赖检测")
+        tf_ver = None
+        try:
+            tf_ver = get_tensorflow_version()
+        except Exception:
+            tf_ver = None
+
+        if bool(TENSORFLOW_AVAILABLE) and tf_ver:
+            st.success(f"TensorFlow: {tf_ver}")
+        else:
+            st.caption("TensorFlow: 未安装或不可用")
+            try:
+                err = globals().get('TENSORFLOW_IMPORT_ERROR', '')
+                if err:
+                    st.caption(f"TF 导入信息: {str(err)[:160]}")
+            except Exception:
+                pass
+
+        st.caption(f"TorchANI: {'可用' if TORCHANI_AVAILABLE else '不可用'}")
+
+        # [增强] 在侧边栏始终显示状态条入口（即使暂无记录，也避免“功能存在但界面不显示”）
+        render_status_sidebar(st.session_state.get('fe_tracker', None))
         return page
+
+
+def render_top_status_bar():
+    """主区域顶部的轻量状态条（防止用户折叠侧边栏后找不到状态条/TF信息）。"""
+    tr = st.session_state.get('fe_tracker', None)
+    if tr is None:
+        return
+
+    try:
+        stats = tr.get_stats()
+        last = tr.get_last_step()
+    except Exception:
+        stats = {'success': 0, 'warning': 0, 'error': 0}
+        last = None
+
+    # TensorFlow 状态
+    tf_ver = None
+    try:
+        tf_ver = get_tensorflow_version()
+    except Exception:
+        tf_ver = None
+    tf_status = "✅" if (bool(TENSORFLOW_AVAILABLE) and tf_ver) else "⛔"
+    tf_text = f"TensorFlow {tf_status} {tf_ver}" if (bool(TENSORFLOW_AVAILABLE) and tf_ver) else "TensorFlow ⛔ 未安装/不可用"
+
+    with st.expander("📋 状态条（快捷）", expanded=False):
+        c1, c2, c3 = st.columns([1.2, 1.2, 3.6])
+        with c1:
+            st.caption("记录统计")
+            st.write(f"✅ {int(stats.get('success', 0))}  ·  ⚠️ {int(stats.get('warning', 0))}  ·  ❌ {int(stats.get('error', 0))}")
+        with c2:
+            st.caption("TFS 依赖")
+            st.write(tf_text)
+        with c3:
+            st.caption("最近一次")
+            if last:
+                icon = {"success": "✅", "warning": "⚠️", "error": "❌"}.get(last.get('status', 'success'), "ℹ️")
+                st.write(f"{icon} [{last.get('timestamp','')}] {last.get('operation','')} - {last.get('description','')}")
+                if last.get('message'):
+                    st.caption(last.get('message'))
+            else:
+                st.write("暂无记录。完成一次数据上传/清洗/特征选择/训练后会自动出现。")
+        st.caption("提示：更完整的时间线与导出在左侧导航「📋 状态条记录」。")
 
 
 # ============================================================
@@ -447,6 +675,15 @@ def page_data_upload():
 
                 st.success(f"✅ 成功加载数据: {df.shape[0]}行 × {df.shape[1]}列")
 
+                # [新增] 记录到状态条
+                log_fe_step(
+                    operation="数据上传",
+                    description=f"加载文件：{uploaded_file.name}",
+                    params={"rows": int(df.shape[0]), "cols": int(df.shape[1]), "type": "csv" if uploaded_file.name.endswith('.csv') else "excel"},
+                    output_df=df,
+                    message=f"数据维度：{df.shape[0]}×{df.shape[1]}"
+                )
+
                 # 数据预览
                 st.markdown("### 📋 数据预览")
                 st.dataframe(df.head(10), use_container_width=True)
@@ -486,6 +723,13 @@ def page_data_upload():
                 st.session_state.data = df
                 st.session_state.processed_data = df.copy()
                 st.success(f"✅ 已生成混合数据集: {df.shape}")
+                log_fe_step(
+                    operation="数据生成",
+                    description="生成混合示例数据集",
+                    params={"n_samples": int(n_samples_hybrid), "type": "hybrid"},
+                    output_df=df,
+                    message=f"数据维度：{df.shape[0]}×{df.shape[1]}"
+                )
                 st.dataframe(df.head(), use_container_width=True)
 
         with col2:
@@ -497,6 +741,13 @@ def page_data_upload():
                 st.session_state.data = df
                 st.session_state.processed_data = df.copy()
                 st.success(f"✅ 已生成纯数值数据集: {df.shape}")
+                log_fe_step(
+                    operation="数据生成",
+                    description="生成纯数值示例数据集",
+                    params={"n_samples": int(n_samples_numeric), "type": "numeric"},
+                    output_df=df,
+                    message=f"数据维度：{df.shape[0]}×{df.shape[1]}"
+                )
                 st.dataframe(df.head(), use_container_width=True)
 
 
@@ -533,18 +784,86 @@ def page_data_explore():
 
     with tab2:
         st.markdown("### 特征相关性矩阵")
-        fig = explorer.plot_correlation_matrix()
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("需要至少2个数值列")
 
-        # 高相关性特征对
-        pairs = explorer.get_high_correlation_pairs(threshold=0.8)
-        if pairs:
-            st.markdown("### ⚠️ 高相关性特征对 (|r| > 0.8)")
-            for p in pairs[:10]:
-                st.write(f"- **{p['feature1']}** ↔ **{p['feature2']}**: {p['correlation']:.3f}")
+        numeric_cols = explorer.numeric_cols
+        if not numeric_cols or len(numeric_cols) < 2:
+            st.info("需要至少2个数值列")
+        else:
+            # --- 自定义热图特征子集 ---
+            col_a, col_b = st.columns([2, 1])
+            with col_a:
+                heatmap_mode = st.radio(
+                    "热图特征来源",
+                    ["全部数值特征", "自定义多选", "使用【特征选择】页当前子集", "按目标相关性Top-K"],
+                    horizontal=True,
+                    key="corr_heatmap_mode"
+                )
+            with col_b:
+                max_show = st.number_input(
+                    "最多显示特征数",
+                    min_value=2,
+                    max_value=min(80, len(numeric_cols)),
+                    value=min(25, len(numeric_cols)),
+                    key="corr_heatmap_max"
+                )
+
+            target = st.session_state.get("target_col")
+            include_target = st.checkbox("包含目标变量（若为数值列）", value=True, key="corr_heatmap_include_target")
+
+            selected_cols = None
+
+            if heatmap_mode == "全部数值特征":
+                selected_cols = numeric_cols.copy()
+
+            elif heatmap_mode == "使用【特征选择】页当前子集":
+                selected_cols = [c for c in st.session_state.get("feature_cols", []) if c in numeric_cols]
+                if not selected_cols:
+                    st.info("当前尚未在【特征选择】页选定特征子集，将回退为“自定义多选”。")
+                    heatmap_mode = "自定义多选"
+
+            if heatmap_mode == "自定义多选":
+                default_cols = numeric_cols[:min(25, len(numeric_cols))]
+                selected_cols = st.multiselect(
+                    "选择用于热图的数值特征",
+                    options=numeric_cols,
+                    default=default_cols,
+                    key="corr_heatmap_cols"
+                )
+
+            elif heatmap_mode == "按目标相关性Top-K":
+                k = st.number_input(
+                    "Top-K（按 |corr| 排序）",
+                    min_value=2,
+                    max_value=len(numeric_cols),
+                    value=min(20, len(numeric_cols)),
+                    key="corr_heatmap_topk"
+                )
+                if target in numeric_cols:
+                    corrs = df[numeric_cols].corrwith(df[target]).abs().sort_values(ascending=False)
+                    selected_cols = corrs.head(int(k)).index.tolist()
+                else:
+                    st.info("目标变量不是数值列，无法按相关性排序；已使用前K个数值列。")
+                    selected_cols = numeric_cols[:int(k)]
+
+            # 可选：把目标变量也放到热图里
+            if include_target and (target in numeric_cols) and (target not in selected_cols):
+                selected_cols = selected_cols + [target]
+
+            # 限制显示数量，避免热图过大
+            if len(selected_cols) > int(max_show):
+                st.warning(f"已选择 {len(selected_cols)} 个特征，为可读性仅显示前 {int(max_show)} 个。")
+                selected_cols = selected_cols[:int(max_show)]
+
+            fig = explorer.plot_correlation_matrix(cols=selected_cols)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+
+            # 高相关性特征对（基于当前热图列）
+            pairs = explorer.get_high_correlation_pairs(cols=selected_cols, threshold=0.8)
+            if pairs:
+                st.markdown("### ⚠️ 高相关性特征对 (|r| > 0.8)")
+                for p in pairs[:10]:
+                    st.write(f"- **{p['feature1']}** ↔ **{p['feature2']}**: {p['correlation']:.3f}")
 
     with tab3:
         st.markdown("### 数值特征分布")
@@ -603,9 +922,9 @@ def page_data_cleaning():
     df = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
     cleaner = AdvancedDataCleaner(df)
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "❓ 缺失值处理", "📊 异常值检测", "🔄 重复数据", "🔧 数据类型", "🧪 SMILES清洗", "🧩 SMILES组分分列", "⚖️ 类别平衡"
-    ])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+        "❓ 缺失值处理", "📊 异常值检测", "🔄 重复数据", "🔧 数据类型", "🧪 SMILES清洗", "🧩 SMILES组分分列", "⚖️ 类别平衡",
+        "🧩 K-Means聚类"])
 
     with tab1:
         st.markdown("### 缺失值处理")
@@ -636,9 +955,69 @@ def page_data_cleaning():
                     fill_value = st.number_input("填充常数值", value=0.0)
 
                 if st.button("🔧 执行缺失值处理", type="primary"):
-                    cleaned_df = cleaner.handle_missing_values(strategy=strategy, fill_value=fill_value)
+                    # 为了避免“伪数值列(object)无法填充”导致看起来没生效，
+                    # 这里先自动尝试把可转换的列转为数值型再做缺失值处理。
+                    df_in = df.copy()
+                    try:
+                        _tmp_cleaner = AdvancedDataCleaner(df_in)
+                        df_in = _tmp_cleaner.fix_pseudo_numeric_columns()
+                    except Exception:
+                        pass
+
+                    missing_before = int(df_in.isna().sum().sum())
+                    rows_before = int(df_in.shape[0])
+
+                    if strategy == "mode":
+                        cleaned_df = df_in.copy()
+                        # 众数填充：对所有列都生效（含文本列）
+                        for _col in cleaned_df.columns:
+                            if cleaned_df[_col].isna().any():
+                                try:
+                                    _mode = cleaned_df[_col].mode(dropna=True)
+                                    if not _mode.empty:
+                                        cleaned_df[_col] = cleaned_df[_col].fillna(_mode.iloc[0])
+                                except Exception:
+                                    # 某些列 mode 计算可能失败，跳过即可
+                                    pass
+                    elif strategy == "drop_rows":
+                        cleaned_df = df_in.dropna().reset_index(drop=True)
+                    else:
+                        # 其余策略先走原清洗器（主要针对数值列）
+                        _cleaner2 = AdvancedDataCleaner(df_in)
+                        cleaned_df = _cleaner2.handle_missing_values(strategy=strategy, fill_value=fill_value)
+
+                        # 如果还有非数值列缺失，给一个温和回退：用众数补齐
+                        # 避免用户看到“按钮点了但没变化”
+                        non_num_cols = cleaned_df.select_dtypes(exclude=np.number).columns.tolist()
+                        for _col in non_num_cols:
+                            if cleaned_df[_col].isna().any():
+                                try:
+                                    _mode = cleaned_df[_col].mode(dropna=True)
+                                    if not _mode.empty:
+                                        cleaned_df[_col] = cleaned_df[_col].fillna(_mode.iloc[0])
+                                except Exception:
+                                    if strategy == "constant":
+                                        cleaned_df[_col] = cleaned_df[_col].fillna(fill_value if fill_value is not None else 0)
+
+                    missing_after = int(cleaned_df.isna().sum().sum())
+                    rows_after = int(cleaned_df.shape[0])
+
                     st.session_state.processed_data = cleaned_df
-                    st.success("✅ 缺失值处理完成")
+
+                    log_fe_step(
+                        operation="缺失值处理",
+                        description=f"策略: {strategy}",
+                        params={"strategy": strategy, "fill_value": fill_value},
+                        input_df=df_in,
+                        output_df=cleaned_df,
+                        message=f"缺失值: {missing_before} → {missing_after}; 行数: {rows_before} → {rows_after}"
+                    )
+
+                    if strategy == "drop_rows":
+                        st.success(f"✅ 缺失值处理完成：删除 {rows_before - rows_after} 行（{rows_before} → {rows_after}）")
+                    else:
+                        st.success(f"✅ 缺失值处理完成：缺失值 {missing_before} → {missing_after}")
+
                     st.rerun()
         else:
             st.success("✅ 数据无缺失值")
@@ -655,7 +1034,14 @@ def page_data_cleaning():
             handle_method = st.selectbox("处理方法", ["clip", "replace_median", "remove"])
 
         if st.button("🔍 检测异常值"):
-            outliers = cleaner.detect_outliers(method=method, threshold=threshold)
+            # 同样先尝试把“伪数值列”转换为数值列，避免漏检
+            _tmp_cleaner = AdvancedDataCleaner(df.copy())
+            try:
+                _tmp_cleaner.fix_pseudo_numeric_columns()
+            except Exception:
+                pass
+
+            outliers = _tmp_cleaner.detect_outliers(method=method, threshold=threshold)
             if outliers:
                 st.warning(f"检测到 {len(outliers)} 列存在异常值")
                 st.json(outliers)
@@ -663,9 +1049,83 @@ def page_data_cleaning():
                 st.success("✅ 未检测到显著异常值")
 
         if st.button("🔧 处理异常值", type="primary"):
-            cleaned_df = cleaner.handle_outliers(method=handle_method, threshold=threshold)
-            st.session_state.processed_data = cleaned_df
-            st.success("✅ 异常值处理完成")
+            # 后端 cleaner.handle_outliers() 仅支持 IQR + clip/replace_median，
+            # 为了让前端的 remove / zscore 选项真正生效，这里在 app.py 内做兼容实现。
+            df_in = df.copy()
+            _tmp_cleaner = AdvancedDataCleaner(df_in)
+            try:
+                df_in = _tmp_cleaner.fix_pseudo_numeric_columns()
+            except Exception:
+                pass
+
+            numeric_cols = df_in.select_dtypes(include=np.number).columns.tolist()
+            if not numeric_cols:
+                st.info("ℹ️ 未找到可用于异常值处理的数值列。")
+                return
+
+            any_outlier = pd.Series(False, index=df_in.index)
+            total_affected = 0
+
+            for col in numeric_cols:
+                s = df_in[col]
+
+                if method == "iqr":
+                    q1 = s.quantile(0.25)
+                    q3 = s.quantile(0.75)
+                    iqr = q3 - q1
+                    if pd.isna(iqr) or iqr == 0:
+                        continue
+                    lower = q1 - threshold * iqr
+                    upper = q3 + threshold * iqr
+                    mask = (s < lower) | (s > upper)
+                else:
+                    mean = s.mean(skipna=True)
+                    std = s.std(skipna=True)
+                    if pd.isna(std) or std == 0:
+                        continue
+                    z = (s - mean) / std
+                    mask = z.abs() > threshold
+                    lower = mean - threshold * std
+                    upper = mean + threshold * std
+
+                mask = mask.fillna(False)
+
+                if handle_method == "remove":
+                    any_outlier = any_outlier | mask
+                elif handle_method == "clip":
+                    df_in[col] = s.clip(lower, upper)
+                    total_affected += int(mask.sum())
+                elif handle_method == "replace_median":
+                    median_val = s.median(skipna=True)
+                    df_in.loc[mask, col] = median_val
+                    total_affected += int(mask.sum())
+
+            if handle_method == "remove":
+                removed_rows = int(any_outlier.sum())
+                cleaned_df = df_in.loc[~any_outlier].reset_index(drop=True)
+                st.session_state.processed_data = cleaned_df
+                log_fe_step(
+                    operation="异常值处理",
+                    description=f"方法: {method}, 处理: {handle_method}",
+                    params={"method": method, "threshold": float(threshold), "handle": handle_method},
+                    input_df=df_in,
+                    output_df=cleaned_df,
+                    message=f"删除 {removed_rows} 行"
+                )
+                st.success(f"✅ 异常值处理完成：删除 {removed_rows} 行（{len(df_in)} → {len(cleaned_df)}）")
+            else:
+                st.session_state.processed_data = df_in
+                log_fe_step(
+                    operation="异常值处理",
+                    description=f"方法: {method}, 处理: {handle_method}",
+                    params={"method": method, "threshold": float(threshold), "handle": handle_method},
+                    input_df=df,
+                    output_df=df_in,
+                    message=f"调整 {total_affected} 个异常值单元格"
+                )
+                st.success(f"✅ 异常值处理完成：已调整 {total_affected} 个异常值单元格")
+
+            st.rerun()
 
     with tab3:
         st.markdown("### 🔄 数据去重与分布优化")
@@ -682,6 +1142,14 @@ def page_data_cleaning():
                 if st.button("🗑️ 删除重复行", type="primary"):
                     cleaned_df = cleaner.remove_duplicates()
                     st.session_state.processed_data = cleaned_df
+                    log_fe_step(
+                        operation="去重",
+                        description="删除完全重复行",
+                        params={"removed_rows": int(dup_count)},
+                        input_df=df,
+                        output_df=cleaned_df,
+                        message=f"删除 {dup_count} 行"
+                    )
                     st.success(f"✅ 已删除 {dup_count} 行重复数据")
                     st.rerun()
             else:
@@ -729,6 +1197,14 @@ def page_data_cleaning():
                     cleaned_df = cleaner.reduce_feature_repetition(target_col, target_rate)
                     new_len = len(cleaned_df)
                     st.session_state.processed_data = cleaned_df
+                    log_fe_step(
+                        operation="分布优化",
+                        description=f"降低重复率: {target_col}",
+                        params={"feature": target_col, "target_rate": float(target_rate)},
+                        input_df=df,
+                        output_df=cleaned_df,
+                        message=f"行数: {original_len} → {new_len}"
+                    )
 
                     st.success(f"✅ 优化完成！删除了 {original_len - new_len} 个样本")
                     st.info(f"📊 当前行数: {new_len}，'{target_col}' 的众数占比已调整至 {target_rate * 100:.1f}%")
@@ -780,6 +1256,14 @@ def page_data_cleaning():
                 try:
                     new_df = cleaner.aggregate_by_keys(keys=keys, target_col=target_col_for_agg, agg=agg_method, dropna_target=dropna_target)
                     st.session_state.processed_data = new_df
+                    log_fe_step(
+                        operation="重复记录聚合",
+                        description=f"keys={keys} / target={target_col_for_agg} / agg={agg_method}",
+                        params={"keys": keys, "target": target_col_for_agg, "agg": agg_method, "dropna_target": bool(dropna_target)},
+                        input_df=df,
+                        output_df=new_df,
+                        message=f"行数: {len(df)} → {len(new_df)}"
+                    )
                     st.success(f"✅ 聚合完成：{len(df)} 行 → {len(new_df)} 行")
                     st.info("已生成重复统计列：tg_rep_n / tg_rep_std（或 <target>_rep_n / <target>_rep_std）")
                     st.rerun()
@@ -798,6 +1282,13 @@ def page_data_cleaning():
             if st.button("🔧 修复伪数值列", type="primary"):
                 cleaned_df = cleaner.fix_pseudo_numeric_columns()
                 st.session_state.processed_data = cleaned_df
+                log_fe_step(
+                    operation="数据类型修复",
+                    description="修复伪数值列",
+                    input_df=df,
+                    output_df=cleaned_df,
+                    message="已将可转换的 object 列转换为数值类型"
+                )
                 st.success("✅ 数据类型修复完成")
         else:
             st.success("✅ 数据类型正常")
@@ -819,6 +1310,14 @@ def page_data_cleaning():
                     try:
                         new_df = cleaner.one_hot_encode(encode_cols, drop_first=drop_first, dummy_na=False)
                         st.session_state.processed_data = new_df
+                        log_fe_step(
+                            operation="One-Hot 编码",
+                            description=f"编码列: {encode_cols}",
+                            params={"cols": encode_cols, "drop_first": bool(drop_first)},
+                            input_df=df,
+                            output_df=new_df,
+                            message=f"列数: {df.shape[1]} → {new_df.shape[1]}"
+                        )
                         st.success(f"✅ One-Hot 编码完成：列数 {df.shape[1]} → {new_df.shape[1]}")
                         st.rerun()
                     except Exception as e:
@@ -1088,6 +1587,32 @@ def page_data_cleaning():
             st.warning("⚠️ 没有找到文本列，无法执行类别平衡")
 
 
+    with tab8:
+        st.markdown("### 🧩 K-Means 智能聚类 (文献核心策略)")
+        st.info(
+            "💡 文献 [Polymer 256 (2022) 125216] 指出，利用 K-Means 将环氧树脂体系分为 11 个簇，可将 R² 提升至 0.99。此功能将生成 'Cluster_Label' 列作为新特征。")
+
+        # 选择用于聚类的特征（通常是分子描述符 + 温度）
+        num_cols = df.select_dtypes(include=np.number).columns.tolist()
+        cluster_features = st.multiselect("选择用于聚类的特征", num_cols,
+                                          default=num_cols[:5] if len(num_cols) > 5 else num_cols)
+
+        col_k1, col_k2 = st.columns(2)
+        with col_k1:
+            auto_k = st.checkbox("自动搜索最佳簇数量 (Silhouette Score)", value=True)
+        with col_k2:
+            n_clusters = st.slider("手动指定簇数量", 2, 20, 11, disabled=auto_k)
+
+        if st.button("🚀 执行 K-Means 聚类", type="primary"):
+            cleaned_df, final_k = cleaner.apply_kmeans_clustering(
+                feature_cols=cluster_features,
+                n_clusters=None if auto_k else n_clusters,
+                auto_tune=auto_k
+            )
+            st.session_state.processed_data = cleaned_df
+            st.success(f"✅ 聚类完成！最佳簇数量: {final_k}")
+            st.rerun()
+
 # ============================================================
 # 页面：数据增强
 # ============================================================
@@ -1316,17 +1841,18 @@ def page_molecular_features():
     extraction_method = st.radio(
         "选择分子特征提取方法",
         [
-            "👆 分子指纹 (MACCS/Morgan) [新]",
+            "👆 分子指纹 (MACCS/Morgan)",
             "🔹 RDKit 标准版 (推荐新手)",
             "🚀 RDKit 并行版 (大数据集)",
             "💾 RDKit 内存优化版 (低内存)",
             "🔬 Mordred 描述符 (1600+特征)",
-            "🧊 3D构象描述符 (RDKit3D+Coulomb) [新]",
-            "🧩 TDA拓扑特征 (持续同调PH) [新]",
-            "🧠 预训练SMILES Transformer Embedding (ChemBERTa等) [可选]",
+            "🧊 3D构象描述符 (RDKit3D+Coulomb) ",
+            "🧩 TDA拓扑特征 (持续同调PH) ",
+            "🧠 预训练SMILES Transformer Embedding (ChemBERTa等)",
             "🕸️ 图神经网络特征 (拓扑结构)",
             "⚛️ ML力场特征 (ANI能量/力)",
-            "⚗️ 环氧树脂反应特征 (基于领域知识)"
+            "⚗️ 环氧树脂反应特征 (基于领域知识)",
+            "📑 FGD 官能团区分",
         ],
         help="不同方法适用于不同场景"
     )
@@ -1336,8 +1862,15 @@ def page_molecular_features():
     fp_bits = 2048
     fp_radius = 2
     hardener_col = None
+    hardener_component_cols = None
     hardener_fusion_mode = "仅用于指纹/反应特征（当前默认）"  # 初始化固化剂列变量
     phr_col = None
+
+    # --- [修复] 在这里补上 Transformer 变量的默认初始化 ---
+    lm_model_name = "seyonec/ChemBERTa-zinc-base-v1"
+    lm_pooling = "cls"
+    lm_max_length = 128
+    lm_batch_size = 16
 
     # [新增] TDA 参数默认值
     tda_maxdim = 2
@@ -1367,27 +1900,82 @@ def page_molecular_features():
         lm_batch_size = 16
 
         if "Transformer Embedding" in extraction_method:
-            st.markdown("#### 🧠 预训练SMILES Transformer Embedding 参数")
-            st.info("需要先安装 transformers；首次运行会下载模型权重（需要联网）。模型输出维度通常为 768，可配合后续特征选择/降维使用。")
-            lm_model_name = st.text_input("HuggingFace 模型名", value=lm_model_name)
+            st.markdown("#### 🧠 预训练 Transformer 设置")
+            st.info("💡 将调用 HuggingFace `transformers` 库。首次运行会自动下载模型权重（需联网）。")
+
+            # 1. 模型名称输入框
+            lm_model_name = st.text_input(
+                "HuggingFace 模型名称 (Model ID)",
+                value=lm_model_name,  # 使用默认值初始化
+                help="例如: 'seyonec/ChemBERTa-zinc-base-v1' 或 'DeepChem/ChemBERTa-77M-MTR'"
+            )
+
             col_lm1, col_lm2, col_lm3 = st.columns(3)
+
+            # 2. 池化策略
             with col_lm1:
-                lm_pooling = st.selectbox("Pooling", ["cls", "mean"], index=0)
+                lm_pooling = st.selectbox(
+                    "池化策略 (Pooling)",
+                    ["cls", "mean"],
+                    index=["cls", "mean"].index(lm_pooling) if lm_pooling in ["cls", "mean"] else 0,
+                    help="CLS: 取首个token向量; Mean: 取所有token均值"
+                )
+
+            # 3. 最大长度
             with col_lm2:
-                lm_max_length = st.selectbox("Max Length", [64, 128, 256], index=1)
+                lm_max_length = st.selectbox(
+                    "最大序列长度 (Max Length)",
+                    [64, 128, 256, 512],
+                    index=[64, 128, 256, 512].index(lm_max_length) if lm_max_length in [64, 128, 256, 512] else 1
+                )
+
+            # 4. 批大小
             with col_lm3:
-                lm_batch_size = st.selectbox("Batch Size", [4, 8, 16, 32], index=2)
+                lm_batch_size = st.selectbox(
+                    "批处理大小 (Batch Size)",
+                    [8, 16, 32, 64, 128],
+                    index=[8, 16, 32, 64, 128].index(lm_batch_size) if lm_batch_size in [8, 16, 32, 64, 128] else 1,
+                    help="显存越小，请调小此数值"
+                )
 
         # [新增] 双组分选择 UI
         st.markdown("#### 双组分设置 (推荐)")
+
+        # 初始化变量
+        hardener_component_cols = []
+
         col_h1, col_h2 = st.columns(2)
         with col_h1:
-            # 排除已选的树脂列，避免重复选择
+            # 1. 基础单列选择
             candidate_cols = ["无 (仅提取单列)"] + [c for c in text_cols if c != smiles_col]
-            hardener_col_opt = st.selectbox("选择【固化剂】SMILES列", candidate_cols)
+            hardener_col_opt = st.selectbox("选择【固化剂】主列", candidate_cols)
 
             if hardener_col_opt != "无 (仅提取单列)":
                 hardener_col = hardener_col_opt
+                hardener_component_cols = [hardener_col]
+            else:
+                hardener_col = None
+
+        # [新增] 固化剂多组分复选框
+        if hardener_col:
+            hardener_mix_mode = st.checkbox(
+                "固化剂为多组分（多列复配）",
+                value=False,
+                help="如果你的配方包含多种固化剂（如 hardener_1, hardener_2），请勾选此项进行多列选择。"
+            )
+
+            if hardener_mix_mode:
+                # 自动正则匹配推荐
+                pattern_h = re.compile(rf"^{re.escape(hardener_col)}_\d+$")
+                auto_h = [c for c in text_cols if pattern_h.match(c)]
+
+                # 允许用户多选
+                hardener_component_cols = st.multiselect(
+                    "选择所有固化剂组分列",
+                    options=text_cols,
+                    default=auto_h if auto_h else [hardener_col],
+                    help="系统会将这些列合并提取特征（例如：指纹叠加或结构拼接）"
+                )
 
         with col_h2:
             hardener_fusion_mode = st.selectbox(
@@ -1400,7 +1988,6 @@ def page_molecular_features():
                 help="选择第二项后，RDKit/Mordred/3D/ANI/Transformer 等方法将对拼接后的 SMILES 提取特征。"
             )
 
-
     # ============== [UI] 环氧树脂特征参数 ==============
     if "环氧树脂反应特征" in extraction_method:
         st.info("💡 该方法需要同时提供【树脂】和【固化剂】的SMILES结构。")
@@ -1408,6 +1995,8 @@ def page_molecular_features():
         with col_h:
             candidate_cols = [c for c in text_cols if c != smiles_col]
             hardener_col = st.selectbox("选择【固化剂】SMILES列", candidate_cols)
+            if hardener_col:
+                hardener_component_cols = [hardener_col]
         with col_p:
             num_cols = df.select_dtypes(include=np.number).columns.tolist()
             phr_col = st.selectbox("选择【配比/PHR】列 (可选)", ["无 (假设理想配比)"] + num_cols)
@@ -1428,6 +2017,16 @@ def page_molecular_features():
         with col_t4:
             tda_pim_spread = st.number_input("PIM spread", min_value=0.1, max_value=5.0, value=1.0, step=0.1,
                                              disabled=(not tda_use_pim))
+
+        # 速度/稳定性选项（推荐默认即可）
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            tda_add_hs = st.checkbox("添加氢原子（更慢）", value=False)
+        with col_s2:
+            tda_do_optimize = st.checkbox("力场优化MMFF/UFF（更慢）", value=False)
+        with col_s3:
+            tda_max_points = st.selectbox("最大点数(下采样加速)", ["不限制", 64, 128, 256, 512, 1024], index=3)
+        st.caption("提示：TDA 默认只用重原子坐标；通常不需要加氢/力场优化。点数越大越慢。")
 
     # 并行版参数
     if "并行版" in extraction_method and OPTIMIZED_EXTRACTOR_AVAILABLE:
@@ -1486,8 +2085,14 @@ def page_molecular_features():
         hardener_list = None
         hardener_ncomp = None
         if hardener_col:
-            # 如果用户选择了 curing_agent_smiles 这类列，同时存在 curing_agent_smiles_1/2/…，则给出多列模式
-            hardener_component_cols = [hardener_col]
+            if hardener_component_cols is None:
+                hardener_component_cols = [hardener_col]
+
+            # 注意：这里直接使用 UI 中生成的 hardener_component_cols 列表
+            # 移除了原有的自动正则覆盖逻辑，完全尊重用户在 UI 上的选择
+
+            hardener_smiles_series, hardener_ncomp = _combine_components(df, hardener_component_cols)
+            hardener_list = hardener_smiles_series.tolist()
             if resin_mix_mode:
                 # 仅在启用多组分模式时才展示/使用固化剂多列合并逻辑，避免 UI 过复杂
                 st.caption("（提示）固化剂也支持多组分：如果有 hardener_col_1/2/… 可在下方自动合并。")
@@ -1589,13 +2194,15 @@ def page_molecular_features():
                     use_persistence_image=bool(tda_use_pim),
                     pim_size=(int(tda_pim_pixels), int(tda_pim_pixels)),
                     pim_spread=float(tda_pim_spread),
+                    max_points=None if str(tda_max_points) == "不限制" else int(tda_max_points),
+                    do_optimize=bool(tda_do_optimize),
                 )
                 extractor = PersistentHomologyFeatureExtractor(config)
                 if not getattr(extractor, "AVAILABLE", False):
                     st.error("❌ 未检测到 ripser/persim，请先安装：pip install ripser persim")
                     return
 
-                features_df, valid_indices = extractor.smiles_to_tda_features(smiles_list_input)
+                features_df, valid_indices = extractor.smiles_to_tda_features(smiles_list_input, add_hs=bool(tda_add_hs))
 
             elif "Transformer Embedding" in extraction_method:
                 from core.molecular_features import SmilesTransformerEmbeddingExtractor
@@ -1623,6 +2230,27 @@ def page_molecular_features():
                     st.error("TorchANI 未安装")
                     return
                 features_df, valid_indices = extractor.smiles_to_ani_features(smiles_list_input)
+            elif "FGD" in extraction_method:
+                from core.molecular_features import FGDFeatureExtractor
+                status_text.text("正在执行 FGD 结构分类与编码...")
+
+                extractor = FGDFeatureExtractor()
+                # 使用 smiles_list_input (这是上面已经处理过多组分拼接的变量)
+                features_df, valid_indices = extractor.categorize_smiles(smiles_list_input)
+
+                if not features_df.empty:
+                    # --- [关键步骤] 自动 One-Hot 编码 ---
+                    # 文献中 FGD 必须配合 OHE (One-Hot Encoding) 使用
+                    st.info("ℹ️ 已提取 FGD 类别特征，正在自动执行 One-Hot 编码以适配模型...")
+
+                    features_df = pd.get_dummies(
+                        features_df,
+                        columns=["FGD_Substrate", "FGD_Group"],
+                        prefix=["Substrate", "Group"],
+                        dtype=int
+                    )
+                    # -----------------------------------
+
 
             elif "环氧树脂" in extraction_method:
                 from core.molecular_features import EpoxyDomainFeatureExtractor
@@ -1667,6 +2295,16 @@ def page_molecular_features():
                 # [新增] 保存特征列名到 Session State，以便后续清除
                 st.session_state.molecular_feature_names = features_df.columns.tolist()
                 st.success(f"✅ 成功提取 {len(features_df)} 个样本的 {features_df.shape[1]} 个分子特征")
+
+                log_fe_step(
+                    operation="分子特征提取",
+                    description=f"方法: {extraction_method} / 列: {smiles_col}",
+                    params={"method": extraction_method, "smiles_col": smiles_col, "n_features": int(features_df.shape[1]), "n_samples": int(len(valid_indices))},
+                    input_df=df,
+                    output_df=merged_df,
+                    features_added=features_df.columns.tolist(),
+                    message=f"新增分子特征 {features_df.shape[1]} 列，数据列数 {df.shape[1]} → {merged_df.shape[1]}"
+                )
 
                 # 结果统计
                 col1, col2, col3 = st.columns(3)
@@ -1767,7 +2405,38 @@ def page_model_training():
 
     with col1:
         st.markdown("### 📦 模型选择")
-        model_name = st.selectbox("选择模型", trainer.get_available_models())
+
+        # 获取模型目录（包含可用性/缺失依赖原因）；兼容旧版本 trainer
+        if hasattr(trainer, "get_model_catalog"):
+            model_catalog = trainer.get_model_catalog()
+            model_options = trainer.get_available_models(include_unavailable=True)
+        else:
+            # 旧版本：仅提供可用模型
+            model_options = trainer.get_available_models()
+            model_catalog = {m: {"available": True, "reason": ""} for m in model_options}
+
+            # 兼容：即使当前环境未安装 TensorFlow，也显示 TFS 入口（训练会被禁用并提示安装）
+            if "TensorFlow Sequential" not in model_options:
+                model_options = model_options + ["TensorFlow Sequential"]
+                model_catalog["TensorFlow Sequential"] = {
+                    "available": bool(TENSORFLOW_AVAILABLE),
+                    "reason": "" if TENSORFLOW_AVAILABLE else "未安装 TensorFlow（pip install tensorflow）"
+                }
+
+        def _fmt_model_name(n: str) -> str:
+            label = "TFS（TensorFlow Sequential）" if n == "TensorFlow Sequential" else n
+            meta = model_catalog.get(n, {})
+            if meta.get("available", True):
+                return f"{label} ✅"
+            return f"{label} ⛔"
+
+        model_name = st.selectbox("选择模型", model_options, format_func=_fmt_model_name)
+
+        meta = model_catalog.get(model_name, {"available": True, "reason": ""})
+        disable_train = (not meta.get("available", True))
+        if disable_train:
+            reason = meta.get("reason") or "当前环境缺少依赖"
+            st.warning(f"该模型当前不可训练：{reason}")
 
         st.markdown("### ⚙️ 训练设置")
         test_size = st.slider("测试集比例", 0.1, 0.4, 0.2)
@@ -1824,25 +2493,43 @@ def page_model_training():
                     st.session_state[f"param_{model_name}_{k}"] = v
                 st.rerun()
 
-        # 生成参数控件
+         # 生成参数控件
         manual_params = {}
-        if model_name in MANUAL_TUNING_PARAMS:
+
+        # 参数配置优先级：TFS 使用 core.tf_model 中的配置（支持 checkbox 等），其余模型使用 ui_config
+        configs = []
+        if model_name == "TensorFlow Sequential":
+            configs = TFS_TUNING_PARAMS if TFS_TUNING_PARAMS else MANUAL_TUNING_PARAMS.get(model_name, [])
+        elif model_name in MANUAL_TUNING_PARAMS:
             configs = MANUAL_TUNING_PARAMS[model_name]
+
+        if configs:
             p_cols = st.columns(2)
             for i, config in enumerate(configs):
                 with p_cols[i % 2]:
                     key = f"param_{model_name}_{config['name']}"
                     if key not in st.session_state:
-                        st.session_state[key] = config['default']
+                        st.session_state[key] = config.get('default')
 
-                    if config['widget'] == 'slider':
-                        manual_params[config['name']] = st.slider(config['label'], key=key, **config.get('args', {}))
-                    elif config['widget'] == 'number_input':
-                        manual_params[config['name']] = st.number_input(config['label'], key=key, **config.get('args', {}))
-                    elif config['widget'] == 'selectbox':
-                        manual_params[config['name']] = st.selectbox(config['label'], options=config['args']['options'], key=key)
-                    elif config['widget'] == 'text_input':
-                        manual_params[config['name']] = st.text_input(config['label'], key=key)
+                    help_txt = config.get('help', None)
+                    widget = config.get('widget', 'text_input')
+                    args = config.get('args', {}) or {}
+
+                    # 对 TFS：若关闭 early_stopping，则 patience 不必填写
+                    disabled_flag = False
+                    if model_name == "TensorFlow Sequential" and config.get('name') == 'patience':
+                        disabled_flag = (not bool(manual_params.get('early_stopping', True)))
+
+                    if widget == 'slider':
+                        manual_params[config['name']] = st.slider(config['label'], key=key, help=help_txt, disabled=disabled_flag, **args)
+                    elif widget == 'number_input':
+                        manual_params[config['name']] = st.number_input(config['label'], key=key, help=help_txt, disabled=disabled_flag, **args)
+                    elif widget == 'selectbox':
+                        manual_params[config['name']] = st.selectbox(config['label'], options=args.get('options', []), key=key, help=help_txt, disabled=disabled_flag)
+                    elif widget == 'text_input':
+                        manual_params[config['name']] = st.text_input(config['label'], key=key, help=help_txt, disabled=disabled_flag)
+                    elif widget == 'checkbox':
+                        manual_params[config['name']] = st.checkbox(config['label'], key=key, help=help_txt, disabled=disabled_flag)
 
     st.markdown("---")
 
@@ -1850,7 +2537,7 @@ def page_model_training():
     c_btn1, c_btn2 = st.columns(2)
 
     with c_btn1:
-        if st.button("🚀 开始训练", type="primary"):
+        if st.button("🚀 开始训练", type="primary", disabled=disable_train if "disable_train" in locals() else False):
             with st.spinner("训练中..."):
                 try:
                     # 准备参数
@@ -1909,6 +2596,26 @@ def page_model_training():
 
                     st.success("✅ 训练完成")
 
+                    # [新增] 训练过程写入状态条
+                    try:
+                        log_fe_step(
+                            operation="模型训练",
+                            description=f"训练完成: {model_name}",
+                            params={
+                                "model": model_name,
+                                "test_size": float(test_size),
+                                "split_strategy": str(split_strategy),
+                                "n_features": int(len(st.session_state.get('feature_cols') or [])),
+                                **(params or {})
+                            },
+                            input_df=df,
+                            status="success",
+                            message=f"R²={res.get('r2', 0):.4f}, RMSE={res.get('rmse', 0):.4f}, MAE={res.get('mae', 0):.4f}"
+                        )
+                    except Exception:
+                        pass
+
+
                     # --- 指标 ---
                     st.markdown("### 📌 单次划分（Test）指标")
                     m1, m2, m3, m4 = st.columns(4)
@@ -1931,6 +2638,63 @@ def page_model_training():
                             "fold_mae": cv_res.get("fold_mae", []),
                         })
                         st.dataframe(fold_df, use_container_width=True, height=200)
+
+                    # --- [增强] 所有模型的训练曲线 + 训练记录落盘 ---
+                    try:
+                        history = res.get('training_history') or {}
+                        # 图内标题尽量用英文，避免服务器环境缺少中文字体导致方块/乱码
+                        fig_curve, hist_export_df = plot_history(history, title=f"{model_name} Training Curves")
+
+                        st.markdown("### 📉 训练曲线（所有模型）")
+                        st.pyplot(fig_curve, use_container_width=True)
+
+                        if hist_export_df is not None and not hist_export_df.empty:
+                            with st.expander("🧾 查看训练曲线数据", expanded=False):
+                                st.dataframe(hist_export_df, use_container_width=True, height=240)
+                                st.download_button(
+                                    "📥 导出训练曲线 CSV",
+                                    hist_export_df.to_csv(index=False).encode("utf-8-sig"),
+                                    f"{model_name}_training_history.csv",
+                                    "text/csv"
+                                )
+
+                        # 保存一次训练 Run（指标+参数+曲线）
+                        manager = TrainingRunManager()
+                        meta = {
+                            "model_name": model_name,
+                            "r2": float(res.get('r2', 0)),
+                            "rmse": float(res.get('rmse', 0)),
+                            "mae": float(res.get('mae', 0)),
+                            "train_time": float(res.get('train_time', 0)),
+                            "split_strategy": str(res.get('split_strategy', '')),
+                            "test_size": float(test_size),
+                            "random_state": int(random_state),
+                            "params": params or {},
+                            "n_samples": int(len(res.get('y_train', [])) + len(res.get('y_test', []))),
+                            "n_features": int(len(st.session_state.get('feature_cols') or [])),
+                        }
+                        summary = manager.save_run(
+                            model_name=model_name,
+                            metadata=meta,
+                            history_df=hist_export_df,
+                            curve_fig=fig_curve,
+                        )
+                        st.session_state.last_training_run_id = summary.run_id
+                        st.caption(f"🗂️ 已保存训练记录: {summary.run_id}（可在【📈 训练记录】查看）")
+                    except Exception:
+                        pass
+
+                    # --- [新增] TFS 网络结构 Summary ---
+                    if model_name == "TensorFlow Sequential":
+                        try:
+                            summary_str = ""
+                            if hasattr(st.session_state.model, "get_model_summary_str"):
+                                summary_str = st.session_state.model.get_model_summary_str() or ""
+                            if summary_str.strip():
+                                with st.expander("🧾 TFS 网络结构（Model Summary）", expanded=False):
+                                    st.code(summary_str)
+                        except Exception:
+                            pass
 
                     # --- 结果表格与导出 ---
                     st.markdown("### 📈 测试集预测结果详情")
@@ -1983,6 +2747,18 @@ def page_model_training():
 
                 except Exception as e:
                     st.error(f"❌ 训练失败: {e}")
+                    # [新增] 失败也写入状态条
+                    try:
+                        log_fe_step(
+                            operation="模型训练",
+                            description=f"训练失败: {model_name}",
+                            params={"model": model_name},
+                            input_df=df,
+                            status="error",
+                            message=str(e)
+                        )
+                    except Exception:
+                        pass
 
     with c_btn2:
         # 脚本导出按钮
@@ -2407,6 +3183,8 @@ def page_hyperparameter_optimization():
 
     col1, col2 = st.columns(2)
 
+
+    disable_opt = False
     with col1:
         trainer = EnhancedModelTrainer()
         available_models = trainer.get_available_models()
@@ -2415,12 +3193,29 @@ def page_hyperparameter_optimization():
         optimizable_models = [
             "随机森林", "XGBoost", "LightGBM", "CatBoost",
             "SVR", "Ridge回归", "Lasso回归", "ElasticNet",
-            "AdaBoost", "梯度提升树"
+            "AdaBoost", "梯度提升树",
+            "TensorFlow Sequential"
         ]
         optimizable_models = [m for m in optimizable_models if m in available_models]
 
-        model_name = st.selectbox("选择模型", optimizable_models)
+        # 兼容：即使当前环境缺少依赖，也显示 TFS 入口（避免“功能存在但界面不显示”）
+        if "TensorFlow Sequential" not in optimizable_models:
+            optimizable_models.append("TensorFlow Sequential")
 
+
+        def _fmt_model_name(n: str) -> str:
+            if n == "TensorFlow Sequential":
+                if TENSORFLOW_AVAILABLE:
+                    return "TFS (TensorFlow Sequential) ✅"
+                return "TFS (TensorFlow Sequential) ⛔ 需要安装 TensorFlow"
+            return n
+
+        model_name = st.selectbox("选择模型", optimizable_models, format_func=_fmt_model_name)
+
+        # 未安装 TensorFlow 时：仍显示入口，但禁用优化按钮并提示安装
+        disable_opt = (model_name == "TensorFlow Sequential" and (not TENSORFLOW_AVAILABLE))
+        if disable_opt:
+            st.warning("检测到当前环境未安装 TensorFlow，TFS 模型暂不可进行 Optuna 优化。请先安装依赖：`pip install tensorflow`（或按你的硬件选择 tensorflow-cpu / tensorflow-gpu）。")
     with col2:
         n_trials = st.slider("优化轮数", 10, 200, DEFAULT_OPTUNA_TRIALS)
         cv_folds = st.slider("交叉验证折数", 3, 10, 5)
@@ -2429,7 +3224,7 @@ def page_hyperparameter_optimization():
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    if st.button("🚀 开始优化", type="primary"):
+    if st.button("🚀 开始优化", type="primary", disabled=disable_opt):
         try:
             optimizer = HyperparameterOptimizer()
 
@@ -2457,6 +3252,24 @@ def page_hyperparameter_optimization():
             st.session_state.best_params = best_params
             st.session_state.best_score = best_score
             st.session_state.optimized_model_name = model_name  # 记录优化的是哪个模型
+
+            # [新增] 记录到状态条
+            try:
+                log_fe_step(
+                    operation="超参优化",
+                    description=f"优化完成: {model_name}",
+                    params={
+                        "model": model_name,
+                        "n_trials": int(n_trials),
+                        "cv_folds": int(cv_folds),
+                        **(best_params or {})
+                    },
+                    input_df=df,
+                    status="success",
+                    message=f"best_r2={best_score:.4f}"
+                )
+            except Exception:
+                pass
 
             st.markdown("### 最佳参数")
             st.json(best_params)
@@ -2512,6 +3325,18 @@ def page_hyperparameter_optimization():
         except Exception as e:
             st.error(f"❌ 优化失败: {str(e)}")
             st.code(traceback.format_exc())
+            # [新增] 失败也写入状态条
+            try:
+                log_fe_step(
+                    operation="超参优化",
+                    description=f"优化失败: {model_name}",
+                    params={"model": model_name, "n_trials": int(n_trials), "cv_folds": int(cv_folds)},
+                    input_df=df,
+                    status="error",
+                    message=str(e)
+                )
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -2715,37 +3540,168 @@ def page_active_learning():
 
 
 # ============================================================
-# 主函数
+# 页面：训练记录（历史 Run）
 # ============================================================
-def main():
-    """主函数"""
-    page = render_sidebar()
+def page_training_records():
+    st.title("📈 训练记录")
+    st.caption("自动保存每次训练的指标、参数、训练曲线（loss/迭代指标或学习曲线）。")
 
-    if page == "🏠 首页":
-        page_home()
-    elif page == "📤 数据上传":
-        page_data_upload()
-    elif page == "🔍 数据探索":
-        page_data_explore()
-    elif page == "🧹 数据清洗":
-        page_data_cleaning()
-    elif page == "✨ 数据增强":
-        page_data_enhancement()
-    elif page == "🧬 分子特征":
-        page_molecular_features()
-    elif page == "🎯 特征选择":
-        page_feature_selection()
-    elif page == "🤖 模型训练":
-        page_model_training()
-    elif page == "📊 模型解释":
-        page_model_interpretation()
-    elif page == "🔮 预测应用":
-        page_prediction()
-    elif page == "⚙️ 超参优化":
-        page_hyperparameter_optimization()
-    elif page == "🧠 主动学习":
-        page_active_learning()
+    manager = TrainingRunManager()
+    runs = manager.list_runs(limit=200)
+    if not runs:
+        st.info("暂无训练记录。请先在【🤖 模型训练】页面完成一次训练。")
+        return
+
+    # 选择 Run
+    def _label(r):
+        s = f"{r.run_id}｜{r.model_name}"
+        if r.r2 is not None:
+            s += f"｜R²={r.r2:.4f}"
+        return s
+
+    options = { _label(r): r.run_id for r in runs }
+    sel = st.selectbox("选择一条训练记录", options=list(options.keys()), index=0)
+    run_id = options[sel]
+
+    payload = manager.load_run(run_id)
+    meta = payload.get("metadata") or {}
+    hist_df = payload.get("history")
+
+    # 指标概览
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("模型", str(meta.get("model_name", "")) or "-")
+    c2.metric("R²", f"{float(meta.get('r2', 0)):.4f}" if meta.get("r2") is not None else "-")
+    c3.metric("RMSE", f"{float(meta.get('rmse', 0)):.4f}" if meta.get("rmse") is not None else "-")
+    c4.metric("MAE", f"{float(meta.get('mae', 0)):.4f}" if meta.get("mae") is not None else "-")
+
+    st.markdown("---")
+    st.markdown("### 📉 训练曲线")
+    if payload.get("training_curve_png"):
+        st.image(payload["training_curve_png"], use_container_width=True)
+    else:
+        st.info("该记录未包含训练曲线图片（可能为旧版本记录）。")
+
+    if hist_df is not None and not hist_df.empty:
+        st.markdown("### 🧾 训练历史数据")
+        st.dataframe(hist_df, use_container_width=True, height=260)
+        st.download_button(
+            "📥 下载训练历史 CSV",
+            data=hist_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{run_id}_history.csv",
+            mime="text/csv",
+        )
+
+    with st.expander("🔎 查看元数据（参数/切分/时间等）", expanded=False):
+        st.json(meta)
+        st.download_button(
+            "📥 下载 metadata.json",
+            data=json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name=f"{run_id}_metadata.json",
+            mime="application/json",
+        )
+
+    extra_pngs = payload.get("extra_pngs") or {}
+    if extra_pngs:
+        with st.expander("🖼️ 其它图表", expanded=False):
+            for fn, b in extra_pngs.items():
+                st.markdown(f"**{fn}**")
+                st.image(b, use_container_width=True)
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# 页面：状态条记录 / 操作日志
+# ============================================================
+def page_status_log():
+    """特征工程状态条记录与数据导出"""
+    st.title("📋 状态条记录")
+
+    tracker = st.session_state.get("fe_tracker", None)
+    current_df = st.session_state.get('processed_data')
+    if current_df is None:
+        current_df = st.session_state.get('data')
+
+    tab1, tab2, tab3 = st.tabs(["📜 操作记录", "💾 数据导出", "ℹ️ 当前状态"])
+
+    with tab1:
+        render_status_panel(tracker)
+
+    with tab2:
+        if current_df is not None and not getattr(current_df, "empty", True):
+            render_data_export_panel(current_df, tracker)
+        else:
+            st.info("暂无可导出的数据，请先上传/生成数据。")
+
+    with tab3:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("当前数据", "processed_data" if st.session_state.get('processed_data') is not None else ("data" if st.session_state.get('data') is not None else "无"))
+        c2.metric("特征数 (X)", len(st.session_state.get("feature_cols") or []))
+        c3.metric("目标 (Y)", st.session_state.get("target_col") or "未选择")
+
+        last = None
+        if tracker is not None:
+            try:
+                last = tracker.get_last_step()
+            except Exception:
+                last = None
+
+        st.markdown("---")
+        if last:
+            icon = {"success": "✅", "warning": "⚠️", "error": "❌"}.get(last.get("status", "success"), "ℹ️")
+            st.markdown(f"### 最近一次操作\n{icon} **{last.get('operation', '')}** - {last.get('description', '')}")
+            st.caption(f"#{last.get('step_id','?')} @ {last.get('timestamp','')}")
+            if last.get("message"):
+                st.info(last.get("message"))
+        else:
+            st.info("暂无操作记录。完成一次数据处理/特征选择/训练后，这里会自动显示。")
+
+
+def render_export_section():
+    """渲染数据导出区域"""
+    st.markdown("---")
+    st.markdown("## 📥 数据导出")
+
+    current_data = st.session_state.get('processed_data')  # 注意：改为 processed_data
+    tracker = st.session_state.get('fe_tracker')
+
+    if current_data is not None and not current_data.empty:
+        render_data_export_panel(current_data, tracker)
+    else:
+        st.info("请先加载数据后再使用导出功能")
+
+
+# ============================================================
+# 主程序入口（保持原有结构）
+# ============================================================
+page = render_sidebar()
+
+# [增强] 顶部轻量状态条：避免侧边栏折叠后找不到 TFS 入口/操作记录
+render_top_status_bar()
+
+if page == "🏠 首页":
+    page_home()
+elif page == "📤 数据上传":
+    page_data_upload()
+elif page == "🔍 数据探索":
+    page_data_explore()
+elif page == "🧹 数据清洗":
+    page_data_cleaning()
+elif page == "✨ 数据增强":
+    page_data_enhancement()
+elif page == "🧬 分子特征":
+    page_molecular_features()
+elif page == "🎯 特征选择":
+    page_feature_selection()
+elif page == "🤖 模型训练":
+    page_model_training()
+elif page == "📈 训练记录":
+    page_training_records()
+elif page == "📊 模型解释":
+    page_model_interpretation()
+elif page == "🔮 预测应用":
+    page_prediction()
+elif page == "⚙️ 超参优化":
+    page_hyperparameter_optimization()
+elif page == "🧠 主动学习":
+    page_active_learning()
+elif page == "📋 状态条记录":
+    page_status_log()
