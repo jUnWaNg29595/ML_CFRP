@@ -43,6 +43,36 @@ try:
 except ImportError:
     TORCHANI_AVAILABLE = False
 import streamlit as st
+
+# =========================
+# Operation Log Utilities
+# =========================
+def _oplog_init():
+    if "oplog" not in st.session_state:
+        st.session_state["oplog"] = []
+
+def oplog(msg: str):
+    """Append a timestamped message to operation log and show it in UI."""
+    _oplog_init()
+    import datetime as _dtmod
+    ts = _dtmod.datetime.now().strftime("%H:%M:%S")
+    st.session_state["oplog"].append(f"[{ts}] {msg}")
+
+def oplog_clear():
+    st.session_state["oplog"] = []
+
+def oplog_render():
+    _oplog_init()
+    with st.expander("🧾 Operation Log", expanded=False):
+        if st.session_state["oplog"]:
+            st.code("\n".join(st.session_state["oplog"]))
+        else:
+            st.caption("No operations yet.")
+        c1, c2 = st.columns([1, 5])
+        with c1:
+            if st.button("Clear Log"):
+                oplog_clear()
+                st.rerun()
 import pandas as pd
 import numpy as np
 import os
@@ -81,6 +111,7 @@ from core.molecular_features import AdvancedMolecularFeatureExtractor, RDKitFeat
 from core.feature_selector import SmartFeatureSelector, SmartSparseDataSelector, show_robust_feature_selection
 from core.optimizer import HyperparameterOptimizer, InverseDesigner, generate_tuning_suggestions
 from core.visualizer import Visualizer
+from core.plot_utils import fig_to_png_bytes, fig_to_html
 from core.training_curves import plot_history
 from core.training_runs import TrainingRunManager
 from core.applicability_domain import ApplicabilityDomainAnalyzer, TanimotoADAnalyzer
@@ -1362,6 +1393,15 @@ def page_data_cleaning():
                 help="如果勾选，那些经过修复仍无法解析为分子的行将被直接删除。"
             )
 
+        # ==== 清洗结果预览（支持多列） ====
+        if st.session_state.get("smiles_clean_preview") is not None:
+            st.markdown("#### 👀 清洗前后预览（最多50行）")
+            st.dataframe(st.session_state["smiles_clean_preview"], use_container_width=True)
+            if st.button("🧹 清除预览", key="clear_smiles_preview"):
+                st.session_state["smiles_clean_preview"] = None
+                st.session_state["smiles_clean_cols"] = None
+                st.rerun()
+
         st.markdown("---")
 
         if st.button("🧪 执行清洗与修复", type="primary"):
@@ -1374,12 +1414,26 @@ def page_data_cleaning():
                     if not hasattr(cleaner, 'clean_smiles_columns'):
                         st.error("❌ 后端代码未更新：未在 AdvancedDataCleaner 中找到 `clean_smiles_columns` 方法。")
                     else:
+                        df_before = df[cols_to_clean].copy()
                         new_df = cleaner.clean_smiles_columns(
                             columns=cols_to_clean,
                             strategy=strategy,
                             drop_invalid=drop_invalid
                         )
                         st.session_state.processed_data = new_df
+
+                        # 保存清洗前后对比预览（多列支持），供 rerun 后展示
+                        try:
+                            _preview = pd.DataFrame(index=new_df.index)
+                            for _c in cols_to_clean:
+                                _preview[f"{_c} (before)"] = df_before.get(_c)
+                                _preview[f"{_c} (after)"] = new_df.get(_c)
+                            st.session_state["smiles_clean_preview"] = _preview.head(50)
+                            st.session_state["smiles_clean_cols"] = cols_to_clean
+                        except Exception:
+                            # 预览失败不影响主流程
+                            pass
+
 
                         st.success("✅ 清洗完成！")
 
@@ -1719,6 +1773,9 @@ def page_molecular_features():
 
     st.markdown("### 🔬 SMILES列选择")
 
+    # Render operation log panel
+    oplog_render()
+
     # -----------------------------
     # 多组分/混合物 SMILES 处理
     # 说明：
@@ -1857,6 +1914,10 @@ def page_molecular_features():
         help="不同方法适用于不同场景"
     )
 
+
+    # Log selected extraction method
+    oplog(f"Selected molecular feature method: {extraction_method}")
+
     # UI 变量初始化
     fp_type = "MACCS"
     fp_bits = 2048
@@ -1877,6 +1938,10 @@ def page_molecular_features():
     tda_use_pim = False
     tda_pim_pixels = 10
     tda_pim_spread = 1.0
+
+    # [新增] ML力场(ANI) 参数默认值
+    ani_batch_size = 64
+    ani_cpu_workers = max(1, (os.cpu_count() or 1) - 1) if os.name != 'nt' else 1
 
     # ============== [修改] 指纹参数设置 ==============
     if "分子指纹" in extraction_method:
@@ -1994,15 +2059,59 @@ def page_molecular_features():
         col_h, col_p = st.columns(2)
         with col_h:
             candidate_cols = [c for c in text_cols if c != smiles_col]
-            hardener_col = st.selectbox("选择【固化剂】SMILES列", candidate_cols)
-            if hardener_col:
-                hardener_component_cols = [hardener_col]
+
+            # ✅ 支持多选：允许选择多个【固化剂】SMILES列（例如 hardener_smiles_1/2/3）
+            # 使用 key 交给 Streamlit 管理状态，避免“需要点两次才能选上”的交互问题
+            if "epoxy_hardener_cols" not in st.session_state:
+                st.session_state["epoxy_hardener_cols"] = ([candidate_cols[0]] if candidate_cols else [])
+
+            hardener_cols = st.multiselect(
+                "选择【固化剂】SMILES列",
+                options=candidate_cols,
+                key="epoxy_hardener_cols",
+                help="可多选：系统会把所选固化剂SMILES列合并用于环氧树脂反应特征提取"
+            )
+
+            # 为兼容后续逻辑：hardener_col 保留第一个选择；hardener_component_cols 为全部选择
+            hardener_col = hardener_cols[0] if hardener_cols else None
+            hardener_component_cols = hardener_cols if hardener_cols else None
+
         with col_p:
             num_cols = df.select_dtypes(include=np.number).columns.tolist()
-            phr_col = st.selectbox("选择【配比/PHR】列 (可选)", ["无 (假设理想配比)"] + num_cols)
+            phr_col = st.selectbox("选择【配比】列 (可选)", ["无 (假设理想配比)"] + num_cols)
+
+            stoich_mode = "theoretical"
+            if phr_col and phr_col != "无 (假设理想配比)":
+                stoich_mode = st.selectbox(
+                    "配比含义",
+                    ["Resin/Hardener (总质量比, R/H)", "PHR (Hardener per 100 Resin)"],
+                    index=0,
+                    help="如果你的配比列是‘树脂总量/固化剂总量(R/H)’，选第一项；如果是传统 PHR（每100份树脂对应固化剂份数），选第二项。"
+                )
 
 
-    # ============== [新增 UI] TDA 参数 ==============
+    
+    # ============== [新增 UI] ML力场(ANI) 参数 ==============
+    if "ML力场特征" in extraction_method:
+        st.markdown("#### ⚛️ ML 力场 (ANI2x) 参数")
+        st.info("该方法会先生成3D构象，再用 ANI2x 推理能量/力。较耗时，建议调大批量并使用多核CPU。")
+        col_a1, col_a2 = st.columns(2)
+        with col_a1:
+            ani_batch_size = st.selectbox("ANI Batch Size", [16, 32, 64, 128], index=2)
+        with col_a2:
+            max_workers = max(1, (os.cpu_count() or 1) - 1) if os.name != 'nt' else 1
+            if max_workers <= 1:
+                ani_cpu_workers = 1
+                st.info("⚠️ 当前环境仅支持 1 个 CPU worker（Windows / 单核环境）。")
+            else:
+                ani_cpu_workers = st.slider(
+                    "CPU Workers (3D Generation)",
+                    min_value=1,
+                    max_value=max_workers,
+                    value=min(max_workers, ani_cpu_workers)
+                )
+        st.caption("提示：3D 构象生成使用多进程；ANI 推理在主进程使用 Torch CPU 多线程。")
+# ============== [新增 UI] TDA 参数 ==============
     if "TDA拓扑特征" in extraction_method:
         st.markdown("#### 🧩 TDA(持续同调) 参数")
         st.info("需要安装 ripser/persim：pip install ripser persim。TDA 将把 3D 构象点云转为 Betti0/1/2 的拓扑统计特征。")
@@ -2206,6 +2315,11 @@ def page_molecular_features():
 
             elif "Transformer Embedding" in extraction_method:
                 from core.molecular_features import SmilesTransformerEmbeddingExtractor
+                oplog(f"Running Transformer embedding: model={lm_model_name}, pooling={lm_pooling}, max_length={lm_max_length}, batch={lm_batch_size}")
+                oplog(f"SMILES sources (resin_component_cols): {resin_component_cols}")
+                if hardener_component_cols is not None:
+                    oplog(f"SMILES sources (hardener_component_cols): {hardener_component_cols}")
+                oplog(f"Hardener fusion mode: {hardener_fusion_mode}")
                 status_text.text("正在加载预训练Transformer并提取Embedding...")
                 extractor = SmilesTransformerEmbeddingExtractor(
                     model_name=lm_model_name,
@@ -2224,12 +2338,14 @@ def page_molecular_features():
 
             elif "ML力场" in extraction_method:
                 from core.molecular_features import MLForceFieldExtractor
+                oplog("Running ML force field features (ANI2x): 3D generation + ANI inference")
                 status_text.text("正在计算ANI力场特征...")
                 extractor = MLForceFieldExtractor()
                 if not extractor.AVAILABLE:
                     st.error("TorchANI 未安装")
                     return
-                features_df, valid_indices = extractor.smiles_to_ani_features(smiles_list_input)
+                oplog(f"ANI params: batch_size={ani_batch_size}, cpu_workers(3D)={ani_cpu_workers}")
+                features_df, valid_indices = extractor.smiles_to_ani_features(smiles_list_input, batch_size=ani_batch_size, n_jobs=ani_cpu_workers)
             elif "FGD" in extraction_method:
                 from core.molecular_features import FGDFeatureExtractor
                 status_text.text("正在执行 FGD 结构分类与编码...")
@@ -2264,14 +2380,22 @@ def page_molecular_features():
                     phr_list = df[phr_col].tolist()
 
                 extractor = EpoxyDomainFeatureExtractor()
-                features_df, valid_indices = extractor.extract_features(smiles_list, hardener_list, phr_list)
+                features_df, valid_indices = extractor.extract_features(smiles_list, hardener_list, phr_list, stoich_mode)
 
             progress_bar.progress(100)
 
             # --- 合并结果逻辑 ---
             if len(features_df) > 0:
                 st.session_state.molecular_features = features_df
-                prefix = f"{smiles_col}_"
+                prefix = f"{smiles_col}_"  # default
+                # ✅ 更清晰的命名：多组分/拼接模式不再使用“第一列名”作为前缀
+                try:
+                    if hardener_list and isinstance(hardener_fusion_mode, str) and hardener_fusion_mode.startswith("拼接SMILES"):
+                        prefix = "resin_hardener_"
+                    elif resin_mix_mode and isinstance(resin_component_cols, list) and len(resin_component_cols) > 1:
+                        prefix = f"multi_smiles_{len(resin_component_cols)}_"
+                except Exception:
+                    pass
                 features_df = features_df.add_prefix(prefix)
 
                 df_valid = df.iloc[valid_indices].reset_index(drop=True)
@@ -2786,86 +2910,392 @@ def page_model_interpretation():
     y_train = st.session_state.y_train
     X_test = st.session_state.X_test
     y_test = st.session_state.y_test
-    feature_names = st.session_state.feature_cols
+    feature_names = st.session_state.feature_cols or []
+    n_features = len(feature_names)
 
     tab1, tab2, tab3 = st.tabs(["🔍 SHAP分析", "📈 预测性能", "🎯 特征重要性"])
 
-    # --- 1. SHAP 分析 (恢复选项) ---
+    def _export_matplotlib_fig(fig, base_name: str, key_prefix: str):
+        """Export matplotlib fig as PNG/HTML download buttons."""
+        if fig is None:
+            return
+        try:
+            png_bytes = fig_to_png_bytes(fig)
+            st.download_button(
+                "📥 导出图像 PNG",
+                png_bytes,
+                file_name=f"{base_name}.png",
+                mime="image/png",
+                key=f"{key_prefix}_png",
+            )
+            html_str = fig_to_html(fig, title=base_name)
+            st.download_button(
+                "📥 导出图像 HTML",
+                html_str.encode("utf-8"),
+                file_name=f"{base_name}.html",
+                mime="text/html",
+                key=f"{key_prefix}_html",
+            )
+        except Exception as e:
+            st.warning(f"图像导出失败: {e}")
+
+    # --- 1) SHAP / 快速解释 ---
     with tab1:
-        st.markdown("### SHAP特征重要性")
+        st.markdown("### 特征解释")
 
-        # 恢复这两个选项控件
-        c_opt1, c_opt2 = st.columns(2)
-        with c_opt1:
-            plot_type = st.selectbox("图表类型", ["bar", "beeswarm"], index=0)
-        with c_opt2:
-            max_display = st.slider("显示特征数量", 5, 50, 20)
+        default_fast = n_features >= 300
+        method = st.radio(
+            "解释方法",
+            ["SHAP（更准确，可能较慢）", "快速模式（Permutation Importance，推荐）"],
+            index=1 if default_fast else 0,
+            horizontal=True,
+            key="interp_method",
+        )
 
-        if st.button("🔍 计算SHAP值"):
-            with st.spinner("正在计算 SHAP 值 (可能较慢)..."):
-                try:
-                    interp = EnhancedModelInterpreter(
-                        model, X_train, y_train, X_test, y_test,
-                        model_name, feature_names=feature_names
+        if n_features >= 300:
+            st.warning(
+                f"当前特征数量为 {n_features}。若模型不是树/线性模型，SHAP（尤其 KernelExplainer）可能非常慢甚至卡住。建议使用“快速模式”。"
+            )
+
+        # ---------- SHAP ----------
+        if method.startswith("SHAP"):
+            c_opt1, c_opt2, c_opt3 = st.columns(3)
+            with c_opt1:
+                plot_type = st.selectbox("图表类型", ["bar", "beeswarm"], index=0, key="shap_plot_type")
+            with c_opt2:
+                max_display = st.slider("显示特征数量", 5, 50, 20, key="shap_max_display")
+            with c_opt3:
+                # 限制采样条数，提速
+                max_val = max(20, min(500, len(X_test)))
+                max_samples = int(
+                    st.number_input(
+                        "采样条数（越小越快）",
+                        min_value=20,
+                        max_value=int(max_val),
+                        value=int(min(200, len(X_test))),
+                        step=10,
+                        key="shap_max_samples",
                     )
-                    # 调用修改后的 plot_summary，获取图和数据
-                    fig, df_shap = interp.plot_summary(plot_type=plot_type, max_display=max_display)
+                )
 
-                    if fig:
-                        # 限制图片宽度
+            c_k1, c_k2 = st.columns(2)
+            with c_k1:
+                kernel_bg_default = 20 if n_features >= 300 else 50
+                kernel_bg = int(
+                    st.number_input(
+                        "Kernel 背景样本数",
+                        min_value=5,
+                        max_value=100,
+                        value=int(kernel_bg_default),
+                        step=5,
+                        key="shap_kernel_bg",
+                    )
+                )
+            with c_k2:
+                kernel_ns = int(
+                    st.number_input(
+                        "Kernel nsamples",
+                        min_value=50,
+                        max_value=2000,
+                        value=200,
+                        step=50,
+                        key="shap_kernel_nsamples",
+                    )
+                )
+
+            if st.button("🔍 计算SHAP值", key="btn_compute_shap"):
+                with st.spinner("正在计算 SHAP 值 (可能较慢)..."):
+                    try:
+                        interp = EnhancedModelInterpreter(
+                            model,
+                            X_train,
+                            y_train,
+                            X_test,
+                            y_test,
+                            model_name,
+                            feature_names=feature_names,
+                            max_samples=max_samples,
+                            kernel_background=kernel_bg,
+                            kernel_nsamples=kernel_ns,
+                        )
+                        fig, df_shap = interp.plot_summary(plot_type=plot_type, max_display=max_display)
+
+                        if fig:
+                            c1, c2, c3 = st.columns([1, 6, 1])
+                            with c2:
+                                st.pyplot(fig, use_container_width=True)
+
+                                if df_shap is not None:
+                                    csv = df_shap.to_csv(index=False).encode("utf-8-sig")
+                                    st.download_button(
+                                        "📥 导出 SHAP 数据 (CSV)",
+                                        csv,
+                                        "shap_values.csv",
+                                        "text/csv",
+                                        key="shap_csv",
+                                    )
+
+                                _export_matplotlib_fig(fig, base_name="shap_summary", key_prefix="shap_fig")
+                        else:
+                            st.error("无法生成 SHAP 图，请检查模型是否支持。")
+                    except Exception as e:
+                        st.error(f"计算出错: {str(e)}")
+            else:
+                st.caption("提示：SHAP 结果会受到采样条数/背景样本的影响；特征数很大时推荐使用快速模式。")
+
+        # ---------- Permutation (Fast) ----------
+        else:
+            st.markdown("#### ⚡ 快速重要性（Permutation Importance）")
+
+            c_q1, c_q2, c_q3, c_q4 = st.columns(4)
+            with c_q1:
+                top_n = st.slider("显示特征数量", 5, 50, 20, key="perm_top_n")
+            with c_q2:
+                n_repeats = st.slider("重复次数", 1, 10, 3, key="perm_repeats")
+            with c_q3:
+                max_val = max(30, min(1000, len(X_test)))
+                sample_n = int(
+                    st.number_input(
+                        "采样条数",
+                        min_value=30,
+                        max_value=int(max_val),
+                        value=int(min(200, len(X_test))),
+                        step=20,
+                        key="perm_sample_n",
+                    )
+                )
+            with c_q4:
+                scoring = st.selectbox("评分指标", ["r2", "neg_root_mean_squared_error"], index=0, key="perm_scoring")
+
+            if st.button("⚡ 计算快速重要性", key="btn_compute_perm"):
+                with st.spinner("正在计算 permutation importance..."):
+                    try:
+                        from sklearn.inspection import permutation_importance
+
+                        # 确保 X/y 的索引对齐
+                        if isinstance(X_test, pd.DataFrame):
+                            Xdf = X_test.copy()
+                        else:
+                            Xdf = pd.DataFrame(np.asarray(X_test), columns=feature_names)
+
+                        if isinstance(y_test, pd.Series):
+                            y_series = y_test.copy()
+                        elif isinstance(y_test, pd.DataFrame):
+                            y_series = y_test.iloc[:, 0].copy()
+                        else:
+                            y_series = pd.Series(np.asarray(y_test).ravel(), index=Xdf.index)
+
+                        if len(Xdf) > sample_n:
+                            X_sample = Xdf.sample(n=sample_n, random_state=42)
+                            y_sample = y_series.loc[X_sample.index]
+                        else:
+                            X_sample = Xdf
+                            y_sample = y_series
+
+                        result = permutation_importance(
+                            model,
+                            X_sample,
+                            np.asarray(y_sample).ravel(),
+                            n_repeats=int(n_repeats),
+                            random_state=42,
+                            scoring=scoring,
+                        )
+
+                        df_perm = pd.DataFrame(
+                            {
+                                "Feature": feature_names,
+                                "Importance": result.importances_mean,
+                                "Std": result.importances_std,
+                            }
+                        ).sort_values("Importance", ascending=False)
+
+                        viz = Visualizer()
+                        fig, _ = viz.plot_feature_importance(
+                            df_perm["Importance"].values,
+                            df_perm["Feature"].values.tolist(),
+                            f"{model_name} - Permutation",
+                            top_n=int(top_n),
+                        )
+
                         c1, c2, c3 = st.columns([1, 6, 1])
                         with c2:
                             st.pyplot(fig, use_container_width=True)
 
-                            # SHAP 数据导出
-                            if df_shap is not None:
-                                csv = df_shap.to_csv(index=False).encode('utf-8')
-                                st.download_button("📥 导出 SHAP 数据 (CSV)", csv, "shap_values.csv", "text/csv")
-                    else:
-                        st.error("无法生成 SHAP 图，请检查模型是否支持。")
-                except Exception as e:
-                    st.error(f"计算出错: {str(e)}")
+                            csv = df_perm.to_csv(index=False).encode("utf-8-sig")
+                            st.download_button(
+                                "📥 导出 permutation 数据 (CSV)",
+                                csv,
+                                "permutation_importance.csv",
+                                "text/csv",
+                                key="perm_csv",
+                            )
 
-    # --- 2. 预测性能 ---
+                            _export_matplotlib_fig(fig, base_name="permutation_importance", key_prefix="perm_fig")
+
+                    except Exception as e:
+                        st.error(f"计算失败: {e}")
+            else:
+                st.caption("Permutation importance 对模型无假设、速度更快；数值越大表示该特征越重要。")
+
+    # --- 2) 预测性能 ---
     with tab2:
         st.markdown("### 预测性能")
         visualizer = Visualizer()
-        c1, c2, c3 = st.columns([1, 2, 1])
-        with c2:
-            fig, df_res = visualizer.plot_residuals(y_test, st.session_state.train_result['y_pred'], model_name)
-            st.pyplot(fig, use_container_width=True)
-            csv = df_res.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 导出残差数据", csv, "residuals.csv")
 
-    # --- 3. 特征重要性 (含 MACCS 解释) ---
+        try:
+            y_pred = st.session_state.train_result["y_pred"] if st.session_state.get("train_result") else None
+        except Exception:
+            y_pred = None
+
+        if y_pred is None:
+            st.warning("缺少预测结果，请先在训练页完成一次训练。")
+        else:
+            c1, c2, c3 = st.columns([1, 2, 1])
+            with c2:
+                fig, df_res = visualizer.plot_residuals(y_test, y_pred, model_name)
+                st.pyplot(fig, use_container_width=True)
+
+                if df_res is not None:
+                    csv = df_res.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "📥 导出残差数据 (CSV)",
+                        csv,
+                        "residuals.csv",
+                        "text/csv",
+                        key="res_csv",
+                    )
+
+                _export_matplotlib_fig(fig, base_name="residuals", key_prefix="res_fig")
+
+    # --- 3) 特征重要性 ---
     with tab3:
         st.markdown("### 特征重要性")
-        if hasattr(model, 'feature_importances_'):
+        top_n = st.slider("显示特征数量", 5, 50, 20, key="fi_top_n")
+
+        if hasattr(model, "feature_importances_"):
             visualizer = Visualizer()
             c1, c2, c3 = st.columns([1, 2, 1])
             with c2:
-                fig, df_imp = visualizer.plot_feature_importance(model.feature_importances_, feature_names, model_name)
+                fig, df_imp = visualizer.plot_feature_importance(
+                    model.feature_importances_, feature_names, model_name, top_n=int(top_n)
+                )
                 st.pyplot(fig, use_container_width=True)
-                csv = df_imp.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 导出重要性数据", csv, "importance.csv")
+
+                if df_imp is not None:
+                    csv = df_imp.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "📥 导出重要性数据 (CSV)",
+                        csv,
+                        "importance.csv",
+                        "text/csv",
+                        key="fi_csv",
+                    )
+
+                _export_matplotlib_fig(fig, base_name="feature_importance", key_prefix="fi_fig")
 
             # MACCS 解释表
-            st.markdown("#### 🧬 特征含义解析")
-            exps = []
-            for f in df_imp.head(15)['Feature']:
-                desc = "数值特征"
-                if "MACCS" in f:
-                    try:
-                        # 动态导入防止报错
-                        from core.molecular_features import get_maccs_description
-                        idx = int(f.split('_')[-1])
-                        desc = get_maccs_description(idx)
-                    except:
-                        desc = "MACCS 指纹片段"
-                exps.append({"特征名": f, "含义": desc})
-            st.table(pd.DataFrame(exps))
+            if df_imp is not None and not df_imp.empty:
+                st.markdown("#### 🧬 特征含义解析（Top 15）")
+                exps = []
+                for f in df_imp.head(15)["Feature"]:
+                    desc = "数值特征"
+                    if "MACCS" in str(f):
+                        try:
+                            from core.molecular_features import get_maccs_description
+
+                            idx = int(str(f).split("_")[-1])
+                            desc = get_maccs_description(idx)
+                        except Exception:
+                            desc = "MACCS 指纹片段"
+                    exps.append({"特征名": f, "含义": desc})
+                st.table(pd.DataFrame(exps))
         else:
-            st.info("该模型不支持原生特征重要性，请使用 SHAP 分析。")
+            st.info("该模型不支持原生 feature_importances_。可在【SHAP分析】中使用 SHAP 或快速模式。")
+            st.markdown("#### （可选）用 permutation importance 作为替代")
+
+            c_q1, c_q2, c_q3 = st.columns(3)
+            with c_q1:
+                n_repeats = st.slider("重复次数", 1, 10, 3, key="fi_perm_repeats")
+            with c_q2:
+                max_val = max(30, min(1000, len(X_test)))
+                sample_n = int(
+                    st.number_input(
+                        "采样条数",
+                        min_value=30,
+                        max_value=int(max_val),
+                        value=int(min(200, len(X_test))),
+                        step=20,
+                        key="fi_perm_sample",
+                    )
+                )
+            with c_q3:
+                scoring = st.selectbox(
+                    "评分指标", ["r2", "neg_root_mean_squared_error"], index=0, key="fi_perm_scoring"
+                )
+
+            if st.button("⚡ 计算替代重要性", key="btn_fi_perm"):
+                with st.spinner("正在计算 permutation importance..."):
+                    try:
+                        from sklearn.inspection import permutation_importance
+
+                        if isinstance(X_test, pd.DataFrame):
+                            Xdf = X_test.copy()
+                        else:
+                            Xdf = pd.DataFrame(np.asarray(X_test), columns=feature_names)
+
+                        if isinstance(y_test, pd.Series):
+                            y_series = y_test.copy()
+                        elif isinstance(y_test, pd.DataFrame):
+                            y_series = y_test.iloc[:, 0].copy()
+                        else:
+                            y_series = pd.Series(np.asarray(y_test).ravel(), index=Xdf.index)
+
+                        if len(Xdf) > sample_n:
+                            X_sample = Xdf.sample(n=sample_n, random_state=42)
+                            y_sample = y_series.loc[X_sample.index]
+                        else:
+                            X_sample = Xdf
+                            y_sample = y_series
+
+                        result = permutation_importance(
+                            model,
+                            X_sample,
+                            np.asarray(y_sample).ravel(),
+                            n_repeats=int(n_repeats),
+                            random_state=42,
+                            scoring=scoring,
+                        )
+
+                        df_perm = pd.DataFrame(
+                            {
+                                "Feature": feature_names,
+                                "Importance": result.importances_mean,
+                                "Std": result.importances_std,
+                            }
+                        ).sort_values("Importance", ascending=False)
+
+                        viz = Visualizer()
+                        fig, _ = viz.plot_feature_importance(
+                            df_perm["Importance"].values,
+                            df_perm["Feature"].values.tolist(),
+                            f"{model_name} - Permutation",
+                            top_n=int(top_n),
+                        )
+                        st.pyplot(fig, use_container_width=True)
+
+                        csv = df_perm.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            "📥 导出替代重要性 (CSV)",
+                            csv,
+                            "permutation_importance.csv",
+                            "text/csv",
+                            key="fi_perm_csv",
+                        )
+
+                        _export_matplotlib_fig(fig, base_name="permutation_importance", key_prefix="fi_perm_fig")
+
+                    except Exception as e:
+                        st.error(f"计算失败: {e}")
 
 def page_prediction():
     """预测应用页面（修复：预测阶段应用 imputer/scaler；支持指纹适用域）"""

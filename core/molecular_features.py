@@ -102,7 +102,7 @@ def _generate_3d_data_worker(smiles):
 
             # 3) 快速几何优化：优先 MMFF，否则 UFF
             try:
-                AllChem.MMFFOptimizeMolecule(mol, maxIters=80)
+                AllChem.MMFFOptimizeMolecule(mol, maxIters=40)
             except Exception:
                 try:
                     AllChem.UFFOptimizeMolecule(mol, maxIters=200)
@@ -283,7 +283,7 @@ class RDKit3DDescriptorExtractor:
             raise ImportError("需要安装 RDKit 才能使用 3D 描述符。")
 
         if n_jobs is None:
-            n_jobs = 1 if os.name == 'nt' else mp.cpu_count()
+            n_jobs = 1 if os.name == 'nt' else max(1, (mp.cpu_count() or 1) - 1)
 
         feats = []
         valid_indices = []
@@ -827,8 +827,24 @@ class MLForceFieldExtractor:
 
         self.energy_unit = (energy_unit or "hartree").lower()
 
+        # ✅ CPU 性能优化：让 Torch 在 CPU 上充分使用线程
+        # 注意：在多进程 3D 生成时，ANI 推理通常在主进程执行，因此这里多线程能明显加速
+        try:
+            if self.device.type == "cpu":
+                import os as _os
+                n_cpu = _os.cpu_count() or 1
+                # 计算线程：尽量用满 CPU；Interop 线程保持较小以减少调度开销
+                self.torch.set_num_threads(n_cpu)
+                try:
+                    self.torch.set_num_interop_threads(min(4, n_cpu))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         try:
             self.model = self.torchani.models.ANI2x().to(self.device)
+            self.model.eval()
         except Exception as e:
             print(f"ANI Model load error: {e}")
             self.AVAILABLE = False
@@ -883,7 +899,7 @@ class MLForceFieldExtractor:
             forces.detach().cpu().numpy().astype(np.float64)
         )
 
-    def smiles_to_ani_features(self, smiles_list, batch_size: int = 32, n_jobs: int | None = None):
+    def smiles_to_ani_features(self, smiles_list, batch_size: int = 64, n_jobs: int | None = None):
         if not self.AVAILABLE:
             raise ImportError("请先安装 torchani: pip install torchani")
 
@@ -892,7 +908,7 @@ class MLForceFieldExtractor:
 
         # Windows 下多进程可能不稳定，默认降为单进程
         if n_jobs is None:
-            n_jobs = 1 if os.name == 'nt' else mp.cpu_count()
+            n_jobs = 1 if os.name == 'nt' else max(1, (mp.cpu_count() or 1) - 1)
 
         valid_indices = []
         sample_frags = []  # list[list[(atoms, coords)]]
@@ -1084,7 +1100,7 @@ class EpoxyDomainFeatureExtractor:
         except Exception:
             return 0.0, 0.0, 0.0
 
-    def extract_features(self, resin_smiles_list, hardener_smiles_list, stoichiometry_list=None):
+    def extract_features(self, resin_smiles_list, hardener_smiles_list, stoichiometry_list=None, stoich_mode: str = 'Resin/Hardener (总质量比, R/H)'):
         features_list = []
         valid_indices = []
 
@@ -1112,6 +1128,30 @@ class EpoxyDomainFeatureExtractor:
                 # 计算理论配比 (phr)
                 theo_phr = (ahew / eew) * 100 if eew > 0 else 0
 
+
+                # 用户提供的配比（可选）
+                # 说明：
+                # - stoich_mode = "Resin/Hardener (总质量比, R/H)"：列值为 树脂总量/固化剂总量 (R/H)
+                #   则可换算为实际 PHR = 100 / (R/H)
+                # - stoich_mode = "PHR (Hardener per 100 Resin)"：列值即为 PHR
+                actual_phr = theo_phr
+                if stoichiometry_list is not None and idx < len(stoichiometry_list):
+                    try:
+                        v = float(stoichiometry_list[idx])
+                        if v > 0:
+                            if stoich_mode.startswith("Resin/Hardener"):
+                                # R/H -> PHR = 100 * H/R = 100 / (R/H)
+                                actual_phr = 100.0 / v
+                            elif stoich_mode.startswith("PHR"):
+                                actual_phr = v
+                            else:
+                                actual_phr = v
+                    except Exception:
+                        pass
+
+                # 与理论配比的偏离（用于反映固化欠量/过量）
+                stoich_ratio = (actual_phr / theo_phr) if theo_phr > 0 else 0.0
+                stoich_delta = actual_phr - theo_phr
                 # 2. 电子性质特征 (新增功能 - 模拟DFT)
                 r_pos_chg, r_neg_chg, r_tpsa = self._calc_electronic_props(mol_r)
                 h_pos_chg, h_neg_chg, h_tpsa = self._calc_electronic_props(mol_h)
@@ -1122,6 +1162,9 @@ class EpoxyDomainFeatureExtractor:
                     'Resin_Functionality': f_epoxy,
                     'Hardener_Functionality': f_amine,
                     'Theoretical_PHR': theo_phr,
+                    'Actual_PHR': actual_phr,
+                    'Stoich_Ratio': stoich_ratio,
+                    'Stoich_Delta': stoich_delta,
                     # 新增特征列
                     'Resin_Max_Pos_Charge': r_pos_chg,
                     'Resin_Max_Neg_Charge': r_neg_chg,

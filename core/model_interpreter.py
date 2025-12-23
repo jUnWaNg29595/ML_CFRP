@@ -30,8 +30,12 @@ class ModelInterpreter:
 class EnhancedModelInterpreter:
     """增强版模型解释器 - 修复版"""
 
-    def __init__(self, model, X_train, y_train, X_test, y_test, model_name, feature_names=None):
+    def __init__(self, model, X_train, y_train, X_test, y_test, model_name, feature_names=None, max_samples: int = 200, kernel_background: int = 50, kernel_nsamples: int = 200):
         self.model = model
+        self.max_samples = int(max_samples) if max_samples is not None else 200
+        self.kernel_background = int(kernel_background) if kernel_background is not None else 50
+        self.kernel_nsamples = int(kernel_nsamples) if kernel_nsamples is not None else 200
+        self._X_sample = None
         # 确保保存特征名
         # NOTE:
         # X_train / X_test 在训练器中通常被保存为 DataFrame(列名为 0..n-1)。
@@ -69,11 +73,16 @@ class EnhancedModelInterpreter:
                 self._explainer = shap.LinearExplainer(self.model, background)
             # 其他模型
             else:
-                background = shap.sample(self.X_train, min(50, len(self.X_train)))
+                bg_n = min(int(getattr(self, 'kernel_background', 50)), len(self.X_train))
+                # 高维特征时进一步压缩背景样本，避免 KernelExplainer 过慢/爆内存
+                if self.X_train.shape[1] > 512:
+                    bg_n = min(bg_n, 20)
+                background = shap.sample(self.X_train, bg_n)
                 self._explainer = shap.KernelExplainer(self.model.predict, background)
         except:
             # 兜底方案
-            background = shap.sample(self.X_train, min(20, len(self.X_train)))
+            bg_n = min(20, len(self.X_train))
+            background = shap.sample(self.X_train, bg_n)
             self._explainer = shap.KernelExplainer(self.model.predict, background)
 
         return self._explainer
@@ -85,7 +94,7 @@ class EnhancedModelInterpreter:
         explainer = self._get_explainer()
         # 采样测试集，防止计算太慢
         # 使用 pandas.sample 保证与后续作图的样本一致且可复现
-        n = min(200, len(self.X_test))
+        n = min(int(getattr(self, 'max_samples', 200)), len(self.X_test))
         self._X_sample = self.X_test.sample(n=n, random_state=42) if len(self.X_test) > n else self.X_test.copy()
 
         try:
@@ -93,10 +102,18 @@ class EnhancedModelInterpreter:
                 warnings.simplefilter("ignore")
                 # check_additivity=False 主要用于树模型，防止微小误差导致报错。
                 # 部分 Explainer（如 LinearExplainer）不支持该参数，这里做兼容处理。
-                try:
-                    shap_values = explainer.shap_values(self._X_sample, check_additivity=False)
-                except TypeError:
-                    shap_values = explainer.shap_values(self._X_sample)
+                # KernelExplainer 默认 nsamples='auto' 在高维时会非常慢，这里给一个上限
+                explainer_name = explainer.__class__.__name__.lower()
+                if "kernel" in explainer_name:
+                    try:
+                        shap_values = explainer.shap_values(self._X_sample, nsamples=int(getattr(self, "kernel_nsamples", 200)))
+                    except TypeError:
+                        shap_values = explainer.shap_values(self._X_sample)
+                else:
+                    try:
+                        shap_values = explainer.shap_values(self._X_sample, check_additivity=False)
+                    except TypeError:
+                        shap_values = explainer.shap_values(self._X_sample)
 
             # 处理 list (多分类) 和 array (回归) 的区别
             if isinstance(shap_values, list):
