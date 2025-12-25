@@ -20,6 +20,7 @@ try:
     from rdkit.Chem import Descriptors
     from rdkit.Chem import AllChem
     from rdkit.Chem import Descriptors3D, rdMolDescriptors
+<<<<<<< HEAD
 
     def _embed_molecule_compat(mol, params):
         """Try both EmbedMolecule calling conventions across RDKit versions."""
@@ -141,6 +142,8 @@ try:
             pass
         return params
 
+=======
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
     from rdkit.Chem import MACCSkeys
 
     RDKIT_AVAILABLE = True
@@ -174,6 +177,7 @@ def _generate_3d_data_worker(smiles):
         return None
 
     try:
+<<<<<<< HEAD
         if smiles is None or (isinstance(smiles, float) and np.isnan(smiles)) or (hasattr(pd, 'isna') and pd.isna(smiles)):
             return None
         s = str(smiles).strip()
@@ -181,6 +185,14 @@ def _generate_3d_data_worker(smiles):
             return None
 
 
+=======
+        if smiles is None or (isinstance(smiles, float) and np.isnan(smiles)):
+            return None
+        s = str(smiles).strip()
+        if not s:
+            return None
+
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
         # 1) 智能分割多组分
         # 先按 ; / ； / | 分割
         parts = re.split(r"\s*[;；|]\s*", s)
@@ -206,12 +218,17 @@ def _generate_3d_data_worker(smiles):
         for frag in frags:
             mol = Chem.MolFromSmiles(frag)
             if mol is None:
+<<<<<<< HEAD
                 # 片段解析失败：跳过该片段（不放弃整个样本）
                 continue
+=======
+                return None
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
             mol = Chem.AddHs(mol)  # 力场/ANI 计算建议加氢
 
             # 2) 生成 3D 构象（ETKDGv3）
+<<<<<<< HEAD
             params = _get_etkdg_params()
             # RDKit 版本差异：部分属性可能不存在/只读，使用 best-effort 设置
             for _attr, _val in [("useRandomCoords", True), ("numThreads", 1), ("maxAttempts", 50)]:
@@ -237,6 +254,18 @@ def _generate_3d_data_worker(smiles):
                 if res != 0:
                     # 该片段 3D 生成失败：跳过该片段
                     continue
+=======
+            params = AllChem.ETKDGv3()
+            params.useRandomCoords = True
+            params.numThreads = 1  # 禁用 RDKit 内部线程，避免与多进程冲突
+
+            res = AllChem.EmbedMolecule(mol, params)
+            if res != 0:
+                # 兜底：再试一次
+                res = AllChem.EmbedMolecule(mol, useRandomCoords=True)
+                if res != 0:
+                    return None
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
             # 3) 快速几何优化：优先 MMFF，否则 UFF
             try:
@@ -250,8 +279,12 @@ def _generate_3d_data_worker(smiles):
             # 4) 提取数据
             atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
             if not set(atoms).issubset(supported_species):
+<<<<<<< HEAD
                 # ANI2x 不支持该片段元素：跳过该片段
                 continue
+=======
+                return None
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
             coords = mol.GetConformer().GetPositions().astype(np.float32)
 
@@ -275,6 +308,7 @@ def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
         return None
 
     try:
+<<<<<<< HEAD
         if smiles is None or (isinstance(smiles, float) and np.isnan(smiles)) or (hasattr(pd, 'isna') and pd.isna(smiles)):
             return None
         s = str(smiles).strip()
@@ -282,6 +316,14 @@ def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
             return None
 
 
+=======
+        if smiles is None or (isinstance(smiles, float) and np.isnan(smiles)):
+            return None
+        s = str(smiles).strip()
+        if not s:
+            return None
+
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
         # --- 预处理：处理聚合物中的 * 号 ---
         # 3D 构象生成不支持 *，将其替换为 C (甲基) 以模拟占位
         if '*' in s:
@@ -316,6 +358,7 @@ def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
             mol = Chem.AddHs(mol)
 
             # --- 生成 3D 构象 (放宽参数) ---
+<<<<<<< HEAD
             params = _get_etkdg_params()
             # RDKit 版本差异：部分属性可能不存在/只读，使用 best-effort 设置
             for _attr, _val in [("useRandomCoords", True), ("numThreads", 1), ("maxAttempts", 50)]:
@@ -343,6 +386,22 @@ def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
                         res2 = -1
                 if res2 != 0:
                     # [修改] 如果该片段生成失败，仅跳过该片段，不放弃整个样本
+=======
+            params = AllChem.ETKDGv3()
+            params.useRandomCoords = True
+            params.numThreads = 1
+            params.maxAttempts = 50  # [修改] 增加尝试次数
+
+            # 尝试嵌入
+            res = AllChem.EmbedMolecule(mol, params)
+
+            # 如果失败，尝试更激进的随机坐标
+            if res != 0:
+                res = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=100)
+                if res != 0:
+                    # [修改] 如果该片段生成失败，仅跳过该片段，不放弃整个样本
+                    # print(f"⚠️ 3D生成失败 (跳过片段): {frag}")
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
                     continue
 
                     # 优化
@@ -804,7 +863,11 @@ class AdvancedMolecularFeatureExtractor:
 
         return self._process_result(all_features, valid_indices)
 
+<<<<<<< HEAD
     def smiles_to_mordred(self, smiles_list, batch_size=1000, ignore_3D: bool = True):
+=======
+    def smiles_to_mordred(self, smiles_list, batch_size=1000):
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
         """
         Mordred特征提取 - 优化版
         增加了分批处理和Windows环境下的稳定性保护
@@ -827,7 +890,11 @@ class AdvancedMolecularFeatureExtractor:
             return pd.DataFrame(), []
 
         # 2. 初始化计算器
+<<<<<<< HEAD
         calc = Calculator(descriptors, ignore_3D=bool(ignore_3D))
+=======
+        calc = Calculator(descriptors, ignore_3D=True)
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
         # 3. 智能选择进程数
         # Windows 下多进程极其不稳定，强制使用单进程
@@ -1345,16 +1412,28 @@ class FingerprintExtractor:
         if not RDKIT_AVAILABLE:
             raise ImportError("需要安装 rdkit")
 
+<<<<<<< HEAD
     def _gen_fp_array(self, mol, fp_type, n_bits, radius, use_chirality: bool = False, use_features: bool = False):
+=======
+    def _gen_fp_array(self, mol, fp_type, n_bits, radius):
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
         """辅助函数：生成单个分子的指纹数组"""
         if fp_type == 'MACCS':
             return np.array(MACCSkeys.GenMACCSKeys(mol))
         elif fp_type == 'Morgan':
+<<<<<<< HEAD
             fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits, useChirality=use_chirality, useFeatures=use_features)
             return np.array(fp)
         return np.array([])
 
     def smiles_to_fingerprints(self, smiles_list, smiles_list_2=None, fp_type='MACCS', n_bits=2048, radius=2, use_chirality: bool = False, use_features: bool = False, drop_all_zero_bits: bool = False):
+=======
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+            return np.array(fp)
+        return np.array([])
+
+    def smiles_to_fingerprints(self, smiles_list, smiles_list_2=None, fp_type='MACCS', n_bits=2048, radius=2):
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
         """
         提取分子指纹。
         Args:
@@ -1383,7 +1462,11 @@ class FingerprintExtractor:
                 feat_dict = {}
 
                 # 生成指纹 1
+<<<<<<< HEAD
                 fp1_arr = self._gen_fp_array(mol1, fp_type, n_bits, radius, use_chirality=use_chirality, use_features=use_features)
+=======
+                fp1_arr = self._gen_fp_array(mol1, fp_type, n_bits, radius)
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
                 for i, val in enumerate(fp1_arr):
                     # 特征名加前缀区分
                     feat_dict[f"Resin_{fp_type}_{i}"] = val
@@ -1398,7 +1481,11 @@ class FingerprintExtractor:
                         continue
 
                         # 生成指纹 2
+<<<<<<< HEAD
                     fp2_arr = self._gen_fp_array(mol2, fp_type, n_bits, radius, use_chirality=use_chirality, use_features=use_features)
+=======
+                    fp2_arr = self._gen_fp_array(mol2, fp_type, n_bits, radius)
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
                     for i, val in enumerate(fp2_arr):
                         feat_dict[f"Hardener_{fp_type}_{i}"] = val
 
@@ -1415,9 +1502,14 @@ class FingerprintExtractor:
         df = pd.DataFrame(all_fps)
         df = df.astype(np.uint8)
 
+<<<<<<< HEAD
         # 可选：移除全为0的列（会导致不同数据集列数不一致；用于模型复用时建议关闭）
         if drop_all_zero_bits:
             df = df.loc[:, (df != 0).any(axis=0)]
+=======
+        # 移除全为0的列 (无信息量的位)
+        df = df.loc[:, (df != 0).any(axis=0)]
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
         return df, valid_indices
 
@@ -1580,4 +1672,8 @@ class FGDFeatureExtractor:
             return pd.DataFrame(), []
 
         df = pd.DataFrame(results)
+<<<<<<< HEAD
         return df, valid_indices
+=======
+        return df, valid_indices
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4

@@ -50,6 +50,7 @@ persim>=0.3.8
 # ydata-profiling>=4.6.1  # 数据探索报告
 # tabpfn>=2.0.9           # TabPFN模型
 # autogluon>=1.0.0        # AutoML
+<<<<<<< HEAD
 
 
 # === SMILES识别（图像/文件 -> SMILES，DECIMER，可选） ===
@@ -64,3 +65,5 @@ pyyaml
 # PDF 支持（二选一）：
 # pymupdf
 # pdf2image
+=======
+>>>>>>> f168256419b9b557a70253c84666a6aee162abf4
