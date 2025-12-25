@@ -180,6 +180,14 @@ def _generate_3d_data_worker(smiles):
         if (not s) or (s.lower() in {"nan", "none", "<na>", "na"}):
             return None
 
+        # --- 预处理：处理聚合物中的 * / [*] 占位符 ---
+        # RDKit/ETKDG 不支持 '*' 原子；用 'C' 作为占位（与 3D 构象描述符逻辑保持一致）
+        if '*' in s:
+            try:
+                s = re.sub(r"\[\s*\*\s*\]", "C", s)  # 替换 [*] 或 [ * ]
+            except Exception:
+                pass
+            s = s.replace('*', 'C')
 
         # 1) 智能分割多组分
         # 先按 ; / ； / | 分割
@@ -437,6 +445,14 @@ class RDKit3DDescriptorExtractor:
 
         if n_jobs is None:
             n_jobs = 1 if os.name == 'nt' else max(1, (mp.cpu_count() or 1) - 1)
+
+        # 避免 CUDA + fork 多进程导致崩溃/报错：在 CUDA 下强制 3D 生成单进程更稳
+        try:
+            if getattr(self, 'device', None) is not None and getattr(self.device, 'type', '') == 'cuda' and n_jobs and int(n_jobs) > 1:
+                print('⚠️ 检测到 CUDA 环境：为避免多进程 fork/CUDA 问题，已将 3D 生成 n_jobs 自动降为 1')
+                n_jobs = 1
+        except Exception:
+            pass
 
         feats = []
         valid_indices = []
@@ -968,10 +984,15 @@ class MLForceFieldExtractor:
             self.torch = torch
             self.torchani = torchani
             self.AVAILABLE = True
-        except ImportError:
+            self.IMPORT_ERROR = None
+        except Exception as e:
+            # torchani 可能“已安装但无法导入”（例如版本/依赖不匹配、CUDA/GLIBC 问题等）
             self.AVAILABLE = False
             self.feature_names = []
+            self.IMPORT_ERROR = repr(e)
+            self.MODEL_ERROR = None
             return
+
 
         if device is None:
             self.device = self.torch.device('cuda' if self.torch.cuda.is_available() else 'cpu')
@@ -998,7 +1019,10 @@ class MLForceFieldExtractor:
         try:
             self.model = self.torchani.models.ANI2x().to(self.device)
             self.model.eval()
+            self.MODEL_ERROR = None
         except Exception as e:
+            # 可能原因：首次实例化需要联网下载权重；或 torch/torchani 版本不兼容
+            self.MODEL_ERROR = repr(e)
             print(f"ANI Model load error: {e}")
             self.AVAILABLE = False
             self.feature_names = []
@@ -1062,6 +1086,14 @@ class MLForceFieldExtractor:
         # Windows 下多进程可能不稳定，默认降为单进程
         if n_jobs is None:
             n_jobs = 1 if os.name == 'nt' else max(1, (mp.cpu_count() or 1) - 1)
+
+        # 避免 CUDA + fork 多进程导致崩溃/报错：在 CUDA 下强制 3D 生成单进程更稳
+        try:
+            if getattr(self, 'device', None) is not None and getattr(self.device, 'type', '') == 'cuda' and n_jobs and int(n_jobs) > 1:
+                print('⚠️ 检测到 CUDA 环境：为避免多进程 fork/CUDA 问题，已将 3D 生成 n_jobs 自动降为 1')
+                n_jobs = 1
+        except Exception:
+            pass
 
         valid_indices = []
         sample_frags = []  # list[list[(atoms, coords)]]

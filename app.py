@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-碳纤维复合材料智能预测平台 v1.4.2
+碳纤维复合材料智能预测平台 v1.3.0
+更新内容：
+1. 修复SHAP图表显示和特征名缺失问题
+2. 优化所有图表布局，防止缩放变形
+3. 为所有图表增加数据导出(CSV)功能
+4. 增加双组分分子指纹拼接功能
+5. 增加训练脚本一键导出功能
 """
 # [新增] TensorFlow Sequential (TFS) 模型支持（即使未安装 TF 也要显示入口）
 try:
@@ -2507,9 +2513,21 @@ def page_molecular_features():
                 oplog("Running ML force field features (ANI2x): 3D generation + ANI inference")
                 status_text.text("正在计算ANI力场特征...")
                 extractor = MLForceFieldExtractor()
-                if not extractor.AVAILABLE:
-                    st.error("TorchANI 未安装")
+                if not getattr(extractor, "AVAILABLE", False):
+                    detail = []
+                    imp_err = getattr(extractor, "IMPORT_ERROR", None)
+                    mdl_err = getattr(extractor, "MODEL_ERROR", None)
+                    if imp_err:
+                        detail.append(f"Import error: {imp_err}")
+                    if mdl_err:
+                        detail.append(f"Model load error: {mdl_err}")
+                    msg = "❌ TorchANI / ANI2x 不可用。请先安装 torchani，并确保首次加载模型时可联网下载权重（或已缓存）。"
+                    if detail:
+                        msg += "\n\n" + "\n".join(detail)
+                    st.error(msg)
+                    st.caption("常见原因：1) 未安装 torchani；2) torch/torchani 版本不兼容；3) 无网络导致模型权重无法下载；4) SMILES 含 '*' 等占位符或含金属元素（ANI2x 仅支持 H,C,N,O,F,S,Cl）。")
                     return
+
                 oplog(f"ANI params: batch_size={ani_batch_size}, cpu_workers(3D)={ani_cpu_workers}")
                 features_df, valid_indices = extractor.smiles_to_ani_features(smiles_list_input, batch_size=ani_batch_size, n_jobs=ani_cpu_workers)
             elif "FGD" in extraction_method:
