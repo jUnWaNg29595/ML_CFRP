@@ -2,7 +2,7 @@
 """配置文件 - 更新版（含 TensorFlow Sequential 模型）"""
 
 APP_NAME = "碳纤维复合材料智能预测平台"
-VERSION = "1.4.1"  # 版本更新
+VERSION = "1.4.2"  # 版本更新
 
 DATA_DIR = "datasets"
 MODEL_DIR = "models"

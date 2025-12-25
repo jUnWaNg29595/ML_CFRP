@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-碳纤维复合材料智能预测平台 v1.3.0
-更新内容：
-1. 修复SHAP图表显示和特征名缺失问题
-2. 优化所有图表布局，防止缩放变形
-3. 为所有图表增加数据导出(CSV)功能
-4. 增加双组分分子指纹拼接功能
-5. 增加训练脚本一键导出功能
+碳纤维复合材料智能预测平台 v1.4.2
 """
 # [新增] TensorFlow Sequential (TFS) 模型支持（即使未安装 TF 也要显示入口）
 try:
@@ -74,7 +68,6 @@ def oplog_render():
                 oplog_clear()
                 st.rerun()
 import pandas as pd
-<<<<<<< HEAD
 
 from rdkit import Chem as _Chem
 
@@ -115,8 +108,6 @@ def _quick_rdkit_parse_stats(smiles_list, max_check: int = 200):
             if len(bad) < 5:
                 bad.append(ss[:200])
     return ok, checked, bad
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 import numpy as np
 import os
 import matplotlib.pyplot as plt
@@ -503,10 +494,7 @@ def render_sidebar():
                 "🧹 数据清洗",
                 "✨ 数据增强",
                 "🧬 分子特征",
-<<<<<<< HEAD
                 "🖼️ 图像转SMILES",
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
                 "🎯 特征选择",
                 "🤖 模型训练",
                 "📈 训练记录",
@@ -1885,10 +1873,7 @@ def page_molecular_features():
             text_cols,
             index=default_idx
         )
-<<<<<<< HEAD
         st.session_state.selected_smiles_col = smiles_col
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
     with col2:
         st.markdown("**示例SMILES:**")
@@ -1994,7 +1979,6 @@ def page_molecular_features():
     ani_batch_size = 64
     ani_cpu_workers = max(1, (os.cpu_count() or 1) - 1) if os.name != 'nt' else 1
 
-<<<<<<< HEAD
     # [新增] 指纹默认参数
     fp_use_chirality = False
     fp_use_features = False
@@ -2009,8 +1993,6 @@ def page_molecular_features():
     rdkit3d_n_jobs = None
 
 
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
     # ============== [修改] 指纹参数设置 ==============
     if "分子指纹" in extraction_method:
         st.info("💡 提示：对于环氧树脂体系，建议同时选择树脂和固化剂列，系统将自动拼接两者的指纹以描述完整网络结构。")
@@ -2019,18 +2001,14 @@ def page_molecular_features():
         with col_fp1:
             fp_type = st.selectbox("指纹类型", ["MACCS", "Morgan"])
 
-<<<<<<< HEAD
         
             drop_all_zero_bits = st.checkbox("移除全为0的指纹位（不推荐：会造成列缺失，影响模型导入/复用）", value=False)
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
         if fp_type == "Morgan":
             with col_fp2:
                 fp_radius = st.selectbox("半径 (Radius)", [2, 3, 4], index=0)
             with col_fp3:
                 fp_bits = st.selectbox("位长 (Bits)", [1024, 2048, 4096], index=1)
 
-<<<<<<< HEAD
             # [新增] Morgan 额外参数
             col_fpa, col_fpb = st.columns(2)
             with col_fpa:
@@ -2040,8 +2018,6 @@ def page_molecular_features():
                 fp_use_features = st.checkbox("使用 Feature Morgan (FCFP, useFeatures)", value=False,
                                              help="启用后使用 feature-based Morgan 指纹（更偏向官能团/药效团风格）")
 
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
         # ---- 预训练 SMILES Transformer Embedding 参数（可选）----
         lm_model_name = "seyonec/ChemBERTa-zinc-base-v1"
@@ -2177,7 +2153,6 @@ def page_molecular_features():
 
     
     # ============== [新增 UI] ML力场(ANI) 参数 ==============
-<<<<<<< HEAD
     
     # ============== [新增 UI] 3D 构象描述符 参数 ==============
     if "3D构象" in extraction_method:
@@ -2258,8 +2233,6 @@ def page_molecular_features():
                 except Exception as e:
                     st.error(f"Self-test failed: {e}")
 
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
     if "ML力场特征" in extraction_method:
         st.markdown("#### ⚛️ ML 力场 (ANI2x) 参数")
         st.info("该方法会先生成3D构象，再用 ANI2x 推理能量/力。较耗时，建议调大批量并使用多核CPU。")
@@ -2279,7 +2252,6 @@ def page_molecular_features():
                     value=min(max_workers, ani_cpu_workers)
                 )
         st.caption("提示：3D 构象生成使用多进程；ANI 推理在主进程使用 Torch CPU 多线程。")
-<<<<<<< HEAD
 
     # ============== [新增 UI] Mordred 参数 ==============
     if "Mordred" in extraction_method:
@@ -2292,8 +2264,6 @@ def page_molecular_features():
             mordred_ignore_3d = st.checkbox("ignore_3D (推荐 True)", value=bool(mordred_ignore_3d),
                                             help="True: 仅计算 2D 描述符，更稳定、更快；False: 允许 3D 相关描述符（更慢、对构象敏感）")
 
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 # ============== [新增 UI] TDA 参数 ==============
     if "TDA拓扑特征" in extraction_method:
         st.markdown("#### 🧩 TDA(持续同调) 参数")
@@ -2440,7 +2410,6 @@ def page_molecular_features():
 
                 extractor = FingerprintExtractor()
                 # 传入 smiles_list_2 (固化剂)
-<<<<<<< HEAD
                 import inspect
                 _kwargs = dict(
                     smiles_list_2=hardener_list,
@@ -2458,12 +2427,6 @@ def page_molecular_features():
                 features_df, valid_indices = extractor.smiles_to_fingerprints(
                     smiles_list,
                     **_kwargs
-=======
-                features_df, valid_indices = extractor.smiles_to_fingerprints(
-                    smiles_list,
-                    smiles_list_2=hardener_list,
-                    fp_type=fp_type, n_bits=fp_bits, radius=fp_radius
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
                 )
 
             elif "标准版" in extraction_method:
@@ -2489,22 +2452,13 @@ def page_molecular_features():
             elif "Mordred" in extraction_method:
                 status_text.text("正在使用Mordred提取...")
                 extractor = AdvancedMolecularFeatureExtractor()
-<<<<<<< HEAD
                 features_df, valid_indices = extractor.smiles_to_mordred(smiles_list_input, batch_size=int(mordred_batch_size), ignore_3D=bool(mordred_ignore_3d))
-=======
-                features_df, valid_indices = extractor.smiles_to_mordred(smiles_list_input)
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
             elif "3D构象" in extraction_method:
                 from core.molecular_features import RDKit3DDescriptorExtractor
                 status_text.text("正在提取RDKit 3D构象描述符...")
-<<<<<<< HEAD
                 extractor = RDKit3DDescriptorExtractor(coulomb_top_k=int(rdkit3d_coulomb_top_k))
                 features_df, valid_indices = extractor.smiles_to_3d_descriptors(smiles_list_input, n_jobs=rdkit3d_n_jobs)
-=======
-                extractor = RDKit3DDescriptorExtractor()
-                features_df, valid_indices = extractor.smiles_to_3d_descriptors(smiles_list_input)
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
             elif "TDA拓扑特征" in extraction_method:
                 from core.tda_features import PersistentHomologyFeatureExtractor, TDAConfig
@@ -2610,7 +2564,6 @@ def page_molecular_features():
                     pass
                 features_df = features_df.add_prefix(prefix)
 
-<<<<<<< HEAD
                 # -----------------------------
                 # 合并策略：
                 # - keep_all_rows_3d=True：保留原始所有行；仅对 valid_indices 填充特征，其余为 NaN（推荐，适合大量空值场景）
@@ -2641,17 +2594,6 @@ def page_molecular_features():
                         df_valid = df_valid.drop(columns=cols_to_drop)
 
                     merged_df = pd.concat([df_valid, features_df], axis=1)
-=======
-                df_valid = df.iloc[valid_indices].reset_index(drop=True)
-                features_df = features_df.reset_index(drop=True)
-
-                # 防止列名冲突：如果新特征名已存在，先删除旧的
-                cols_to_drop = [col for col in features_df.columns if col in df_valid.columns]
-                if cols_to_drop:
-                    df_valid = df_valid.drop(columns=cols_to_drop)
-
-                merged_df = pd.concat([df_valid, features_df], axis=1)
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
                 # 可选：追加组分数量特征
                 if resin_mix_mode and add_component_count_features:
@@ -2684,7 +2626,6 @@ def page_molecular_features():
                 st.markdown("### 📋 特征预览")
                 st.dataframe(features_df.head(), use_container_width=True)
             else:
-<<<<<<< HEAD
                 st.error("❌ 未能提取任何特征：当前选择的 SMILES 列可能全部为空/无效，或 3D 构象生成全部失败。")
                 # 额外诊断：快速检查前 200 条是否能被 RDKit 解析（不做 3D）
                 try:
@@ -2699,9 +2640,6 @@ def page_molecular_features():
 
                 st.info(f"总行数={len(df)}，树脂/主体 SMILES 非空数≈{pd.Series(smiles_list_input).replace(['nan','NaN','<NA>'], np.nan).notna().sum()}（仅粗略统计）")
                 st.caption("建议：1) 确认选择了正确的 SMILES 列；2) 先把 n_jobs 调到 1；3) 先用少量样本测试；4) 多组分/含盐/含金属体系更易失败。")
-=======
-                st.error("❌ 未能提取任何特征，请检查SMILES格式")
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
         except Exception as e:
             st.error(f"❌ 提取失败: {str(e)}")
@@ -2828,7 +2766,6 @@ def page_model_training():
         test_size = st.slider("测试集比例", 0.1, 0.4, 0.2)
         random_state = st.number_input("随机种子", 0, 1000000, 42)
 
-<<<<<<< HEAD
         # 并行训练核数（对支持 n_jobs/thread_count 的算法生效；其它算法自动忽略）
         cpu_total = os.cpu_count() or 1
         core_opts = ["Auto (all cores)"] + [str(i) for i in range(1, min(cpu_total, 64) + 1)]
@@ -2836,8 +2773,6 @@ def page_model_training():
                               help="会应用到 RandomForest/ExtraTrees/XGBoost/LightGBM/CatBoost/部分线性模型等。Auto=使用全部CPU核心。")
         train_n_jobs = -1 if core_sel.startswith("Auto") else int(core_sel)
 
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
         # --- [P0-3 / P1-1] 划分策略 ---
         st.markdown("### 🧩 划分策略")
         split_ui = st.selectbox(
@@ -2938,10 +2873,7 @@ def page_model_training():
                 try:
                     # 准备参数
                     params = manual_params.copy()
-<<<<<<< HEAD
                     params['train_n_jobs'] = int(train_n_jobs)
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
                     if 'random_state' in params:
                         params.pop('random_state')
 
@@ -3172,7 +3104,6 @@ def page_model_training():
                 )
                 st.download_button("💾 导出 Python 训练脚本", script, "train_script.py")
 
-<<<<<<< HEAD
                 st.markdown("---")
                 with st.expander("📦 导出训练好的模型（.joblib）", expanded=False):
                     st.caption("导出的模型文件包含：pipeline/模型、特征列、目标列、评估指标等。可在“预测应用”页面直接导入使用。")
@@ -3208,8 +3139,6 @@ def page_model_training():
                         st.info("提示：若使用深度学习模型（TF/自定义网络），joblib 序列化可能失败。可改用“导出训练脚本”在目标环境复现训练。")
 
 
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 def page_model_interpretation():
     """模型解释页面"""
     st.title("📊 模型解释")
@@ -3615,7 +3544,6 @@ def page_prediction():
     """预测应用页面（修复：预测阶段应用 imputer/scaler；支持指纹适用域）"""
     st.title("🔮 预测应用")
 
-<<<<<<< HEAD
     # =========================
     # 📦 导入模型（无需先训练）
     # =========================
@@ -3656,8 +3584,6 @@ def page_prediction():
 
 
 
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
     if st.session_state.model is None:
         st.warning("⚠️ 请先训练模型")
         return
@@ -3748,7 +3674,6 @@ def page_prediction():
                     if missing:
                         st.error(f"缺少特征列: {missing[:10]}{'...' if len(missing)>10 else ''}")
                     else:
-<<<<<<< HEAD
                         # 对齐特征列：避免因指纹“全零列被删”导致模型所需列缺失
                         missing_cols = [c for c in feature_cols if c not in pred_df.columns]
                         if missing_cols:
@@ -3760,8 +3685,6 @@ def page_prediction():
                             for c in other_missing:
                                 pred_df[c] = np.nan
                             st.warning(f"检测到模型所需特征列缺失 {len(missing_cols)} 个，已自动补齐（指纹列填0，其它列填NaN）。")
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
                         X_pred = pred_df[feature_cols]
 
                         if pipeline is not None:
@@ -4470,7 +4393,6 @@ def render_export_section():
         st.info("请先加载数据后再使用导出功能")
 
 
-<<<<<<< HEAD
 
 # ============================================================
 # 页面：图像/文件转SMILES（DECIMER）
@@ -4593,8 +4515,6 @@ def page_image_to_smiles():
         st.session_state["smiles_results"] = df_res
         st.info("结果已保存到会话变量：st.session_state['smiles_results']。")
 
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 # ============================================================
 # 主程序入口（保持原有结构）
 # ============================================================
@@ -4615,12 +4535,9 @@ elif page == "✨ 数据增强":
     page_data_enhancement()
 elif page == "🧬 分子特征":
     page_molecular_features()
-<<<<<<< HEAD
 
 elif page == "🖼️ 图像转SMILES":
     page_image_to_smiles()
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 elif page == "🎯 特征选择":
     page_feature_selection()
 elif page == "🤖 模型训练":

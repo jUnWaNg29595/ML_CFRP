@@ -1,4 +1,4 @@
-# 碳纤维复合材料智能预测平台 v1.4.1
+# 碳纤维复合材料智能预测平台 v1.4.2
 
 ## 🚀 项目简介
 
@@ -43,7 +43,6 @@ streamlit run app.py
 ## 📄 许可证
 
 MIT License
-<<<<<<< HEAD
 
 
 ## 🖼️ 图像/文件转 SMILES（DECIMER）
@@ -63,5 +62,3 @@ pip install opencv-python pystow pillow-heif efficientnet selfies pyyaml
 pip install pymupdf
 # 或：pip install pdf2image  （系统需额外安装 poppler）
 ```
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4

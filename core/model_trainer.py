@@ -9,10 +9,7 @@
 
 import time
 import numpy as np
-<<<<<<< HEAD
 import os
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 import pandas as pd
 import shutil
 
@@ -165,7 +162,6 @@ class AutoGluonWrapper(BaseEstimator, RegressorMixin):
         pass
 
 
-<<<<<<< HEAD
 
 def _normalize_train_n_jobs(train_n_jobs):
     """Normalize user-specified parallelism.
@@ -211,8 +207,6 @@ def _apply_parallel_settings(model_name: str, model_params: dict, train_n_jobs: 
     return model_params
 
 
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 class EnhancedModelTrainer:
     """增强版模型训练器"""
 
@@ -317,14 +311,10 @@ class EnhancedModelTrainer:
         params_clean = {k: v for k, v in params.items() if k != 'random_state'}
 
         if model_name == "线性回归":
-<<<<<<< HEAD
             n_jobs = params_clean.pop("n_jobs", None)
             if n_jobs is None:
                 return LinearRegression()
             return LinearRegression(n_jobs=n_jobs)
-=======
-            return LinearRegression()
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
         elif model_name == "Ridge回归":
             return Ridge(random_state=random_state, **params_clean)
@@ -339,19 +329,12 @@ class EnhancedModelTrainer:
             return DecisionTreeRegressor(random_state=random_state, **params_clean)
 
         elif model_name == "随机森林":
-<<<<<<< HEAD
             n_jobs = params_clean.pop("n_jobs", -1)
             return RandomForestRegressor(random_state=random_state, n_jobs=n_jobs, **params_clean)
 
         elif model_name == "Extra Trees":
             n_jobs = params_clean.pop("n_jobs", -1)
             return ExtraTreesRegressor(random_state=random_state, n_jobs=n_jobs, **params_clean)
-=======
-            return RandomForestRegressor(random_state=random_state, n_jobs=-1, **params_clean)
-
-        elif model_name == "Extra Trees":
-            return ExtraTreesRegressor(random_state=random_state, n_jobs=-1, **params_clean)
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
         elif model_name == "梯度提升树":
             return GradientBoostingRegressor(random_state=random_state, **params_clean)
@@ -368,34 +351,23 @@ class EnhancedModelTrainer:
         elif model_name == "XGBoost":
             if not XGBOOST_AVAILABLE:
                 raise ImportError("XGBoost 未安装，请运行: pip install xgboost")
-<<<<<<< HEAD
             n_jobs = params_clean.pop("n_jobs", -1)
             return XGBRegressor(random_state=random_state, n_jobs=n_jobs, **params_clean)
-=======
-            return XGBRegressor(random_state=random_state, n_jobs=-1, **params_clean)
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
         elif model_name == "LightGBM":
             if not LIGHTGBM_AVAILABLE:
                 raise ImportError("LightGBM 未安装，请运行: pip install lightgbm")
             params_clean.setdefault('verbose', -1)
-<<<<<<< HEAD
             n_jobs = params_clean.pop("n_jobs", -1)
             return LGBMRegressor(random_state=random_state, n_jobs=n_jobs, **params_clean)
-=======
-            return LGBMRegressor(random_state=random_state, n_jobs=-1, **params_clean)
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
 
         elif model_name == "CatBoost":
             if not CATBOOST_AVAILABLE:
                 raise ImportError("CatBoost 未安装，请运行: pip install catboost")
             params_clean.setdefault('verbose', 0)
-<<<<<<< HEAD
             thread_count = params_clean.pop("thread_count", None)
             if thread_count is not None:
                 return CatBoostRegressor(random_state=random_state, thread_count=int(thread_count), **params_clean)
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
             return CatBoostRegressor(random_state=random_state, **params_clean)
 
         elif model_name == "人工神经网络":
@@ -495,7 +467,6 @@ class EnhancedModelTrainer:
         feature_names = None
         X_df = None
         if isinstance(X, pd.DataFrame):
-<<<<<<< HEAD
             # 保留列名，但对训练输入做一次“数值化 + 清洗”，避免出现全 NaN/非数值列导致后续形状不一致
             X_df = X.copy()
 
@@ -517,11 +488,6 @@ class EnhancedModelTrainer:
 
             feature_names = X_df.columns.tolist()
             X_arr = X_df.values
-=======
-            feature_names = X.columns.tolist()
-            X_df = X.copy()
-            X_arr = X.values
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
         else:
             X_arr = np.asarray(X)
             feature_names = [f"feat_{i}" for i in range(X_arr.shape[1])]
@@ -539,7 +505,6 @@ class EnhancedModelTrainer:
         if np.sum(~mask) > 0:
             X_arr = X_arr[mask]
             X_df = X_df.loc[mask].reset_index(drop=True)
-<<<<<<< HEAD
         # 过滤无效 y 之后，再次丢弃“整列都是 NaN”的特征列（避免训练/回传 DataFrame 形状不一致）
         if X_df is not None:
             dropped_all_nan_cols_2 = X_df.columns[X_df.isna().all()].tolist()
@@ -547,8 +512,6 @@ class EnhancedModelTrainer:
                 X_df = X_df.drop(columns=dropped_all_nan_cols_2)
                 feature_names = X_df.columns.tolist()
                 X_arr = X_df.values
-=======
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
             y_arr = y_arr[mask]
             if groups is not None:
                 groups = np.asarray(groups)[mask]
@@ -569,15 +532,11 @@ class EnhancedModelTrainer:
 
         # 3) 模型参数注入 random_state（对不支持的模型跳过）
         NO_SEED_MODELS = ["线性回归", "SVR", "TabPFN", "AutoGluon"]
-<<<<<<< HEAD
         # 并行训练设置（UI：训练并行核数）
         train_n_jobs = params.pop('train_n_jobs', -1)
         train_n_jobs = _normalize_train_n_jobs(train_n_jobs)
         model_params = params.copy()
         _apply_parallel_settings(model_name, model_params, train_n_jobs)
-=======
-        model_params = params.copy()
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
         if model_name not in NO_SEED_MODELS:
             model_params.setdefault('random_state', random_state)
 
@@ -689,18 +648,11 @@ class EnhancedModelTrainer:
             'pipeline': pipeline,
             'scaler': scaler,
             'imputer': imputer,
-<<<<<<< HEAD
             # 防御性处理：如果经过清洗/转换导致列数与 feature_names 不一致，自动对齐，避免训练失败
             'X_train': pd.DataFrame(X_train_scaled, columns=(feature_names if (feature_names is not None and len(feature_names) == X_train_scaled.shape[1]) else [f"feat_{i}" for i in range(X_train_scaled.shape[1])])),
             'X_test': pd.DataFrame(X_test_scaled, columns=(feature_names if (feature_names is not None and len(feature_names) == X_test_scaled.shape[1]) else [f"feat_{i}" for i in range(X_test_scaled.shape[1])])),
             'X_train_raw': pd.DataFrame(X_train_raw, columns=(feature_names if (feature_names is not None and len(feature_names) == X_train_raw.shape[1]) else [f"feat_{i}" for i in range(X_train_raw.shape[1])])),
             'X_test_raw': pd.DataFrame(X_test_raw, columns=(feature_names if (feature_names is not None and len(feature_names) == X_test_raw.shape[1]) else [f"feat_{i}" for i in range(X_test_raw.shape[1])])),
-=======
-            'X_train': pd.DataFrame(X_train_scaled, columns=feature_names),
-            'X_test': pd.DataFrame(X_test_scaled, columns=feature_names),
-            'X_train_raw': pd.DataFrame(X_train_raw, columns=feature_names),
-            'X_test_raw': pd.DataFrame(X_test_raw, columns=feature_names),
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
             'y_train': y_train,
             'y_test': y_test,
             'y_pred': y_pred_test,
@@ -795,15 +747,11 @@ class EnhancedModelTrainer:
         fold_mae = []
 
         NO_SEED_MODELS = ["线性回归", "SVR", "TabPFN", "AutoGluon"]
-<<<<<<< HEAD
         # 并行训练设置（UI：训练并行核数）
         train_n_jobs = params.pop('train_n_jobs', -1)
         train_n_jobs = _normalize_train_n_jobs(train_n_jobs)
         model_params = params.copy()
         _apply_parallel_settings(model_name, model_params, train_n_jobs)
-=======
-        model_params = params.copy()
->>>>>>> f168256419b9b557a70253c84666a6aee162abf4
         if model_name not in NO_SEED_MODELS:
             model_params.setdefault('random_state', random_state)
 
