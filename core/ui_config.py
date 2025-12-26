@@ -8,6 +8,7 @@ INVERSE_DESIGN_SPACE = {}
 
 MODEL_PARAMETERS = {
     "线性回归": {},
+    "Epoxy PINN (Physics-Informed)": {"mode": "auto", "hidden_dim": 256, "n_layers": 3, "dropout": 0.1, "lr": 0.001, "weight_decay": 0.0001, "batch_size": 256, "epochs": 200, "patience": 25, "physics_weight": 1.0},
     "Ridge回归": {"alpha": 1.0},
     "Lasso回归": {"alpha": 1.0},
     "ElasticNet": {"alpha": 1.0, "l1_ratio": 0.5},
@@ -165,6 +166,37 @@ MANUAL_TUNING_PARAMS = {
         {'name': 'batch_size', 'widget': 'slider', 'label': '批大小',
          'default': 32, 'args': {'min_value': 8, 'max_value': 128, 'step': 8}}
     ],
+
+    "Epoxy PINN (Physics-Informed)": [
+        {'name': 'mode', 'widget': 'selectbox', 'label': 'PINN Mode',
+         'default': 'auto', 'args': {'options': ['auto', 'tg', 'mechanics', 'generic']},
+         'help': 'auto: 根据目标列名自动选择；tg: Tg-α (DiBenedetto)；mechanics: Halpin–Tsai（模量）；generic: 纯 MLP'},
+        {'name': 'hidden_dim', 'widget': 'slider', 'label': 'Hidden Dim',
+         'default': 256, 'args': {'min_value': 64, 'max_value': 1024, 'step': 64}},
+        {'name': 'n_layers', 'widget': 'slider', 'label': 'Num Layers',
+         'default': 3, 'args': {'min_value': 1, 'max_value': 8, 'step': 1}},
+        {'name': 'dropout', 'widget': 'slider', 'label': 'Dropout',
+         'default': 0.10, 'args': {'min_value': 0.0, 'max_value': 0.6, 'step': 0.05}},
+        {'name': 'lr', 'widget': 'number_input', 'label': 'Learning Rate',
+         'default': 0.001, 'args': {'min_value': 1e-5, 'max_value': 1e-1, 'step': 1e-4, 'format': '%.5f'}},
+        {'name': 'weight_decay', 'widget': 'number_input', 'label': 'Weight Decay',
+         'default': 0.0001, 'args': {'min_value': 0.0, 'max_value': 0.01, 'step': 1e-4, 'format': '%.5f'}},
+        {'name': 'batch_size', 'widget': 'slider', 'label': 'Batch Size',
+         'default': 256, 'args': {'min_value': 32, 'max_value': 1024, 'step': 32}},
+        {'name': 'epochs', 'widget': 'slider', 'label': 'Epochs',
+         'default': 200, 'args': {'min_value': 50, 'max_value': 500, 'step': 25}},
+        {'name': 'patience', 'widget': 'slider', 'label': 'EarlyStop Patience',
+         'default': 25, 'args': {'min_value': 5, 'max_value': 100, 'step': 5}},
+        {'name': 'physics_weight', 'widget': 'slider', 'label': 'Physics Loss Weight',
+         'default': 1.0, 'args': {'min_value': 0.0, 'max_value': 10.0, 'step': 0.5}},
+        {'name': 'grad_clip', 'widget': 'slider', 'label': 'Grad Clip',
+         'default': 1.0, 'args': {'min_value': 0.0, 'max_value': 5.0, 'step': 0.5}},
+        {'name': 'device', 'widget': 'selectbox', 'label': 'Device',
+         'default': 'auto', 'args': {'options': ['auto', 'cpu', 'cuda']}},
+        {'name': 'verbose', 'widget': 'checkbox', 'label': 'Verbose (print training log)',
+         'default': False, 'args': {}},
+    ],
+
     
     "TabPFN": [],
     "AutoGluon": [],

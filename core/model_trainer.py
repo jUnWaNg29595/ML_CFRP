@@ -46,6 +46,14 @@ except Exception:
     ANN_AVAILABLE = False
     ANNRegressor = None
 
+
+# [新增] Epoxy PINN (Physics-Informed) 模型
+try:
+    from .pinn_model import EpoxyPINNRegressor
+    PINN_AVAILABLE = True
+except Exception:
+    PINN_AVAILABLE = False
+    EpoxyPINNRegressor = None
 try:
     from .tf_model import TFSequentialRegressor, TENSORFLOW_AVAILABLE
 except Exception:
@@ -259,6 +267,12 @@ class EnhancedModelTrainer:
             "reason": "" if ANN_AVAILABLE else "ANNRegressor 不可用（检查 core/ann_model.py 依赖）",
         }
 
+
+        # Epoxy PINN (Physics-Informed)
+        catalog["Epoxy PINN (Physics-Informed)"] = {
+            "available": bool(PINN_AVAILABLE),
+            "reason": "" if PINN_AVAILABLE else "未安装 torch 或 PINN 模块不可用（需要 torch>=2.1.0）",
+        }
         # TabPFN / AutoGluon
         catalog["TabPFN"] = {
             "available": bool(TABPFN_AVAILABLE),
@@ -377,6 +391,25 @@ class EnhancedModelTrainer:
             params_clean.setdefault('external_preprocess', True)
             return ANNRegressor(random_state=random_state, **params_clean)
 
+        elif model_name == "Epoxy PINN (Physics-Informed)":
+
+            if not PINN_AVAILABLE:
+
+                raise ImportError("Epoxy PINN 不可用（需要安装 torch>=2.1.0）")
+
+            # 将 random_state 映射为 PINN 的 seed（保持与其它模型一致）
+
+            if "seed" not in params_clean:
+
+                params_clean["seed"] = int(random_state)
+
+            # external_preprocess 对 PINN 不适用（模型内部已完成解析/归一化）
+
+            params_clean.pop("external_preprocess", None)
+
+            return EpoxyPINNRegressor(**params_clean)
+
+
         elif model_name == "TensorFlow Sequential":
             # 训练器内部已用 Pipeline 做缺失填充 + 标准化，避免 TFS 内部重复预处理
             # 若未安装 TensorFlow，训练时给出明确提示（模型仍可在 UI 中选择）
@@ -449,6 +482,183 @@ class EnhancedModelTrainer:
         tr, te = train_test_split(idx, test_size=test_size, random_state=random_state)
         return np.array(tr), np.array(te)
 
+    def _train_pinn_special(
+
+        self,
+
+        X,
+
+        y,
+
+        model_name,
+
+        test_size=0.2,
+
+        random_state=42,
+
+        split_strategy='random',
+
+        n_bins=10,
+
+        groups=None,
+
+        **params
+
+    ):
+
+        """Epoxy PINN 专用训练分支：允许输入包含带单位字符串列（如 nanofiller_content），由模型内部解析。"""
+
+        if isinstance(X, pd.DataFrame):
+
+            X_df = X.copy()
+
+            feature_names = X_df.columns.tolist()
+
+        else:
+
+            X_arr = np.asarray(X)
+
+            feature_names = [f"feat_{i}" for i in range(X_arr.shape[1])]
+
+            X_df = pd.DataFrame(X_arr, columns=feature_names)
+
+
+        y_arr = pd.to_numeric(np.asarray(y).ravel(), errors="coerce").astype(float)
+
+
+        mask = np.isfinite(y_arr)
+
+        X_df = X_df.loc[mask].reset_index(drop=True)
+
+        y_arr = y_arr[mask]
+
+        if groups is not None:
+
+            groups = np.asarray(groups)[mask]
+
+
+        if len(y_arr) == 0:
+
+            raise ValueError("所有样本的目标变量均无效（NaN/Inf），无法训练 Epoxy PINN")
+
+
+        train_idx, test_idx = self._resolve_split(
+
+            X_df, y_arr, test_size=test_size, random_state=random_state,
+
+            split_strategy=split_strategy, n_bins=n_bins, groups=groups
+
+        )
+
+
+        X_train_raw = X_df.iloc[train_idx].reset_index(drop=True)
+
+        X_test_raw = X_df.iloc[test_idx].reset_index(drop=True)
+
+        y_train = y_arr[train_idx]
+
+        y_test = y_arr[test_idx]
+
+
+        params.pop('train_n_jobs', None)
+
+        model_params = params.copy()
+
+        model_params.setdefault("seed", int(random_state))
+
+        if "target_name" not in model_params and hasattr(y, "name"):
+
+            model_params["target_name"] = getattr(y, "name", None)
+
+
+        model = self._get_model(model_name, random_state=int(random_state), **model_params)
+
+
+        start_time = time.time()
+
+        model.fit(X_train_raw, y_train)
+
+        train_time = time.time() - start_time
+
+
+        pipeline = Pipeline(steps=[('model', model)])
+
+
+        y_pred_test = pipeline.predict(X_test_raw)
+
+        y_pred_train = pipeline.predict(X_train_raw)
+
+
+        metrics = {
+
+            'train_r2': float(r2_score(y_train, y_pred_train)),
+
+            'test_r2': float(r2_score(y_test, y_pred_test)),
+
+            'train_rmse': float(np.sqrt(mean_squared_error(y_train, y_pred_train))),
+
+            'test_rmse': float(np.sqrt(mean_squared_error(y_test, y_pred_test))),
+
+            'train_mae': float(mean_absolute_error(y_train, y_pred_train)),
+
+            'test_mae': float(mean_absolute_error(y_test, y_pred_test)),
+
+            'train_time': float(train_time),
+
+        }
+
+
+        training_history = extract_history_from_fitted_model(
+
+            model_name=model_name,
+
+            model=model,
+
+            X_train_scaled=None,
+
+            y_train=np.asarray(y_train),
+
+            X_test_scaled=None,
+
+            y_test=np.asarray(y_test),
+
+        )
+
+
+        return {
+            'model': model,
+            'pipeline': pipeline,
+            'scaler': None,
+            'imputer': None,
+            # 供 UI/分析使用：返回与普通模型一致的“数值化+标准化”特征矩阵（来自 PINN 内部预处理）
+            'X_train': pd.DataFrame(model._transform(X_train_raw)[0], columns=getattr(getattr(model, "_prep_", None), "feature_names", None)
+                                    or [f"feat_{i}" for i in range(model._transform(X_train_raw)[0].shape[1])]),
+            'X_test': pd.DataFrame(model._transform(X_test_raw)[0], columns=getattr(getattr(model, "_prep_", None), "feature_names", None)
+                                   or [f"feat_{i}" for i in range(model._transform(X_test_raw)[0].shape[1])]),
+            # 原始数据（含字符串列）保留，供 PINN 预测/解析使用
+            'X_train_raw': X_train_raw,
+            'X_test_raw': X_test_raw,
+            'y_train': y_train,
+            'y_test': y_test,
+            'y_pred': y_pred_test,
+            'y_pred_test': y_pred_test,
+            'y_pred_train': y_pred_train,
+            # 与 app.py 指标展示对齐（Test 指标）
+            'r2': float(r2_score(y_test, y_pred_test)),
+            'rmse': float(np.sqrt(mean_squared_error(y_test, y_pred_test))),
+            'mae': float(mean_absolute_error(y_test, y_pred_test)),
+            'train_time': float(train_time),
+            'split_strategy': split_strategy,
+            'n_bins': int(n_bins),
+            'train_indices': train_idx,
+            'test_indices': test_idx,
+            'training_history': training_history,
+            'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
+
+
+        }
+
+
     def train_model(
         self,
         X,
@@ -462,6 +672,20 @@ class EnhancedModelTrainer:
         **params
     ):
         """训练单个模型（支持随机/分层/分组划分）"""
+        # Epoxy PINN 专用分支：允许原始字符串列，由模型内部解析（用于 Tg / 力学等物理约束）
+        if str(model_name) == "Epoxy PINN (Physics-Informed)":
+            return self._train_pinn_special(
+                X=X,
+                y=y,
+                model_name=model_name,
+                test_size=test_size,
+                random_state=random_state,
+                split_strategy=split_strategy,
+                n_bins=n_bins,
+                groups=groups,
+                **params
+            )
+
 
         # 1) 输入统一为 numpy，并做 y 清洗
         feature_names = None
@@ -671,6 +895,189 @@ class EnhancedModelTrainer:
             'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
         }
 
+    def _cross_validate_pinn_special(
+
+        self,
+
+        X,
+
+        y,
+
+        model_name,
+
+        cv_strategy: str = 'repeated_kfold',
+
+        n_splits: int = 5,
+
+        n_repeats: int = 3,
+
+        random_state: int = 42,
+
+        groups=None,
+
+        n_bins: int = 10,
+
+        **params
+
+    ):
+
+        """Epoxy PINN 专用交叉验证：保留 DataFrame 原始字符串列给模型解析。"""
+
+        if isinstance(X, pd.DataFrame):
+
+            X_df = X.copy()
+
+        else:
+
+            X_arr = np.asarray(X)
+
+            X_df = pd.DataFrame(X_arr, columns=[f"feat_{i}" for i in range(X_arr.shape[1])])
+
+
+        y_arr = pd.to_numeric(np.asarray(y).ravel(), errors="coerce").astype(float)
+
+
+        mask = np.isfinite(y_arr)
+
+        X_df = X_df.loc[mask].reset_index(drop=True)
+
+        y_arr = y_arr[mask]
+
+        if groups is not None:
+
+            groups = np.asarray(groups)[mask]
+
+
+        n = len(y_arr)
+
+        if n < 20:
+
+            raise ValueError("有效样本过少，无法进行 CV")
+
+
+        cv_strategy = (cv_strategy or 'repeated_kfold').lower()
+
+
+        if cv_strategy == 'group_kfold':
+
+            if groups is None:
+
+                raise ValueError("group_kfold 需要 groups")
+
+            splitter = GroupKFold(n_splits=n_splits)
+
+            split_iter = splitter.split(np.zeros((n, 1)), y_arr, groups)
+
+        elif cv_strategy == 'stratified_kfold':
+
+            y_bins = _make_y_bins(y_arr, n_bins=n_bins)
+
+            if y_bins is None:
+
+                splitter = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=random_state)
+
+                split_iter = splitter.split(np.zeros((n, 1)), y_arr)
+
+            else:
+
+                splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+
+                split_iter = splitter.split(np.zeros((n, 1)), y_bins)
+
+        else:
+
+            splitter = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=random_state)
+
+            split_iter = splitter.split(np.zeros((n, 1)), y_arr)
+
+
+        oof_sum = np.zeros(n, dtype=float)
+
+        oof_cnt = np.zeros(n, dtype=int)
+
+        fold_scores, fold_rmse, fold_mae = [], [], []
+
+
+        params.pop('train_n_jobs', None)
+
+
+        for fold_i, (tr_idx, va_idx) in enumerate(split_iter):
+
+            model_params = params.copy()
+
+            model_params.setdefault("seed", int(random_state + fold_i))
+
+            if "target_name" not in model_params and hasattr(y, "name"):
+
+                model_params["target_name"] = getattr(y, "name", None)
+
+
+            base_model = self._get_model(model_name, random_state=int(random_state + fold_i), **model_params)
+
+            base_model.fit(X_df.iloc[tr_idx].reset_index(drop=True), y_arr[tr_idx])
+
+            pred = base_model.predict(X_df.iloc[va_idx].reset_index(drop=True))
+
+
+            oof_sum[va_idx] += pred
+
+            oof_cnt[va_idx] += 1
+
+
+            fold_scores.append(float(r2_score(y_arr[va_idx], pred)))
+
+            fold_rmse.append(float(np.sqrt(mean_squared_error(y_arr[va_idx], pred))))
+
+            fold_mae.append(float(mean_absolute_error(y_arr[va_idx], pred)))
+
+
+        valid_mask = oof_cnt > 0
+
+        oof_pred = np.zeros(n, dtype=float)
+
+        oof_pred[valid_mask] = oof_sum[valid_mask] / oof_cnt[valid_mask]
+
+
+        oof_r2 = float(r2_score(y_arr[valid_mask], oof_pred[valid_mask]))
+
+        oof_rmse = float(np.sqrt(mean_squared_error(y_arr[valid_mask], oof_pred[valid_mask])))
+
+        oof_mae = float(mean_absolute_error(y_arr[valid_mask], oof_pred[valid_mask]))
+
+
+        return {
+
+            'model_name': model_name,
+
+            'cv_strategy': cv_strategy,
+
+            'n_splits': int(n_splits),
+
+            'n_repeats': int(n_repeats),
+
+            'fold_r2': fold_scores,
+
+            'fold_rmse': fold_rmse,
+
+            'fold_mae': fold_mae,
+
+            'cv_r2_mean': float(np.mean(fold_scores)) if len(fold_scores) else float('nan'),
+
+            'cv_r2_std': float(np.std(fold_scores, ddof=1)) if len(fold_scores) > 1 else 0.0,
+
+            'oof_pred': oof_pred,
+
+            'oof_true': y_arr,
+
+            'oof_r2': oof_r2,
+
+            'oof_rmse': oof_rmse,
+
+            'oof_mae': oof_mae,
+
+        }
+
+
     def cross_validate_model(
         self,
         X,
@@ -691,6 +1098,22 @@ class EnhancedModelTrainer:
             - stratified_kfold: 对 y 分箱后用 StratifiedKFold
             - group_kfold: GroupKFold（需要 groups）
         """
+        # Epoxy PINN 专用分支：允许原始字符串列，由模型内部解析（用于 Tg / 力学等物理约束）
+        if str(model_name) == "Epoxy PINN (Physics-Informed)":
+            return self._cross_validate_pinn_special(
+                X=X,
+                y=y,
+                model_name=model_name,
+                cv_strategy=cv_strategy,
+                n_splits=n_splits,
+                n_repeats=n_repeats,
+                random_state=random_state,
+                groups=groups,
+                n_bins=n_bins,
+                **params
+            )
+
+
 
         feature_names = None
         if isinstance(X, pd.DataFrame):

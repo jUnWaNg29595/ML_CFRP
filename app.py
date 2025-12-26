@@ -3776,11 +3776,15 @@ def page_prediction():
                     if missing:
                         st.error(f"输入样本缺少特征列: {missing[:10]}{'...' if len(missing)>10 else ''}")
                     else:
-                        X_input = input_df[feature_cols].values
-                        if imputer is not None:
-                            X_input = imputer.transform(X_input)
-                        if scaler is not None:
-                            X_input = scaler.transform(X_input)
+                        # Epoxy PINN: 使用模型内部的数值化+标准化，确保与训练特征空间一致
+                        if st.session_state.get("model_name") == "Epoxy PINN (Physics-Informed)" and hasattr(st.session_state.get("model", None), "_transform"):
+                            X_input = st.session_state.model._transform(input_df[feature_cols])[0]
+                        else:
+                            X_input = input_df[feature_cols].values
+                            if imputer is not None:
+                                X_input = imputer.transform(X_input)
+                            if scaler is not None:
+                                X_input = scaler.transform(X_input)
 
                         analyzer = ApplicabilityDomainAnalyzer(st.session_state.X_train.values)
                         analyzer.fit()

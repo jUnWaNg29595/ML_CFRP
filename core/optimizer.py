@@ -106,6 +106,21 @@ class HyperparameterOptimizer:
                 'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None])
             }
 
+
+        elif model_name == "Epoxy PINN (Physics-Informed)":
+            params = {
+                'mode': trial.suggest_categorical('mode', ['auto', 'tg', 'mechanics', 'generic']),
+                'hidden_dim': trial.suggest_int('hidden_dim', 128, 768, step=64),
+                'n_layers': trial.suggest_int('n_layers', 2, 6),
+                'dropout': trial.suggest_float('dropout', 0.0, 0.5, step=0.05),
+                'lr': trial.suggest_float('lr', 1e-4, 5e-3, log=True),
+                'weight_decay': trial.suggest_float('weight_decay', 0.0, 1e-3),
+                'batch_size': trial.suggest_categorical('batch_size', [64, 128, 256, 512]),
+                'epochs': trial.suggest_int('epochs', 120, 300, step=30),
+                'patience': trial.suggest_int('patience', 10, 40, step=5),
+                'physics_weight': trial.suggest_float('physics_weight', 0.0, 5.0, step=0.5),
+            }
+
         return params
 
     def optimize(self, model_name, X, y, n_trials=50, cv=5, random_state=42, progress_callback=None):
@@ -115,8 +130,11 @@ class HyperparameterOptimizer:
             progress_callback: 回调函数，接收一个 0-1 之间的浮点数表示进度
         """
 
+        # 0. 记录目标列名（用于 Epoxy PINN auto mode）
+        y_name = getattr(y, 'name', None)
+
         # 1. 确保输入是 numpy 数组
-        if isinstance(X, pd.DataFrame):
+        if isinstance(X, pd.DataFrame) and model_name != "Epoxy PINN (Physics-Informed)":
             X = X.values
         if isinstance(y, (pd.DataFrame, pd.Series)):
             y = y.values.ravel() if hasattr(y, 'values') else np.array(y).ravel()
@@ -143,16 +161,25 @@ class HyperparameterOptimizer:
             # 获取建议参数
             params = self.get_model_params(trial, model_name)
 
+            # Epoxy PINN: 传入目标列名用于 auto mode
+            if model_name == "Epoxy PINN (Physics-Informed)" and y_name is not None:
+                params.setdefault("target_name", y_name)
+
+
             try:
                 # 调用正确的方法名 _get_model
                 base_model = self.trainer._get_model(model_name, **params)
 
                 # 增加 SimpleImputer 处理特征缺失
-                pipeline = make_pipeline(
-                    SimpleImputer(strategy='median'),
-                    StandardScaler(),
-                    base_model
-                )
+                # Epoxy PINN: 允许原始 DataFrame（含字符串列），前处理由模型内部完成
+                if model_name == "Epoxy PINN (Physics-Informed)":
+                    pipeline = base_model
+                else:
+                    pipeline = make_pipeline(
+                        SimpleImputer(strategy='median'),
+                        StandardScaler(),
+                        base_model
+                    )
 
                 # 定义交叉验证策略
                 cv_strategy = KFold(n_splits=cv, shuffle=True, random_state=random_state)

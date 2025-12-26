@@ -1,0 +1,30 @@
+{
+  "model_name": "Epoxy PINN (Physics-Informed)",
+  "r2": -0.008158745911097887,
+  "rmse": 58.06382059627753,
+  "mae": 46.48495406398066,
+  "train_time": 29.03948664665222,
+  "split_strategy": "stratified",
+  "test_size": 0.2,
+  "random_state": 42,
+  "params": {
+    "mode": "tg",
+    "hidden_dim": 256,
+    "n_layers": 3,
+    "dropout": 0.1,
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "batch_size": 256,
+    "epochs": 200,
+    "patience": 25,
+    "physics_weight": 1.0,
+    "grad_clip": 1.0,
+    "device": "auto",
+    "verbose": false,
+    "train_n_jobs": -1
+  },
+  "n_samples": 4319,
+  "n_features": 419,
+  "run_id": "20251226_102854_Epoxy_PINN__Physics-Informed_",
+  "created_at": "2025-12-26T10:28:54"
+}

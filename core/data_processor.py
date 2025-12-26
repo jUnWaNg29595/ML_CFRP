@@ -3,6 +3,12 @@
 
 import pandas as pd
 import numpy as np
+
+# [新增] 解析带单位/符号的数值（用于 epoxy/复合材料数据清洗）
+try:
+    from .epoxy_physics import parse_first_number
+except Exception:
+    parse_first_number = None
 from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.decomposition import PCA
@@ -146,19 +152,46 @@ class AdvancedDataCleaner:
         self.cleaning_log = []
 
     def detect_pseudo_numeric_columns(self):
+        """检测“看起来像数字”的 object 列。
+
+        兼容两类情况：
+        1) 纯数字字符串：pd.to_numeric 可直接转换
+        2) 带单位/符号：如 '80 wt%', '25°C', '1.2e3 MPa' —— 通过正则抽取首个数字转换
+        """
         pseudo = {}
         for col in self.cleaned_data.columns:
             if self.cleaned_data[col].dtype == 'object':
-                converted = pd.to_numeric(self.cleaned_data[col], errors='coerce')
-                orig_count = self.cleaned_data[col].notna().sum()
+                s = self.cleaned_data[col]
+                converted = pd.to_numeric(s, errors='coerce')
+                orig_count = s.notna().sum()
                 conv_count = converted.notna().sum()
                 if orig_count > 0 and conv_count / orig_count >= 0.5:
-                    pseudo[col] = {'转换成功率': conv_count / orig_count}
+                    pseudo[col] = {'转换成功率': conv_count / orig_count, 'method': 'direct'}
+                    continue
+
+                if parse_first_number is not None and orig_count > 0:
+                    sample = s.dropna().astype(str).head(200)
+                    if len(sample) == 0:
+                        continue
+                    parsed = sample.apply(parse_first_number)
+                    parsed_ok = np.isfinite(parsed).sum()
+                    ratio = parsed_ok / max(1, len(sample))
+                    if ratio >= 0.5:
+                        pseudo[col] = {'转换成功率': ratio, 'method': 'regex_number'}
         return pseudo
 
     def fix_pseudo_numeric_columns(self):
-        for col in self.detect_pseudo_numeric_columns():
-            self.cleaned_data[col] = pd.to_numeric(self.cleaned_data[col], errors='coerce')
+        """将 detect_pseudo_numeric_columns 检出的列转为数值。"""
+        pseudo = self.detect_pseudo_numeric_columns()
+        for col, info in pseudo.items():
+            method = info.get('method', 'direct')
+            if method == 'direct':
+                self.cleaned_data[col] = pd.to_numeric(self.cleaned_data[col], errors='coerce')
+            elif method == 'regex_number' and parse_first_number is not None:
+                self.cleaned_data[col] = self.cleaned_data[col].apply(parse_first_number)
+                self.cleaned_data[col] = pd.to_numeric(self.cleaned_data[col], errors='coerce')
+            else:
+                self.cleaned_data[col] = pd.to_numeric(self.cleaned_data[col], errors='coerce')
         return self.cleaned_data
 
     def handle_missing_values(self, strategy='median', fill_value=None):
