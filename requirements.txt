@@ -1,0 +1,259 @@
+# CFRP智能预测平台 - 依赖列表
+
+## 核心依赖 (必需)
+
+### 数据处理
+```
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+```
+
+### 机器学习
+```
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+lightgbm>=4.0.0
+joblib>=1.3.0
+```
+
+### 化学信息学
+```
+rdkit>=2023.03.1
+mordred>=1.2.0
+```
+
+### Web框架
+```
+streamlit>=1.30.0
+plotly>=5.18.0
+altair>=5.2.0
+```
+
+### 可视化
+```
+matplotlib>=3.7.0
+seaborn>=0.12.0
+```
+
+### 模型解释
+```
+shap>=0.42.0
+```
+
+### 超参数优化
+```
+optuna>=3.4.0
+```
+
+## 深度学习 (可选)
+
+### PyTorch
+```
+torch>=2.0.0
+torchvision>=0.15.0
+```
+
+### 图神经网络
+```
+torch-geometric>=2.4.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.18
+```
+
+### Transformer模型
+```
+transformers>=4.35.0
+```
+
+## 专业模型 (可选)
+
+### AutoGluon
+```
+autogluon>=1.0.0
+```
+
+### TabNet
+```
+pytorch-tabnet>=4.1.0
+```
+
+### TabPFN
+```
+tabpfn>=0.1.9
+```
+
+## 图像处理 (可选)
+
+### DECIMER (图像转SMILES)
+```
+tensorflow>=2.12.0,<=2.20.0
+efficientnet>=1.0.0
+selfies>=2.1.0
+opencv-python>=4.8.0
+pillow-heif>=0.14.0
+pystow>=1.0.0
+pyyaml>=6.0.0
+```
+
+### PDF支持
+```
+pymupdf>=1.23.0
+# 或
+pdf2image>=1.16.0
+```
+
+## 数据库 (可选)
+
+```
+sqlalchemy>=2.0.0
+```
+
+## 开发工具 (可选)
+
+### 代码质量
+```
+black>=23.0.0
+flake8>=6.1.0
+isort>=5.12.0
+mypy>=1.7.0
+pytest>=7.4.0
+pytest-cov>=4.1.0
+```
+
+### Jupyter
+```
+jupyter>=1.0.0
+ipykernel>=6.27.0
+```
+
+## 安装指南
+
+### 最小安装 (仅核心功能)
+```bash
+pip install pandas numpy scikit-learn xgboost rdkit streamlit plotly shap optuna
+```
+
+### 推荐安装 (包含深度学习)
+```bash
+pip install -r requirements.txt
+
+# PyTorch with CUDA (根据你的CUDA版本选择)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+### 完整安装 (包含所有可选功能)
+```bash
+pip install -r requirements-full.txt
+```
+
+## 版本兼容性
+
+### Python版本
+- 推荐: Python 3.10.x
+- 支持: Python 3.9 - 3.11
+- 不支持: Python 3.12+ (部分依赖不兼容)
+
+### CUDA版本 (GPU训练)
+- CUDA 11.8: 推荐
+- CUDA 12.1: 支持
+- CUDA 12.4: 部分支持
+
+### 操作系统
+- Windows 10/11: ✅ 完全支持
+- Linux (Ubuntu 20.04+): ✅ 完全支持
+- macOS: ⚠️ 部分功能受限 (无CUDA,部分RDKit功能)
+
+## 常见安装问题
+
+### Q1: RDKit安装失败
+```bash
+# 使用conda安装
+conda install -c conda-forge rdkit
+
+# 或使用mamba
+mamba install rdkit
+```
+
+### Q2: PyTorch Geometric安装失败
+```bash
+# 确保PyTorch版本匹配
+pip install torch==2.1.0
+
+# 安装PyG
+pip install torch-geometric
+pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
+```
+
+### Q3: TensorFlow版本冲突
+```bash
+# DECIMER需要TensorFlow 2.x
+pip install tensorflow==2.15.0
+
+# 如果与PyTorch冲突,考虑使用不同环境
+conda create -n decimer_env tensorflow==2.15.0
+```
+
+### Q4: SHAP安装慢
+```bash
+# 使用预编译wheel
+pip install shap --prefer-binary
+```
+
+## 依赖更新
+
+### 检查可更新包
+```bash
+pip list --outdated
+```
+
+### 更新特定包
+```bash
+pip install --upgrade package-name
+```
+
+### 更新所有包
+```bash
+pip install --upgrade -r requirements.txt
+```
+
+## 虚拟环境建议
+
+### Conda环境
+```bash
+conda create -n cfrp_env python=3.10
+conda activate cfrp_env
+pip install -r requirements.txt
+```
+
+### venv环境
+```bash
+python -m venv cfrp_venv
+source cfrp_venv/bin/activate  # Linux/macOS
+cfrp_venv\Scripts\activate      # Windows
+pip install -r requirements.txt
+```
+
+## 内存需求
+
+### 最小内存
+- 训练: 4GB RAM
+- 预测: 2GB RAM
+- 虚拟筛选: 8GB RAM (取决于候选数量)
+
+### 推荐内存
+- 训练深度学习模型: 16GB+ RAM
+- 大规模虚拟筛选: 32GB+ RAM
+- 图像转SMILES: 8GB+ RAM
+
+## GPU需求
+
+### NVIDIA GPU
+- 计算能力: 7.0+ (推荐)
+- 显存: 6GB+ (训练), 8GB+ (虚拟筛选)
+- CUDA: 11.8或12.1
+
+### AMD GPU (ROCm)
+- 支持: 部分支持
+- 需要ROCm 5.4+
+- 参考: https://rocm.docs.amd.com/
