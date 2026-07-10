@@ -1,98 +1,386 @@
-# 碳纤维复合材料智能预测平台 v1.4.5
+# CFRP 智能预测平台
 
-## 🚀 项目简介
+<div align="center">
 
-本平台是一个基于机器学习的碳纤维复合材料（CFRP）性能预测系统
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-1.30+-red.svg)](https://streamlit.io/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## ⚙️ v1.4.5 更新：OpenMP 线程优化
+**基于机器学习的碳纤维复合材料性能预测与虚拟筛选系统**
 
-解决了 RDKit 底层 OpenMP 占满所有 CPU 核心的问题。
+[English](#english) | [中文文档](#中文文档)
 
-**问题描述：**
-即使设置 `n_jobs=1`，RDKit 内部的 OpenMP 仍会启动与 CPU 核心数相等的线程，导致 CPU 占用率 100%。
+</div>
 
-**解决方案：**
-- 新增 `core/thread_config.py` 模块，在导入 RDKit 之前设置环境变量
-- 默认限制线程数为 CPU 核心数的一半（最多 8 个）
+---
 
-**自定义线程数：**
+## 中文文档
+
+### 📋 目录
+
+- [项目简介](#项目简介)
+- [核心功能](#核心功能)
+- [技术架构](#技术架构)
+- [快速开始](#快速开始)
+- [使用指南](#使用指南)
+- [性能优化](#性能优化)
+- [常见问题](#常见问题)
+
+---
+
+### 项目简介
+
+本平台是一个集成的机器学习系统，用于碳纤维增强聚合物（CFRP）的性能预测与材料筛选。系统结合了分子特征工程、深度学习模型、虚拟筛选和主动学习等先进技术。
+
+**主要应用场景:**
+- 🎯 **性能预测**: 预测CFRP的拉伸强度、模量等关键性能指标
+- 🔬 **虚拟筛选**: 高通量生成候选分子并筛选配方
+- 🧪 **分子特征提取**: 从SMILES自动生成分子描述符
+- 📊 **模型解释**: SHAP可视化、特征重要性分析
+- 🤖 **主动学习**: 智能推荐最有价值的实验样本
+
+---
+
+### 核心功能
+
+#### 1. 🧪 虚拟分子筛选 (核心亮点)
+- **反应约束生成**: 基于环氧树脂化学反应规则生成候选配方
+- **PubChem集成**: 自动检索PubChem数据库扩充候选库
+- **多源候选融合**: 组合树脂库、固化剂库、PubChem候选
+- **化学规则过滤**: 环氧官能度、分子量、芳香环数、元素组成
+- **可合成性评估**: 合成难度评分与可行性筛选
+- **配方可行性**: 当量比计算、组分配比合理性检查
+- **适用域分析**: 预测结果的可信度评估
+
+#### 2. 🧬 分子特征工程
+**指纹特征:**
+- Morgan指纹 (ECFP)
+- MACCS keys
+- RDKit指纹
+- Atom Pair指纹
+
+**描述符特征:**
+- RDKit描述符 (210+)
+- Mordred描述符 (1800+)
+- 3D分子描述符
+
+**深度学习特征:**
+- ChemBERTa (Transformer预训练模型)
+- 分子图神经网络 (GNN)
+- SMILES Transformer
+
+#### 3. 🤖 模型训练
+**支持的模型:**
+| 模型类型 | 特点 | 适用场景 |
+|---------|------|----------|
+| **XGBoost** | 快速、高效、可解释 | 中小数据集 |
+| **BNN (贝叶斯神经网络)** | 不确定性量化 | 需要置信度的场景 |
+| **PINN (物理信息神经网络)** | 融入物理约束 | 物理规律明确的系统 |
+| **TabNet** | 深度表格学习 | 大规模表格数据 |
+| **GNN (图神经网络)** | 分子图结构学习 | 分子结构重要场景 |
+| **Transformer系列** | 注意力机制 | 序列建模 |
+| **AutoGluon** | 自动化集成 | 快速建模 |
+
+**高级功能:**
+- 超参数优化 (Optuna)
+- 交叉验证
+- 早停机制
+- 模型集成
+- GPU加速训练
+
+#### 4. 📊 模型解释与可视化
+- **SHAP分析**: 特征重要性、依赖图、交互图
+- **学习曲线**: 训练过程可视化
+- **预测分析**: 残差图、误差分布
+- **特征相关性**: 相关性矩阵、散点图
+
+#### 5. 🔍 主动学习
+- **不确定性采样**: 选择模型最不确定的样本
+- **多样性采样**: 选择最具代表性的样本
+- **混合策略**: 综合不确定性与多样性
+- **批量推荐**: 批量推荐最有价值的实验
+
+#### 6. 🖼️ 图像转SMILES
+- **DECIMER集成**: 从化学结构图像识别SMILES
+- **多格式支持**: PNG, JPG, PDF等
+- **批量处理**: 支持批量图像识别
+
+---
+
+### 技术架构
+
+```
+CFRP系统/
+├── app.py                      # Streamlit主应用
+├── config.py                   # 全局配置
+├── UserPrediction.py           # 用户预测模块
+│
+├── core/                       # 核心功能模块
+│   ├── virtual_screening.py    # 虚拟筛选 (核心)
+│   ├── molecular_features.py   # 分子特征提取
+│   ├── model_trainer.py        # 模型训练
+│   ├── model_interpreter.py    # 模型解释 (SHAP)
+│   ├── pubchem_client.py       # PubChem API
+│   ├── smiles_utils.py         # SMILES处理
+│   ├── epoxy_physics.py        # 环氧物理约束
+│   ├── active_learning.py      # 主动学习
+│   └── ...                     # 其他模块
+│
+├── DECIMER/                    # 图像转SMILES
+│   ├── decimer.py
+│   └── efficientnetv2/
+│
+├── docs/                       # 文档
+└── scripts/                    # 辅助脚本
+```
+
+---
+
+### 快速开始
+
+#### 1. 环境准备
+
+**系统要求:**
+- Python 3.10+
+- 推荐: 8GB+ RAM, 4核+ CPU
+- GPU训练: NVIDIA GPU with CUDA 11.8+
+
+**创建虚拟环境:**
 ```bash
-# 方法1：设置环境变量
+conda create -n cfrp_env python=3.10
+conda activate cfrp_env
+```
+
+#### 2. 安装依赖
+
+**基础依赖:**
+```bash
+# PyTorch (CPU版本)
+pip install torch torchvision torchaudio
+
+# 核心依赖
+pip install streamlit pandas numpy scikit-learn
+pip install rdkit mordred
+pip install xgboost lightgbm
+pip install shap optuna
+
+# Web应用
+pip install plotly altair
+```
+
+**GPU加速 (可选):**
+```bash
+# PyTorch with CUDA 11.8
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# GNN支持
+pip install torch_geometric
+pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.3.0+cu118.html
+```
+
+**图像转SMILES (可选):**
+```bash
+pip install tensorflow>=2.12.0,<=2.20.0
+pip install opencv-python pillow-heif efficientnet selfies pyyaml
+pip install pymupdf  # PDF支持
+```
+
+#### 3. 启动应用
+
+```bash
+streamlit run app.py
+```
+
+浏览器自动打开: `http://localhost:8501`
+
+---
+
+### 使用指南
+
+#### 完整工作流程
+
+```
+1. 数据上传 → 2. 数据清洗 → 3. 分子特征提取 → 4. 特征选择
+      ↓              ↓                ↓                 ↓
+   CSV/XLSX    缺失值处理      SMILES→描述符        降维/筛选
+                                  ↓
+                            5. 模型训练 ← 6. 超参数优化
+                                  ↓
+                            7. 模型解释
+                                  ↓
+                            8. 预测/虚拟筛选
+                                  ↓
+                            9. 主动学习
+```
+
+#### 虚拟筛选使用流程
+
+1. **准备模型和特征配置**
+   - 训练模型并导出 `.joblib` 文件
+   - 保存分子特征流程配置 `feature_process.json`
+
+2. **上传到虚拟筛选页面**
+   - 导入训练好的模型
+   - 上传分子特征配置文件
+
+3. **配置候选库**
+   - 上传树脂SMILES列表 (CSV)
+   - 上传固化剂SMILES列表 (可选)
+   - 设置PubChem搜索关键词 (可选)
+
+4. **设置筛选参数**
+   - 总候选数上限
+   - 化学规则过滤参数
+   - 目标性能范围
+   - 不确定度阈值
+
+5. **运行筛选**
+   - 点击"开始虚拟筛选"
+   - 查看实时进度
+   - 导出筛选结果
+
+#### 关键参数说明
+
+**化学规则过滤:**
+- `min_epoxide`: 最小环氧官能度 (建议: 1-2)
+- `min_aromatic_rings`: 最小芳香环数 (建议: 1-2)
+- `min_mw`: 最小分子量 (建议: 180-250)
+- `allowed_elements`: 允许的元素组成
+
+**配方可行性:**
+- `amine_ratio`: 胺当量比范围 (建议: 0.25-4.0)
+- `reject_mixed_class`: 是否拒绝混合类型固化剂
+
+**性能优化:**
+- `n_jobs`: 并行任务数 (建议: CPU核心数的50%)
+- `batch_size`: 批量预测大小
+- `use_gpu`: 是否使用GPU加速
+
+---
+
+### 性能优化
+
+#### OpenMP线程优化 (v1.4.5)
+
+**问题:** RDKit底层OpenMP会占满所有CPU核心，即使设置`n_jobs=1`
+
+**解决方案:**
+系统自动限制线程数为CPU核心数的一半(最多8个)
+
+**自定义线程数:**
+```bash
+# 方法1: 环境变量
 export ML_THREAD_COUNT=4
 streamlit run app.py
 
-# 方法2：直接设置 OpenMP 线程数
+# 方法2: OpenMP设置
 export OMP_NUM_THREADS=4
 streamlit run app.py
 ```
 
-## 🛠️ 安装
+#### GPU内存优化
 
-### 1. 创建环境
-
-```bash
-conda create -n CFRP_env python=3.10
-conda activate CFRP_env
+```python
+# 在app.py中启用GPU内存增长
+import tensorflow as tf
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
 ```
 
-### 2. 安装PyTorch
+#### 大规模数据集
+
+- 使用`batch_size`参数分批预测
+- 启用特征缓存
+- 考虑使用更快的模型(XGBoost > 神经网络)
+
+---
+
+### 常见问题
+
+**Q1: 虚拟筛选后候选为空?**
+- 检查化学规则过滤参数是否过于严格
+- 降低`min_epoxide`和`min_aromatic_rings`
+- 尝试关闭化学规则过滤(`filter_timing='off'`)
+
+**Q2: 模型导入失败?**
+- 确认模型文件来自本系统导出
+- 检查依赖版本是否一致
+- 查看错误日志定位具体模块
+
+**Q3: GPU训练报错?**
+- 确认CUDA版本与PyTorch匹配
+- 检查GPU内存是否足够
+- 尝试减小batch_size
+
+**Q4: 特征提取过慢?**
+- 减少特征类型(如不使用Mordred)
+- 启用特征缓存
+- 使用`n_jobs`并行化
+
+**Q5: SHAP计算耗时过长?**
+- 减少背景样本数(`background_samples`)
+- 使用TreeExplainer(仅限树模型)
+- 降低可视化样本数
+
+---
+
+## English
+
+### Project Overview
+
+An integrated machine learning system for Carbon Fiber Reinforced Polymer (CFRP) performance prediction and virtual screening. The system combines molecular feature engineering, deep learning models, virtual screening, and active learning.
+
+### Key Features
+
+- **Virtual Screening**: Reaction-constrained candidate generation with PubChem integration
+- **Molecular Features**: Fingerprints, RDKit/Mordred descriptors, ChemBERTa embeddings
+- **Multiple Models**: XGBoost, BNN, PINN, TabNet, GNN, Transformer, AutoGluon
+- **Model Interpretation**: SHAP analysis, feature importance
+- **Active Learning**: Smart sample recommendation
+
+### Quick Start
 
 ```bash
-# CPU版本
-pip install torch torchvision torchaudio
+# Create environment
+conda create -n cfrp_env python=3.10
+conda activate cfrp_env
 
-# GPU版本（CUDA 11.8）
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-```
+# Install dependencies
+pip install streamlit pandas numpy scikit-learn rdkit xgboost shap
+pip install torch torchvision
 
-### 3. 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. 安装PyTorch Geometric（可选）
-
-```bash
-pip install torch_geometric
-pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.3.0+cpu.html
-```
-## 🚀 运行
-
-```bash
+# Run application
 streamlit run app.py
 ```
-## 📄 许可证
+
+### Project Structure
+
+```
+CFRP系统/
+├── app.py                      # Streamlit main app
+├── core/                       # Core modules
+│   ├── virtual_screening.py    # Virtual screening
+│   ├── molecular_features.py   # Feature extraction
+│   ├── model_trainer.py        # Model training
+│   └── ...
+└── docs/                       # Documentation
+```
+
+### License
 
 MIT License
 
+---
 
-## 🖼️ 图像/文件转 SMILES（DECIMER）
+## 📧 Contact
 
-平台已集成 **DECIMER**（Image Transformer）用于从化学结构图像识别 SMILES。
+For questions or issues, please open an issue on GitHub.
 
-- 入口：侧边栏 **“🖼️ 图像转SMILES”**
-- 支持：png/jpg/jpeg/bmp/tif/tiff/webp/heif/heic；PDF（需安装 PyMuPDF 或 pdf2image）
-- 注意：**首次运行会自动下载预训练权重（需要联网）**
+---
 
-### 安装依赖（可选）
+<div align="center">
 
-```bash
-pip install tensorflow>=2.12.0,<=2.20.0
-pip install opencv-python pystow pillow-heif efficientnet selfies pyyaml
-# 若需要 PDF 支持（二选一）
-pip install pymupdf
-# 或：pip install pdf2image  （系统需额外安装 poppler）
-```
+**⭐ If this project helps your research, please give it a star! ⭐**
 
-
-## AMD Integrated GPU on WSL (Ubuntu 22.04)
-
-This project uses PyTorch for GPU acceleration. On AMD GPUs, PyTorch uses the ROCm/HIP backend but **still exposes the `torch.cuda` API**, so in the UI you should choose device `cuda` to use GPU.
-
-High level steps (refer to AMD official docs for exact versions):
-1) Install the compatible AMD Windows driver for WSL.
-2) In WSL Ubuntu 22.04, install ROCm using `amdgpu-install` with `--usecase=wsl,rocm --no-dkms`.
-3) Install ROCm/HIP PyTorch wheels from AMD repo (`repo.radeon.com`).
-4) Verify: `rocminfo` and `python -c "import torch; print(torch.cuda.is_available(), torch.version.hip, torch.cuda.get_device_name(0))"`.
-
+</div>
