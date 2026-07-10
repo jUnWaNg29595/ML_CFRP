@@ -1,0 +1,74 @@
+# 缓存和中间文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.onnx
+*.npy
+*.npz
+*.tfrecord
+*.tfevents
+*.ckpt
+*.safetensors
+*.msgpack
+*.bin
+
+# 模型文件
+AutogluonModels/
+models/
+checkpoints/
+training_runs/
+training_records/
+experiments/
+
+# 数据文件
+*.csv
+*.xlsx
+*.xls
+*.json
+*.db
+*.sqlite
+*.parquet
+*.feather
+*.arrow
+*.hdf5
+data/
+datasets/
+
+# 环境和配置
+.env
+venv/
+.venv/
+env/
+envs/
+.conda/
+node_modules/
+
+# 日志
+logs/
+*.log
+streamlit_logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
+.desktop.ini
+
+# 临时文件
+temp/
+tmp/
+*.bak
+*.tmp

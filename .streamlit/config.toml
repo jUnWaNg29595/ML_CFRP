@@ -1,0 +1,29 @@
+[server]
+# 局域网访问配置
+address = "0.0.0.0"
+port = 8501
+
+# 性能优化配置
+maxUploadSize = 500
+maxMessageSize = 500
+enableCORS = false
+enableXsrfProtection = false
+
+# 启用文件监控，允许代码保存后自动热更新
+fileWatcherType = "auto"
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+# 加快脚本执行
+fastReruns = true
+enforceSerializableSessionState = false
+
+[client]
+# 显示优化
+showErrorDetails = false
+toolbarMode = "minimal"
+
+[theme]
+base = "light"

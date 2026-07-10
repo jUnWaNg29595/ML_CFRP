@@ -1,0 +1,752 @@
+# -*- coding: utf-8 -*-
+"""模型解释模块"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import warnings
+import matplotlib
+import sys
+import locale
+import builtins
+
+try:
+    import shap
+    SHAP_IMPORT_ERROR = None
+except Exception as exc:
+    shap = None
+    SHAP_IMPORT_ERROR = exc
+
+matplotlib.use('Agg')
+
+
+def _configure_safe_console_output():
+    preferred_encoding = locale.getpreferredencoding(False) or "utf-8"
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding=preferred_encoding, errors="replace")
+        except Exception:
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+    original_print = builtins.print
+
+    def _safe_print(*args, **kwargs):
+        try:
+            return original_print(*args, **kwargs)
+        except UnicodeEncodeError:
+            output_file = kwargs.get("file", sys.stdout)
+            output_encoding = getattr(output_file, "encoding", None) or preferred_encoding
+            safe_args = [
+                str(arg).encode(output_encoding, errors="replace").decode(output_encoding, errors="replace")
+                for arg in args
+            ]
+            return original_print(*safe_args, **kwargs)
+
+    return _safe_print
+
+
+print = _configure_safe_console_output()
+
+# 统一图表风格
+try:
+    from .plot_style import apply_global_style
+    apply_global_style()
+except Exception:
+    # 解释模块不应因样式失败而中断
+    pass
+warnings.filterwarnings('ignore')
+
+
+def compute_xgboost_native_shap(model, X_data, feature_names=None):
+    """Use XGBoost's native pred_contribs to avoid SHAP TreeExplainer instability."""
+    import xgboost as xgb
+
+    if isinstance(X_data, pd.DataFrame):
+        X_frame = X_data.copy()
+    else:
+        X_arr = np.asarray(X_data, dtype=np.float64)
+        if X_arr.ndim != 2:
+            raise ValueError("X_data must be 2D for XGBoost SHAP computation")
+        if feature_names is None or len(feature_names) != X_arr.shape[1]:
+            feature_names = [f"Feature_{i}" for i in range(X_arr.shape[1])]
+        X_frame = pd.DataFrame(X_arr, columns=list(feature_names), dtype=np.float64)
+
+    if feature_names is not None and len(feature_names) == X_frame.shape[1]:
+        X_frame.columns = list(feature_names)
+
+    for col in X_frame.columns:
+        X_frame[col] = pd.to_numeric(X_frame[col], errors="coerce")
+
+    booster = None
+    if hasattr(model, "get_booster"):
+        booster = model.get_booster()
+        if hasattr(model, "set_params"):
+            try:
+                model.set_params(n_jobs=1)
+            except Exception:
+                pass
+    elif hasattr(model, "_Booster"):
+        booster = model._Booster
+    else:
+        booster = model
+
+    if hasattr(booster, "set_param"):
+        try:
+            booster.set_param("nthread", 1)
+        except Exception:
+            pass
+
+    dmatrix = xgb.DMatrix(
+        X_frame,
+        feature_names=list(X_frame.columns),
+        missing=np.nan,
+    )
+
+    try:
+        contribs = booster.predict(
+            dmatrix,
+            pred_contribs=True,
+            validate_features=False,
+        )
+    except TypeError:
+        contribs = booster.predict(dmatrix, pred_contribs=True)
+
+    contribs = np.asarray(contribs, dtype=np.float64)
+
+    if contribs.ndim == 2 and contribs.shape[1] == X_frame.shape[1] + 1:
+        base_values = contribs[:, -1].copy()
+        shap_values = contribs[:, :-1].copy()
+    elif contribs.ndim == 3 and contribs.shape[-1] == X_frame.shape[1] + 1:
+        base_values = contribs[..., -1].copy()
+        shap_values = contribs[..., :-1].copy()
+    else:
+        base_values = None
+        shap_values = contribs.copy()
+
+    return shap_values, X_frame, base_values
+
+
+def _plot_custom_shap_bar(ax, vals_plot, feature_names_plot):
+    mean_abs_shap = np.abs(np.asarray(vals_plot, dtype=np.float64)).mean(axis=0)
+    order = np.argsort(mean_abs_shap)
+    ordered_vals = mean_abs_shap[order]
+    ordered_names = [feature_names_plot[i] for i in order]
+
+    ax.barh(range(len(ordered_names)), ordered_vals, color="#2E7D6E", alpha=0.9)
+    ax.set_yticks(range(len(ordered_names)))
+    ax.set_yticklabels(ordered_names, fontsize=10)
+    ax.set_xlabel("mean(|SHAP value|)")
+    ax.set_title("SHAP Summary")
+    ax.grid(axis="x", alpha=0.2, linestyle="--")
+
+
+def _plot_custom_shap_beeswarm(ax, vals_plot, X_plot_for_color, feature_names_plot):
+    vals_plot = np.asarray(vals_plot, dtype=np.float64)
+    if isinstance(X_plot_for_color, pd.DataFrame):
+        feature_frame = X_plot_for_color.copy()
+    else:
+        feature_frame = pd.DataFrame(
+            np.asarray(X_plot_for_color, dtype=np.float64),
+            columns=list(feature_names_plot),
+        )
+
+    display_order = list(range(len(feature_names_plot) - 1, -1, -1))
+    cmap = plt.cm.coolwarm
+    norm = plt.Normalize(vmin=0.0, vmax=1.0)
+
+    for display_idx, feature_idx in enumerate(display_order):
+        feature_name = feature_names_plot[feature_idx]
+        shap_values = vals_plot[:, feature_idx].astype(np.float64, copy=False)
+        feature_values = pd.to_numeric(feature_frame[feature_name], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        valid_mask = np.isfinite(shap_values)
+        shap_values = shap_values[valid_mask]
+        feature_values = feature_values[valid_mask]
+        if shap_values.size == 0:
+            continue
+
+        finite_feature_values = feature_values[np.isfinite(feature_values)]
+        if finite_feature_values.size > 0:
+            low, high = np.nanpercentile(finite_feature_values, [5, 95])
+            if not np.isfinite(low):
+                low = np.nanmin(finite_feature_values)
+            if not np.isfinite(high):
+                high = np.nanmax(finite_feature_values)
+            if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+                normalized = np.full_like(shap_values, 0.5)
+            else:
+                normalized = np.clip((feature_values - low) / (high - low), 0, 1)
+                normalized[~np.isfinite(normalized)] = 0.5
+        else:
+            normalized = np.full_like(shap_values, 0.5)
+
+        order = np.argsort(shap_values)
+        shap_sorted = shap_values[order]
+        color_sorted = normalized[order]
+        rng = np.random.default_rng(42 + feature_idx)
+        y_positions = np.full(shap_sorted.shape[0], display_idx, dtype=np.float64)
+        y_positions += rng.normal(0.0, 0.11, size=shap_sorted.shape[0])
+
+        ax.scatter(
+            shap_sorted,
+            y_positions,
+            c=color_sorted,
+            cmap=cmap,
+            norm=norm,
+            s=18,
+            alpha=0.8,
+            edgecolors="none",
+        )
+
+    ax.axvline(0.0, color="#777777", linewidth=1.0, alpha=0.7)
+    ax.set_yticks(range(len(feature_names_plot)))
+    ax.set_yticklabels([feature_names_plot[i] for i in display_order], fontsize=10)
+    ax.set_xlabel("SHAP value")
+    ax.set_title("SHAP Summary")
+    ax.grid(axis="x", alpha=0.15, linestyle="--")
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, pad=0.02)
+    cbar.set_label("Feature value")
+
+
+class ModelInterpreter:
+    """基础模型解释器 (兼容旧代码)"""
+
+    def __init__(self, model, background_data, model_type: str):
+        pass
+
+
+class EnhancedModelInterpreter:
+    """增强版模型解释器 - 修复版"""
+
+    def __init__(self, model, X_train, y_train, X_test, y_test, model_name, feature_names=None, max_samples: int = 200, kernel_background: int = 50, kernel_nsamples: int = 200, scaler=None):
+        self.model = model
+        self.max_samples = int(max_samples) if max_samples is not None else 200
+        self.kernel_background = int(kernel_background) if kernel_background is not None else 50
+        self.kernel_nsamples = int(kernel_nsamples) if kernel_nsamples is not None else 200
+        self._X_sample = None
+        self.scaler = scaler  # 保存 scaler 用于反标准化
+
+        print(f"\n{'='*60}")
+        print(f"Initializing EnhancedModelInterpreter")
+        print(f"{'='*60}")
+        print(f"Model name: {model_name}")
+        print(f"Model type: {type(model)}")
+        print(f"X_train shape: {X_train.shape if hasattr(X_train, 'shape') else 'N/A'}")
+        print(f"X_test shape: {X_test.shape if hasattr(X_test, 'shape') else 'N/A'}")
+
+        # 确保保存特征名
+        # NOTE:
+        # X_train / X_test 在训练器中通常被保存为 DataFrame(列名为 0..n-1)。
+        # 旧实现使用 pd.DataFrame(X_train, columns=feature_names) 会触发"按列名重索引"，
+        # 结果把整张表变成 NaN，导致 beeswarm 退化成灰色竖条。
+        # 这里统一先取数值矩阵，再显式赋予 feature_names。
+
+        # 1. 先提取数值数组
+        X_train_arr = X_train.values if isinstance(X_train, pd.DataFrame) else np.asarray(X_train)
+        X_test_arr = X_test.values if isinstance(X_test, pd.DataFrame) else np.asarray(X_test)
+
+        # 关键修复：确保数组是数值类型，不是 object
+        if X_train_arr.dtype == 'object':
+            print(f"WARNING: X_train_arr is object dtype, converting to float64...")
+            X_train_arr = X_train_arr.astype(np.float64)
+        if X_test_arr.dtype == 'object':
+            print(f"WARNING: X_test_arr is object dtype, converting to float64...")
+            X_test_arr = X_test_arr.astype(np.float64)
+
+        # 2. 确定特征名（必须与数组列数匹配）
+        n_features = X_train_arr.shape[1]
+
+        # [调试] 打印传入的特征名信息
+        print(f"\n[DEBUG] Feature names analysis:")
+        print(f"  - Received feature_names: {feature_names is not None}")
+        if feature_names is not None:
+            print(f"  - feature_names length: {len(feature_names)}")
+            print(f"  - First 5 feature names: {list(feature_names)[:5]}")
+        print(f"  - n_features from X_train: {n_features}")
+
+        # [关键修复] 优先使用传入的feature_names参数
+        if feature_names is not None and len(feature_names) == n_features:
+            print(f"  ✓ Using provided feature_names parameter")
+            feature_names = list(feature_names)
+        elif isinstance(X_train, pd.DataFrame) and hasattr(X_train, 'columns'):
+            df_columns = X_train.columns.tolist()
+            print(f"  - X_train has DataFrame columns: {df_columns[:5]}")
+            # 如果DataFrame的列名不是数字索引，使用它
+            if not all(isinstance(col, (int, np.integer)) for col in df_columns):
+                print(f"  ✓ Using DataFrame column names (non-numeric)")
+                feature_names = df_columns
+            else:
+                print(f"  ⚠️ DataFrame has numeric columns and no valid feature_names provided")
+                feature_names = [f"Feature_{i}" for i in range(n_features)]
+        else:
+            print(f"  ⚠️ No valid feature_names, using default names")
+            feature_names = [f"Feature_{i}" for i in range(n_features)]
+
+        self.feature_names = feature_names
+        print(f"  - Final feature_names (first 5): {self.feature_names[:5]}")
+        print(f"{'='*60}")
+
+        # 3. 创建新的 DataFrame，确保数据和列名完全对应
+        # 关键：不要尝试重索引，直接用数组创建新 DataFrame
+        self.X_train = pd.DataFrame(X_train_arr, columns=self.feature_names, dtype=np.float64)
+        self.X_test = pd.DataFrame(X_test_arr, columns=self.feature_names, dtype=np.float64)
+
+        # 4. 验证数据完整性
+        if self.X_train.isnull().all().all() or self.X_test.isnull().all().all():
+            raise ValueError("ERROR: X_train or X_test contains all NaN values after initialization!")
+
+        print(f"✓ X_train dtype: {self.X_train.dtypes.unique()}")
+        print(f"✓ X_test dtype: {self.X_test.dtypes.unique()}")
+        print(f"{'='*60}\n")
+
+        self.model_name = model_name
+        self._shap_values = None
+        self._explainer = None
+        self._base_values = None
+
+    def _check_xgboost_compatibility(self, model):
+        """检查 XGBoost 模型的兼容性"""
+        print(f"\n--- XGBoost Compatibility Check ---")
+        try:
+            import xgboost as xgb
+            print(f"XGBoost version: {xgb.__version__}")
+
+            # 检查模型类型
+            if isinstance(model, xgb.XGBRegressor) or isinstance(model, xgb.XGBClassifier):
+                print(f"✓ Model is XGBoost sklearn API: {type(model)}")
+
+                # 检查是否已训练
+                if hasattr(model, '_Booster'):
+                    print(f"✓ Model has _Booster attribute")
+                else:
+                    print(f"⚠️ Model missing _Booster attribute")
+
+                # 尝试获取 booster
+                try:
+                    booster = model.get_booster()
+                    print(f"✓ get_booster() successful: {type(booster)}")
+
+                    # 检查特征数量
+                    num_features = booster.num_features()
+                    print(f"✓ Booster num_features: {num_features}")
+                    print(f"  X_train features: {self.X_train.shape[1]}")
+
+                    if num_features != self.X_train.shape[1]:
+                        print(f"⚠️ WARNING: Feature count mismatch!")
+                        return False
+
+                    return True
+                except Exception as e:
+                    print(f"❌ get_booster() failed: {e}")
+                    return False
+            else:
+                print(f"⚠️ Model is not XGBoost sklearn API: {type(model)}")
+                return False
+
+        except ImportError:
+            print(f"❌ XGBoost not installed")
+            return False
+        except Exception as e:
+            print(f"❌ Compatibility check failed: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return False
+        finally:
+            print(f"--- End Compatibility Check ---\n")
+
+    def _normalize_xgboost_eval_metric(self):
+        """兼容部分 XGBoost 模型将 eval_metric 保存为 list 的情况。"""
+        if self.model_name != 'XGBoost' or not hasattr(self.model, 'get_xgb_params'):
+            return
+
+        try:
+            params = self.model.get_xgb_params()
+            eval_metric = params.get("eval_metric") if isinstance(params, dict) else None
+            if isinstance(eval_metric, list) and eval_metric:
+                self.model.set_params(eval_metric=str(eval_metric[0]))
+                print(f"✓ Normalized XGBoost eval_metric from list to: {eval_metric[0]}")
+        except Exception as e:
+            print(f"⚠️ Failed to normalize XGBoost eval_metric: {e}")
+
+    def _get_explainer(self):
+        if self._explainer is not None:
+            return self._explainer
+
+        print(f"\n{'='*60}")
+        print(f"Creating SHAP Explainer for {self.model_name}")
+        print(f"{'='*60}")
+
+        try:
+            if shap is None:
+                raise ImportError(f"shap import failed: {SHAP_IMPORT_ERROR}")
+
+            self._normalize_xgboost_eval_metric()
+
+            # 树模型使用 TreeExplainer
+            tree_models = ['XGBoost', 'LightGBM', 'CatBoost', '随机森林', 'Extra Trees', '梯度提升树']
+
+            print(f"Model type: {type(self.model)}")
+            print(f"Model name: {self.model_name}")
+            print(f"Has feature_importances_: {hasattr(self.model, 'feature_importances_')}")
+
+            # 检查模型是否是树模型或有 feature_importances_ 属性
+            if self.model_name in tree_models or hasattr(self.model, 'feature_importances_'):
+                print(f"✓ Detected tree model: {self.model_name}")
+
+                # 尝试使用 TreeExplainer (更快)
+                print(f"Creating TreeExplainer for {self.model_name}...")
+                try:
+                    if self.model_name == 'XGBoost':
+                        raise RuntimeError("XGBoost explainer fallback is disabled; use native pred_contribs only.")
+                    else:
+                        self._explainer = shap.TreeExplainer(self.model)
+                        print(f"✓ TreeExplainer created successfully")
+                except Exception as e:
+                    print(f"  - TreeExplainer failed: {e}")
+                    if self.model_name == 'XGBoost':
+                        raise
+                    print(f"  - Falling back to KernelExplainer (slower but more stable)...")
+                    # 如果 TreeExplainer 失败,使用 KernelExplainer
+                    bg_n = min(50, len(self.X_train))
+                    background = shap.sample(self.X_train, bg_n)
+                    self._explainer = shap.KernelExplainer(self.model.predict, background)
+                    print(f"✓ KernelExplainer created as fallback")
+            # 线性模型
+            elif self.model_name in ['线性回归', 'Ridge回归', 'Lasso回归', 'ElasticNet']:
+                print(f"✓ Detected linear model: {self.model_name}")
+                background = shap.sample(self.X_train, min(100, len(self.X_train)))
+                self._explainer = shap.LinearExplainer(self.model, background)
+                print(f"✓ LinearExplainer created successfully")
+            # 其他模型
+            else:
+                print(f"Using KernelExplainer for {self.model_name}")
+                bg_n = min(int(getattr(self, 'kernel_background', 50)), len(self.X_train))
+                # 高维特征时进一步压缩背景样本，避免 KernelExplainer 过慢/爆内存
+                if self.X_train.shape[1] > 512:
+                    bg_n = min(bg_n, 20)
+                    print(f"  - High dimensional features ({self.X_train.shape[1]}), reducing background to {bg_n}")
+                background = shap.sample(self.X_train, bg_n)
+                print(f"  - Background samples: {bg_n}")
+                self._explainer = shap.KernelExplainer(self.model.predict, background)
+                print(f"✓ KernelExplainer created successfully")
+
+        except Exception as e:
+            print(f"❌ ERROR creating explainer: {e}")
+            print(f"Error type: {type(e).__name__}")
+            import traceback
+            print(f"Traceback:\n{traceback.format_exc()}")
+            if self.model_name == 'XGBoost':
+                raise
+
+            # 兜底方案
+            try:
+                print(f"\nTrying fallback KernelExplainer...")
+                bg_n = min(20, len(self.X_train))
+                background = shap.sample(self.X_train, bg_n)
+                self._explainer = shap.KernelExplainer(self.model.predict, background)
+                print(f"✓ Fallback KernelExplainer created successfully")
+            except Exception as e2:
+                print(f"❌ Fallback explainer also failed: {e2}")
+                import traceback
+                print(f"Traceback:\n{traceback.format_exc()}")
+                raise
+
+        print(f"{'='*60}\n")
+        return self._explainer
+
+    def compute_shap_values(self):
+        if self._shap_values is not None:
+            return self._shap_values
+
+        print(f"\n{'='*60}")
+        print(f"Computing SHAP Values")
+        print(f"{'='*60}")
+
+        # 采样测试集，防止计算太慢
+        # 使用 pandas.sample 保证与后续作图的样本一致且可复现
+        n = min(int(getattr(self, 'max_samples', 200)), len(self.X_test))
+        print(f"Sampling {n} from {len(self.X_test)} test samples...")
+        self._X_sample = self.X_test.sample(n=n, random_state=42) if len(self.X_test) > n else self.X_test.copy()
+        print(f"Sample shape: {self._X_sample.shape}")
+        print(f"Sample dtype: {self._X_sample.dtypes.unique()}")
+
+        if self.model_name == "XGBoost":
+            try:
+                print("Using native XGBoost pred_contribs path instead of SHAP TreeExplainer...")
+                shap_values, x_sample_frame, base_values = compute_xgboost_native_shap(
+                    self.model,
+                    self._X_sample,
+                    feature_names=self.feature_names,
+                )
+                self._X_sample = x_sample_frame
+                self._base_values = base_values
+                self._shap_values = shap_values
+                print(f"✓ Native XGBoost SHAP values computed: {np.asarray(self._shap_values).shape}")
+                print(f"{'='*60}\n")
+                return self._shap_values
+            except Exception as e:
+                print(f"⚠️ Native XGBoost SHAP path failed: {e}")
+                return None
+
+        explainer = self._get_explainer()
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+
+                explainer_name = explainer.__class__.__name__.lower()
+                print(f"Explainer type: {explainer_name}")
+
+                # check_additivity=False 主要用于树模型，防止微小误差导致报错。
+                # 部分 Explainer（如 LinearExplainer）不支持该参数，这里做兼容处理。
+                # KernelExplainer 默认 nsamples='auto' 在高维时会非常慢，这里给一个上限
+                if "kernel" in explainer_name:
+                    # ✅ 修复：当样本数 < 特征数时，增加 nsamples 或使用 l1_reg
+                    n_samples = self._X_sample.shape[0]
+                    n_features = self._X_sample.shape[1]
+
+                    if n_samples < n_features:
+                        print(f"⚠️ 警告：样本数 ({n_samples}) < 特征数 ({n_features})")
+                        print(f"   使用 l1_reg='aic' 来避免 LassoLarsIC 错误")
+                        # 使用 l1_reg 参数来避免 LassoLarsIC 的问题
+                        kernel_nsamples = max(n_features * 2, int(getattr(self, "kernel_nsamples", 200)))
+                        print(f"   增加 nsamples 到 {kernel_nsamples}")
+                    else:
+                        kernel_nsamples = int(getattr(self, "kernel_nsamples", 200))
+
+                    print(f"Using KernelExplainer with nsamples={kernel_nsamples}")
+                    try:
+                        # 使用 l1_reg='aic' 来避免 LassoLarsIC 的噪声方差估计问题
+                        shap_values = explainer.shap_values(
+                            self._X_sample,
+                            nsamples=kernel_nsamples,
+                            l1_reg='aic'  # 使用 AIC 准则而不是默认的 'auto'
+                        )
+                    except TypeError as e:
+                        print(f"  - l1_reg parameter not supported, trying without it: {e}")
+                        try:
+                            shap_values = explainer.shap_values(self._X_sample, nsamples=kernel_nsamples)
+                        except Exception as e2:
+                            print(f"  - nsamples parameter also failed: {e2}")
+                            shap_values = explainer.shap_values(self._X_sample)
+                else:
+                    print(f"Computing SHAP values...")
+                    try:
+                        shap_values = explainer.shap_values(self._X_sample, check_additivity=False)
+                    except TypeError as e:
+                        print(f"  - check_additivity parameter not supported: {e}")
+                        shap_values = explainer.shap_values(self._X_sample)
+
+            print(f"✓ SHAP values computed")
+            print(f"  - Type: {type(shap_values)}")
+            if isinstance(shap_values, list):
+                print(f"  - List length: {len(shap_values)}")
+                print(f"  - First element shape: {shap_values[0].shape if len(shap_values) > 0 else 'N/A'}")
+            else:
+                print(f"  - Shape: {shap_values.shape}")
+
+            # 处理 list (多分类) 和 array (回归) 的区别
+            if isinstance(shap_values, list):
+                self._shap_values = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+                print(f"  - Using element {1 if len(shap_values) > 1 else 0} from list")
+            else:
+                self._shap_values = shap_values
+
+            print(f"  - Final shape: {self._shap_values.shape}")
+            print(f"{'='*60}\n")
+
+            return self._shap_values
+
+        except Exception as e:
+            print(f"❌ SHAP 计算错误: {e}")
+            print(f"Error type: {type(e).__name__}")
+            import traceback
+            print(f"Traceback:\n{traceback.format_exc()}")
+            print(f"{'='*60}\n")
+            return None
+
+    def plot_summary(self, plot_type='bar', max_display=20):
+        # 确保 SHAP 值与用于作图的样本完全一致
+        shap_values = self.compute_shap_values()
+        if shap_values is None:
+            return None, None
+
+        # 统一处理plot_type
+        if plot_type == 'beeswarm':
+            plot_type = 'dot'  # SHAP内部使用'dot'表示beeswarm
+
+        vals = np.array(shap_values)
+
+        # self._X_sample 已在 compute_shap_values 中创建（默认 200 条）
+        X_plot_full = self._X_sample.copy()
+
+        # 追踪实际使用的特征名（用于最后导出）
+        feature_names_for_export = self.feature_names.copy()
+
+        # 检查数据是否有效
+        if X_plot_full.isnull().all().all():
+            print("Warning: X_plot_full contains all NaN values")
+            return None, None
+
+        # ============================================================
+        # 关键修复: 先按 SHAP 重要性排序,再处理 NaN
+        # ============================================================
+
+        # 1. 计算每个特征的平均绝对 SHAP 值(重要性)
+        mean_abs_shap = np.abs(vals).mean(axis=0)
+
+        # 2. 按重要性排序特征索引
+        importance_order = np.argsort(mean_abs_shap)[::-1]  # 降序
+
+        # 3. 选择 top N 个最重要的特征
+        valid_indices = importance_order[:max_display].tolist()
+
+        # 4. 填充这些特征中的 NaN 值
+        for idx in valid_indices:
+            col_name = self.feature_names[idx]
+            if X_plot_full[col_name].isnull().any():
+                # 用中位数填充
+                X_plot_full[col_name].fillna(X_plot_full[col_name].median(), inplace=True)
+
+        # 5. 提取选中的特征
+        selected_features = [self.feature_names[i] for i in valid_indices]
+        vals_plot = vals[:, valid_indices]
+        X_plot = X_plot_full[selected_features]
+        feature_names_plot = selected_features
+        feature_names_for_export = selected_features
+
+        print(f"\n{'='*60}")
+        print(f"Selected top {len(selected_features)} features by SHAP importance:")
+        for i, (idx, feat) in enumerate(zip(valid_indices[:10], selected_features[:10])):
+            print(f"  {i+1}. {feat}: {mean_abs_shap[idx]:.4f}")
+        print(f"{'='*60}")
+        print(f"[CRITICAL] feature_names_plot that will be used in SHAP plot:")
+        print(f"  {feature_names_plot[:10]}")
+        print(f"{'='*60}\n")
+
+        # 根据特征数量和图表类型动态调整图表大小
+        n_features_to_show = min(max_display, len(feature_names_plot))
+
+        if plot_type == 'dot':  # beeswarm图需要更大的空间
+            fig_height = max(10, n_features_to_show * 0.6)  # 每个特征0.6英寸
+            fig_width = 14  # 更宽以容纳散点和特征名
+        else:  # bar图
+            fig_height = max(8, n_features_to_show * 0.5)
+            fig_width = 12
+
+        fig = plt.figure(figsize=(fig_width, fig_height))
+
+        # 详细调试信息
+        print(f"\n{'='*60}")
+        print(f"SHAP Plot Debug Info:")
+        print(f"{'='*60}")
+        print(f"Plot type: {plot_type}")
+        print(f"X_plot shape: {X_plot.shape}")
+        print(f"vals_plot shape: {vals_plot.shape}")
+        print(f"X_plot dtype: {X_plot.dtypes.unique()}")
+        print(f"X_plot columns (first 5): {X_plot.columns[:5].tolist()}")
+        print(f"X_plot has NaN: {X_plot.isnull().any().any()}")
+        print(f"X_plot value stats:")
+        print(f"  - min: {X_plot.min().min():.6f}")
+        print(f"  - max: {X_plot.max().max():.6f}")
+        print(f"  - mean: {X_plot.mean().mean():.6f}")
+        print(f"  - std: {X_plot.std().mean():.6f}")
+        print(f"\nFirst 3 rows, first 5 columns of X_plot:")
+        print(X_plot.iloc[:3, :5])
+        print(f"\nFirst 3 rows, first 5 columns of vals_plot:")
+        print(vals_plot[:3, :5])
+
+        # 关键修复：如果数据被标准化了，需要反标准化用于着色
+        X_plot_for_color = X_plot.copy()
+        if self.scaler is not None and plot_type == 'dot':
+            try:
+                print(f"\n⚠️ 检测到 scaler，尝试反标准化数据用于 beeswarm 着色...")
+                # 反标准化
+                X_plot_raw = self.scaler.inverse_transform(X_plot)
+                X_plot_for_color = pd.DataFrame(X_plot_raw, columns=feature_names_plot, index=X_plot.index)
+                print(f"✓ 反标准化成功")
+                print(f"反标准化后的值范围: min={X_plot_for_color.min().min():.6f}, max={X_plot_for_color.max().max():.6f}")
+            except Exception as e:
+                print(f"⚠️ 反标准化失败: {e}，使用原始数据")
+                X_plot_for_color = X_plot
+
+        # 确保DataFrame使用正确的特征名（关键修复：SHAP会优先使用DataFrame的列名）
+        if isinstance(X_plot_for_color, pd.DataFrame):
+            X_plot_for_color.columns = feature_names_plot
+
+        print(f"{'='*60}\n")
+
+        try:
+            # 关键修复：使用非交互式后端
+            import matplotlib
+            matplotlib.use('Agg')
+
+            if self.model_name == "XGBoost" or shap is None:
+                ax = fig.add_subplot(111)
+                if plot_type == 'dot':
+                    _plot_custom_shap_beeswarm(ax, vals_plot, X_plot_for_color, feature_names_plot)
+                else:
+                    _plot_custom_shap_bar(ax, vals_plot, feature_names_plot)
+            else:
+                shap.summary_plot(
+                    vals_plot,
+                    X_plot_for_color,  # 使用反标准化的数据用于着色
+                    plot_type=plot_type,
+                    max_display=n_features_to_show,
+                    feature_names=feature_names_plot,
+                    show=False,
+                    color_bar=True,  # 显示颜色条
+                    plot_size=None  # 让我们自己控制大小
+                )
+
+            # 根据图表类型调整布局
+            if plot_type == 'dot':
+                # beeswarm图：为左侧特征名和右侧颜色条留出空间
+                plt.subplots_adjust(left=0.30, right=0.88, top=0.95, bottom=0.08)
+            else:
+                # bar图：只需要左侧空间
+                plt.subplots_adjust(left=0.35, right=0.95, top=0.95, bottom=0.08)
+
+            # 强制关闭所有交互式窗口
+            plt.ioff()
+
+        except Exception as e:
+            print(f"SHAP plot error: {e}")
+            import traceback
+            traceback.print_exc()
+            plt.close(fig)
+            return None, None
+
+        # ✅ 修复：使用筛选后的 vals_plot 而不是完整的 vals
+        # vals_plot 的列数与 feature_names_for_export 匹配
+        export_df = pd.DataFrame(vals_plot, columns=feature_names_for_export)
+
+        # 关键修复: 在返回前关闭所有其他图形,避免内存泄漏
+        try:
+            # 获取当前图形的编号
+            current_fig_num = fig.number
+            # 关闭所有其他图形
+            for fignum in plt.get_fignums():
+                if fignum != current_fig_num:
+                    plt.close(fignum)
+        except Exception as e:
+            print(f"Warning: Failed to close other figures: {e}")
+
+        # 清理内存
+        import gc
+        gc.collect()
+
+        # 关键修复：清理explainer引用，防止XGBoost模型导致的内存问题
+        self._explainer = None
+        gc.collect()
+
+        return fig, export_df

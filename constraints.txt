@@ -1,0 +1,4 @@
+# Constraints to reduce pip backtracking (tune if resolver reports conflicts)
+rfc3986==1.5.0
+idna>=3.6,<4
+urllib3<3
