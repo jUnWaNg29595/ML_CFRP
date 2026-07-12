@@ -1313,6 +1313,127 @@ def _resolve_effective_feature_cols(
     return chosen_cols, expected_n, chosen_source
 
 
+def _build_screening_reference_export(
+    train_result,
+    effective_feature_cols,
+    *,
+    session_x_train_raw=None,
+    session_x_train=None,
+    processed_data=None,
+    target_col=None,
+    molecular_feature_config=None,
+    max_rows=2500,
+):
+    """Build portable screening references from the best available training state."""
+    tr = train_result if isinstance(train_result, dict) else {}
+    feature_cols = [str(col) for col in (effective_feature_cols or [])]
+    max_rows = max(1, int(max_rows))
+
+    def _coerce_frame(value):
+        if isinstance(value, pd.DataFrame) and not value.empty:
+            frame = value.copy()
+            if feature_cols and all(col in frame.columns for col in feature_cols):
+                return frame.loc[:, feature_cols]
+            if feature_cols and frame.shape[1] == len(feature_cols):
+                frame.columns = feature_cols
+                return frame
+            return frame
+        try:
+            arr = np.asarray(value)
+        except Exception:
+            return None
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            return None
+        if feature_cols and arr.shape[1] == len(feature_cols):
+            return pd.DataFrame(arr, columns=feature_cols)
+        return None
+
+    frame = None
+    for value in (
+        tr.get("X_train_raw"),
+        tr.get("X_train"),
+        session_x_train_raw,
+        session_x_train,
+    ):
+        frame = _coerce_frame(value)
+        if frame is not None:
+            break
+    if frame is None and isinstance(processed_data, pd.DataFrame) and not processed_data.empty:
+        if feature_cols and all(col in processed_data.columns for col in feature_cols):
+            frame = processed_data.loc[:, feature_cols].copy()
+
+    result = {}
+    if frame is not None and not frame.empty:
+        n_rows = len(frame)
+        y_train = tr.get("y_train")
+        y_num = None
+        try:
+            y_candidate = pd.to_numeric(pd.Series(y_train).reset_index(drop=True), errors="coerce")
+            if len(y_candidate) == n_rows:
+                y_num = y_candidate
+        except Exception:
+            y_num = None
+
+        if n_rows > max_rows:
+            priority = []
+            if y_num is not None and y_num.notna().any():
+                edge_n = min(100, max_rows // 5)
+                priority.extend(y_num.nlargest(edge_n).index.tolist())
+                priority.extend(y_num.nsmallest(edge_n).index.tolist())
+            priority = list(dict.fromkeys(int(i) for i in priority))
+            remaining = np.setdiff1d(np.arange(n_rows), np.asarray(priority, dtype=int), assume_unique=False)
+            sample_n = max_rows - len(priority)
+            if sample_n > 0:
+                rng = np.random.default_rng(42)
+                sampled = rng.choice(remaining, size=min(sample_n, len(remaining)), replace=False).tolist()
+            else:
+                sampled = []
+            positions = np.asarray((priority + sampled)[:max_rows], dtype=int)
+        else:
+            positions = np.arange(n_rows, dtype=int)
+
+        result["screening_reference_X"] = frame.iloc[positions].reset_index(drop=True)
+        for src_key, dst_key in (
+            ("y_train", "screening_reference_y_train"),
+            ("y_pred_train", "screening_reference_y_pred_train"),
+            ("y_std_train", "screening_reference_y_std_train"),
+        ):
+            value = tr.get(src_key)
+            if value is None:
+                continue
+            try:
+                arr = np.asarray(value).reshape(-1)
+                if len(arr) == n_rows:
+                    result[dst_key] = arr[positions]
+            except Exception:
+                continue
+
+    if isinstance(processed_data, pd.DataFrame) and not processed_data.empty:
+        cfg = molecular_feature_config if isinstance(molecular_feature_config, dict) else {}
+        source_cols = list(cfg.get("resin_component_cols") or [])
+        source_cols += list(cfg.get("hardener_component_cols") or [])
+        source_cols += [cfg.get("smiles_col"), cfg.get("hardener_col"), target_col]
+        keep_cols = list(dict.fromkeys(
+            [col for col in source_cols + feature_cols if col and col in processed_data.columns]
+        ))
+        if keep_cols:
+            reference_data = processed_data.loc[:, keep_cols].copy()
+            if len(reference_data) > max_rows:
+                if target_col in reference_data.columns:
+                    target_num = pd.to_numeric(reference_data[target_col], errors="coerce")
+                    high = reference_data.loc[target_num.nlargest(min(100, max_rows // 5)).index]
+                    low = reference_data.loc[target_num.nsmallest(min(100, max_rows // 5)).index]
+                    priority = pd.concat([high, low]).loc[lambda x: ~x.index.duplicated(keep="first")]
+                else:
+                    priority = reference_data.iloc[0:0]
+                remaining = reference_data.drop(index=priority.index, errors="ignore")
+                sample_n = max_rows - len(priority)
+                sampled = remaining.sample(n=min(sample_n, len(remaining)), random_state=42) if sample_n > 0 else remaining.iloc[0:0]
+                reference_data = pd.concat([priority, sampled]).head(max_rows)
+            result["screening_reference_data"] = reference_data.reset_index(drop=True)
+    return result
+
+
 def _count_missing_like(series: pd.Series) -> int:
     if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
         try:
@@ -6321,7 +6442,7 @@ def page_molecular_features():
     xtb_total_timeout_s = 300
     xtb_max_heavy_atoms = 0
     xtb_max_fragments = 0
-    xtb_keep_largest_fragment = True
+    xtb_keep_largest_fragment = False
     xtb_cache_size = 10000
 
     # [新增] 指纹默认参数
@@ -7324,7 +7445,11 @@ def page_molecular_features():
                 step=1,
             )
 
-        xtb_keep_largest_fragment = st.checkbox("仅保留最大片段", value=bool(xtb_keep_largest_fragment))
+        xtb_keep_largest_fragment = st.checkbox(
+            "仅保留最大片段",
+            value=bool(xtb_keep_largest_fragment),
+            help="仅在盐、溶剂或小片段明确不应进入模型时开启。多组分树脂默认关闭，否则会丢失其他树脂/稀释剂组分。",
+        )
 
         col_xtb_cache1, col_xtb_cache2 = st.columns(2)
         with col_xtb_cache1:
@@ -7336,17 +7461,16 @@ def page_molecular_features():
                 step=1000,
             )
         with col_xtb_cache2:
-            # [新增] xTB 并行进程数
+            # xTB 并行进程数：默认限制在 8，避免外部进程与 BLAS/OpenMP 线程争抢。
             cpu_count = os.cpu_count() or 1
-            # Windows 下尝试使用 multiprocessing.Pool 突破 61 限制
             if os.name == 'nt':
-                max_workers = cpu_count  # 允许输入更多，代码会自动尝试
-                default_jobs = min(cpu_count, 61)
-                help_text = f"检测到 {cpu_count} 个 CPU 核心。⚠️ Windows 限制：>61 进程会尝试使用 multiprocessing.Pool（可能不稳定）"
+                max_workers = min(cpu_count, 61)
+                default_jobs = min(cpu_count, 8)
+                help_text = f"检测到 {cpu_count} 个 CPU 核心。推荐 4-8 个进程；Windows 最多允许 61。"
             else:
                 max_workers = cpu_count
-                default_jobs = min(cpu_count, 64)
-                help_text = f"检测到 {cpu_count} 个 CPU 核心。推荐 32-128 核以平衡速度和内存"
+                default_jobs = min(cpu_count, 8)
+                help_text = f"检测到 {cpu_count} 个 CPU 核心。推荐 4-8 个进程以平衡速度和内存。"
 
             xtb_n_jobs = st.number_input(
                 "并行进程数",
@@ -7429,6 +7553,40 @@ def page_molecular_features():
         if n_jobs > 8:
             st.warning("⚠️ 进程数 > 8 可能导致线程争抢，建议使用 4-8 个进程")
 
+    def _infer_selected_component_role(columns):
+        names = " ".join(str(col).lower() for col in (columns or []) if col)
+        hard_score = sum(names.count(token) for token in ("curing_agent", "curingagent", "hardener", "curative", "固化剂"))
+        resin_score = sum(names.count(token) for token in ("resin", "epoxy", "树脂"))
+        if resin_score > hard_score:
+            return "resin"
+        if hard_score > resin_score:
+            return "hardener"
+        return "neutral"
+
+    primary_source_role = _infer_selected_component_role(resin_component_cols)
+    selector_source_role = _infer_selected_component_role([smiles_col])
+    source_role_conflict = (
+        primary_source_role in {"resin", "hardener"}
+        and selector_source_role in {"resin", "hardener"}
+        and primary_source_role != selector_source_role
+    )
+    source_role_label = {"resin": "树脂", "hardener": "固化剂", "neutral": "主体组分"}[primary_source_role]
+    st.info(
+        f"本次真正用于分子特征计算的是：{source_role_label}列 "
+        + ", ".join(str(col) for col in (resin_component_cols or [smiles_col]))
+    )
+    confirm_source_role_conflict = True
+    if source_role_conflict:
+        st.error(
+            f"列映射冲突：主列选择器是 `{smiles_col}`，但实际多组分输入被识别为{source_role_label}列。"
+            "特征提取将使用实际多组分列，而不是主列选择器。请返回上方修正列选择；若这是有意设置，可手动确认。"
+        )
+        confirm_source_role_conflict = st.checkbox(
+            "我确认使用上述实际多组分列提取特征",
+            value=False,
+            key="confirm_molecular_feature_source_role_conflict",
+        )
+
     st.markdown("---")
 
     # [修改] 按钮区域：增加清除按钮
@@ -7474,6 +7632,9 @@ def page_molecular_features():
 
     # 执行提取逻辑
     if run_extraction:
+        if source_role_conflict and not confirm_source_role_conflict:
+            st.error("已阻止特征提取：请先修正树脂/固化剂列映射，或勾选确认后重新开始。")
+            return
         _register_source_feature_names(df, overwrite=False)
 
         # --- [新增] 批量模式处理 ---
@@ -7805,6 +7966,7 @@ def page_molecular_features():
                             max_fragments=xtb_max_fragments,
                             keep_largest_fragment=xtb_keep_largest_fragment,
                             cache_size=xtb_cache_size,
+                            random_state=42,
                         )
                         if not getattr(xtb_extractor, "AVAILABLE", False):
                             st.error("❌ 未检测到 xtb 可执行文件。")
@@ -7830,50 +7992,33 @@ def page_molecular_features():
                         st.warning(f"⚠️ 批量模式暂不支持 `{extraction_method}` 方法，跳过列 `{current_smiles_col}`")
                         continue
 
-                    semantic_feature_frames = []
-                    if auto_polymer_features_batch or append_polymer_semantic_features:
-                        from core.molecular_features import (
-                            extract_polymer_string_features,
-                            extract_bigsmiles_ensemble_features,
-                        )
+                    from core.molecular_features import extract_configured_semantic_features
 
-                        polymer_full_df = extract_polymer_string_features(smiles_list_input)
-                        semantic_feature_frames.append(_add_prefix_safe(polymer_full_df, col_prefix))
-
-                        if append_polymer_semantic_features:
-                            polymer_ensemble_df = extract_bigsmiles_ensemble_features(
-                                smiles_list_input,
-                                n_samples=int(bigsmiles_semantic_num_samples),
-                                min_repeat_units=int(bigsmiles_semantic_min_repeat_units),
-                                max_repeat_units=int(bigsmiles_semantic_max_repeat_units),
-                                random_state=17,
+                    semantic_params_batch = {
+                        "append_polymer_string_features": bool(auto_polymer_features_batch),
+                        "append_polymer_semantic_features": bool(append_polymer_semantic_features),
+                        "append_ionic_semantic_features": bool(append_ionic_semantic_features),
+                        "bigsmiles_semantic_num_samples": int(bigsmiles_semantic_num_samples),
+                        "bigsmiles_semantic_min_repeat_units": int(bigsmiles_semantic_min_repeat_units),
+                        "bigsmiles_semantic_max_repeat_units": int(bigsmiles_semantic_max_repeat_units),
+                        "bigsmiles_semantic_random_state": 17,
+                    }
+                    semantic_full_df = extract_configured_semantic_features(
+                        smiles_list_input,
+                        semantic_params_batch,
+                        prefix=col_prefix,
+                    )
+                    if not semantic_full_df.empty:
+                        if features_df is not None and len(features_df) > 0:
+                            semantic_subset = semantic_full_df.iloc[extracted_valid_indices].reset_index(drop=True)
+                            features_df = pd.concat(
+                                [features_df.reset_index(drop=True), semantic_subset],
+                                axis=1,
                             )
-                            semantic_feature_frames.append(_add_prefix_safe(polymer_ensemble_df, col_prefix))
-
-                    if append_ionic_semantic_features:
-                        from core.molecular_features import extract_ionic_semantic_features
-
-                        ionic_full_df = extract_ionic_semantic_features(smiles_list_input)
-                        semantic_feature_frames.append(_add_prefix_safe(ionic_full_df, col_prefix))
-
-                    if semantic_feature_frames:
-                        semantic_full_df = pd.concat(
-                            [frame.reset_index(drop=True) for frame in semantic_feature_frames if frame is not None and len(frame) == len(smiles_list_input)],
-                            axis=1,
-                        )
-                        if not semantic_full_df.empty:
-                            semantic_full_df = semantic_full_df.loc[:, ~semantic_full_df.columns.duplicated()]
-                            if features_df is not None and len(features_df) > 0:
-                                semantic_subset = semantic_full_df.iloc[extracted_valid_indices].reset_index(drop=True)
-                                if not semantic_subset.empty:
-                                    features_df = pd.concat(
-                                        [features_df.reset_index(drop=True), semantic_subset],
-                                        axis=1,
-                                    )
-                                    features_df = features_df.loc[:, ~features_df.columns.duplicated()]
-                            else:
-                                features_df = semantic_full_df.iloc[valid_indices].reset_index(drop=True)
-                                extracted_valid_indices = valid_indices.copy()
+                            features_df = features_df.loc[:, ~features_df.columns.duplicated()]
+                        else:
+                            features_df = semantic_full_df.iloc[valid_indices].reset_index(drop=True)
+                            extracted_valid_indices = valid_indices.copy()
                     
                     if features_df is not None and len(features_df) > 0:
                         # 重置索引并对齐
@@ -7955,6 +8100,7 @@ def page_molecular_features():
             'hardener_component_cols': hardener_component_cols,
             'hardener_fusion_mode': hardener_fusion_mode,
             'resin_mix_mode': resin_mix_mode,
+            'primary_component_role': primary_source_role,
             'device_pref': _dev_pref,
             'device_resolved': str(torch_device),
             'params': {},
@@ -7976,6 +8122,7 @@ def page_molecular_features():
                 'bigsmiles_semantic_num_samples': int(bigsmiles_semantic_num_samples),
                 'bigsmiles_semantic_min_repeat_units': int(bigsmiles_semantic_min_repeat_units),
                 'bigsmiles_semantic_max_repeat_units': int(bigsmiles_semantic_max_repeat_units),
+                'bigsmiles_semantic_random_state': 17,
             }
         )
         oplog(f"Start molecular feature extraction: {extraction_method} (device={torch_device})")
@@ -8455,6 +8602,8 @@ def page_molecular_features():
                         'xtb_max_fragments': int(xtb_max_fragments),
                         'xtb_keep_largest_fragment': bool(xtb_keep_largest_fragment),
                         'xtb_cache_size': int(xtb_cache_size),
+                        'xtb_n_jobs': int(xtb_n_jobs),
+                        'xtb_random_state': 42,
                     })
                 except Exception:
                     pass
@@ -8471,6 +8620,7 @@ def page_molecular_features():
                     max_fragments=xtb_max_fragments,
                     keep_largest_fragment=xtb_keep_largest_fragment,
                     cache_size=xtb_cache_size,
+                    random_state=42,
                 )
                 if not getattr(extractor, "AVAILABLE", False):
                     st.error("❌ 未检测到 xtb 可执行文件。")
@@ -8624,50 +8774,14 @@ def page_molecular_features():
                     except Exception:
                         pass
 
-            semantic_feature_frames = []
-            if auto_polymer_string_features or append_polymer_semantic_features:
-                from core.molecular_features import (
-                    extract_polymer_string_features,
-                    extract_bigsmiles_ensemble_features,
-                )
+            from core.molecular_features import append_configured_semantic_features
 
-                polymer_full_df = extract_polymer_string_features(smiles_list_input)
-                semantic_feature_frames.append(polymer_full_df)
-
-                if append_polymer_semantic_features:
-                    polymer_ensemble_df = extract_bigsmiles_ensemble_features(
-                        smiles_list_input,
-                        n_samples=int(bigsmiles_semantic_num_samples),
-                        min_repeat_units=int(bigsmiles_semantic_min_repeat_units),
-                        max_repeat_units=int(bigsmiles_semantic_max_repeat_units),
-                        random_state=17,
-                    )
-                    semantic_feature_frames.append(polymer_ensemble_df)
-
-            if append_ionic_semantic_features:
-                from core.molecular_features import extract_ionic_semantic_features
-
-                ionic_full_df = extract_ionic_semantic_features(smiles_list_input)
-                semantic_feature_frames.append(ionic_full_df)
-
-            if semantic_feature_frames:
-                semantic_full_df = pd.concat(
-                    [frame.reset_index(drop=True) for frame in semantic_feature_frames if frame is not None and len(frame) == len(smiles_list_input)],
-                    axis=1,
-                )
-                if not semantic_full_df.empty:
-                    semantic_full_df = semantic_full_df.loc[:, ~semantic_full_df.columns.duplicated()]
-                    if features_df is not None and len(features_df) > 0 and valid_indices:
-                        semantic_subset = semantic_full_df.iloc[valid_indices].reset_index(drop=True)
-                        if not semantic_subset.empty:
-                            features_df = pd.concat(
-                                [features_df.reset_index(drop=True), semantic_subset],
-                                axis=1,
-                            )
-                            features_df = features_df.loc[:, ~features_df.columns.duplicated()]
-                    elif len(semantic_full_df) > 0:
-                        features_df = semantic_full_df.reset_index(drop=True)
-                        valid_indices = list(range(len(semantic_full_df)))
+            features_df, valid_indices = append_configured_semantic_features(
+                features_df,
+                valid_indices,
+                smiles_list_input,
+                mf_cfg.get("params") or {},
+            )
 
             # [调试] 显示提取结果信息
             print(f"[DEBUG] features_df type: {type(features_df)}")
@@ -8692,9 +8806,9 @@ def page_molecular_features():
 
                     if not base_prefix:
                         # 自动生成简洁的前缀
-                        if "resin" in smiles_col.lower():
+                        if primary_source_role == "resin":
                             base_prefix = "resin"
-                        elif "hardener" in smiles_col.lower() or "curing" in smiles_col.lower():
+                        elif primary_source_role == "hardener":
                             base_prefix = "hardener"
                         else:
                             # 使用列名的简化版本
@@ -10955,20 +11069,20 @@ def page_model_training():
                                     _extra['feature_engineering_log'] = _tracker.export_log()
                             _extra['effective_feature_cols'] = effective_feature_cols
                             _tr = st.session_state.get("train_result") or {}
-                            _x_ref = _tr.get("X_train_raw")
-                            if isinstance(_x_ref, pd.DataFrame) and not _x_ref.empty:
-                                _extra["screening_reference_X"] = _x_ref.head(2500).copy()
-                            for _src_key, _dst_key in (
-                                ("y_train", "screening_reference_y_train"),
-                                ("y_pred_train", "screening_reference_y_pred_train"),
-                                ("y_std_train", "screening_reference_y_std_train"),
-                            ):
-                                _val = _tr.get(_src_key)
-                                if _val is not None:
-                                    try:
-                                        _extra[_dst_key] = np.asarray(_val).reshape(-1)[:2500]
-                                    except Exception:
-                                        pass
+                            _processed_ref = st.session_state.get("processed_data")
+                            if _processed_ref is None:
+                                _processed_ref = st.session_state.get("data")
+                            _extra.update(
+                                _build_screening_reference_export(
+                                    _tr,
+                                    effective_feature_cols,
+                                    session_x_train_raw=st.session_state.get("X_train_raw"),
+                                    session_x_train=st.session_state.get("X_train"),
+                                    processed_data=_processed_ref,
+                                    target_col=target_col,
+                                    molecular_feature_config=st.session_state.get("molecular_feature_config"),
+                                )
+                            )
 
                             # [关键修复] 使用get_current_model()获取模型
                             current_model = get_current_model()
@@ -11230,21 +11344,22 @@ def page_model_training():
                         extra_export = {
                             "app_version": str(VERSION),
                             "effective_feature_cols": effective_feature_cols,
+                            "molecular_feature_config": st.session_state.get("molecular_feature_config"),
                         }
-                        _x_ref = tr.get("X_train_raw")
-                        if isinstance(_x_ref, pd.DataFrame) and not _x_ref.empty:
-                            extra_export["screening_reference_X"] = _x_ref.head(2500).copy()
-                        for _src_key, _dst_key in (
-                            ("y_train", "screening_reference_y_train"),
-                            ("y_pred_train", "screening_reference_y_pred_train"),
-                            ("y_std_train", "screening_reference_y_std_train"),
-                        ):
-                            _val = tr.get(_src_key)
-                            if _val is not None:
-                                try:
-                                    extra_export[_dst_key] = np.asarray(_val).reshape(-1)[:2500]
-                                except Exception:
-                                    pass
+                        _processed_ref = st.session_state.get("processed_data")
+                        if _processed_ref is None:
+                            _processed_ref = st.session_state.get("data")
+                        extra_export.update(
+                            _build_screening_reference_export(
+                                tr,
+                                effective_feature_cols,
+                                session_x_train_raw=st.session_state.get("X_train_raw"),
+                                session_x_train=st.session_state.get("X_train"),
+                                processed_data=_processed_ref,
+                                target_col=st.session_state.get("target_col"),
+                                molecular_feature_config=st.session_state.get("molecular_feature_config"),
+                            )
+                        )
                         model_bytes = create_model_artifact_bytes(
                             model_name=str(st.session_state.get("model_name") or model_name),
                             target_col=str(st.session_state.get("target_col") or ""),
@@ -14190,6 +14305,8 @@ def page_virtual_screening():
         generate_candidate_pool,
         generate_virtual_component_library,
         generate_feature_guided_candidates,
+        infer_primary_component_role,
+        limit_unique_candidates_for_expensive_features,
         merge_component_libraries,
         predict_with_uncertainty_info,
         predict_with_model,
@@ -14201,6 +14318,28 @@ def page_virtual_screening():
 
     hardener_required = bool(mf_cfg.get("hardener_col") or mf_cfg.get("hardener_component_cols"))
     hardener_formula_enabled = bool(hardener_required)
+    primary_component_role = infer_primary_component_role(mf_cfg)
+    primary_role_label = {
+        "resin": "树脂",
+        "hardener": "固化剂",
+        "neutral": "主体组分",
+    }.get(primary_component_role, "主体组分")
+    primary_library_role = (
+        primary_component_role if primary_component_role in {"resin", "hardener"} else "resin"
+    )
+    secondary_role_label = "固化剂" if primary_component_role != "hardener" else "第二组分"
+    screening_feature_method = str(mf_cfg.get("method") or "")
+    screening_uses_xtb = "xTB" in screening_feature_method
+    screening_uses_expensive_features = any(
+        token in screening_feature_method
+        for token in ("xTB", "Mordred", "3D构象", "ML力场", "快速力场", "图神经网络", "TDA")
+    )
+    configured_primary_cols = list(mf_cfg.get("resin_component_cols") or [])
+    configured_selector_col = str(mf_cfg.get("smiles_col") or "")
+    source_mapping_conflict = (
+        primary_component_role == "hardener"
+        and any(token in configured_selector_col.lower() for token in ("resin", "epoxy"))
+    )
 
     def _summ_target_stats(values):
         if values is None:
@@ -14231,6 +14370,16 @@ def page_virtual_screening():
                 except Exception:
                     pass
         target_stats = _summ_target_stats(vals)
+    if target_stats is None:
+        imported_artifact_stats = st.session_state.get("imported_model_artifact") or {}
+        if isinstance(imported_artifact_stats, dict):
+            imported_extra_stats = imported_artifact_stats.get("extra") or {}
+            imported_y = (
+                imported_artifact_stats.get("y_train")
+                if imported_artifact_stats.get("y_train") is not None
+                else imported_extra_stats.get("screening_reference_y_train")
+            )
+            target_stats = _summ_target_stats(imported_y)
     if target_stats is None:
         df_ref = st.session_state.get("processed_data")
         if df_ref is None:
@@ -14298,6 +14447,68 @@ def page_virtual_screening():
         sample = _clean_smiles_list(sample)
         return _dedupe_keep_order(sample)
 
+    def _collect_observed_formula_rows(
+        df_in,
+        resin_cols,
+        hardener_cols,
+        process_cols,
+        *,
+        max_rows=4000,
+        target_col=None,
+        maximize=True,
+    ):
+        if not isinstance(df_in, pd.DataFrame) or df_in.empty or not resin_cols:
+            return pd.DataFrame()
+        resin_cols = [c for c in resin_cols if c in df_in.columns]
+        hardener_cols = [c for c in hardener_cols if c in df_in.columns]
+        if not resin_cols:
+            return pd.DataFrame()
+
+        work = df_in.copy()
+        max_rows = max(1, int(max_rows))
+        if len(work) > max_rows:
+            priority_n = min(len(work), max(1, min(500, max_rows // 4)))
+            priority = pd.DataFrame()
+            if target_col in work.columns:
+                target_num = pd.to_numeric(work[target_col], errors="coerce")
+                priority = work.loc[target_num.sort_values(ascending=not bool(maximize)).index].head(priority_n)
+            remaining = work.drop(index=priority.index, errors="ignore")
+            random_n = max_rows - len(priority)
+            if random_n > 0 and not remaining.empty:
+                remaining = remaining.sample(n=min(random_n, len(remaining)), random_state=42)
+            work = pd.concat([priority, remaining], axis=0).head(max_rows)
+
+        def _join_role(row, cols):
+            parts = []
+            for col in cols:
+                parts.extend(split_smiles_cell(row.get(col)))
+            return ".".join(parts)
+
+        records = []
+        for _, row in work.iterrows():
+            resin_smi = _join_role(row, resin_cols)
+            hardener_smi = _join_role(row, hardener_cols) if hardener_cols else ""
+            if not resin_smi:
+                continue
+            record = {
+                "resin_smiles": resin_smi,
+                "hardener_smiles": hardener_smi or None,
+                "combo_smiles": f"{resin_smi}.{hardener_smi}" if hardener_smi else resin_smi,
+                "resin_source": "train_observed_pair",
+                "hardener_source": "train_observed_pair" if hardener_smi else None,
+                "resin_availability_score": 95.0,
+                "hardener_availability_score": 95.0 if hardener_smi else np.nan,
+                "candidate_origin": "train_observed_pair",
+            }
+            for col in process_cols or []:
+                if col in row.index:
+                    record[col] = row.get(col)
+            records.append(record)
+        if not records:
+            return pd.DataFrame()
+        dedupe_cols = ["resin_smiles", "hardener_smiles"] + [c for c in process_cols or [] if c in work.columns]
+        return pd.DataFrame(records).drop_duplicates(subset=dedupe_cols).reset_index(drop=True)
+
     @st.cache_data(ttl=3600, show_spinner=False)
     def _fetch_pubchem_smiles_cached(smarts: str, max_cids: int, property_workers: int = 4):
         from core.pubchem_client import fetch_smiles_by_smarts
@@ -14354,6 +14565,18 @@ def page_virtual_screening():
         if feature_cols:
             row = row.reindex(feature_cols)
         return row
+
+    def _pick_extreme_base_row(X_ref, y_ref, feature_cols, *, maximize=True):
+        if not isinstance(X_ref, pd.DataFrame) or y_ref is None or len(X_ref) != len(y_ref):
+            return None
+        y_num = pd.to_numeric(pd.Series(y_ref), errors="coerce")
+        valid_pos = np.flatnonzero(y_num.notna().to_numpy())
+        if valid_pos.size == 0:
+            return None
+        valid_y = y_num.iloc[valid_pos].to_numpy(dtype=float)
+        best_pos = int(valid_pos[int(np.argmax(valid_y) if maximize else np.argmin(valid_y))])
+        row = X_ref.iloc[best_pos]
+        return row.reindex(feature_cols) if feature_cols else row
 
     def _calc_feature_score(X, effect_df, X_ref=None, max_features: int = 20):
         if X is None or X.empty or effect_df is None or effect_df.empty:
@@ -14430,6 +14653,11 @@ def page_virtual_screening():
             extra_ref = extra_local.get("screening_reference_X")
             if isinstance(extra_ref, pd.DataFrame) and not extra_ref.empty:
                 return extra_ref.copy()
+            reference_data = extra_local.get("screening_reference_data")
+            if isinstance(reference_data, pd.DataFrame) and not reference_data.empty:
+                cols = [c for c in feature_cols if c in reference_data.columns]
+                if cols:
+                    return reference_data[cols].copy()
         df_ref_local = st.session_state.get("processed_data")
         if df_ref_local is None:
             df_ref_local = st.session_state.get("data")
@@ -14527,8 +14755,6 @@ def page_virtual_screening():
             if overwrite or key not in st.session_state:
                 st.session_state[key] = value
 
-    _apply_model_profile_defaults(model_profile, overwrite=False)
-
     with st.expander("🧭 当前模型筛选画像", expanded=False):
         profile_cols = st.columns(4)
         profile_cols[0].metric("当前模型", str(model_profile.get("display_name") or "-"))
@@ -14542,18 +14768,9 @@ def page_virtual_screening():
         )
         for note in model_profile.get("notes") or []:
             st.caption(f"- {note}")
-        if st.button("应用当前模型推荐筛选策略", key="vs_apply_model_profile"):
-            _apply_model_profile_defaults(model_profile, overwrite=True)
-            st.rerun()
 
-    # --- 生成方式 ---
-    st.markdown("### 1) 生成方式")
-    gen_mode = st.radio(
-        "生成方式",
-        ["配方级高通量筛选（推荐）", "模型驱动生成（基于特征正负）", "候选池筛选（旧版）"],
-        horizontal=True,
-        index=0,
-    )
+    # 旧版候选池与独立模型驱动页面已并入统一工作流。
+    gen_mode = "配方级高通量筛选（推荐）"
 
     candidate_df = None
     resin_col = None
@@ -14577,11 +14794,17 @@ def page_virtual_screening():
     hardener_pool = []
 
     if gen_mode.startswith("配方级高通量"):
-        st.caption("组合已有树脂/固化剂库、PubChem 候选与模型引导虚拟组分，批量生成虚拟分子和虚拟配方，并联合评估可合成性、适用域和预测不确定度。")
+        st.caption("组合当前数据、PubChem 候选与完整虚拟组分，批量生成配方并联合评估模型性能、可合成性、适用域和不确定度。")
 
         df_ref_design = st.session_state.get("processed_data")
         if df_ref_design is None:
             df_ref_design = st.session_state.get("data")
+        if df_ref_design is None:
+            imported_design_artifact = st.session_state.get("imported_model_artifact") or {}
+            imported_design_extra = imported_design_artifact.get("extra") or {}
+            imported_design_ref = imported_design_extra.get("screening_reference_data")
+            if isinstance(imported_design_ref, pd.DataFrame) and not imported_design_ref.empty:
+                df_ref_design = imported_design_ref.copy()
         target_col_name = st.session_state.get("target_col")
 
         text_cols_design = []
@@ -14591,7 +14814,7 @@ def page_virtual_screening():
                 if (df_ref_design[c].dtype == object or str(df_ref_design[c].dtype).startswith("string"))
             ]
         auto_hard_cols_global = _resolve_smiles_cols(mf_cfg, "hardener")
-        if not auto_hard_cols_global:
+        if not auto_hard_cols_global and primary_component_role != "hardener":
             for cand in ["curing_agent_smiles_key", "hardener_smiles_key", "curing_agent_smiles", "hardener_smiles"]:
                 if cand in text_cols_design:
                     auto_hard_cols_global = [cand]
@@ -14610,7 +14833,9 @@ def page_virtual_screening():
             c for c in numeric_design_cols
             if any(token in str(c).lower() for token in ["phr", "ratio", "stoich", "equiv", "cure", "temp", "time", "post"])
         ]
-        default_design_cols = detected_design_cols[:4] if detected_design_cols else numeric_design_cols[:3]
+        # 默认保留训练集中最佳样本的相关工艺组合。用户需要时再展开单列网格，
+        # 避免把相关的温度/时间/配比拆成极少命中的笛卡尔积。
+        default_design_cols = []
 
         def _suggest_design_values(col_name):
             if not isinstance(df_ref_design, pd.DataFrame) or col_name not in df_ref_design.columns:
@@ -14622,7 +14847,7 @@ def page_virtual_screening():
             if len(uniq) <= 6:
                 return [float(v) for v in uniq[:6]]
             vals = []
-            for q in (0.10, 0.25, 0.50, 0.75, 0.90):
+            for q in (0.02, 0.10, 0.25, 0.50, 0.75, 0.90, 0.98):
                 try:
                     vals.append(float(np.quantile(ser, q)))
                 except Exception:
@@ -14723,7 +14948,8 @@ def page_virtual_screening():
                 for query_text in query_map.get(cls, [])
             ]
 
-            total_queries = max(1, 1 + len(hardener_jobs))
+            has_resin_query = bool(str(resin_query or "").strip())
+            total_queries = max(1, int(has_resin_query) + len(hardener_jobs))
             query_done = 0
             progress_bar = st.progress(0)
             progress_text = st.empty()
@@ -14743,18 +14969,19 @@ def page_virtual_screening():
                     property_workers=int(max(1, property_workers)),
                 )
 
-            try:
-                resin_property_workers = max_workers if len(hardener_jobs) <= 1 else min(max_workers, 3)
-                resin_df = _fetch_pubchem_smiles_cached(
-                    resin_query,
-                    int(max_cids),
-                    property_workers=int(resin_property_workers),
-                )
-                if isinstance(resin_df, pd.DataFrame) and "smiles" in resin_df.columns:
-                    fetched_resin = resin_df["smiles"].tolist()
-            except Exception as e:
-                st.error(f"{progress_label} resin query failed: {e}")
-            _tick("resin query done")
+            if has_resin_query:
+                try:
+                    resin_property_workers = max_workers if len(hardener_jobs) <= 1 else min(max_workers, 3)
+                    resin_df = _fetch_pubchem_smiles_cached(
+                        str(resin_query).strip(),
+                        int(max_cids),
+                        property_workers=int(resin_property_workers),
+                    )
+                    if isinstance(resin_df, pd.DataFrame) and "smiles" in resin_df.columns:
+                        fetched_resin = resin_df["smiles"].tolist()
+                except Exception as e:
+                    st.error(f"{progress_label} primary query failed: {e}")
+                _tick("primary query done")
 
             hardener_query_workers = max(1, min(max_workers, len(hardener_jobs), 4))
             hardener_property_workers = 1 if hardener_query_workers >= 4 else 2 if hardener_query_workers >= 2 else max_workers
@@ -14810,17 +15037,32 @@ def page_virtual_screening():
             )
             return fetched_resin, fetched_hard, hard_errors
         st.markdown("### 2) 组分候选来源")
+        st.caption(f"根据模型保存的源列自动识别：当前主要筛选对象为 {primary_role_label}。")
+        if source_mapping_conflict:
+            st.error(
+                "模型的特征源记录存在角色冲突：主列名称看起来是树脂，但真正合并计算的列是 "
+                + ", ".join(configured_primary_cols[:12])
+                + "。筛选按真正的特征输入列解释；若要筛环氧树脂，需要用 resin_smiles_* 重新提取并训练模型。"
+            )
         source_col1, source_col2 = st.columns(2)
         with source_col1:
-            use_dataset_source = st.checkbox("使用当前数据中的树脂/固化剂库", value=True, key="vs_formula_use_dataset")
-            use_guided_source = st.checkbox("叠加模型引导虚拟组分", value=True, key="vs_formula_use_guided")
+            use_dataset_source = st.checkbox(f"使用当前数据中的{primary_role_label}库", value=True, key="vs_formula_use_dataset_v2")
+            use_guided_source = st.checkbox("叠加虚拟组分", value=False, key="vs_formula_use_guided_v2")
         with source_col2:
             hardener_formula_enabled = st.checkbox(
-                "配方中包含固化剂",
+                f"配方中包含{secondary_role_label}",
                 value=hardener_formula_enabled_default,
                 key="vs_formula_include_hardener",
+                disabled=primary_component_role == "hardener" and not hardener_required,
+                help=(
+                    "当前模型只保存了一个固化剂输入，额外第二组分不会进入特征流程。"
+                    if primary_component_role == "hardener" and not hardener_required
+                    else None
+                ),
             )
-            use_pubchem_source = st.checkbox("叠加 PubChem 候选", value=False, key="vs_formula_use_pubchem")
+            if primary_component_role == "hardener" and not hardener_required:
+                hardener_formula_enabled = False
+            use_pubchem_source = st.checkbox("叠加 PubChem 候选", value=True, key="vs_formula_use_pubchem_v2")
             use_upload_source = st.checkbox("叠加上传候选库", value=False, key="vs_formula_use_upload")
         if hardener_required and not hardener_formula_enabled:
             st.warning("当前分子特征流程要求固化剂，但你关闭了固化剂配方生成。系统将继续按双组分流程处理。")
@@ -14840,20 +15082,20 @@ def page_virtual_screening():
                             auto_resin_cols = [cand]
                             break
                 dataset_resin_cols = st.multiselect(
-                    "树脂/主体 SMILES 列（当前数据）",
+                    f"{primary_role_label} SMILES 列（当前数据）",
                     options=text_cols_design,
                     default=[c for c in auto_resin_cols if c in text_cols_design] or text_cols_design[:1],
                     key="vs_formula_dataset_resin_cols",
                 )
                 if hardener_formula_enabled:
                     auto_hard_cols = _resolve_smiles_cols(mf_cfg, "hardener")
-                    if not auto_hard_cols:
+                    if not auto_hard_cols and primary_component_role != "hardener":
                         for cand in ["curing_agent_smiles_key", "hardener_smiles_key", "curing_agent_smiles", "hardener_smiles"]:
                             if cand in text_cols_design:
                                 auto_hard_cols = [cand]
                                 break
                     dataset_hard_cols = st.multiselect(
-                        "固化剂 SMILES 列（当前数据）",
+                        f"{secondary_role_label} SMILES 列（当前数据）",
                         options=text_cols_design,
                         default=[c for c in auto_hard_cols if c in text_cols_design],
                         key="vs_formula_dataset_hard_cols",
@@ -14880,14 +15122,14 @@ def page_virtual_screening():
                     ]
                     if upload_text_cols:
                         upload_resin_col = st.selectbox(
-                            "上传库中的树脂/主体列",
+                            f"上传库中的{primary_role_label}列",
                             options=upload_text_cols,
                             index=0,
                             key="vs_formula_upload_resin_col",
                         )
                         if hardener_formula_enabled:
                             upload_hard_col = st.selectbox(
-                                "上传库中的固化剂列",
+                                f"上传库中的{secondary_role_label}列",
                                 options=["无"] + upload_text_cols,
                                 index=0,
                                 key="vs_formula_upload_hard_col",
@@ -14905,40 +15147,45 @@ def page_virtual_screening():
         pubchem_hard_pool = []
         if use_pubchem_source:
             st.markdown("#### PubChem 子结构扩库")
-            pubchem_resin_smarts = st.text_input(
-                "树脂 SMARTS / SMILES 查询",
-                value="C1CO1",
-                key="vs_formula_pubchem_resin_smarts",
-            )
             hardener_class_options = ["胺", "酸酐", "酚", "硫醇", "咪唑", "叔胺"]
+            if primary_component_role == "hardener":
+                pubchem_resin_smarts = ""
+                st.caption("当前模型学习的是固化剂空间，PubChem 将按固化剂类别扩库，不执行默认环氧子结构查询。")
+            else:
+                pubchem_resin_smarts = st.text_input(
+                    f"{primary_role_label} SMARTS / SMILES 查询",
+                    value="C1CO1" if primary_component_role == "resin" else "",
+                    key="vs_formula_pubchem_primary_smarts_v4",
+                )
             pubchem_hardener_classes = st.multiselect(
-                "固化剂类别（PubChem）",
+                "固化剂类别（作为主体或第二组分）",
                 options=hardener_class_options,
-                default=["胺", "酸酐"] if hardener_formula_enabled else [],
-                key="vs_formula_pubchem_hardener_classes",
+                default=["胺", "酸酐"] if (hardener_formula_enabled or primary_component_role == "hardener") else [],
+                key="vs_formula_pubchem_hardener_classes_v4",
             )
             pubchem_max_cids = st.number_input(
                 "每类最大 CID 数",
                 min_value=100,
-                max_value=50000,
-                value=2000,
+                max_value=10000,
+                value=1000,
                 step=100,
-                key="vs_formula_pubchem_max_cids",
+                key="vs_formula_pubchem_max_cids_v4",
             )
             pubchem_sample_each = st.number_input(
-                "每类采样数（0=不采样）",
-                min_value=0,
-                max_value=50000,
-                value=1500,
+                "最终 PubChem 候选采样上限",
+                min_value=100,
+                max_value=5000,
+                value=500,
                 step=100,
-                key="vs_formula_pubchem_sample_each",
+                key="vs_formula_pubchem_sample_each_v4",
             )
-            pubchem_seed = st.number_input("PubChem 随机种子", 0, 10_000_000, 42, key="vs_formula_pubchem_seed")
-            if st.button("🔎 从 PubChem 拉取候选", key="vs_formula_pubchem_fetch"):
+            pubchem_seed = st.number_input("PubChem 随机种子", 0, 10_000_000, 42, key="vs_formula_pubchem_seed_v4")
+            st.caption("已下载过的查询会从磁盘缓存秒级读取；所有缓存和在线结果都会再用 RDKit 复核子结构，并在进入 xTB 前采样。")
+            if st.button("🔎 从 PubChem 拉取候选", key="vs_formula_pubchem_fetch_v4"):
                 with st.spinner("正在从 PubChem 拉取候选..."):
                     fetched_resin, fetched_hard, hard_errors = _fetch_pubchem_candidate_sets(
                         pubchem_resin_smarts,
-                        pubchem_hardener_classes if hardener_formula_enabled else [],
+                        pubchem_hardener_classes if (hardener_formula_enabled or primary_component_role == "hardener") else [],
                         int(pubchem_max_cids),
                         int(pubchem_sample_each),
                         int(pubchem_seed),
@@ -14948,17 +15195,22 @@ def page_virtual_screening():
                     if hard_errors:
                         st.warning("部分固化剂 PubChem 查询失败：\n" + "\n".join(hard_errors[:6]))
 
-                    st.session_state["vs_formula_pubchem_resin_smiles"] = fetched_resin
-                    st.session_state["vs_formula_pubchem_hardener_smiles"] = fetched_hard
-                    if fetched_resin or fetched_hard:
-                        st.success(f"PubChem 查询完成：树脂 {len(fetched_resin)} 条，固化剂 {len(fetched_hard)} 条。")
+                    primary_fetched = fetched_hard if primary_component_role == "hardener" else fetched_resin
+                    secondary_fetched = fetched_hard if primary_component_role != "hardener" else []
+                    st.session_state["vs_formula_pubchem_primary_smiles_v4"] = primary_fetched
+                    st.session_state["vs_formula_pubchem_secondary_smiles_v4"] = secondary_fetched
+                    if primary_fetched or secondary_fetched:
+                        st.success(
+                            f"PubChem 查询完成：{primary_role_label} {len(primary_fetched)} 条"
+                            + (f"，第二组分 {len(secondary_fetched)} 条。" if hardener_formula_enabled else "。")
+                        )
                     else:
                         st.warning("PubChem 查询完成，但未返回可用候选。请尝试放宽 SMARTS 或减少约束。")
 
-            pubchem_resin_pool = st.session_state.get("vs_formula_pubchem_resin_smiles") or []
-            pubchem_hard_pool = st.session_state.get("vs_formula_pubchem_hardener_smiles") or []
+            pubchem_resin_pool = st.session_state.get("vs_formula_pubchem_primary_smiles_v4") or []
+            pubchem_hard_pool = st.session_state.get("vs_formula_pubchem_secondary_smiles_v4") or []
             if pubchem_resin_pool:
-                st.caption(f"PubChem 树脂候选: {len(pubchem_resin_pool)}")
+                st.caption(f"PubChem {primary_role_label}候选: {len(pubchem_resin_pool)}")
             if pubchem_hard_pool:
                 st.caption(f"PubChem 固化剂候选: {len(pubchem_hard_pool)}")
 
@@ -14975,21 +15227,11 @@ def page_virtual_screening():
 
         guided_top_pos = 10
         guided_top_neg = 10
-        guided_n_generate = 1200
-        guided_max_fragments = 3
+        guided_n_generate = 500
+        guided_max_fragments = 1
         guided_seed = 42
         if use_guided_source:
-            st.markdown("#### 模型引导虚拟组分")
-            effect_method_formula = st.selectbox(
-                "特征方向来源",
-                ["自动（优先模型参数）", "仅相关性（根据当前数据/训练数据）"],
-                index=0,
-                key="vs_formula_effect_method",
-            )
-            method_map_formula = {
-                "自动（优先模型参数）": "auto",
-                "仅相关性（根据当前数据/训练数据）": "corr",
-            }
+            st.markdown("#### 完整虚拟组分扩展")
             effect_df = compute_feature_effects(
                 model,
                 feature_cols,
@@ -14998,58 +15240,153 @@ def page_virtual_screening():
                 pipeline=pipeline,
                 imputer=imputer,
                 scaler=scaler,
-                method=method_map_formula.get(effect_method_formula, "auto"),
+                method="auto",
             )
-            guided_top_pos = st.slider("正向特征数（引导生成）", 1, 30, 10, key="vs_formula_guided_top_pos")
-            guided_top_neg = st.slider("负向特征数（引导生成）", 1, 30, 10, key="vs_formula_guided_top_neg")
             pos_tags, neg_tags = extract_effect_tags(effect_df, top_pos=guided_top_pos, top_neg=guided_top_neg)
-            guided_n_generate = st.slider("虚拟组分数量", 100, 10000, 1200, step=100, key="vs_formula_guided_n_generate")
-            guided_max_fragments = st.slider("每个虚拟组分最多片段数", 1, 4, 3, key="vs_formula_guided_max_fragments")
-            guided_seed = st.number_input("虚拟组分随机种子", 0, 10_000_000, 42, key="vs_formula_guided_seed")
-            if pos_tags:
-                st.caption("正向官能团/骨架标签: " + ", ".join(pos_tags))
-            if neg_tags:
-                st.caption("负向官能团/骨架标签: " + ", ".join(neg_tags))
+            guided_n_generate = st.number_input(
+                "虚拟完整分子上限",
+                min_value=20,
+                max_value=5000,
+                value=500,
+                step=20,
+                key="vs_formula_guided_n_generate_v2",
+            )
+            guided_seed = st.number_input("虚拟组分随机种子", 0, 10_000_000, 42, key="vs_formula_guided_seed_v2")
+            st.caption("仅生成完整、连通且可解析的单分子 SMILES；不再把点号分隔的片段混合物当作新分子。")
 
         st.markdown("### 3) 虚拟配方设计空间")
         formula_random_state = st.number_input("配方随机种子", 0, 10_000_000, 42, key="vs_formula_seed")
         if hardener_formula_enabled:
             pair_mode_label = st.selectbox(
-                "树脂/固化剂组合方式",
+                f"{primary_role_label}/{secondary_role_label}组合方式",
                 ["全组合（笛卡尔积）", "随机组合采样", "按行配对"],
                 index=0,
                 key="vs_formula_pair_mode",
             )
         else:
             pair_mode_label = "单组分库"
-            st.info("ℹ️ 当前按单组分体系筛选。若需要配方里包含固化剂，请开启上方“配方中包含固化剂”。")
-        max_pairs_formula = st.slider("组分组合采样上限", 100, 50000, 8000, step=100, key="vs_formula_max_pairs")
-        max_formulations = st.slider("总虚拟配方上限", 200, 200000, 20000, step=200, key="vs_formula_max_formulations")
-        formula_min_epoxide = st.slider(
-            "树脂最小环氧官能度",
-            1,
-            6,
-            2,
-            key="vs_formula_min_epoxide",
-            help="按树脂分子中的环氧基数量预筛候选；设置为 2 表示至少双官能环氧。",
-        )
+            st.info(f"当前按单组分{primary_role_label}体系筛选；额外组分只有在模型特征流程包含对应输入时才应启用。")
+        limit_col1, limit_col2 = st.columns(2)
+        with limit_col1:
+            max_pairs_formula = st.number_input(
+                "组分组合采样上限",
+                min_value=100,
+                max_value=500000,
+                value=50000,
+                step=1000,
+                key="vs_formula_max_pairs_v2",
+            )
+        with limit_col2:
+            max_formulations = st.number_input(
+                "模型评估配方上限",
+                min_value=500,
+                max_value=1000000,
+                value=100000,
+                step=5000,
+                key="vs_formula_max_formulations_v2",
+            )
 
-        formula_chem_rule_mode = st.selectbox(
-            "化学规则过滤时机",
-            options=["pre", "post", "off"],
-            index=0,
-            key="vs_formula_chem_rule_mode",
-            format_func=lambda x: {
-                "pre": "特征提取前（默认）",
-                "post": "特征提取后",
-                "off": "关闭",
-            }.get(x, str(x)),
-            help="默认在分子特征提取前执行环氧/固化剂化学规则过滤。也可以先提特征再过滤，或完全关闭。",
+        with st.expander("化学有效性规则", expanded=False):
+            formula_rule_profile = st.selectbox(
+                "规则强度",
+                options=["basic", "strict", "off"],
+                index=0,
+                key="vs_formula_rule_profile_v2",
+                format_func=lambda x: {
+                    "basic": "基础有效性（推荐）",
+                    "strict": "角色专用规则（严格）",
+                    "off": "关闭规则",
+                }[x],
+            )
+            if primary_component_role == "resin":
+                formula_min_epoxide = st.slider(
+                    "树脂最小环氧官能度",
+                    1,
+                    6,
+                    1,
+                    key="vs_formula_min_epoxide_v2",
+                    disabled=formula_rule_profile == "off",
+                )
+            else:
+                formula_min_epoxide = 0
+            if formula_rule_profile == "basic":
+                if primary_component_role == "resin":
+                    st.caption("仅要求结构可解析、主体含环氧基，并采用宽松尺寸边界；不强制芳环或双官能。")
+                elif primary_component_role == "hardener":
+                    st.caption("仅要求结构可解析并采用宽松尺寸边界；不强制限定为胺、酸酐等传统固化剂类别。")
+                else:
+                    st.caption("仅检查结构可解析性和宽松尺寸边界，不附加环氧或固化剂类别假设。")
+            elif formula_rule_profile == "strict":
+                if primary_component_role == "resin":
+                    st.caption("要求传统双官能芳香环氧结构，会排除脂环族与小分子候选。")
+                else:
+                    st.caption("仅保留常见胺、酸酐、酚、硫醇、咪唑或叔胺固化组分，并收紧尺寸与电荷限制。")
+
+        formula_chem_rule_mode = "off" if formula_rule_profile == "off" else "pre"
+        if primary_component_role == "resin":
+            formula_chem_rules = {"resin": {"min_epoxide": int(formula_min_epoxide)}}
+        else:
+            formula_chem_rules = {
+                "hardener": {
+                    "min_mw": 25.0,
+                    "max_mw": 1500.0,
+                    "min_heavy_atoms": 2,
+                    "max_heavy_atoms": 120,
+                    "ban_strong_acids": False,
+                    "ban_epoxide": False,
+                    "allowed_classes": None,
+                }
+            }
+        if formula_rule_profile == "strict" and primary_component_role == "resin":
+            formula_chem_rules = {
+                "global": {"reject_charged": True},
+                "resin": {
+                    "min_epoxide": max(2, int(formula_min_epoxide)),
+                    "max_epoxide": 6,
+                    "min_aromatic_rings": 1,
+                    "min_mw": 150.0,
+                    "max_mw": 2000.0,
+                    "min_heavy_atoms": 10,
+                    "max_heavy_atoms": 150,
+                    "ban_strong_acids": True,
+                    "ban_amines": True,
+                },
+                "hardener": {
+                    "min_mw": 40.0,
+                    "max_mw": 1000.0,
+                    "min_heavy_atoms": 3,
+                    "max_heavy_atoms": 100,
+                    "ban_strong_acids": True,
+                    "ban_epoxide": True,
+                    "allowed_classes": ["amine", "anhydride", "phenol", "thiol", "imidazole", "tertiary_amine"],
+                },
+                "pair": {
+                    "amine_ratio": (0.2, 5.0),
+                    "anhydride_ratio": (0.2, 5.0),
+                    "phenol_ratio": (0.2, 5.0),
+                    "thiol_ratio": (0.2, 5.0),
+                },
+            }
+        elif formula_rule_profile == "strict":
+            formula_chem_rules = {
+                "global": {"reject_charged": True},
+                "hardener": {
+                    "min_mw": 40.0,
+                    "max_mw": 1000.0,
+                    "min_heavy_atoms": 3,
+                    "max_heavy_atoms": 100,
+                    "ban_strong_acids": True,
+                    "ban_epoxide": True,
+                    "allowed_classes": ["amine", "anhydride", "phenol", "thiol", "imidazole", "tertiary_amine"],
+                },
+            }
+
+        formula_rule_resin_col = "resin_smiles" if primary_component_role == "resin" else None
+        formula_rule_hardener_col = (
+            "hardener_smiles" if primary_component_role == "resin" and hardener_formula_enabled
+            else "resin_smiles" if primary_component_role != "resin"
+            else None
         )
-        if formula_chem_rule_mode == "post":
-            st.caption("当前模式：先提取分子特征，再执行化学规则过滤。候选更宽松，但速度会更慢。")
-        elif formula_chem_rule_mode == "off":
-            st.caption("当前模式：关闭化学规则过滤。系统将完全依赖模型打分与后续筛选。")
 
         selected_design_cols = st.multiselect(
             "选择要枚举的配方/工艺特征",
@@ -15075,7 +15412,7 @@ def page_virtual_screening():
                     formula_feature_grid[col_name] = parsed_vals
                     st.caption(f"{col_name}: {len(parsed_vals)} 个取值")
         else:
-            st.caption("未选择额外配方/工艺特征时，系统只组合树脂/固化剂本身。")
+            st.caption(f"未选择额外配方/工艺特征时，系统只枚举{primary_role_label}与已配置的第二组分。")
 
         estimated_grid_size = 1
         for vals in formula_feature_grid.values():
@@ -15100,11 +15437,13 @@ def page_virtual_screening():
             st.warning("当前工艺网格较大，且未启用“分子优先预筛”，这会显著增加内存占用。若你主要在乎分子式，建议开启该选项。")
 
         st.markdown("### 4) 非分子特征填充与目标设置")
-        fill_modes_formula = ["保持NaN（交给模型/Imputer）", "填充为0"]
+        fill_modes_formula = ["使用高性能训练样本（推荐）", "保持NaN（交给模型/Imputer）", "填充为0"]
         if isinstance(st.session_state.get("train_result"), dict) and "X_train_raw" in st.session_state.get("train_result"):
-            fill_modes_formula.insert(0, "使用训练集特征中位数")
+            fill_modes_formula.insert(1, "使用训练集特征中位数")
         fill_modes_formula.append("使用模板行（上传文件）")
-        formula_fill_mode = st.selectbox("基准行填充策略", fill_modes_formula, index=0, key="vs_formula_fill_mode")
+        formula_fill_mode = st.selectbox("非分子特征基线", fill_modes_formula, index=0, key="vs_formula_fill_mode_v2")
+        if formula_fill_mode.startswith("使用高性能"):
+            st.caption("保留训练集中最高目标样本的配比与工艺条件，再替换候选分子特征，避免中位数工艺把模型预测上限压低。")
         formula_template_row = None
         if formula_fill_mode.startswith("使用模板行"):
             template_file = st.file_uploader(
@@ -15135,12 +15474,54 @@ def page_virtual_screening():
             disabled=formula_use_target,
             key="vs_formula_minimize",
         )
-        formula_top_k = st.slider("返回 Top-K", 1, 500, 60, key="vs_formula_top_k")
-        formula_batch_size = st.slider("每类实验建议数量", 3, 60, 12, key="vs_formula_batch_size")
+        formula_top_k = st.slider("返回候选数", 1, 1000, 100, key="vs_formula_top_k_v2")
+        formula_batch_size = st.slider("每类实验建议数量", 3, 100, 15, key="vs_formula_batch_size_v2")
+        screening_expensive_unique_cap = 20000
+        screening_xtb_n_jobs = max(1, int((mf_cfg.get("params") or {}).get("xtb_n_jobs", 1)))
+        if screening_uses_expensive_features:
+            st.markdown("#### 昂贵分子特征计算保护")
+            expensive_col1, expensive_col2 = st.columns(2)
+            with expensive_col1:
+                screening_expensive_unique_cap = st.number_input(
+                    "进入分子特征计算的唯一分子上限",
+                    min_value=100,
+                    max_value=10000,
+                    value=1000,
+                    step=100,
+                    key="vs_expensive_feature_unique_cap_v3",
+                    help="会优先保留原始实测配方，并按训练数据、上传库、PubChem、虚拟库等来源分层抽样。",
+                )
+            with expensive_col2:
+                if screening_uses_xtb:
+                    cpu_total = max(1, int(os.cpu_count() or 1))
+                    safe_job_max = min(32, 61 if os.name == "nt" else cpu_total, cpu_total)
+                    default_xtb_jobs = min(8, safe_job_max)
+                    screening_xtb_n_jobs = st.number_input(
+                        "xTB 并行进程数",
+                        min_value=1,
+                        max_value=max(1, safe_job_max),
+                        value=max(1, default_xtb_jobs),
+                        step=1,
+                        key="vs_xtb_n_jobs_v3",
+                        help="建议 4-8。进程过多会造成 CPU/内存争抢，并不一定更快。",
+                    )
+                else:
+                    st.metric("当前昂贵特征方法", screening_feature_method)
+            st.warning(
+                f"当前方法 `{screening_feature_method}` 不会再对全部候选直接计算；"
+                f"最多提取 {int(screening_expensive_unique_cap):,} 个唯一分子。"
+            )
+
+        screening_mf_cfg = dict(mf_cfg)
+        screening_mf_cfg["params"] = dict(mf_cfg.get("params") or {})
+        if screening_uses_xtb:
+            screening_mf_cfg["params"]["xtb_n_jobs"] = int(screening_xtb_n_jobs)
+
         formula_molecule_first = st.checkbox(
-            "分子优先预筛（先筛唯一分子组合，再补工艺，显著降低内存）",
-            value=True,
-            key="vs_formula_molecule_first",
+            "超大空间时先做分子预筛",
+            value=False,
+            key="vs_formula_molecule_first_v2",
+            help="仅在内存不足时启用。若模型强依赖工艺特征，过早预筛可能漏掉高性能组合。",
         )
         formula_molecule_prefilter_cap = st.slider(
             "唯一分子预筛保留上限",
@@ -15148,7 +15529,7 @@ def page_virtual_screening():
             20000,
             min(int(max_formulations), max(500, int(formula_top_k) * 20)),
             step=100,
-            key="vs_formula_molecule_prefilter_cap",
+            key="vs_formula_molecule_prefilter_cap_v2",
         )
         formula_min_pred_txt = st.text_input("预测下限（可选）", value="", key="vs_formula_min_pred")
         formula_max_pred_txt = st.text_input("预测上限（可选）", value="", key="vs_formula_max_pred")
@@ -15162,21 +15543,31 @@ def page_virtual_screening():
             train_low = target_stats.get("p01", target_stats.get("min"))
             train_high = target_stats.get("p99", target_stats.get("max"))
             if train_low is not None and train_high is not None:
-                st.caption(f"训练标签参考范围: {float(train_low):.4f} ~ {float(train_high):.4f}")
+                observed_max = target_stats.get("max")
+                range_text = f"训练标签高密度范围: {float(train_low):.4f} ~ {float(train_high):.4f}"
+                if observed_max is not None and float(observed_max) > float(train_high):
+                    range_text += f" | 实测最大值: {float(observed_max):.4f}"
+                st.caption(range_text)
 
         st.markdown("### 5) 联合评分")
-        formula_synth_min = st.slider("最低可合成性分数", 0, 100, 25, key="vs_formula_synth_min")
+        formula_synth_min = st.slider(
+            "最低可合成性分数（0=只排序不淘汰）",
+            0,
+            100,
+            0,
+            key="vs_formula_synth_min_v2",
+        )
         formula_diversity_enable = st.checkbox("保留结构多样性", value=True, key="vs_formula_diversity_enable")
-        formula_similarity_thr = st.slider("候选相似度上限", 0.50, 0.99, 0.92, 0.01, key="vs_formula_similarity_thr")
-        formula_mc_samples = st.slider("不确定度采样次数（若模型支持）", 5, 200, 50, 5, key="vs_formula_mc_samples")
+        formula_similarity_thr = st.slider("候选相似度上限", 0.50, 0.99, 0.92, 0.01, key="vs_formula_similarity_thr_v2")
+        formula_mc_samples = st.slider("不确定度采样次数（若模型支持）", 5, 200, 50, 5, key="vs_formula_mc_samples_v2")
         with st.expander("综合评分权重", expanded=False):
-            w_perf = st.slider("性能权重", 0.0, 1.0, 0.40, 0.05, key="vs_formula_w_perf")
-            w_synth = st.slider("可合成性权重", 0.0, 1.0, 0.15, 0.05, key="vs_formula_w_synth")
-            w_feas = st.slider("化学/工艺可行性权重", 0.0, 1.0, 0.15, 0.05, key="vs_formula_w_feas")
-            w_ad = st.slider("适用域权重", 0.0, 1.0, 0.12, 0.02, key="vs_formula_w_ad")
-            w_unc = st.slider("不确定度权重", 0.0, 1.0, 0.10, 0.02, key="vs_formula_w_unc")
-            w_novel = st.slider("新颖性权重", 0.0, 1.0, 0.05, 0.01, key="vs_formula_w_novel")
-            w_feat = st.slider("特征方向一致性权重", 0.0, 1.0, 0.03, 0.01, key="vs_formula_w_feat")
+            w_perf = st.slider("性能权重", 0.0, 1.0, 0.40, 0.05, key="vs_formula_w_perf_v2")
+            w_synth = st.slider("可合成性权重", 0.0, 1.0, 0.15, 0.05, key="vs_formula_w_synth_v2")
+            w_feas = st.slider("化学/工艺可行性权重", 0.0, 1.0, 0.15, 0.05, key="vs_formula_w_feas_v2")
+            w_ad = st.slider("适用域权重", 0.0, 1.0, 0.12, 0.02, key="vs_formula_w_ad_v2")
+            w_unc = st.slider("不确定度权重", 0.0, 1.0, 0.10, 0.02, key="vs_formula_w_unc_v2")
+            w_novel = st.slider("新颖性权重", 0.0, 1.0, 0.05, 0.01, key="vs_formula_w_novel_v2")
+            w_feat = st.slider("特征方向一致性权重", 0.0, 1.0, 0.03, 0.01, key="vs_formula_w_feat_v2")
 
         if st.button("🚀 开始配方级高通量筛选", type="primary", key="vs_formula_run"):
             formula_run_t0 = time.time()
@@ -15192,7 +15583,7 @@ def page_virtual_screening():
                     resin_libraries.append(
                         build_component_library(
                             dataset_resin_pool,
-                            role="resin",
+                            role=primary_library_role,
                             source="train_data",
                             max_items=int(dataset_pool_limit),
                             random_state=int(formula_random_state),
@@ -15217,7 +15608,7 @@ def page_virtual_screening():
                     resin_libraries.append(
                         build_component_library(
                             upload_resin_pool,
-                            role="resin",
+                            role=primary_library_role,
                             source="uploaded",
                             max_items=int(upload_pool_limit),
                             random_state=int(formula_random_state),
@@ -15240,7 +15631,7 @@ def page_virtual_screening():
                 resin_libraries.append(
                     build_component_library(
                         pubchem_resin_pool,
-                        role="resin",
+                        role=primary_library_role,
                         source="pubchem",
                         random_state=int(formula_random_state),
                     )
@@ -15260,7 +15651,7 @@ def page_virtual_screening():
 
             if use_guided_source:
                 guided_resin_library = generate_virtual_component_library(
-                    role="resin",
+                    role=primary_library_role,
                     n_samples=int(guided_n_generate),
                     pos_tags=pos_tags,
                     neg_tags=neg_tags,
@@ -15284,12 +15675,12 @@ def page_virtual_screening():
                     hardener_libraries.append(guided_hardener_library)
 
             formula_progress.progress(12)
-            formula_status.info("正在构建树脂/固化剂候选库...")
+            formula_status.info(f"正在构建{primary_role_label}候选库与配方空间...")
             resin_library = merge_component_libraries(*resin_libraries)
             hardener_library = merge_component_libraries(*hardener_libraries) if hardener_formula_enabled else pd.DataFrame()
 
             if resin_library.empty:
-                st.error("❌ 树脂候选库为空，请至少提供一种树脂来源。")
+                st.error(f"❌ {primary_role_label}候选库为空，请至少提供一种候选来源。")
                 return
             if hardener_formula_enabled and hardener_library.empty:
                 if hardener_required:
@@ -15299,8 +15690,8 @@ def page_virtual_screening():
                 return
 
             st.info(
-                f"树脂候选 {len(resin_library)} 个"
-                + (f" | 固化剂候选 {len(hardener_library)} 个" if hardener_formula_enabled else "")
+                f"{primary_role_label}候选 {len(resin_library)} 个"
+                + (f" | {secondary_role_label}候选 {len(hardener_library)} 个" if hardener_formula_enabled else "")
                 + f" | 工艺网格 {estimated_grid_size}"
             )
 
@@ -15323,6 +15714,34 @@ def page_virtual_screening():
                 hardener_required=bool(hardener_formula_enabled),
             )
             pool_df = design_space.candidate_df
+            observed_anchor_count = 0
+            if use_dataset_source and isinstance(df_ref_design, pd.DataFrame) and dataset_resin_cols:
+                observed_formula_df = _collect_observed_formula_rows(
+                    df_ref_design,
+                    dataset_resin_cols,
+                    dataset_hard_cols if hardener_formula_enabled else [],
+                    feature_cols,
+                    max_rows=int(dataset_pool_limit),
+                    target_col=target_col_name,
+                    maximize=not bool(formula_minimize),
+                )
+                if hardener_formula_enabled and not observed_formula_df.empty:
+                    observed_formula_df = observed_formula_df[
+                        observed_formula_df["hardener_smiles"].fillna("").astype(str).str.strip().astype(bool)
+                    ]
+                if not observed_formula_df.empty:
+                    dedupe_cols = ["resin_smiles", "hardener_smiles"] + [
+                        c for c in selected_design_cols if c in observed_formula_df.columns
+                    ]
+                    observed_formula_df = observed_formula_df.drop_duplicates(subset=dedupe_cols, keep="first")
+                    observed_anchor_count = int(len(observed_formula_df))
+                    if observed_anchor_count:
+                        pool_df = pd.concat([observed_formula_df, pool_df], ignore_index=True, sort=False)
+                        pool_df = pool_df.drop_duplicates(subset=dedupe_cols, keep="first").reset_index(drop=True)
+                        pool_df["formulation_id"] = np.arange(1, len(pool_df) + 1)
+                        design_space.metadata["observed_anchor_count"] = observed_anchor_count
+                        design_space.metadata["sampled"] = int(len(pool_df))
+                        st.caption(f"已强制加入 {observed_anchor_count} 个原始实测{primary_role_label}配方，避免高性能训练样本在随机组合中丢失。")
             if pool_df.empty:
                 st.warning("⚠️ 未生成任何虚拟配方，请检查候选库和组合设置。")
                 return
@@ -15336,18 +15755,57 @@ def page_virtual_screening():
             apply_formula_chem_rules_pre = VS_RDKIT_AVAILABLE and formula_chem_rule_mode == "pre"
             apply_formula_chem_rules_post = VS_RDKIT_AVAILABLE and formula_chem_rule_mode == "post"
 
+            # 记录化学规则过滤前后的漏斗，避免诊断表把“规则过滤砍掉的候选”误报为“本来就没有候选”。
+            chem_rule_funnel = {
+                "sampled_pairs": int(design_space.metadata.get("sampled", len(pool_df))),
+                "before_chem_rules": int(len(pool_df)),
+                "after_chem_rules": None,
+                "applied": False,
+                "stage": formula_chem_rule_mode,
+            }
+
             if apply_formula_chem_rules_pre:
                 formula_progress.progress(34)
-                formula_status.info("正在执行树脂/固化剂化学规则筛选...")
-                pool_df = filter_candidates_by_epoxy_rules(
-                    pool_df,
-                    resin_col="resin_smiles",
-                    hardener_col="hardener_smiles" if hardener_formula_enabled else None,
-                    rules={"resin": {"min_epoxide": int(formula_min_epoxide)}},
+                formula_status.info(f"正在执行{primary_role_label}角色化学规则筛选...")
+                _pool_before_chem = int(len(pool_df))
+                _pool_before_chem_df = pool_df.copy()
+                _pool_before_chem_df["_chem_row_id"] = np.arange(len(_pool_before_chem_df))
+                filtered_pool_df = filter_candidates_by_epoxy_rules(
+                    _pool_before_chem_df,
+                    resin_col=formula_rule_resin_col,
+                    hardener_col=formula_rule_hardener_col,
+                    rules=formula_chem_rules,
                 )
-                if pool_df.empty:
-                    st.warning("⚠️ 没有虚拟配方满足树脂/固化剂规则约束。")
-                    return
+                chem_rule_funnel["applied"] = True
+                chem_rule_funnel["after_chem_rules"] = int(len(filtered_pool_df))
+                filtered_pool_df["chem_rule_pass"] = True
+                empirical_origin = _pool_before_chem_df.get(
+                    "candidate_origin",
+                    pd.Series("", index=_pool_before_chem_df.index),
+                )
+                empirical_anchor_df = _pool_before_chem_df[
+                    empirical_origin.astype(str).eq("train_observed_pair")
+                ].copy()
+                if not empirical_anchor_df.empty:
+                    passed_ids = set(filtered_pool_df.get("_chem_row_id", pd.Series(dtype=int)).tolist())
+                    empirical_anchor_df = empirical_anchor_df[
+                        ~empirical_anchor_df["_chem_row_id"].isin(passed_ids)
+                    ].copy()
+                    empirical_anchor_df["chem_rule_pass"] = False
+                if filtered_pool_df.empty and empirical_anchor_df.empty:
+                    pool_df = _pool_before_chem_df
+                    pool_df["chem_rule_pass"] = False
+                    chem_rule_funnel["fallback_to_unfiltered"] = True
+                    st.warning(
+                        f"化学规则未命中（{_pool_before_chem:,} 个候选均未通过），已继续预测并将这些结果标记为探索候选。"
+                    )
+                else:
+                    pool_df = pd.concat(
+                        [empirical_anchor_df, filtered_pool_df],
+                        ignore_index=True,
+                        sort=False,
+                    )
+                pool_df = pool_df.drop(columns=["_chem_row_id"], errors="ignore")
 
             torch_device = None
             try:
@@ -15371,7 +15829,38 @@ def page_virtual_screening():
             pool_df["_molecule_key"] = _make_formula_molecule_key(pool_df)
 
             base_row = None
-            if formula_fill_mode.startswith("使用训练集特征中位数"):
+            if formula_fill_mode.startswith("使用高性能"):
+                train_x_for_base = train_result_effect.get("X_train_raw") if isinstance(train_result_effect, dict) else None
+                train_y_for_base = train_result_effect.get("y_train") if isinstance(train_result_effect, dict) else None
+                base_row = _pick_extreme_base_row(
+                    train_x_for_base,
+                    train_y_for_base,
+                    feature_cols,
+                    maximize=not bool(formula_minimize),
+                )
+                if base_row is None:
+                    imported_reference = _get_uncertainty_reference_bundle()
+                    base_row = _pick_extreme_base_row(
+                        imported_reference.get("X_train_raw"),
+                        imported_reference.get("y_train"),
+                        feature_cols,
+                        maximize=not bool(formula_minimize),
+                    )
+                if base_row is None and isinstance(df_ref_design, pd.DataFrame) and target_col_name in df_ref_design.columns:
+                    base_row = _pick_extreme_base_row(
+                        df_ref_design,
+                        df_ref_design[target_col_name],
+                        feature_cols,
+                        maximize=not bool(formula_minimize),
+                    )
+                if base_row is None:
+                    ref_frame_for_fill = _get_reference_feature_frame()
+                    if isinstance(ref_frame_for_fill, pd.DataFrame):
+                        cols_fill = [c for c in feature_cols if c in ref_frame_for_fill.columns]
+                        if cols_fill:
+                            base_row = ref_frame_for_fill[cols_fill].median(numeric_only=True)
+                            st.warning("模型文件未包含训练标签参考，非分子特征已回退为训练特征中位数。")
+            elif formula_fill_mode.startswith("使用训练集特征中位数"):
                 ref_frame_for_fill = _get_reference_feature_frame()
                 if isinstance(ref_frame_for_fill, pd.DataFrame):
                     cols_fill = [c for c in feature_cols if c in ref_frame_for_fill.columns]
@@ -15409,46 +15898,95 @@ def page_virtual_screening():
                     base_row = target_row
 
             unique_mol_df = pool_df.drop_duplicates(subset=["_molecule_key"]).reset_index(drop=True).copy()
-            unique_hardener_inputs = (
-                unique_mol_df["hardener_smiles"].tolist()
-                if hardener_formula_enabled and "hardener_smiles" in unique_mol_df.columns
+            expensive_limit_metadata = None
+            if (
+                screening_uses_expensive_features
+                and len(unique_mol_df) > int(screening_expensive_unique_cap)
+            ):
+                pool_df, expensive_limit_metadata = limit_unique_candidates_for_expensive_features(
+                    pool_df,
+                    key_col="_molecule_key",
+                    max_unique=int(screening_expensive_unique_cap),
+                    random_state=int(formula_random_state),
+                )
+                unique_mol_df = pool_df.drop_duplicates(subset=["_molecule_key"]).reset_index(drop=True).copy()
+                design_space.metadata["expensive_feature_limit"] = expensive_limit_metadata
+                design_space.metadata["sampled"] = int(len(pool_df))
+                st.warning(
+                    f"昂贵特征预限流：唯一分子从 {int(expensive_limit_metadata.get('before_unique', 0)):,} "
+                    f"缩减到 {int(expensive_limit_metadata.get('after_unique', 0)):,}；"
+                    f"保留实测锚点 {int(expensive_limit_metadata.get('anchors_kept', 0)):,} 个。"
+                )
+            saved_mol_feature_cols = [
+                c for c in (mf_cfg.get("feature_names") or [])
+                if c in feature_cols
+            ]
+            reusable_feature_mask = pd.Series(False, index=unique_mol_df.index)
+            if saved_mol_feature_cols and all(c in unique_mol_df.columns for c in saved_mol_feature_cols):
+                observed_origin = unique_mol_df.get(
+                    "candidate_origin",
+                    pd.Series("", index=unique_mol_df.index),
+                ).astype(str)
+                reusable_feature_mask = observed_origin.eq("train_observed_pair")
+            extract_positions = np.flatnonzero(~reusable_feature_mask.to_numpy())
+            extract_mol_df = unique_mol_df.iloc[extract_positions].reset_index(drop=True)
+            extract_hardener_inputs = (
+                extract_mol_df["hardener_smiles"].tolist()
+                if hardener_formula_enabled and "hardener_smiles" in extract_mol_df.columns
                 else None
             )
             formula_progress.progress(48)
             formula_status.info(
-                f"正在提取分子特征（唯一分子 {len(unique_mol_df)} / 配方 {len(pool_df)}）..."
+                f"正在准备分子特征（复用实测 {int(reusable_feature_mask.sum())} / "
+                f"新提取 {len(extract_mol_df)} / 配方 {len(pool_df)}）..."
             )
-            formula_feature_cache, formula_feature_cache_order = _get_formula_feature_cache()
-            feature_cache_key = _build_formula_feature_cache_key(
-                unique_mol_df["resin_smiles"].tolist(),
-                unique_hardener_inputs,
-                mf_cfg,
-                torch_device,
+            extracted_mol_features = pd.DataFrame(index=range(len(extract_mol_df)))
+            if not extract_mol_df.empty:
+                formula_feature_cache, formula_feature_cache_order = _get_formula_feature_cache()
+                feature_cache_key = _build_formula_feature_cache_key(
+                    extract_mol_df["resin_smiles"].tolist(),
+                    extract_hardener_inputs,
+                    screening_mf_cfg,
+                    torch_device,
+                )
+                cached_feature_df = formula_feature_cache.get(feature_cache_key)
+                if isinstance(cached_feature_df, pd.DataFrame) and len(cached_feature_df) == len(extract_mol_df):
+                    extracted_mol_features = cached_feature_df.copy()
+                else:
+                    extracted_mol_features, err = extract_features_from_config(
+                        resin_smiles=extract_mol_df["resin_smiles"].tolist(),
+                        hardener_smiles=extract_hardener_inputs,
+                        mf_cfg=screening_mf_cfg,
+                        device=torch_device,
+                    )
+                    if err:
+                        st.error(f"❌ 分子特征提取失败: {err}")
+                        return
+                    extracted_mol_features = _downcast_screening_numeric(extracted_mol_features)
+                    formula_feature_cache[feature_cache_key] = extracted_mol_features.copy()
+                    if feature_cache_key in formula_feature_cache_order:
+                        formula_feature_cache_order.remove(feature_cache_key)
+                    formula_feature_cache_order.append(feature_cache_key)
+                    while len(formula_feature_cache_order) > 6:
+                        old_key = formula_feature_cache_order.pop(0)
+                        formula_feature_cache.pop(old_key, None)
+
+            combined_feature_cols = list(dict.fromkeys(
+                saved_mol_feature_cols + list(extracted_mol_features.columns)
+            ))
+            unique_mol_features = pd.DataFrame(
+                np.nan,
+                index=unique_mol_df.index,
+                columns=combined_feature_cols,
             )
-            cached_feature_df = formula_feature_cache.get(feature_cache_key)
-            if isinstance(cached_feature_df, pd.DataFrame) and len(cached_feature_df) == len(unique_mol_df):
-                unique_mol_features = cached_feature_df.copy()
-                formula_status.info(
-                    f"正在复用已缓存的分子特征（唯一分子 {len(unique_mol_df)} / 配方 {len(pool_df)}）..."
+            if reusable_feature_mask.any() and saved_mol_feature_cols:
+                unique_mol_features.loc[reusable_feature_mask, saved_mol_feature_cols] = (
+                    unique_mol_df.loc[reusable_feature_mask, saved_mol_feature_cols].to_numpy()
                 )
-            else:
-                unique_mol_features, err = extract_features_from_config(
-                    resin_smiles=unique_mol_df["resin_smiles"].tolist(),
-                    hardener_smiles=unique_hardener_inputs,
-                    mf_cfg=mf_cfg,
-                    device=torch_device,
+            if len(extract_positions) and not extracted_mol_features.empty:
+                unique_mol_features.loc[extract_positions, extracted_mol_features.columns] = (
+                    extracted_mol_features.reset_index(drop=True).to_numpy()
                 )
-                if err:
-                    st.error(f"❌ 分子特征提取失败: {err}")
-                    return
-                unique_mol_features = _downcast_screening_numeric(unique_mol_features)
-                formula_feature_cache[feature_cache_key] = unique_mol_features.copy()
-                if feature_cache_key in formula_feature_cache_order:
-                    formula_feature_cache_order.remove(feature_cache_key)
-                formula_feature_cache_order.append(feature_cache_key)
-                while len(formula_feature_cache_order) > 6:
-                    old_key = formula_feature_cache_order.pop(0)
-                    formula_feature_cache.pop(old_key, None)
             unique_mol_features = _downcast_screening_numeric(unique_mol_features)
             unique_feature_table = pd.concat(
                 [
@@ -15461,14 +15999,22 @@ def page_virtual_screening():
             if apply_formula_chem_rules_post:
                 formula_progress.progress(56)
                 formula_status.info("正在执行分子特征提取后的化学规则过滤...")
+                _pool_before_chem_post = int(len(pool_df))
                 pool_df = filter_candidates_by_epoxy_rules(
                     pool_df,
-                    resin_col="resin_smiles",
-                    hardener_col="hardener_smiles" if hardener_formula_enabled else None,
-                    rules={"resin": {"min_epoxide": int(formula_min_epoxide)}},
+                    resin_col=formula_rule_resin_col,
+                    hardener_col=formula_rule_hardener_col,
+                    rules=formula_chem_rules,
                 )
+                chem_rule_funnel["applied"] = True
+                chem_rule_funnel["before_chem_rules"] = _pool_before_chem_post
+                chem_rule_funnel["after_chem_rules"] = int(len(pool_df))
                 if pool_df.empty:
                     st.warning("⚠️ 分子特征提取后，所有虚拟配方都被化学规则过滤掉了。")
+                    st.info(
+                        f"化学规则过滤把候选从 {_pool_before_chem_post:,} 个直接清空。"
+                        "请切换到“基础有效性”或关闭规则后重试。"
+                    )
                     return
                 pool_df = pool_df.reset_index(drop=True).copy()
                 unique_mol_df = pool_df.drop_duplicates(subset=["_molecule_key"]).reset_index(drop=True).copy()
@@ -15557,6 +16103,17 @@ def page_virtual_screening():
             )
             X = _downcast_screening_numeric(X)
             X = apply_feature_overrides(X, pool_df)
+            observed_row_mask = pool_df.get(
+                "candidate_origin",
+                pd.Series("", index=pool_df.index),
+            ).astype(str).eq("train_observed_pair")
+            observed_feature_cols = [c for c in feature_cols if c in pool_df.columns]
+            if observed_row_mask.any() and observed_feature_cols:
+                X.loc[observed_row_mask, observed_feature_cols] = (
+                    pool_df.loc[observed_row_mask, observed_feature_cols]
+                    .apply(pd.to_numeric, errors="coerce")
+                    .to_numpy()
+                )
 
             try:
                 formula_progress.progress(78)
@@ -15613,15 +16170,9 @@ def page_virtual_screening():
                 out_df,
                 resin_col="resin_smiles",
                 hardener_col="hardener_smiles" if hardener_formula_enabled else None,
+                primary_role=primary_component_role,
             )
             _append_formula_filter_trace("feasibility_scored", out_df)
-            if int(formula_synth_min) > 0:
-                out_df = out_df[out_df["synth_score"] >= float(formula_synth_min)]
-            _append_formula_filter_trace(
-                "after_synth_filter",
-                out_df,
-                synth_min=float(formula_synth_min),
-            )
 
             X_ref_screen = _get_reference_feature_frame()
             if isinstance(X_ref_screen, pd.DataFrame):
@@ -15673,6 +16224,15 @@ def page_virtual_screening():
                         out_df["uncertainty_multiplier"] = pd.to_numeric(
                             proxy_uncertainty_df["uncertainty_multiplier"], errors="coerce"
                         ).reindex(out_df.index).to_numpy(dtype=float)
+
+            unconstrained_rank_df = out_df.copy()
+            if int(formula_synth_min) > 0:
+                out_df = out_df[out_df["synth_score"] >= float(formula_synth_min)]
+            _append_formula_filter_trace(
+                "after_synth_filter",
+                out_df,
+                synth_min=float(formula_synth_min),
+            )
 
             try:
                 min_pred_formula = float(formula_min_pred_txt) if formula_min_pred_txt.strip() else None
@@ -15730,12 +16290,83 @@ def page_virtual_screening():
                     target_tol=target_tol_formula,
                 )
 
+            formula_used_fallback = False
+            if out_df.empty and not unconstrained_rank_df.empty:
+                formula_used_fallback = True
+                out_df = unconstrained_rank_df.copy()
+                pred_for_gap = pd.to_numeric(out_df["prediction"], errors="coerce")
+                gap_parts = []
+                if min_pred_formula is not None:
+                    gap_parts.append((float(min_pred_formula) - pred_for_gap).clip(lower=0.0))
+                if max_pred_formula is not None:
+                    gap_parts.append((pred_for_gap - float(max_pred_formula)).clip(lower=0.0))
+                if formula_use_target and target_value_num_formula is not None and target_tol_formula is not None:
+                    target_gap = (pred_for_gap - float(target_value_num_formula)).abs() - float(target_tol_formula)
+                    gap_parts.append(target_gap.clip(lower=0.0))
+                if int(formula_synth_min) > 0 and "synth_score" in out_df.columns:
+                    synth_gap = (
+                        float(formula_synth_min)
+                        - pd.to_numeric(out_df["synth_score"], errors="coerce")
+                    ).clip(lower=0.0)
+                    gap_parts.append(synth_gap / 100.0)
+                if gap_parts:
+                    out_df["constraint_gap"] = pd.concat(gap_parts, axis=1).sum(axis=1)
+                else:
+                    out_df["constraint_gap"] = 0.0
+                out_df["constraint_match"] = False
+                out_df = out_df.sort_values(
+                    ["constraint_gap", "prediction"],
+                    ascending=[True, bool(formula_minimize)],
+                )
+                nearest_pred = pd.to_numeric(out_df["prediction"], errors="coerce").dropna()
+                nearest_text = f"，当前最高预测值为 {nearest_pred.max():.4f}" if not nearest_pred.empty else ""
+                st.warning(
+                    "严格条件没有命中，以下仍返回最接近目标的探索候选"
+                    f"{nearest_text}。constraint_match=False，constraint_gap 越小越接近要求。"
+                )
+                with st.expander("筛选漏斗", expanded=False):
+                    st.dataframe(pd.DataFrame(formula_filter_trace), use_container_width=True, height=220)
+            elif not out_df.empty:
+                out_df = out_df.copy()
+                out_df["constraint_match"] = True
+                out_df["constraint_gap"] = 0.0
+
+            # A genuinely empty prediction set still needs the detailed failure path.
             if out_df.empty:
                 st.warning("⚠️ 当前筛选条件下没有保留下来的虚拟配方。")
                 trace_df = pd.DataFrame(formula_filter_trace)
                 if not trace_df.empty:
                     with st.expander("筛选失败诊断", expanded=True):
-                        st.dataframe(trace_df, use_container_width=True, height=220)
+                        # 先暴露化学规则过滤这一段隐藏漏斗：诊断表的 predicted 行是“规则过滤之后”的候选数，
+                        # 若不显示这一段，用户会误以为候选库本来就这么少。
+                        _predicted_row_diag = next(
+                            (item for item in formula_filter_trace if item.get("stage") == "predicted"),
+                            None,
+                        )
+                        predicted_count_for_diag = int(_predicted_row_diag.get("count", 0)) if _predicted_row_diag else 0
+                        if chem_rule_funnel.get("applied") and chem_rule_funnel.get("after_chem_rules") is not None:
+                            _before = int(chem_rule_funnel.get("before_chem_rules", 0))
+                            _after = int(chem_rule_funnel.get("after_chem_rules", 0))
+                            _sampled = int(chem_rule_funnel.get("sampled_pairs", _before))
+                            if _before > 0:
+                                _kept_pct = 100.0 * _after / _before
+                                if _after < _before:
+                                    st.warning(
+                                        f"⚠️ 化学规则过滤（时机={chem_rule_funnel.get('stage')}）把候选从 "
+                                        f"{_before:,} 个砍到 {_after:,} 个（仅保留 {_kept_pct:.1f}%）。"
+                                        f"诊断表里 predicted={int(predicted_count_for_diag):,} 是过滤之后的数字，不是候选库总量。"
+                                    )
+                                    if _kept_pct < 5.0:
+                                        if primary_component_role == "resin":
+                                            st.info(
+                                                "当前树脂规则与候选库不匹配。请切换到“基础有效性”，"
+                                                f"或把最小环氧官能度从 {int(formula_min_epoxide)} 降低后重试。"
+                                            )
+                                        else:
+                                            st.info(
+                                                "当前固化组分规则与候选库不匹配。请切换到“基础有效性”；"
+                                                "严格模式只保留常见固化剂类别并排除带电、含环氧或强酸结构。"
+                                            )
                         suggestions = []
                         predicted_row = next((item for item in formula_filter_trace if item.get("stage") == "predicted"), None)
                         synth_row = next((item for item in formula_filter_trace if item.get("stage") == "after_synth_filter"), None)
@@ -15752,6 +16383,29 @@ def page_virtual_screening():
                                 suggestions.append(
                                     f"当前候选的最高预测值约为 {float(pred_max):.4f}，低于你设置的预测下限 {float(min_pred_formula):.4f}。先降低下限，或扩大候选库/提高采样量。"
                                 )
+                                # 量纲不匹配自动识别：下限比候选最高预测值大一个数量级以上时，几乎可以确定是单位问题。
+                                try:
+                                    _pmax = float(pred_max)
+                                    _lo = float(min_pred_formula)
+                                    _train_hi = None
+                                    if target_stats:
+                                        _train_hi = target_stats.get("p99", target_stats.get("max"))
+                                    if _pmax > 0 and _lo >= _pmax * 10:
+                                        _ratio = _lo / _pmax
+                                        _msg = (
+                                            f"⚠️ 疑似量纲不一致：预测下限 {_lo:g} 约为候选最高预测值 {_pmax:.4f} 的 {_ratio:.0f} 倍。"
+                                            "模型输出与训练标签同量纲"
+                                        )
+                                        if _train_hi is not None:
+                                            _msg += f"（训练标签高位约 {float(_train_hi):.4f}）"
+                                        _msg += (
+                                            "，说明模型是按这个尺度学习的。若你想要“6 GPa”而模型是以 GPa 训练，"
+                                            "下限就应填 6 附近而不是 6000；若模型其实以 MPa 训练，则应重新用统一量纲训练/换算。"
+                                            "请先核对训练标签单位，再按同一单位填写下限。"
+                                        )
+                                        suggestions.append(_msg)
+                                except Exception:
+                                    pass
                             if max_pred_formula is not None and pred_min is not None and float(pred_min) > float(max_pred_formula):
                                 suggestions.append(
                                     f"当前候选的最低预测值约为 {float(pred_min):.4f}，高于你设置的预测上限 {float(max_pred_formula):.4f}。请放宽上限。"
@@ -15805,7 +16459,20 @@ def page_virtual_screening():
                 target_value=target_value_num_formula if formula_use_target else None,
                 weights=weight_cfg,
             )
-            out_df = out_df.sort_values(["total_score", "prediction"], ascending=[False, bool(formula_minimize)])
+            selection_score_col = "total_score"
+            if formula_used_fallback:
+                gap_ser = pd.to_numeric(out_df["constraint_gap"], errors="coerce").fillna(np.inf)
+                finite_gap = gap_ser[np.isfinite(gap_ser)]
+                gap_scale = max(float(finite_gap.max()) if not finite_gap.empty else 1.0, 1e-9)
+                out_df["fallback_score"] = (
+                    100.0 * (1.0 - (gap_ser / gap_scale).clip(0.0, 1.0))
+                    + pd.to_numeric(out_df["total_score"], errors="coerce").fillna(0.0) * 0.001
+                )
+                selection_score_col = "fallback_score"
+            out_df = out_df.sort_values(
+                [selection_score_col, "prediction"],
+                ascending=[False, bool(formula_minimize)],
+            )
 
             X_rank = X.loc[out_df.index].copy()
             if formula_diversity_enable:
@@ -15813,7 +16480,7 @@ def page_virtual_screening():
                     out_df,
                     feature_frame=X_rank,
                     top_k=int(formula_top_k),
-                    score_col="total_score",
+                    score_col=selection_score_col,
                     similarity_threshold=float(formula_similarity_thr),
                 )
             else:
@@ -15823,7 +16490,7 @@ def page_virtual_screening():
                 out_df,
                 feature_frame=X_rank,
                 top_n_each=int(formula_batch_size),
-                score_col="total_score",
+                score_col=selection_score_col,
                 diversity_similarity_threshold=float(formula_similarity_thr),
                 strategy_bias=model_profile.get("recommended_strategy_bias"),
             )
@@ -15834,6 +16501,9 @@ def page_virtual_screening():
 
             if "resin_smiles" in final_df.columns:
                 final_df["resin_formula"] = final_df["resin_smiles"].apply(calc_mol_formula)
+                final_df["primary_smiles"] = final_df["resin_smiles"]
+                final_df["primary_formula"] = final_df["resin_formula"]
+                final_df["component_role"] = primary_role_label
             if "hardener_smiles" in final_df.columns:
                 final_df["hardener_formula"] = final_df["hardener_smiles"].apply(calc_mol_formula)
             if "combo_smiles" in final_df.columns:
@@ -15857,7 +16527,7 @@ def page_virtual_screening():
                     mol = Chem.MolFromSmiles(resin_smi)
                     if mol is not None:
                         mols.append(mol)
-                        legends.append(f"Resin: {row.get('resin_formula') or 'n/a'}")
+                        legends.append(f"{primary_role_label}: {row.get('primary_formula') or row.get('resin_formula') or 'n/a'}")
                 if isinstance(hardener_smi, str) and hardener_smi.strip():
                     mol = Chem.MolFromSmiles(hardener_smi)
                     if mol is not None:
@@ -15880,22 +16550,28 @@ def page_virtual_screening():
             )
             formula_progress.progress(100)
             formula_status.success(f"配方级高通量筛选完成，用时 {time.time() - formula_run_t0:.1f} s。")
-            st.success(
-                f"✅ 配方级筛选完成：理论空间 {meta.get('total_possible', len(final_df))} 个，"
+            completion_text = (
+                f"配方级筛选完成：理论空间 {meta.get('total_possible', len(final_df))} 个，"
                 f"实际评估 {meta.get('sampled', len(out_df))} 个，返回 {len(final_df)} 个候选。"
             )
+            if formula_used_fallback:
+                st.warning(completion_text + " 当前返回的是最接近目标的探索候选，未宣称满足全部硬条件。")
+            else:
+                st.success(completion_text)
             with st.expander("筛选空间摘要", expanded=False):
                 st.write(
                     {
                         "当前模型": str(model_profile.get("display_name") or "-"),
                         "模型家族": str(model_profile.get("family_label") or "-"),
                         "推荐偏好": str(model_profile.get("recommended_strategy_label") or "-"),
-                        "树脂库规模": int(len(resin_library)),
+                        f"{primary_role_label}库规模": int(len(resin_library)),
                         "固化剂库规模": int(len(hardener_library)) if hardener_formula_enabled else 0,
                         "组分组合数": int(meta.get("total_pairs", 0)),
                         "工艺网格大小": int(meta.get("grid_size", estimated_grid_size)),
                         "理论总空间": int(meta.get("total_possible", 0)),
                         "实际评估数": int(meta.get("sampled", len(out_df))),
+                        "复用实测分子特征": int(reusable_feature_mask.sum()),
+                        "新提取分子特征": int(len(extract_mol_df)),
                     }
                 )
                 origin_counts = final_df.get("candidate_origin")
@@ -15913,22 +16589,28 @@ def page_virtual_screening():
                 f"推荐偏好：{model_profile.get('recommended_strategy_label', '-')}"
             )
             metric_cols = st.columns(5)
-            metric_cols[0].metric("树脂候选库", f"{len(resin_library)}")
+            metric_cols[0].metric(f"{primary_role_label}候选库", f"{len(resin_library)}")
             metric_cols[1].metric("固化剂候选库", f"{len(hardener_library)}" if hardener_formula_enabled else "单组分")
             metric_cols[2].metric("评估配方数", f"{meta.get('sampled', len(out_df))}")
             metric_cols[3].metric("Top1 总分", f"{float(final_df['total_score'].iloc[0]):.2f}")
             metric_cols[4].metric("Top1 预测值", f"{float(final_df['prediction'].iloc[0]):.4f}")
 
+            role_formula_cols = (
+                ["Resin_Functionality", "Hardener_Functionality", "EEW", "AHEW", "Theoretical_PHR", "Actual_PHR", "Stoich_Ratio"]
+                if primary_component_role == "resin"
+                else []
+            )
             show_cols = [
                 c for c in [
-                    "formulation_id", "resin_smiles", "resin_formula", "hardener_smiles", "hardener_formula",
-                    "combo_formula", "Resin_Functionality", "Hardener_Functionality", "EEW", "AHEW",
-                    "Theoretical_PHR", "Actual_PHR", "Stoich_Ratio", "prediction", "prediction_std", "uncertainty_source",
+                    "formulation_id", "component_role", "primary_smiles", "primary_formula",
+                    "hardener_smiles", "hardener_formula",
+                    "combo_formula", "prediction", "prediction_std", "uncertainty_source",
+                    "constraint_match", "constraint_gap", "chem_rule_pass",
                     "uncertainty_base_error", "uncertainty_multiplier", "total_score",
                     "synth_score", "feasibility_score", "reaction_score", "processability_score",
                     "availability_score", "ad_score", "novelty_score", "feature_score",
                     "chemistry_label", "candidate_origin"
-                ] + selected_design_cols
+                ] + role_formula_cols + selected_design_cols
                 if c in final_df.columns
             ]
             if show_cols:
@@ -15989,7 +16671,13 @@ def page_virtual_screening():
                     except Exception:
                         st.info("未检测到 RDKit Draw，无法生成结构图。")
 
-            smiles_export_cols = [c for c in ["resin_smiles", "hardener_smiles", "prediction", "total_score"] if c in final_df.columns]
+            smiles_export_cols = [
+                c for c in [
+                    "component_role", "primary_smiles", "primary_formula", "hardener_smiles",
+                    "prediction", "total_score"
+                ]
+                if c in final_df.columns
+            ]
             smiles_bytes = final_df[smiles_export_cols].to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "⬇️ 下载候选 SMILES 列表（CSV）",
@@ -16007,6 +16695,9 @@ def page_virtual_screening():
             )
 
             return
+
+        # 统一配方级工作流已经覆盖下方旧版功能，避免继续渲染重复控件。
+        return
 
     if gen_mode.startswith("模型驱动"):
         st.markdown("#### 模型特征方向")

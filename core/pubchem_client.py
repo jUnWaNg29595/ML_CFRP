@@ -163,6 +163,45 @@ def _is_plain_smiles_query(text: str) -> bool:
         return False
 
 
+def _filter_pubchem_query_matches(df: pd.DataFrame, query_text: str) -> pd.DataFrame:
+    """Revalidate PubChem substructure results locally before caching or screening."""
+    if not isinstance(df, pd.DataFrame) or df.empty or "smiles" not in df.columns:
+        out = pd.DataFrame(columns=["cid", "smiles", "mol_wt"]) if df is None else df.copy()
+        out.attrs.update({"query_validated": False, "raw_count": int(len(out)), "rejected_count": 0})
+        return out
+    if not RDKIT_AVAILABLE:
+        out = df.copy()
+        out.attrs.update({"query_validated": False, "raw_count": int(len(out)), "rejected_count": 0})
+        return out
+
+    query = _clean_query_text(query_text)
+    try:
+        query_mol = Chem.MolFromSmiles(query) if _is_plain_smiles_query(query) else Chem.MolFromSmarts(query)
+    except Exception:
+        query_mol = None
+    if query_mol is None:
+        out = df.copy()
+        out.attrs.update({"query_validated": False, "raw_count": int(len(out)), "rejected_count": 0})
+        return out
+
+    keep_mask = []
+    for value in df["smiles"].tolist():
+        try:
+            mol = Chem.MolFromSmiles(str(value or "").strip())
+            keep_mask.append(bool(mol is not None and mol.HasSubstructMatch(query_mol)))
+        except Exception:
+            keep_mask.append(False)
+    out = df.loc[keep_mask].drop_duplicates(subset=["smiles"]).reset_index(drop=True).copy()
+    out.attrs.update(
+        {
+            "query_validated": True,
+            "raw_count": int(len(df)),
+            "rejected_count": int(len(df) - len(out)),
+        }
+    )
+    return out
+
+
 def _poll_listkey_for_cids(
     listkey: Optional[str],
     *,
@@ -475,7 +514,11 @@ def fetch_smiles_by_smarts(
         return pd.DataFrame(columns=["cid", "smiles", "mol_wt"])
     disk_cached_df = _load_smiles_cache(smarts, int(max_cids))
     if disk_cached_df is not None:
-        return disk_cached_df.copy(deep=True)
+        validated_df = _filter_pubchem_query_matches(disk_cached_df, smarts)
+        if len(validated_df) != len(disk_cached_df):
+            _save_smiles_cache(smarts, int(max_cids), validated_df)
+        validated_df.attrs["cache_source"] = "disk"
+        return validated_df.copy(deep=True)
     worker_count = _normalize_worker_count(property_workers, max(1, int(max_cids) // 100 + 1), cap=6)
     df = _fetch_smiles_by_smarts_cached(
         smarts=smarts,
@@ -484,5 +527,7 @@ def fetch_smiles_by_smarts(
         retries=int(retries),
         property_workers=worker_count,
     )
-    _save_smiles_cache(smarts, int(max_cids), df)
-    return df.copy(deep=True)
+    validated_df = _filter_pubchem_query_matches(df, smarts)
+    _save_smiles_cache(smarts, int(max_cids), validated_df)
+    validated_df.attrs["cache_source"] = "network"
+    return validated_df.copy(deep=True)

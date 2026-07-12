@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import itertools
 import inspect
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -27,43 +28,41 @@ from .smiles_utils import normalize_chemical_string
 DEFAULT_EPOXY_RULES = {
     "global": {
         "allowed_elements": {1, 6, 7, 8, 9, 14, 15, 16, 17, 35, 53},
-        "reject_charged": True,
+        "reject_charged": False,
     },
     "resin": {
         "min_epoxide": 1,
-        "max_epoxide": 4,
-        "min_aromatic_rings": 2,
-        "min_mw": 250.0,
-        "max_mw": 2000.0,
-        "min_heavy_atoms": 20,
-        "max_heavy_atoms": 150,
-        "ban_strong_acids": True,
-        "ban_amines": True,
+        "max_epoxide": None,
+        "min_aromatic_rings": None,
+        "min_mw": 40.0,
+        "max_mw": 2500.0,
+        "min_heavy_atoms": 3,
+        "max_heavy_atoms": 200,
+        "ban_strong_acids": False,
+        "ban_amines": False,
     },
     "hardener": {
-        "min_mw": 70.0,
-        "max_mw": 800.0,
-        "min_heavy_atoms": 6,
-        "max_heavy_atoms": 80,
-        "ban_strong_acids": True,
-        "ban_epoxide": True,
-        "allowed_classes": [
-            "amine",
-            "anhydride",
-            "phenol",
-            "thiol",
-            "imidazole",
-            "tertiary_amine",
-        ],
+        "min_mw": 25.0,
+        "max_mw": 1500.0,
+        "min_heavy_atoms": 2,
+        "max_heavy_atoms": 120,
+        "ban_strong_acids": False,
+        "ban_epoxide": False,
+        "allowed_classes": None,
     },
     "pair": {
-        "amine_ratio": (0.30, 3.00),
-        "anhydride_ratio": (0.30, 3.00),
-        "phenol_ratio": (0.30, 3.00),
-        "thiol_ratio": (0.30, 3.00),
-        "reject_mixed_class": True,
+        "amine_ratio": (0.05, 20.00),
+        "anhydride_ratio": (0.05, 20.00),
+        "phenol_ratio": (0.05, 20.00),
+        "thiol_ratio": (0.05, 20.00),
+        "reject_mixed_class": False,
     },
 }
+
+
+# The former ``[OX2r3]1[CR2r3][CR2r3]1`` query uses RDKit's R2
+# (membership in two rings), so it misses ordinary oxirane rings entirely.
+EPOXIDE_SMARTS = "[O;r3]1[C;r3][C;r3]1"
 
 
 @dataclass
@@ -110,6 +109,39 @@ def _smiles_lookup_key(value: Any) -> str:
 
 def _normalize_feature_key(name: Any) -> str:
     return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _is_fingerprint_bit_column(name: Any) -> bool:
+    text = str(name or "")
+    return bool(re.search(r"(?:^|_)(?:Resin|Hardener)_(?:MACCS|Morgan)_\d+$", text, flags=re.I))
+
+
+def infer_primary_component_role(mf_cfg: Optional[Dict]) -> str:
+    """Infer the chemistry role represented by the saved primary SMILES inputs."""
+    cfg = mf_cfg or {}
+    explicit_role = str(cfg.get("primary_component_role") or "").strip().lower()
+    if explicit_role in {"resin", "hardener", "neutral"}:
+        return explicit_role
+    names = list(cfg.get("resin_component_cols") or [])
+    if cfg.get("smiles_col"):
+        names.append(cfg.get("smiles_col"))
+    text = " ".join(str(name).lower() for name in names if name)
+    hardener_tokens = (
+        "hardener",
+        "curing_agent",
+        "curingagent",
+        "curative",
+        "固化剂",
+        "交联剂",
+    )
+    resin_tokens = ("resin", "epoxy", "树脂", "基体")
+    hardener_score = sum(text.count(token) for token in hardener_tokens)
+    resin_score = sum(text.count(token) for token in resin_tokens)
+    if hardener_score > resin_score:
+        return "hardener"
+    if resin_score > hardener_score:
+        return "resin"
+    return "neutral"
 
 
 def _pick_matching_column(columns: Sequence[str], aliases: Sequence[str]) -> Optional[str]:
@@ -182,8 +214,9 @@ def generate_candidate_pool(
                 hard_idx = flat % n_h
         else:
             size = min(int(max_candidates), total) if total > 0 else int(max_candidates)
-            res_idx = rng.integers(0, n_r, size=size)
-            hard_idx = rng.integers(0, n_h, size=size)
+            flat = rng.choice(total, size=size, replace=False)
+            res_idx = flat // n_h
+            hard_idx = flat % n_h
 
     df = pd.DataFrame(
         {
@@ -243,6 +276,51 @@ def _sample_or_limit_indices(total: int, max_candidates: int, random_state: int 
     idx = np.asarray(idx, dtype=int)
     idx.sort()
     return idx
+
+
+def _sample_pair_grid_indices(
+    pair_count: int,
+    grid_size: int,
+    limit: int,
+    random_state: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Sample a pair x process grid while covering pairs before repeats."""
+    pair_count = max(0, int(pair_count))
+    grid_size = max(1, int(grid_size))
+    total = pair_count * grid_size
+    limit = min(max(0, int(limit)), total)
+    if pair_count == 0 or limit == 0:
+        empty = np.asarray([], dtype=int)
+        return empty, empty
+
+    rng = np.random.default_rng(int(random_state))
+    if total <= limit:
+        return (
+            np.repeat(np.arange(pair_count), grid_size),
+            np.tile(np.arange(grid_size), pair_count),
+        )
+
+    if limit < pair_count:
+        pair_idx = rng.choice(pair_count, size=limit, replace=False)
+        grid_idx = rng.integers(0, grid_size, size=limit)
+        return np.asarray(pair_idx, dtype=int), np.asarray(grid_idx, dtype=int)
+
+    full_cycles, remainder = divmod(limit, pair_count)
+    offsets = rng.integers(0, grid_size, size=pair_count)
+    pair_parts = []
+    grid_parts = []
+    for cycle in range(full_cycles):
+        order = rng.permutation(pair_count)
+        pair_parts.append(order)
+        grid_parts.append((offsets[order] + cycle) % grid_size)
+    if remainder:
+        order = rng.choice(pair_count, size=remainder, replace=False)
+        pair_parts.append(order)
+        grid_parts.append((offsets[order] + full_cycles) % grid_size)
+    return (
+        np.concatenate(pair_parts).astype(int, copy=False),
+        np.concatenate(grid_parts).astype(int, copy=False),
+    )
 
 
 def _compute_grid_spec(feature_grid: Optional[Dict[str, Iterable]]) -> Tuple[List[str], List[List[Any]], int]:
@@ -418,7 +496,7 @@ def filter_candidates_by_size(
 
 def filter_candidates_by_epoxy_rules(
     df: pd.DataFrame,
-    resin_col: str = "resin_smiles",
+    resin_col: Optional[str] = "resin_smiles",
     hardener_col: Optional[str] = "hardener_smiles",
     rules: Optional[Dict] = None,
     keep_invalid: bool = False,
@@ -553,7 +631,9 @@ def filter_candidates_by_epoxy_rules(
         for name in ("amine", "anhydride", "phenol", "thiol", "imidazole", "tertiary_amine"):
             if class_flags.get(name) and (allowed_set is None or name in allowed_set):
                 return True, name
-        return False, ""
+        # The permissive default accepts other valid curing components. A
+        # caller that needs class-specific chemistry can pass allowed_classes.
+        return (True, "other") if allowed_set is None else (False, "")
 
     amine_ratio = pair_rules.get("amine_ratio", (0.0, float("inf")))
     anhydride_ratio = pair_rules.get("anhydride_ratio", (0.0, float("inf")))
@@ -561,14 +641,18 @@ def filter_candidates_by_epoxy_rules(
     thiol_ratio = pair_rules.get("thiol_ratio", amine_ratio)
 
     mask = []
+    has_resin = bool(resin_col and resin_col in df.columns)
+    has_hardener = bool(hardener_col and hardener_col in df.columns)
     for _, row in df.iterrows():
-        resin_smiles = row.get(resin_col) if resin_col in df.columns else None
-        resin_feat = _get_feat(resin_smiles)
-        if not _passes_resin(resin_feat):
-            mask.append(False)
-            continue
+        resin_feat = {}
+        if has_resin:
+            resin_smiles = row.get(resin_col)
+            resin_feat = _get_feat(resin_smiles)
+            if not _passes_resin(resin_feat):
+                mask.append(False)
+                continue
 
-        if not hardener_col or hardener_col not in df.columns:
+        if not has_hardener:
             mask.append(True)
             continue
 
@@ -577,6 +661,10 @@ def filter_candidates_by_epoxy_rules(
         ok, cls = _passes_hardener(hardener_feat)
         if not ok:
             mask.append(False)
+            continue
+
+        if not has_resin:
+            mask.append(True)
             continue
 
         if cls == "amine":
@@ -720,7 +808,7 @@ def _calc_rule_features(smiles: str, allowed_elements: Optional[set]) -> Dict[st
     except Exception:
         pass
 
-    out["epoxide"] = _count_smarts(mol, "[OX2r3]1[CR2r3][CR2r3]1")
+    out["epoxide"] = _count_smarts(mol, EPOXIDE_SMARTS)
     out["carboxylic_acid"] = _count_smarts(mol, "[CX3](=O)[OX2H1]")
     out["sulfonic_acid"] = _count_smarts(mol, "[SX4](=O)(=O)[OX2H1]")
     out["phosphoric_acid"] = _count_smarts(mol, "[PX4](=O)([OX2H1])([OX2H1])[OX2H1]")
@@ -1111,10 +1199,14 @@ def extract_features_from_config(
                 max_fragments=params.get("xtb_max_fragments"),
                 keep_largest_fragment=bool(params.get("xtb_keep_largest_fragment", False)),
                 cache_size=int(params.get("xtb_cache_size", 10000)),
+                random_state=int(params.get("xtb_random_state", 42)),
             )
             if not getattr(extractor, "AVAILABLE", False):
                 return pd.DataFrame(), "xtb not available"
-            features_df, valid_indices = extractor.featurize(smiles_list_input)
+            features_df, valid_indices = extractor.featurize(
+                smiles_list_input,
+                n_jobs=max(1, int(params.get("xtb_n_jobs", 1))),
+            )
 
         elif "FGD" in method:
             from .molecular_features import FGDFeatureExtractor
@@ -1187,30 +1279,43 @@ def extract_features_from_config(
     except Exception as e:  # pragma: no cover - best effort
         return pd.DataFrame(), str(e)
 
-    if bool(params.get("append_polymer_string_features", False)):
-        try:
-            from .molecular_features import extract_polymer_string_features
+    try:
+        from .molecular_features import append_configured_semantic_features
 
-            polymer_full_df = extract_polymer_string_features(smiles_list_input)
-            if features_df is not None and not features_df.empty and valid_indices:
-                polymer_subset = polymer_full_df.iloc[valid_indices].reset_index(drop=True)
-                features_df = pd.concat(
-                    [features_df.reset_index(drop=True), polymer_subset],
-                    axis=1,
-                )
-                features_df = features_df.loc[:, ~features_df.columns.duplicated()]
-            elif polymer_full_df is not None and not polymer_full_df.empty:
-                features_df = polymer_full_df.reset_index(drop=True)
-                valid_indices = list(range(len(polymer_full_df)))
-        except Exception as e:  # pragma: no cover - best effort
-            return pd.DataFrame(), f"polymer feature extraction failed: {e}"
+        features_df, valid_indices = append_configured_semantic_features(
+            features_df,
+            valid_indices,
+            smiles_list_input,
+            params,
+        )
+    except Exception as e:  # pragma: no cover - best effort
+        return pd.DataFrame(), f"semantic feature extraction failed: {e}"
 
     features_df = _apply_prefix(features_df, prefix)
     full_df = _restore_full_rows(features_df, valid_indices, len(resin_smiles))
 
-    req_cols = (mf_cfg or {}).get("feature_names") or []
+    req_cols = [str(c) for c in ((mf_cfg or {}).get("feature_names") or []) if str(c)]
     if req_cols:
-        full_df = _fill_missing_columns(full_df, req_cols)
+        duplicate_cols = full_df.columns[full_df.columns.duplicated()].tolist()
+        if duplicate_cols:
+            return pd.DataFrame(), (
+                "feature contract produced duplicate columns: "
+                + ", ".join(str(c) for c in duplicate_cols[:12])
+            )
+        missing_cols = [c for c in req_cols if c not in full_df.columns]
+        missing_fp_cols = [col for col in missing_cols if _is_fingerprint_bit_column(col)]
+        if missing_fp_cols and "分子指纹" in method:
+            for col in missing_fp_cols:
+                full_df[col] = 0
+            missing_cols = [col for col in missing_cols if col not in set(missing_fp_cols)]
+        if missing_cols:
+            preview = ", ".join(missing_cols[:12])
+            suffix = " ..." if len(missing_cols) > 12 else ""
+            return pd.DataFrame(), (
+                f"saved feature contract could not be reproduced: missing {len(missing_cols)} columns "
+                f"[{preview}{suffix}]"
+            )
+        full_df = full_df.reindex(columns=req_cols)
     return full_df, None
 
 
@@ -1281,9 +1386,7 @@ def add_candidate_equivalent_metrics(
                     except Exception:
                         info["mw"] = 0.0
                     if include_epoxide:
-                        epoxy_count = _count_smarts(mol, "[C]1[O][C]1")
-                        if epoxy_count <= 0:
-                            epoxy_count = _count_smarts(mol, "[OX2r3]1[CR2r3][CR2r3]1")
+                        epoxy_count = _count_smarts(mol, EPOXIDE_SMARTS)
                         info["epoxide"] = float(epoxy_count)
                     if include_active_h:
                         info["active_h"] = float(_count_active_hydrogens_on_nitrogen(mol))
@@ -1511,6 +1614,49 @@ FRAGMENT_LIBRARY = [
     {"name": "linker_ether", "smiles": "COC", "tags": ["Linker"], "role": "both"},
     {"name": "linker_alkyl", "smiles": "CC", "tags": ["Linker"], "role": "both"},
 ]
+
+
+def _curated_virtual_component_smiles(role: str) -> List[str]:
+    """Return complete, connected molecules for the unified HTVS workflow."""
+    role_key = str(role or "resin").strip().lower()
+    if role_key == "hardener":
+        homologous_diamines = ["N" + ("C" * n) + "N" for n in range(2, 13)]
+        return _dedupe_keep_order(
+            homologous_diamines
+            + [
+                "NCCNCCN",
+                "NCCNCCNCCN",
+                "Nc1ccc(N)cc1",
+                "Nc1ccc(cc1)c2ccc(N)cc2",
+                "NCCc1ccccc1",
+                "O=C1OC(=O)CC1",
+                "O=C1OC(=O)C=C1",
+                "O=C1OC(=O)c2ccccc12",
+                "Oc1ccc(O)cc1",
+                "Oc1ccc(cc1)C(c2ccc(O)cc2)(C)C",
+                "SCCS",
+                "SCCCS",
+                "c1ncc[nH]1",
+                "Cn1ccnc1",
+                "CN(C)C",
+                "CCN(CC)CC",
+            ]
+        )
+
+    alkyl_glycidyl_ethers = [("C" * n) + "OCC1CO1" for n in range(1, 19)]
+    return _dedupe_keep_order(
+        alkyl_glycidyl_ethers
+        + [
+            "C1CO1",
+            "C1CO1COCCOCC2CO2",
+            "C1CO1COCCCOCC2CO2",
+            "C1CO1COCCCCOCC2CO2",
+            "c1ccc(OCC2CO2)cc1",
+            "c1cc(OCC2CO2)cc(OCC3CO3)c1",
+            "c1cc(OCC2CO2)ccc1Cc3ccc(OCC4CO4)cc3",
+            "CC(C)(c1ccc(OCC2CO2)cc1)c3ccc(OCC4CO4)cc3",
+        ]
+    )
 
 
 def _get_estimator(model):
@@ -2172,6 +2318,83 @@ def merge_component_libraries(*libraries: Optional[pd.DataFrame]) -> pd.DataFram
     return out.sort_values(["availability_score", "smiles"], ascending=[False, True]).reset_index(drop=True)
 
 
+def limit_unique_candidates_for_expensive_features(
+    df: pd.DataFrame,
+    *,
+    key_col: str = "_molecule_key",
+    max_unique: int = 1000,
+    random_state: int = 42,
+    origin_col: str = "candidate_origin",
+    source_cols: Sequence[str] = ("resin_source", "hardener_source"),
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Limit expensive molecular calculations while preserving anchors and source diversity."""
+    if df is None or df.empty or key_col not in df.columns:
+        return df, {"before_unique": 0, "after_unique": 0, "limit": int(max_unique)}
+    limit = max(1, int(max_unique))
+    unique_df = df.drop_duplicates(subset=[key_col], keep="first").copy()
+    before_unique = int(len(unique_df))
+    if before_unique <= limit:
+        return df.reset_index(drop=True), {
+            "before_unique": before_unique,
+            "after_unique": before_unique,
+            "limit": limit,
+        }
+
+    origin = unique_df.get(origin_col, pd.Series("", index=unique_df.index)).fillna("").astype(str)
+    anchor_df = unique_df[origin.eq("train_observed_pair")].copy()
+    if len(anchor_df) > limit:
+        if "availability_score" in anchor_df.columns:
+            anchor_df = anchor_df.sort_values("availability_score", ascending=False).head(limit)
+        else:
+            anchor_df = anchor_df.head(limit)
+
+    selected_keys = list(dict.fromkeys(anchor_df[key_col].tolist()))
+    remaining_slots = max(0, limit - len(selected_keys))
+    remaining_df = unique_df[~unique_df[key_col].isin(selected_keys)].copy()
+    if remaining_slots > 0 and not remaining_df.empty:
+        source_parts = []
+        for col in source_cols:
+            if col in remaining_df.columns:
+                source_parts.append(remaining_df[col].fillna("").astype(str))
+        if source_parts:
+            source_group = source_parts[0]
+            for part in source_parts[1:]:
+                source_group = source_group + "|" + part
+            remaining_df["_source_group"] = source_group.replace("", "unknown")
+        else:
+            remaining_df["_source_group"] = "unknown"
+
+        groups = [grp for _, grp in remaining_df.groupby("_source_group", sort=True)]
+        quota = max(1, remaining_slots // max(1, len(groups)))
+        stratified_keys = []
+        for group_idx, group in enumerate(groups):
+            take_n = min(quota, len(group))
+            sampled = group.sample(n=take_n, random_state=int(random_state) + group_idx)
+            stratified_keys.extend(sampled[key_col].tolist())
+        stratified_keys = list(dict.fromkeys(stratified_keys))[:remaining_slots]
+        selected_keys.extend(stratified_keys)
+
+        fill_slots = limit - len(selected_keys)
+        if fill_slots > 0:
+            leftovers = remaining_df[~remaining_df[key_col].isin(selected_keys)]
+            if not leftovers.empty:
+                sampled = leftovers.sample(
+                    n=min(fill_slots, len(leftovers)),
+                    random_state=int(random_state) + 1009,
+                )
+                selected_keys.extend(sampled[key_col].tolist())
+
+    selected_key_set = set(selected_keys[:limit])
+    out = df[df[key_col].isin(selected_key_set)].reset_index(drop=True).copy()
+    after_unique = int(out[key_col].nunique()) if not out.empty else 0
+    return out, {
+        "before_unique": before_unique,
+        "after_unique": after_unique,
+        "limit": limit,
+        "anchors_kept": int(sum(key in selected_key_set for key in anchor_df[key_col].tolist())),
+    }
+
+
 def generate_virtual_component_library(
     *,
     role: str,
@@ -2193,26 +2416,27 @@ def generate_virtual_component_library(
         seed_vals = _dedupe_keep_order(seed_vals)
         seed_vals = _filter_pool_by_fragments(seed_vals, min_fragments, max_fragments)
 
+    curated_vals = _curated_virtual_component_smiles(role_key)
+    if RDKIT_AVAILABLE:
+        curated_vals = [s for s in curated_vals if _mol_from_smiles(s) is not None]
+        if role_key == "resin":
+            curated_vals = [
+                s for s in curated_vals
+                if _calc_rule_features(s, DEFAULT_EPOXY_RULES["global"]["allowed_elements"]).get("epoxide", 0) > 0
+            ]
+
+    limit = max(1, int(n_samples))
     out_smiles: List[str] = []
-    seed_quota = int(round(max(0, int(n_samples)) * 0.55)) if seed_vals else 0
     if seed_vals:
-        idx = rng.integers(0, len(seed_vals), size=max(1, seed_quota))
-        out_smiles.extend([seed_vals[int(i)] for i in idx])
+        seed_quota = min(len(seed_vals), max(1, limit // 2))
+        seed_idx = rng.choice(len(seed_vals), size=seed_quota, replace=False)
+        out_smiles.extend([seed_vals[int(i)] for i in seed_idx])
+    remaining = max(0, limit - len(out_smiles))
+    if curated_vals and remaining:
+        curated_order = rng.permutation(len(curated_vals))
+        out_smiles.extend([curated_vals[int(i)] for i in curated_order[:remaining]])
 
-    frag_pool = _build_fragment_pool(role_key, pos_tags or [], neg_tags or [])
-    remaining = max(0, int(n_samples) - len(out_smiles))
-    for _ in range(remaining):
-        smi, _ = _sample_component_smiles(
-            frag_pool,
-            max_fragments,
-            rng,
-            min_frags=min_fragments,
-        )
-        if smi:
-            out_smiles.append(smi)
-
-    if not out_smiles and seed_vals:
-        out_smiles = seed_vals[: max(1, min(len(seed_vals), int(n_samples)))]
+    out_smiles = _dedupe_keep_order(out_smiles)
 
     return build_component_library(
         out_smiles,
@@ -2289,13 +2513,12 @@ def enumerate_formulation_candidates(
     full_total_possible = int(total_pairs * max(1, grid_size))
     limit = max(1, int(max_formulations))
 
-    if effective_total_possible <= limit:
-        pair_idx = np.repeat(np.arange(len(pair_df)), max(1, grid_size))
-        grid_idx = np.tile(np.arange(max(1, grid_size)), len(pair_df))
-    else:
-        flat_idx = _sample_or_limit_indices(effective_total_possible, limit, random_state=int(random_state))
-        pair_idx = flat_idx // max(1, grid_size)
-        grid_idx = flat_idx % max(1, grid_size)
+    pair_idx, grid_idx = _sample_pair_grid_indices(
+        len(pair_df),
+        max(1, grid_size),
+        min(limit, effective_total_possible),
+        random_state=int(random_state),
+    )
 
     base = pair_df.iloc[pair_idx].reset_index(drop=True).copy()
     if grid_keys and grid_values:
@@ -2353,7 +2576,8 @@ def apply_feature_overrides(
             continue
         vals = pd.to_numeric(candidate_df[col], errors="coerce")
         if vals.notna().any():
-            out[col] = vals.values
+            valid = vals.notna()
+            out.loc[valid, col] = vals.loc[valid].to_numpy()
     return out
 
 
@@ -2735,6 +2959,7 @@ def add_formulation_feasibility_scores(
     *,
     resin_col: str = "resin_smiles",
     hardener_col: Optional[str] = "hardener_smiles",
+    primary_role: str = "resin",
 ) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -2748,6 +2973,7 @@ def add_formulation_feasibility_scores(
     process_scores = []
     availability_scores = []
     chemistry_labels = []
+    primary_role = str(primary_role or "resin").strip().lower()
 
     def _get_feat(cache: Dict[str, Dict[str, float]], smiles: str) -> Dict[str, float]:
         key = str(smiles or "")
@@ -2756,12 +2982,17 @@ def add_formulation_feasibility_scores(
         return cache[key]
 
     for _, row in out.iterrows():
-        resin_feat = _get_feat(resin_feats, row.get(resin_col))
-        hard_feat = _get_feat(hard_feats, row.get(hardener_col)) if hardener_col and hardener_col in out.columns else {}
+        primary_feat = _get_feat(resin_feats, row.get(resin_col))
+        if primary_role == "hardener":
+            resin_feat = {}
+            hard_feat = primary_feat
+        else:
+            resin_feat = primary_feat
+            hard_feat = _get_feat(hard_feats, row.get(hardener_col)) if hardener_col and hardener_col in out.columns else {}
 
         chemistry_score = 0.0
         labels = []
-        if resin_feat.get("valid"):
+        if primary_feat.get("valid"):
             chemistry_score += 20.0
         if not hardener_col or hardener_col not in out.columns:
             chemistry_score += 15.0

@@ -24,6 +24,7 @@ from . import thread_config
 
 import pandas as pd
 import numpy as np
+import builtins
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 from rdkit.Chem import MACCSkeys
@@ -34,9 +35,26 @@ import re  # 新增: 用于分割多组分 SMILES
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from functools import partial  # 新增
+
+
+def _safe_console_print(*args, **kwargs):
+    """Keep diagnostic logging from breaking extraction on GBK Windows consoles."""
+    try:
+        return builtins.print(*args, **kwargs)
+    except UnicodeEncodeError:
+        encoding = getattr(kwargs.get("file", sys.stdout), "encoding", None) or "ascii"
+        safe_args = [
+            str(arg).encode(encoding, errors="replace").decode(encoding, errors="replace")
+            for arg in args
+        ]
+        return builtins.print(*safe_args, **kwargs)
+
+
+print = _safe_console_print
 
 # PyTorch 是可选依赖 (用于 ANI2x 力场计算)
 try:
@@ -831,6 +849,73 @@ def extract_bigsmiles_ensemble_features(
     if prefix:
         df = _add_prefix_to_columns(df, prefix)
     return df
+
+
+def extract_configured_semantic_features(
+    smiles_like_list,
+    params=None,
+    *,
+    prefix=None,
+) -> pd.DataFrame:
+    """Build every configured notation/ionic feature with one shared contract."""
+    params = dict(params or {})
+    frames = []
+    append_polymer_ensemble = bool(params.get("append_polymer_semantic_features", False))
+    append_polymer_string = bool(params.get("append_polymer_string_features", False))
+    append_ionic = bool(params.get("append_ionic_semantic_features", False))
+
+    # Training historically included string features whenever ensemble features
+    # were enabled, even if the explicit string flag was absent.
+    if append_polymer_string or append_polymer_ensemble:
+        frames.append(extract_polymer_string_features(smiles_like_list))
+    if append_polymer_ensemble:
+        frames.append(
+            extract_bigsmiles_ensemble_features(
+                smiles_like_list,
+                n_samples=int(params.get("bigsmiles_semantic_num_samples", 8)),
+                min_repeat_units=int(params.get("bigsmiles_semantic_min_repeat_units", 1)),
+                max_repeat_units=int(params.get("bigsmiles_semantic_max_repeat_units", 4)),
+                random_state=int(params.get("bigsmiles_semantic_random_state", 17)),
+            )
+        )
+    if append_ionic:
+        frames.append(extract_ionic_semantic_features(smiles_like_list))
+
+    frames = [
+        frame.reset_index(drop=True)
+        for frame in frames
+        if isinstance(frame, pd.DataFrame) and len(frame) == len(smiles_like_list)
+    ]
+    if not frames:
+        return pd.DataFrame(index=range(len(smiles_like_list)))
+
+    result = pd.concat(frames, axis=1)
+    result = result.loc[:, ~result.columns.duplicated()]
+    if prefix:
+        result = _add_prefix_to_columns(result, prefix)
+    return result
+
+
+def append_configured_semantic_features(
+    features_df,
+    valid_indices,
+    smiles_like_list,
+    params=None,
+) -> tuple[pd.DataFrame, list[int]]:
+    """Append configured semantic features while preserving extractor row alignment."""
+    base = features_df.copy() if isinstance(features_df, pd.DataFrame) else pd.DataFrame()
+    indices = [int(i) for i in (valid_indices or [])]
+    semantic_full = extract_configured_semantic_features(smiles_like_list, params)
+    if semantic_full.empty and len(semantic_full.columns) == 0:
+        return base, indices
+
+    if not base.empty and indices:
+        semantic_subset = semantic_full.iloc[indices].reset_index(drop=True)
+        base = pd.concat([base.reset_index(drop=True), semantic_subset], axis=1)
+        base = base.loc[:, ~base.columns.duplicated()]
+        return base, indices
+
+    return semantic_full.reset_index(drop=True), list(range(len(semantic_full)))
 
 
 # =============================================================================
@@ -3089,10 +3174,21 @@ class XTBFeatureExtractor:
         max_fragments: int | None = None,
         keep_largest_fragment: bool = False,
         cache_size: int = 10000,
+        random_state: int = 42,
     ):
         if not RDKIT_AVAILABLE:
             raise ImportError("需要安装 rdkit")
-        self.xtb_path = xtb_path or "xtb"
+        requested_xtb_path = str(xtb_path or "xtb").strip()
+        resolved_xtb_path = shutil.which(requested_xtb_path)
+        if resolved_xtb_path is None and os.path.basename(requested_xtb_path).lower() in {"xtb", "xtb.exe"}:
+            executable_name = "xtb.exe" if os.name == "nt" else "xtb"
+            env_candidates = [
+                os.path.join(sys.prefix, "Library", "bin", executable_name),
+                os.path.join(sys.prefix, "bin", executable_name),
+                os.path.join(sys.prefix, "Scripts", executable_name),
+            ]
+            resolved_xtb_path = next((p for p in env_candidates if os.path.isfile(p)), None)
+        self.xtb_path = resolved_xtb_path or requested_xtb_path
         self.method = str(method or "gfn2").lower()
         self.run_mode = str(run_mode or "sp").lower()
         self.charge = int(charge)
@@ -3108,7 +3204,8 @@ class XTBFeatureExtractor:
         self.max_fragments = int(max_fragments) if max_fragments not in (None, "", 0) else None
         self.keep_largest_fragment = bool(keep_largest_fragment)
         self.cache_size = int(cache_size) if cache_size is not None else 0
-        self.AVAILABLE = bool(shutil.which(self.xtb_path))
+        self.random_state = int(random_state)
+        self.AVAILABLE = bool(resolved_xtb_path or shutil.which(self.xtb_path))
         self.feature_names = [
             "xtb_total_energy",
             "xtb_energy_per_atom",
@@ -3147,7 +3244,12 @@ class XTBFeatureExtractor:
     def _embed_mol(self, mol):
         mol = Chem.AddHs(mol)
         params = _get_etkdg_params()
-        for _attr, _val in [("useRandomCoords", True), ("numThreads", 1), ("maxAttempts", 50)]:
+        for _attr, _val in [
+            ("useRandomCoords", True),
+            ("numThreads", 1),
+            ("maxAttempts", 50),
+            ("randomSeed", self.random_state),
+        ]:
             try:
                 setattr(params, _attr, _val)
             except Exception:
@@ -3156,7 +3258,12 @@ class XTBFeatureExtractor:
         res = int(res) if res is not None else -1
         if res != 0:
             try:
-                res = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=100)
+                res = AllChem.EmbedMolecule(
+                    mol,
+                    useRandomCoords=True,
+                    maxAttempts=100,
+                    randomSeed=self.random_state,
+                )
             except Exception:
                 res = -1
         if res != 0:

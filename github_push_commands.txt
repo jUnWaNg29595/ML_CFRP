@@ -1,0 +1,79 @@
+===========================================
+ GitHub 上传命令（带代理）
+===========================================
+
+=== 仓库1: ML_CFRP ===
+仓库地址: https://github.com/jUnWaNg29595/ML_CFRP
+本地路径: c:/Users/wangj/Desktop/CFRP系统/CFRP系统
+
+cd c:/Users/wangj/Desktop/CFRP系统/CFRP系统
+git config http.proxy http://127.0.0.1:10808
+git config https.proxy http://127.0.0.1:10808
+git add .
+git commit -m "更新说明"
+git push origin main
+git config --unset http.proxy
+git config --unset https.proxy
+
+===========================================
+
+=== 仓库2: VSCode_CodexHistoryRecover ===
+仓库地址: https://github.com/jUnWaNg29595/VSCode_CodexHistoryRecover
+本地路径: c:/Users/wangj/Desktop/codex-import-temp
+
+cd c:/Users/wangj/Desktop/codex-import-temp
+git config http.proxy http://127.0.0.1:10808
+git config https.proxy http://127.0.0.1:10808
+git add codex-vscode-import.cmd
+git commit -m "更新说明"
+git push origin main
+git config --unset http.proxy
+git config --unset https.proxy
+
+===========================================
+ 快速推送（一行命令）
+===========================================
+
+cd c:/Users/wangj/Desktop/CFRP系统/CFRP系统 && ^
+git config http.proxy http://127.0.0.1:10808 && ^
+git config https.proxy http://127.0.0.1:10808 && ^
+git add . && ^
+git commit -m "更新说明" && ^
+git push origin main && ^
+git config --unset http.proxy && ^
+git config --unset https.proxy
+
+===========================================
+ 初始化新仓库并上传
+===========================================
+
+cd <项目目录>
+git init
+git config user.email "junwang29595@gmail.com"
+git config user.name "jUnWaNg29595"
+git add .
+git commit -m "Initial commit"
+git branch -M main
+git remote add origin https://github.com/jUnWaNg29595/<仓库名>.git
+git config http.proxy http://127.0.0.1:10808
+git config https.proxy http://127.0.0.1:10808
+git push -u origin main --force
+git config --unset http.proxy
+git config --unset https.proxy
+
+===========================================
+ 常用Git命令
+===========================================
+
+git status                    # 查看当前状态
+git add <文件>                # 添加文件到暂存区
+git commit -m "说明"          # 提交暂存区
+git push origin main          # 推送到远程
+git pull origin main          # 拉取远程更新
+git log --oneline             # 查看提交历史
+git diff                      # 查看修改内容
+git checkout -- <文件>        # 撤销修改
+git rm --cached <文件>        # 移除跟踪但不删除文件
+git clone <地址>              # 克隆仓库
+
+===========================================
