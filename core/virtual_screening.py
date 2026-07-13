@@ -137,6 +137,14 @@ def infer_primary_component_role(mf_cfg: Optional[Dict]) -> str:
     resin_tokens = ("resin", "epoxy", "树脂", "基体")
     hardener_score = sum(text.count(token) for token in hardener_tokens)
     resin_score = sum(text.count(token) for token in resin_tokens)
+    # 当列名冲突时（如 resin_component_cols 含 curing_agent 但 smiles_col 是 resin），
+    # 以 smiles_col 为优先级更高的判断依据，因为它是用户明确指定的主列
+    if resin_score > 0 and hardener_score > 0:
+        selector = str(cfg.get("smiles_col") or "").lower()
+        if any(t in selector for t in ("resin", "epoxy", "树脂", "基体")):
+            return "resin"
+        if any(t in selector for t in hardener_tokens):
+            return "hardener"
     if hardener_score > resin_score:
         return "hardener"
     if resin_score > hardener_score:
@@ -175,7 +183,7 @@ def generate_candidate_pool(
     random_state: int = 42,
     dedupe_inputs: bool = True,
 ) -> CandidatePool:
-    """Generate candidate pool by pairing resin/hardener lists."""
+    """Generate candidate pool by pairing resin/hardener lists, never allocate full cartesian product."""
     resin_list = _clean_smiles_list(resin_smiles)
     if dedupe_inputs:
         resin_list = _dedupe_keep_order(resin_list)
@@ -197,26 +205,24 @@ def generate_candidate_pool(
     n_r = len(resin_list)
     n_h = len(hardener_list)
     total = n_r * n_h
+    max_candidates = int(max_candidates)
     rng = np.random.default_rng(int(random_state))
 
+    # ALWAYS sample via random indices, never generate full cartesian product
+    # This prevents memory explosion for large libraries
     if mode in {"paired", "row", "zip"}:
         n = min(n_r, n_h)
         res_idx = np.arange(n)
         hard_idx = np.arange(n)
     else:
-        if mode == "cartesian":
-            if total <= int(max_candidates):
-                res_idx = np.repeat(np.arange(n_r), n_h)
-                hard_idx = np.tile(np.arange(n_h), n_r)
-            else:
-                flat = rng.choice(total, size=int(max_candidates), replace=False)
-                res_idx = flat // n_h
-                hard_idx = flat % n_h
-        else:
-            size = min(int(max_candidates), total) if total > 0 else int(max_candidates)
-            flat = rng.choice(total, size=size, replace=False)
-            res_idx = flat // n_h
-            hard_idx = flat % n_h
+        # For cartesian/random: directly sample from flat index space
+        # Never use np.repeat/np.tile on large arrays
+        sample_size = min(max_candidates, total)
+        if sample_size <= 0:
+            return CandidatePool(df=pd.DataFrame(), total_possible=total, sampled=0)
+        flat_indices = rng.choice(total, size=sample_size, replace=False)
+        res_idx = flat_indices // n_h
+        hard_idx = flat_indices % n_h
 
     df = pd.DataFrame(
         {
@@ -228,7 +234,6 @@ def generate_candidate_pool(
         _combine_smiles(r, h) for r, h in zip(df["resin_smiles"], df["hardener_smiles"])
     ]
     return CandidatePool(df=df, total_possible=total, sampled=len(df))
-
 
 def _clean_numeric_list(
     items: Optional[Iterable],
@@ -598,6 +603,43 @@ def filter_candidates_by_epoxy_rules(
                 return False, ""
             if feat.get("phosphoric_acid", 0) > 0:
                 return False, ""
+        # 固化剂最小官能团限制（按固化剂类型分别判断）
+        min_func = int(hardener_rules.get("min_active_hydrogen", 0) or 0)
+        if min_func > 0:
+            amine_h = 2 * int(feat.get("primary_amine", 0)) + int(feat.get("secondary_amine", 0))
+            anhydride_n = int(feat.get("anhydride", 0))
+            phenol_n = int(feat.get("phenol_oh", 0))
+            thiol_n = int(feat.get("thiol", 0))
+            imidazole_n = int(feat.get("imidazole", 0))
+            tertiary_n = int(feat.get("tertiary_amine", 0))
+            # 胺类：按活泼氢数（伯胺~2 + 仲胺~1）
+            if amine_h > 0:
+                if amine_h < min_func:
+                    return False, ""
+            # 酸酐：按酸酐基团数（每个酸酐开环消耗1个环氧基）
+            elif anhydride_n > 0:
+                if anhydride_n < min_func:
+                    return False, ""
+            # 酚类：按酚羟基数
+            elif phenol_n > 0:
+                if phenol_n < min_func:
+                    return False, ""
+            # 硫醇：按巯基数
+            elif thiol_n > 0:
+                if thiol_n < min_func:
+                    return False, ""
+            # 咪唑：按咪唑环数（催化型，每个咪唑催化多个环氧开环）
+            elif imidazole_n > 0:
+                if imidazole_n < min_func:
+                    return False, ""
+            # 叔胺：按叔胺基数（催化型）
+            elif tertiary_n > 0:
+                if tertiary_n < min_func:
+                    return False, ""
+            else:
+                # 未能识别类型的固化剂，保守过滤
+                if min_func > 1:
+                    return False, ""
 
         has_amine = (feat.get("primary_amine", 0) + feat.get("secondary_amine", 0)) > 0
         has_anhydride = feat.get("anhydride", 0) > 0
@@ -2447,6 +2489,55 @@ def generate_virtual_component_library(
     )
 
 
+
+def _generate_multicomponent_pool(
+    smiles_list: List[str],
+    max_components: int = 2,
+    max_samples: int = 5000,
+    random_state: int = 42,
+    dedupe: bool = True,
+) -> List[str]:
+    """从SMILES列表中随机采样最多max_components个组分的组合（复配），避免枚举全部组合。"""
+    if max_components <= 1:
+        return smiles_list
+    items = _dedupe_keep_order(_clean_smiles_list(smiles_list)) if dedupe else list(smiles_list)
+    if not items:
+        return []
+    rng = np.random.default_rng(int(random_state))
+    n_items = len(items)
+    results = list(items)
+    remaining = max_samples - len(results)
+    if remaining <= 0:
+        return results[:max_samples] if len(results) > max_samples else results
+    from math import comb
+    safe_enum_limit = 100_000
+    total_combos = 0
+    can_enumerate = True
+    for n in range(2, min(max_components, n_items) + 1):
+        c = comb(n_items, n)
+        total_combos += c
+        if total_combos > safe_enum_limit or c > safe_enum_limit:
+            can_enumerate = False
+            break
+    if can_enumerate and total_combos <= remaining:
+        from itertools import combinations
+        for n in range(2, min(max_components, n_items) + 1):
+            for combo in combinations(items, n):
+                results.append(".".join(combo))
+    else:
+        sampled = set()
+        max_attempts = min(remaining * 5, 100_000)
+        attempts = 0
+        while len(sampled) < remaining and attempts < max_attempts:
+            n = rng.integers(2, min(max_components, n_items) + 1)
+            choices = rng.choice(items, size=n, replace=False)
+            combo = tuple(sorted(choices))
+            if combo not in sampled:
+                sampled.add(combo)
+                results.append(".".join(combo))
+            attempts += 1
+    return results[:max_samples]
+
 def enumerate_formulation_candidates(
     resin_library: pd.DataFrame,
     hardener_library: Optional[pd.DataFrame] = None,
@@ -2457,7 +2548,11 @@ def enumerate_formulation_candidates(
     feature_grid: Optional[Dict[str, Iterable]] = None,
     max_formulations: int = 50000,
     hardener_required: bool = False,
+    max_resin_components: int = 1,
+    max_hardener_components: int = 1,
+    comp_diversity: bool = True,
 ) -> FormulaDesignSpace:
+    """Generate formulation design space via batched sampling to avoid OOM."""
     feature_grid = feature_grid or {}
     resin_df = resin_library.copy() if resin_library is not None else pd.DataFrame()
     hard_df = hardener_library.copy() if hardener_library is not None else pd.DataFrame()
@@ -2470,82 +2565,104 @@ def enumerate_formulation_candidates(
     if hardener_required and hard_df.empty:
         return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": 0, "grid_size": 0, "total_possible": 0})
 
-    pair_mode = str(pair_mode or "cartesian").lower()
     use_hardener = not hard_df.empty
 
-    if use_hardener:
-        pool = generate_candidate_pool(
-            resin_df["smiles"].tolist(),
-            hard_df["smiles"].tolist(),
-            mode=pair_mode,
-            max_candidates=int(max_pairs),
+    # 多组分扩展
+    resin_smiles_list = resin_df["smiles"].tolist()
+    if max_resin_components > 1:
+        resin_smiles_list = _generate_multicomponent_pool(
+            resin_smiles_list,
+            max_components=int(max_resin_components),
+            max_samples=int(max_pairs),
             random_state=int(random_state),
-            dedupe_inputs=False,
+            dedupe=bool(comp_diversity),
         )
-        pair_df = pool.df.copy()
-        resin_meta = resin_df.drop_duplicates("smiles").set_index("smiles")
-        hard_meta = hard_df.drop_duplicates("smiles").set_index("smiles")
-        pair_df["resin_source"] = pair_df["resin_smiles"].map(resin_meta["source"]).fillna("custom")
-        pair_df["hardener_source"] = pair_df["hardener_smiles"].map(hard_meta["source"]).fillna("custom")
-        pair_df["resin_availability_score"] = pair_df["resin_smiles"].map(resin_meta["availability_score"]).fillna(70.0)
-        pair_df["hardener_availability_score"] = pair_df["hardener_smiles"].map(hard_meta["availability_score"]).fillna(70.0)
-        total_pairs = int(pool.total_possible)
-    else:
-        pair_df = pd.DataFrame(
-            {
-                "resin_smiles": resin_df["smiles"].tolist(),
-                "hardener_smiles": [None] * len(resin_df),
-                "combo_smiles": resin_df["smiles"].tolist(),
-                "resin_source": resin_df["source"].tolist(),
-                "hardener_source": [None] * len(resin_df),
-                "resin_availability_score": resin_df["availability_score"].tolist(),
-                "hardener_availability_score": [np.nan] * len(resin_df),
-            }
+    hardener_smiles_list = hard_df["smiles"].tolist() if use_hardener else None
+    if use_hardener and max_hardener_components > 1 and hardener_smiles_list:
+        hardener_smiles_list = _generate_multicomponent_pool(
+            hardener_smiles_list,
+            max_components=int(max_hardener_components),
+            max_samples=int(max_pairs),
+            random_state=int(random_state) + 7,
+            dedupe=bool(comp_diversity),
         )
-        total_pairs = len(pair_df)
 
-    if pair_df.empty:
-        return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": total_pairs, "grid_size": 0, "total_possible": 0})
-
+    # 分批生成配对，避免一次性创建巨大数组
+    resin_meta = resin_df.drop_duplicates("smiles").set_index("smiles") if use_hardener else None
+    hard_meta = hard_df.drop_duplicates("smiles").set_index("smiles") if use_hardener else None
     grid_keys, grid_values, grid_size = _compute_grid_spec(feature_grid)
-    sampled_pairs = int(len(pair_df))
-    effective_total_possible = int(sampled_pairs * max(1, grid_size))
-    full_total_possible = int(total_pairs * max(1, grid_size))
     limit = max(1, int(max_formulations))
+    total_pairs = 0
 
-    pair_idx, grid_idx = _sample_pair_grid_indices(
-        len(pair_df),
-        max(1, grid_size),
-        min(limit, effective_total_possible),
+    all_batches = []
+    for batch_result in batch_generate_formulation_pairs(
+        resin_smiles_list,
+        hardener_smiles_list,
+        batch_size=min(5000, int(max_pairs)),
+        max_total=int(max_pairs),
         random_state=int(random_state),
-    )
+    ):
+        pair_df = batch_result.pair_df
+        total_pairs = batch_result.metadata.get("total_pairs", 0)
 
-    base = pair_df.iloc[pair_idx].reset_index(drop=True).copy()
-    if grid_keys and grid_values:
-        overrides = pd.DataFrame(
-            [_decode_grid_index(grid_keys, grid_values, int(i)) for i in grid_idx]
+        # 添加来源信息
+        if resin_meta is not None and not resin_meta.empty:
+            pair_df["resin_source"] = pair_df["resin_smiles"].map(resin_meta.get("source", pd.Series(dtype=str))).fillna("custom")
+            pair_df["resin_availability_score"] = pair_df["resin_smiles"].map(resin_meta.get("availability_score", pd.Series(dtype=float))).fillna(70.0)
+        else:
+            pair_df["resin_source"] = "custom"
+            pair_df["resin_availability_score"] = 70.0
+
+        if hard_meta is not None and not hard_meta.empty and hardener_smiles_list:
+            pair_df["hardener_source"] = pair_df["hardener_smiles"].map(hard_meta.get("source", pd.Series(dtype=str))).fillna("custom")
+            pair_df["hardener_availability_score"] = pair_df["hardener_smiles"].map(hard_meta.get("availability_score", pd.Series(dtype=float))).fillna(70.0)
+        else:
+            pair_df["hardener_source"] = None
+            pair_df["hardener_availability_score"] = np.nan
+
+        pair_df["formulation_id"] = np.arange(1, len(pair_df) + 1) + batch_result.batch_idx * batch_result.metadata.get("batch_size", 5000)
+        pair_df["candidate_origin"] = (
+            pair_df["resin_source"].fillna("custom").astype(str)
+            + (" + " + pair_df["hardener_source"].fillna("none").astype(str) if "hardener_source" in pair_df.columns else "")
         )
-    else:
-        overrides = pd.DataFrame(index=base.index)
-    if not overrides.empty:
-        overrides = overrides.reset_index(drop=True)
-        base = pd.concat([base.reset_index(drop=True), overrides], axis=1)
+
+        all_batches.append(pair_df)
+
+    if not all_batches:
+        return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": 0, "grid_size": 0, "total_possible": 0})
+
+    base = pd.concat(all_batches, ignore_index=True)
+    sampled_pairs = int(len(base))
+
+    # 工艺网格采样
+    if grid_keys and grid_values:
+        pair_idx, grid_idx = _sample_pair_grid_indices(
+            len(base),
+            max(1, grid_size),
+            min(limit, sampled_pairs * max(1, grid_size)),
+            random_state=int(random_state),
+        )
+        if len(pair_idx) > 0:
+            base = base.iloc[pair_idx].reset_index(drop=True).copy()
+            overrides = pd.DataFrame(
+                [_decode_grid_index(grid_keys, grid_values, int(i)) for i in grid_idx]
+            )
+            overrides = overrides.reset_index(drop=True)
+            base = pd.concat([base.reset_index(drop=True), overrides], axis=1)
 
     base["formulation_id"] = np.arange(1, len(base) + 1)
-    base["candidate_origin"] = (
-        base["resin_source"].fillna("custom").astype(str)
-        + (" + " + base["hardener_source"].fillna("none").astype(str) if "hardener_source" in base.columns else "")
-    )
+    effective_total_possible = int(len(base))
+    full_total_possible = int(total_pairs * max(1, grid_size))
+
     metadata = {
         "total_pairs": int(total_pairs),
-        "sampled_pairs": int(sampled_pairs),
+        "sampled_pairs": sampled_pairs,
         "grid_size": int(grid_size),
-        "effective_total_possible": int(effective_total_possible),
-        "total_possible": int(full_total_possible),
+        "effective_total_possible": effective_total_possible,
+        "total_possible": full_total_possible,
         "sampled": int(len(base)),
     }
     return FormulaDesignSpace(candidate_df=base, metadata=metadata)
-
 
 def apply_feature_overrides(
     X: pd.DataFrame,
@@ -3377,3 +3494,105 @@ def build_experiment_recommendation_batches(
         "explore": explore_df,
         "diversify": diversify_df,
     }
+
+
+# ============================================================================
+# 分批流式生成配方候选（避免一次性生成大量配方导致内存爆炸）
+# ============================================================================
+
+@dataclass
+class BatchScreeningResult:
+    """单批筛选结果"""
+    batch_idx: int
+    pair_df: pd.DataFrame
+    total_batches: int
+    flat_indices_used: np.ndarray
+    metadata: Dict
+
+
+def batch_generate_formulation_pairs(
+    resin_smiles_list: list,
+    hardener_smiles_list: list = None,
+    *,
+    batch_size: int = 5000,
+    max_total: int = 50000,
+    random_state: int = 42,
+):
+    """分批生成树脂-固化剂配对，每次返回一批。"""
+    batch_size = max(1, int(batch_size))
+    max_total = max(1, int(max_total))
+
+    resin_list = _dedupe_keep_order(_clean_smiles_list(resin_smiles_list))
+    hardener_list = None
+    if hardener_smiles_list is not None:
+        hardener_list = _dedupe_keep_order(_clean_smiles_list(hardener_smiles_list))
+
+    if not resin_list:
+        return
+
+    n_r = len(resin_list)
+    n_h = len(hardener_list) if hardener_list else 0
+
+    if hardener_list is None or n_h == 0:
+        # 无固化剂：分批返回树脂
+        effective_max = min(n_r, max_total)
+        total_batches = max(1, (effective_max + batch_size - 1) // batch_size)
+        for batch_idx in range(total_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, effective_max)
+            if start >= effective_max:
+                break
+            pair_df = pd.DataFrame({
+                "resin_smiles": resin_list[start:end],
+                "hardener_smiles": [None] * (end - start),
+                "combo_smiles": resin_list[start:end],
+            })
+            yield BatchScreeningResult(
+                batch_idx=batch_idx,
+                pair_df=pair_df,
+                total_batches=total_batches,
+                flat_indices_used=np.arange(start, end),
+                metadata={"n_resin": n_r, "n_hardener": 0, "total_pairs": n_r},
+            )
+        return
+
+    # 有固化剂：从flat索引空间采样
+    total_pairs = n_r * n_h
+    effective_max = min(total_pairs, max_total)
+    total_batches = max(1, (effective_max + batch_size - 1) // batch_size)
+
+    rng = np.random.default_rng(random_state)
+    # 只生成flat索引数组（内存占用很小）
+    all_flat_indices = rng.choice(total_pairs, size=effective_max, replace=False)
+
+    for batch_idx in range(total_batches):
+        start = batch_idx * batch_size
+        end = min(start + batch_size, effective_max)
+        if start >= effective_max:
+            break
+
+        batch_flat = all_flat_indices[start:end]
+        res_indices = batch_flat // n_h
+        hard_indices = batch_flat % n_h
+
+        pair_df = pd.DataFrame({
+            "resin_smiles": [resin_list[i] for i in res_indices],
+            "hardener_smiles": [hardener_list[j] for j in hard_indices],
+        })
+        pair_df["combo_smiles"] = [
+            _combine_smiles(r, h) for r, h in zip(pair_df["resin_smiles"], pair_df["hardener_smiles"])
+        ]
+
+        yield BatchScreeningResult(
+            batch_idx=batch_idx,
+            pair_df=pair_df,
+            total_batches=total_batches,
+            flat_indices_used=batch_flat,
+            metadata={
+                "n_resin": n_r,
+                "n_hardener": n_h,
+                "total_pairs": total_pairs,
+                "batch_size": batch_size,
+                "effective_max": effective_max,
+            },
+        )

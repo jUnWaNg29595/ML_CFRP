@@ -306,7 +306,7 @@ def page_title_with_refresh(title: str, icon: str = ""):
         st.title(f"{icon} {title}" if icon else title)
     with col_refresh:
         st.write("")  # 添加一些垂直空间
-        if st.button("🔄 刷新", key=f"refresh_{title}", help="重新加载页面", use_container_width=True):
+        if st.button("🔄 刷新", key=f"refresh_{title}", help="重新加载页面", width="stretch"):
             st.rerun()
 
 
@@ -574,10 +574,10 @@ def render_shap_importance_outputs(
 
     col_rank, col_pie = st.columns([1.35, 1.0])
     with col_rank:
-        st.pyplot(fig_rank, use_container_width=True)
+        st.pyplot(fig_rank, width="stretch")
     with col_pie:
         if fig_pie is not None:
-            st.pyplot(fig_pie, use_container_width=True)
+            st.pyplot(fig_pie, width="stretch")
             if pie_mode == "type":
                 st.caption("饼图按特征类型聚合；若类型无法区分，会自动退回到按特征名称聚合。")
             else:
@@ -616,10 +616,10 @@ def render_shap_importance_outputs(
             )
 
     with st.expander("查看 SHAP 重要性明细"):
-        st.dataframe(top_features, use_container_width=True, hide_index=True)
+        st.dataframe(top_features, width="stretch", hide_index=True)
         if fig_pie is not None and pie_feature_view is not None and not pie_feature_view.empty:
             st.markdown("##### 饼图聚合数据")
-            st.dataframe(pie_feature_view, use_container_width=True, hide_index=True)
+            st.dataframe(pie_feature_view, width="stretch", hide_index=True)
         if pie_mode == "type" and isinstance(typed_features, pd.DataFrame) and not typed_features.empty:
             type_view = (
                 typed_features[["Feature", "Type", "Importance"]]
@@ -627,7 +627,7 @@ def render_shap_importance_outputs(
                 .reset_index(drop=True)
             )
             st.markdown("##### 特征类型归类")
-            st.dataframe(type_view, use_container_width=True, hide_index=True)
+            st.dataframe(type_view, width="stretch", hide_index=True)
 
     plt.close(fig_rank)
     if fig_pie is not None:
@@ -1644,7 +1644,7 @@ def _render_prediction_feature_check_panel(input_df: pd.DataFrame, required_feat
             if merged_matches:
                 st.dataframe(
                     pd.DataFrame({"匹配列": merged_matches}),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     height=min(420, 36 * len(merged_matches) + 38),
                 )
@@ -1658,7 +1658,7 @@ def _render_prediction_feature_check_panel(input_df: pd.DataFrame, required_feat
             st.warning(f"检测到 {len(missing_df)} 个模型必需特征缺失，建议先补齐再预测。")
             st.dataframe(
                 missing_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=min(420, 36 * len(missing_df) + 38),
             )
@@ -1684,7 +1684,7 @@ def _render_prediction_feature_check_panel(input_df: pd.DataFrame, required_feat
             st.warning(f"其中 {len(incomplete_df)} 个已匹配特征存在空值/空字符串，建议补齐。")
             st.dataframe(
                 incomplete_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=min(420, 36 * len(incomplete_df) + 38),
             )
@@ -2176,7 +2176,7 @@ def init_session_state():
 
         # --- [新增] 会话快照（断连保护） ---
         '_autosave_enabled': True,
-        '_autosave_interval_sec': 30,
+        '_autosave_interval_sec': 120,
         '_last_autosave_ts': 0.0,
         '_auto_restore_enabled': True,
         '_snapshot_loaded': False,
@@ -2497,11 +2497,11 @@ def render_sidebar():
         col1, col2 = st.columns(2)
 
         with col1:
-            if st.button("🔄 刷新页面", help="重新加载当前页面", use_container_width=True):
+            if st.button("🔄 刷新页面", help="重新加载当前页面", width="stretch"):
                 st.rerun()
 
         with col2:
-            if st.button("🗑️ 清除缓存", help="清除模型缓存", use_container_width=True):
+            if st.button("🗑️ 清除缓存", help="清除模型缓存", width="stretch"):
                 try:
                     # 清除XGBoost缓存
                     xgb_cache = get_xgboost_cache()
@@ -2547,7 +2547,7 @@ def render_sidebar():
             "保存间隔 (秒)",
             10,
             300,
-            int(st.session_state.get("_autosave_interval_sec", 30) or 30),
+            int(st.session_state.get("_autosave_interval_sec", 120) or 120),
             key="autosave_interval_slider",
         )
         st.session_state["_autosave_interval_sec"] = int(interval)
@@ -2894,7 +2894,7 @@ def page_data_upload():
 
                 # 数据预览
                 st.markdown("### 📋 数据预览")
-                st.dataframe(df.head(10), use_container_width=True)
+                st.dataframe(df.head(10), width="stretch")
 
                 # 列信息
                 col1, col2 = st.columns(2)
@@ -2945,7 +2945,7 @@ def page_data_upload():
                         output_df=df,
                         message=f"数据维度：{df.shape[0]}×{df.shape[1]}"
                     )
-                    st.dataframe(df.head(), use_container_width=True)
+                    st.dataframe(df.head(), width="stretch")
 
             with col2:
                 st.markdown("#### 📊 纯数值数据集")
@@ -2962,7 +2962,7 @@ def page_data_upload():
                         output_df=df,
                         message=f"数据维度：{df.shape[0]}×{df.shape[1]}"
                     )
-                st.dataframe(df.head(), use_container_width=True)
+                st.dataframe(df.head(), width="stretch")
 
 
 # ============================================================
@@ -2993,7 +2993,7 @@ def page_data_explore():
         st.markdown("### 数值特征统计")
         if numeric_cols:
             desc_df = _cached_numeric_describe(df, tuple(numeric_cols))
-            st.dataframe(desc_df, use_container_width=True)
+            st.dataframe(desc_df, width="stretch")
 
     with tab2:
         st.markdown("### 特征相关性矩阵")
@@ -3097,7 +3097,7 @@ def page_data_explore():
 
             fig = _cached_corr_fig(df_corr, tuple(selected_cols))
             if fig:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
             # ============ 新增：Pearson相关性综合分析 ============
             st.markdown("---")
@@ -3246,7 +3246,7 @@ def page_data_explore():
                                fontsize=14, fontweight='bold', y=0.98)
                     plt.tight_layout()
 
-                    st.pyplot(fig_pearson, use_container_width=True)
+                    st.pyplot(fig_pearson, width="stretch")
 
                     # 导出功能
                     _export_matplotlib_fig(fig_pearson, base_name="pearson_correlation", key_prefix="pearson_fig")
@@ -3268,18 +3268,18 @@ def page_data_explore():
         st.markdown("### 数值特征分布")
         fig = _cached_distribution_fig(df)
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         st.markdown("### 箱线图")
         fig_box = _cached_boxplot_fig(df)
         if fig_box:
-            st.plotly_chart(fig_box, use_container_width=True)
+            st.plotly_chart(fig_box, width="stretch")
 
     with tab4:
         st.markdown("### 缺失值分析")
         fig_missing = _cached_missing_fig(df)
         if fig_missing:
-            st.plotly_chart(fig_missing, use_container_width=True)
+            st.plotly_chart(fig_missing, width="stretch")
         else:
             st.success("✅ 数据无缺失值")
 
@@ -3336,9 +3336,9 @@ def page_data_cleaning():
             key=preview_cols_key,
         )
         if preview_cols:
-            st.dataframe(df[preview_cols].head(int(preview_rows)), use_container_width=True)
+            st.dataframe(df[preview_cols].head(int(preview_rows)), width="stretch")
         else:
-            st.dataframe(df.head(int(preview_rows)), use_container_width=True)
+            st.dataframe(df.head(int(preview_rows)), width="stretch")
 
     _clean_tab_names = [
         "♾️ 无穷值处理", "❓ 缺失值处理", "📊 异常值检测", "🔄 重复数据", "🔧 数据类型", "🧪 SMILES清洗", "🧩 SMILES组分分列", "⚖️ 类别平衡", "🗑️ 删除列"]
@@ -3374,7 +3374,7 @@ def page_data_cleaning():
 
         if inf_stats:
             st.warning(f"检测到 {len(inf_stats)} 列存在无穷大值")
-            st.dataframe(pd.DataFrame(inf_stats).T, use_container_width=True)
+            st.dataframe(pd.DataFrame(inf_stats).T, width="stretch")
 
             col1, col2 = st.columns(2)
             with col1:
@@ -3437,7 +3437,7 @@ def page_data_cleaning():
                     '列名': missing.index,
                     '缺失数量': missing.values,
                     '缺失比例': (missing.values / len(df) * 100).round(2)
-                }), use_container_width=True)
+                }), width="stretch")
 
             with col2:
                 # 添加处理范围选择
@@ -3828,7 +3828,7 @@ def page_data_cleaning():
                         "众数": str(info['most_frequent_value']),
                         "当前占比": f"{info['frequency'] * 100:.1f}%"
                     })
-                st.dataframe(pd.DataFrame(rep_data), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rep_data), width="stretch", hide_index=True)
 
                 # 操作区
                 st.markdown("##### 🔧 执行优化")
@@ -4516,7 +4516,7 @@ def page_data_cleaning():
                 if "severity" in report_view.columns:
                     report_view["_severity_rank"] = report_view["severity"].map(severity_order).fillna(99)
                     report_view = report_view.sort_values(["_severity_rank", "status", "column"]).drop(columns=["_severity_rank"])
-                st.dataframe(report_view.head(display_rows), use_container_width=True, height=300)
+                st.dataframe(report_view.head(display_rows), width="stretch", height=300)
                 if len(report_df) > display_rows:
                     st.caption(f"仅显示前 {display_rows} 行，完整数据请下载 CSV 文件查看")
                 csv_bytes = report_view.to_csv(index=False).encode("utf-8-sig")
@@ -4812,11 +4812,11 @@ def page_data_cleaning():
                                         chart_col1, chart_col2 = st.columns(2)
                                         with chart_col1:
                                             if 'train_loss' in history and history['train_loss']:
-                                                st.line_chart(history['train_loss'], use_container_width=True)
+                                                st.line_chart(history['train_loss'], width="stretch")
                                                 st.caption("训练损失")
                                         with chart_col2:
                                             if 'val_loss' in history and history['val_loss']:
-                                                st.line_chart(history['val_loss'], use_container_width=True)
+                                                st.line_chart(history['val_loss'], width="stretch")
                                                 st.caption("验证损失")
                                         
                                         # 最终指标
@@ -4942,7 +4942,7 @@ def page_data_cleaning():
                                 if l.get('use_transformer') or strategy in ['hybrid', 'transformer']:
                                     row["使用DL"] = "✓"
                                 log_data.append(row)
-                            st.dataframe(pd.DataFrame(log_data), use_container_width=True)
+                            st.dataframe(pd.DataFrame(log_data), width="stretch")
                             
                             # 显示详细修复统计（hybrid/ultra/transformer模式）
                             for l in logs:
@@ -4979,7 +4979,7 @@ def page_data_cleaning():
         # ==== 清洗结果预览（支持多列） ====
         if st.session_state.get("smiles_clean_preview") is not None:
             st.markdown("#### 👀 清洗前后预览（最多50行）")
-            st.dataframe(st.session_state["smiles_clean_preview"], use_container_width=True)
+            st.dataframe(st.session_state["smiles_clean_preview"], width="stretch")
             if st.button("🧹 清除预览", key="clear_smiles_preview"):
                 st.session_state["smiles_clean_preview"] = None
                 st.session_state["smiles_clean_cols"] = None
@@ -5380,7 +5380,7 @@ def page_data_cleaning():
 
             # 预览将被删除的列的前几行
             with st.expander("🔍 预览选中列的数据", expanded=False):
-                st.dataframe(df[cols_to_drop].head(10), use_container_width=True)
+                st.dataframe(df[cols_to_drop].head(10), width="stretch")
 
             remaining = len(all_cols) - len(cols_to_drop)
             st.caption(f"删除后剩余列数: {remaining} / {len(all_cols)}")
@@ -5440,7 +5440,7 @@ def page_data_enhancement():
                 '缺失数量': missing_cols.values,
                 '缺失比例': (missing_cols.values / len(df) * 100).round(2)
             })
-            st.dataframe(missing_df, use_container_width=True, height=200)
+            st.dataframe(missing_df, width="stretch", height=200)
 
             # 列选择
             col1, col2 = st.columns([2, 1])
@@ -5506,7 +5506,7 @@ def page_data_enhancement():
                                         '填充后缺失': after,
                                         '已填充': before - after
                                     })
-                                st.dataframe(pd.DataFrame(detail_data), use_container_width=True)
+                                st.dataframe(pd.DataFrame(detail_data), width="stretch")
 
                         except Exception as e:
                             st.error(f"❌ KNN填充失败: {e}")
@@ -5546,7 +5546,7 @@ def page_data_enhancement():
 
                 # PCA可视化
                 st.markdown("### 📊 PCA可视化对比")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 # 合并选项
                 if st.checkbox("将生成数据合并到原始数据"):
@@ -5638,7 +5638,7 @@ def page_data_enhancement():
                                     pred_df = pd.DataFrame({'行索引': df[pred_mask].index, '预测标签': y_pred})
                                     for col in feature_cols[:3]:
                                         pred_df[col] = df.loc[pred_mask, col].values
-                                    st.dataframe(pred_df.head(20), use_container_width=True)
+                                    st.dataframe(pred_df.head(20), width="stretch")
 
                                     st.markdown("#### 标签分布")
                                     st.bar_chart(pd.Series(y_pred).value_counts())
@@ -5709,7 +5709,7 @@ def page_molecular_features():
                 "是否为文本": df[col].dtype == 'object',
                 "是否被过滤": _is_extracted_feature_col(col)
             })
-        st.dataframe(pd.DataFrame(dtype_info), use_container_width=True, height=300)
+        st.dataframe(pd.DataFrame(dtype_info), width="stretch", height=300)
     
     # 智能检测：基于列名和内容判断
     def _detect_smiles_cols_smart(df_in, exclude_features=True):
@@ -6172,7 +6172,7 @@ def page_molecular_features():
         preview_rows = _preview_bigsmiles_summary(preview_source, sample_size=3)
         if preview_rows:
             with st.expander("BigSMILES 解析预览", expanded=False):
-                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(preview_rows), width="stretch", hide_index=True)
 
     # --- 多组分设置（树脂侧） ---
     st.markdown("#### 🧩 多组分/混合物设置 (可选)")
@@ -7237,7 +7237,7 @@ def page_molecular_features():
             max_workers = max(1, (os.cpu_count() or 1) - 1)
             # Windows ProcessPoolExecutor 限制最多 61 个 workers
             if os.name == 'nt':
-                max_workers = min(max_workers, 61)
+                max_workers = min(max_workers, 128)
 
             # 确保 max_workers 至少为 2，否则不显示滑块
             if max_workers <= 1:
@@ -7325,7 +7325,7 @@ def page_molecular_features():
             _system_max_workers = max(1, (os.cpu_count() or 1) - 1)
             # Windows ProcessPoolExecutor 限制最多 61 个 workers
             if os.name == 'nt':
-                _system_max_workers = min(_system_max_workers, 61)
+                _system_max_workers = min(_system_max_workers, 128)
 
             if _system_max_workers <= 1:
                 ani_cpu_workers = 1
@@ -7366,7 +7366,7 @@ def page_molecular_features():
             with col_ff5:
                 max_workers = max(1, (os.cpu_count() or 1) - 1)
                 if os.name == 'nt':
-                    max_workers = min(max_workers, 61)
+                    max_workers = min(max_workers, 128)
 
                 if max_workers <= 1:
                     ff_n_jobs = 1
@@ -7464,7 +7464,7 @@ def page_molecular_features():
             # xTB 并行进程数：默认限制在 8，避免外部进程与 BLAS/OpenMP 线程争抢。
             cpu_count = os.cpu_count() or 1
             if os.name == 'nt':
-                max_workers = min(cpu_count, 61)
+                max_workers = min(cpu_count, 128)
                 default_jobs = min(cpu_count, 8)
                 help_text = f"检测到 {cpu_count} 个 CPU 核心。推荐 4-8 个进程；Windows 最多允许 61。"
             else:
@@ -7565,25 +7565,24 @@ def page_molecular_features():
 
     primary_source_role = _infer_selected_component_role(resin_component_cols)
     selector_source_role = _infer_selected_component_role([smiles_col])
-    source_role_conflict = (
-        primary_source_role in {"resin", "hardener"}
-        and selector_source_role in {"resin", "hardener"}
-        and primary_source_role != selector_source_role
-    )
+    # 当 resin_component_cols 和 smiles_col 的角色推断冲突时，以 smiles_col 为准
+    if primary_source_role in {"resin", "hardener"} and selector_source_role in {"resin", "hardener"} and primary_source_role != selector_source_role:
+        primary_source_role = selector_source_role
     source_role_label = {"resin": "树脂", "hardener": "固化剂", "neutral": "主体组分"}[primary_source_role]
     st.info(
         f"本次真正用于分子特征计算的是：{source_role_label}列 "
         + ", ".join(str(col) for col in (resin_component_cols or [smiles_col]))
     )
     confirm_source_role_conflict = True
+    source_role_conflict = (primary_source_role != selector_source_role and selector_source_role in {"resin", "hardener"})
     if source_role_conflict:
-        st.error(
-            f"列映射冲突：主列选择器是 `{smiles_col}`，但实际多组分输入被识别为{source_role_label}列。"
-            "特征提取将使用实际多组分列，而不是主列选择器。请返回上方修正列选择；若这是有意设置，可手动确认。"
+        st.warning(
+            f"列名提示：主列选择器是 `{smiles_col}`，但实际多组分列名被识别为其他角色。"
+            "系统已以主列选择器角色为准继续处理。"
         )
         confirm_source_role_conflict = st.checkbox(
-            "我确认使用上述实际多组分列提取特征",
-            value=False,
+            "我确认使用上述角色设置提取特征",
+            value=True,
             key="confirm_molecular_feature_source_role_conflict",
         )
 
@@ -8075,7 +8074,7 @@ def page_molecular_features():
                 
                 # 显示特征预览
                 st.markdown("### 📋 提取的特征预览")
-                st.dataframe(combined_features.head(), use_container_width=True)
+                st.dataframe(combined_features.head(), width="stretch")
             else:
                 st.error("❌ 批量处理未能提取任何特征")
             
@@ -9203,14 +9202,14 @@ def page_feature_selection():
                         showlegend=False,
                         height=420,
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                     # 数据表格
                     score_df = pd.DataFrame({
                         'K': ks,
                         'Silhouette Score': [f"{s:.4f}" for s in scores]
                     })
-                    st.dataframe(score_df, use_container_width=True, hide_index=True)
+                    st.dataframe(score_df, width="stretch", hide_index=True)
 
                 # 清除特征分类缓存并添加聚类标签到已选择特征
                 if 'feature_classification' in st.session_state:
@@ -9372,7 +9371,7 @@ def _render_binary_classification_results(
             for j in range(cm.shape[1]):
                 ax_cm.text(j, i, str(int(cm[i, j])), ha="center", va="center", color="#111827")
         st.markdown("### 混淆矩阵")
-        st.pyplot(fig_cm, use_container_width=True)
+        st.pyplot(fig_cm, width="stretch")
         extra_figs["confusion_matrix_test"] = fig_cm
 
     pred_test_df = pd.DataFrame({"y_true": y_test, "y_pred": y_pred_test})
@@ -9432,7 +9431,7 @@ def _render_binary_classification_results(
             ax_pr.grid(alpha=0.2)
 
             st.markdown("### 概率曲线")
-            st.pyplot(fig_prob, use_container_width=True)
+            st.pyplot(fig_prob, width="stretch")
             extra_figs["roc_pr_curves_test"] = fig_prob
 
             extra_tables["roc_curve_test"] = pd.DataFrame(
@@ -9448,7 +9447,7 @@ def _render_binary_classification_results(
         extra_tables["feature_cols"] = pd.DataFrame({"feature": list(feature_cols)})
 
     st.markdown("### 预测结果（Test）")
-    st.dataframe(pred_test_df, use_container_width=True, height=240)
+    st.dataframe(pred_test_df, width="stretch", height=240)
 
     if cv_res is not None:
         st.markdown("### 交叉验证（CV）")
@@ -9466,7 +9465,7 @@ def _render_binary_classification_results(
             "fold_roc_auc": cv_res.get("fold_roc_auc", []),
         })
         if not fold_df.empty:
-            st.dataframe(fold_df, use_container_width=True, height=220)
+            st.dataframe(fold_df, width="stretch", height=220)
             extra_tables["cv_folds"] = fold_df
 
         oof_df = pd.DataFrame({
@@ -10304,7 +10303,7 @@ def page_model_training():
                         st.markdown("#### 📊 模型性能排名（按 R² 排序）")
                         st.dataframe(
                             models.style.background_gradient(cmap='RdYlGn', subset=['R-Squared']),
-                            use_container_width=True
+                            width="stretch"
                         )
 
                         # 下载结果
@@ -10791,7 +10790,7 @@ def page_model_training():
                                 y_pred_test,
                                 target_name=target_col,
                             )
-                        st.pyplot(fig_paper, use_container_width=True)
+                        st.pyplot(fig_paper, width="stretch")
                         paper_png_bytes = fig_to_png_bytes(fig_paper)
                         paper_csv_bytes = b""
                         if paper_export_df is not None and not paper_export_df.empty:
@@ -10829,7 +10828,7 @@ def page_model_training():
                             "fold_rmse": cv_res.get("fold_rmse", []),
                             "fold_mae": cv_res.get("fold_mae", []),
                         })
-                        st.dataframe(fold_df, use_container_width=True, height=200)
+                        st.dataframe(fold_df, width="stretch", height=200)
 
                     def _compute_metrics(y_true, y_pred):
                         try:
@@ -10940,11 +10939,11 @@ def page_model_training():
                         fig_curve, hist_export_df = plot_history(history, title=f"{model_name} Training Curves")
 
                         st.markdown("### 📉 训练曲线（所有模型）")
-                        st.pyplot(fig_curve, use_container_width=True)
+                        st.pyplot(fig_curve, width="stretch")
 
                         if hist_export_df is not None and not hist_export_df.empty:
                             with st.expander("🧾 查看训练曲线数据", expanded=False):
-                                st.dataframe(hist_export_df, use_container_width=True, height=240)
+                                st.dataframe(hist_export_df, width="stretch", height=240)
                                 st.download_button(
                                     "📥 导出训练曲线 CSV",
                                     hist_export_df.to_csv(index=False).encode("utf-8-sig"),
@@ -10968,7 +10967,7 @@ def page_model_training():
 
                                 # 生成可视化
                                 fig_pca = pca_analyzer.visualize_domain(X_new=None, y_train=y_train_for_pca)
-                                st.pyplot(fig_pca, use_container_width=True)
+                                st.pyplot(fig_pca, width="stretch")
 
                                 st.caption("💡 PCA降维可视化展示训练数据在低维空间的分布，颜色表示目标值大小。")
                             else:
@@ -11122,22 +11121,29 @@ def page_model_training():
                             st.session_state.last_export_feature_process_path = export_proc_path
                             st.session_state.last_export_model_bytes = model_bytes
                             st.session_state.last_export_feature_process_bytes = process_bytes
+                            st.session_state._trained_model_artifact = model_bytes
+                            st.session_state._trained_process_artifact = process_bytes
+                            st.session_state._trained_model_name = os.path.basename(export_model_path)
 
                             with st.expander("📦 自动导出（训练完成后已生成文件）", expanded=False):
-                                st.caption(f"模型文件: {export_model_path}")
-                                st.caption(f"特征流程: {export_proc_path}")
-                                st.download_button(
-                                    "⬇️ 下载模型文件（joblib）",
-                                    data=model_bytes,
-                                    file_name=os.path.basename(export_model_path),
-                                    mime='application/octet-stream'
-                                )
-                                st.download_button(
-                                    "⬇️ 下载特征提取流程（json）",
-                                    data=process_bytes,
-                                    file_name='feature_process.json',
-                                    mime='application/json'
-                                )
+                                st.caption(f"已保存至: {export_model_path}")
+                                dl_col1, dl_col2 = st.columns(2)
+                                with dl_col1:
+                                    st.download_button(
+                                        "⬇️ 下载模型文件（joblib）",
+                                        data=model_bytes,
+                                        file_name=os.path.basename(export_model_path),
+                                        mime='application/octet-stream',
+                                        key="download_model_trained"
+                                    )
+                                with dl_col2:
+                                    st.download_button(
+                                        "⬇️ 下载特征提取流程（json）",
+                                        data=process_bytes,
+                                        file_name='feature_process.json',
+                                        mime='application/json',
+                                        key="download_process_trained"
+                                    )
                         except Exception:
                             pass
 
@@ -11194,7 +11200,7 @@ def page_model_training():
 
                     t1, t2 = st.columns([3, 1])
                     with t1:
-                        st.dataframe(res_df, use_container_width=True, height=200)
+                        st.dataframe(res_df, width="stretch", height=200)
                     with t2:
                         csv = res_df.to_csv(index=False).encode('utf-8')
                         st.download_button("📥 导出结果 CSV", csv, "predictions_test.csv", "text/csv")
@@ -11213,7 +11219,7 @@ def page_model_training():
                                         y_pred_test,
                                         model_name=model_name,
                                     )
-                                st.pyplot(fig_resid, use_container_width=True)
+                                st.pyplot(fig_resid, width="stretch")
                         with tab_b:
                             col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
                             with col_img2:
@@ -11224,7 +11230,7 @@ def page_model_training():
                                         cv_res['oof_pred'],
                                         model_name=f"{model_name} (OOF)"
                                     )
-                                st.pyplot(fig_oof, use_container_width=True)
+                                st.pyplot(fig_oof, width="stretch")
                     else:
                         col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
                         with col_img2:
@@ -11235,7 +11241,7 @@ def page_model_training():
                                     y_pred_test,
                                     model_name=model_name,
                                 )
-                            st.pyplot(fig_resid, use_container_width=True)
+                            st.pyplot(fig_resid, width="stretch")
 
                 except Exception as e:
                     cancelled_by_user = _is_user_cancelled_error(e) or is_cancelled()
@@ -11328,58 +11334,82 @@ def page_model_training():
                 st.markdown("---")
                 with st.expander("📦 导出训练好的模型（.joblib）", expanded=False):
                     st.caption("导出的模型文件包含：pipeline/模型、特征列、目标列、评估指标等。可在【预测应用】页面直接导入使用。")
-                    try:
-                        from core.model_io import create_model_artifact_bytes
-                        metrics = {}
-                        tr = st.session_state.get("train_result") or {}
-                        for k in ["r2", "rmse", "mae", "train_time", "split_strategy", "n_bins"]:
-                            if k in tr:
-                                metrics[k] = tr[k]
-                        effective_feature_cols = _resolve_effective_feature_cols(
-                            train_result=tr,
-                            selected_feature_cols=st.session_state.get("feature_cols") or [],
-                            model=st.session_state.get("model"),
-                            pipeline=st.session_state.get("pipeline"),
-                        )[0] or list(st.session_state.get("feature_cols") or [])
-                        extra_export = {
-                            "app_version": str(VERSION),
-                            "effective_feature_cols": effective_feature_cols,
-                            "molecular_feature_config": st.session_state.get("molecular_feature_config"),
-                        }
-                        _processed_ref = st.session_state.get("processed_data")
-                        if _processed_ref is None:
-                            _processed_ref = st.session_state.get("data")
-                        extra_export.update(
-                            _build_screening_reference_export(
-                                tr,
-                                effective_feature_cols,
-                                session_x_train_raw=st.session_state.get("X_train_raw"),
-                                session_x_train=st.session_state.get("X_train"),
-                                processed_data=_processed_ref,
-                                target_col=st.session_state.get("target_col"),
-                                molecular_feature_config=st.session_state.get("molecular_feature_config"),
+                    _cached_bytes = st.session_state.get("_trained_model_artifact")
+                    _cached_proc_bytes = st.session_state.get("_trained_process_artifact")
+                    _cached_name = st.session_state.get("_trained_model_name", "model")
+                    if _cached_bytes is not None:
+                        dl_a1, dl_a2 = st.columns(2)
+                        with dl_a1:
+                            st.download_button(
+                                "⬇️ 下载模型文件",
+                                data=_cached_bytes,
+                                file_name=_cached_name,
+                                mime="application/octet-stream",
+                                key="download_model_artifact"
                             )
-                        )
-                        model_bytes = create_model_artifact_bytes(
-                            model_name=str(st.session_state.get("model_name") or model_name),
-                            target_col=str(st.session_state.get("target_col") or ""),
-                            feature_cols=effective_feature_cols,
-                            model=st.session_state.get("model"),
-                            pipeline=st.session_state.get("pipeline"),
-                            scaler=st.session_state.get("scaler"),
-                            imputer=st.session_state.get("imputer"),
-                            metrics=metrics,
-                            extra=extra_export,
-                        )
-                        safe_name = (str(st.session_state.get("model_name") or model_name) or "model").replace(" ", "_")
-                        st.download_button(
-                            "⬇️ 下载模型文件",
-                            data=model_bytes,
-                            file_name=f"{safe_name}_artifact.joblib",
-                            mime="application/octet-stream"
-                        )
-                    except Exception as e:
-                        st.error(f"模型导出失败：{e}")
+                        with dl_a2:
+                            if _cached_proc_bytes is not None:
+                                st.download_button(
+                                    "⬇️ 下载特征提取流程（json）",
+                                    data=_cached_proc_bytes,
+                                    file_name="feature_process.json",
+                                    mime="application/json",
+                                    key="download_process_artifact"
+                                )
+                    else:
+                        try:
+                            from core.model_io import create_model_artifact_bytes
+                            metrics = {}
+                            tr = st.session_state.get("train_result") or {}
+                            for k in ["r2", "rmse", "mae", "train_time", "split_strategy", "n_bins"]:
+                                if k in tr:
+                                    metrics[k] = tr[k]
+                            effective_feature_cols = _resolve_effective_feature_cols(
+                                train_result=tr,
+                                selected_feature_cols=st.session_state.get("feature_cols") or [],
+                                model=st.session_state.get("model"),
+                                pipeline=st.session_state.get("pipeline"),
+                            )[0] or list(st.session_state.get("feature_cols") or [])
+                            extra_export = {
+                                "app_version": str(VERSION),
+                                "effective_feature_cols": effective_feature_cols,
+                                "molecular_feature_config": st.session_state.get("molecular_feature_config"),
+                            }
+                            _processed_ref = st.session_state.get("processed_data")
+                            if _processed_ref is None:
+                                _processed_ref = st.session_state.get("data")
+                            extra_export.update(
+                                _build_screening_reference_export(
+                                    tr,
+                                    effective_feature_cols,
+                                    session_x_train_raw=st.session_state.get("X_train_raw"),
+                                    session_x_train=st.session_state.get("X_train"),
+                                    processed_data=_processed_ref,
+                                    target_col=st.session_state.get("target_col"),
+                                    molecular_feature_config=st.session_state.get("molecular_feature_config"),
+                                )
+                            )
+                            model_bytes = create_model_artifact_bytes(
+                                model_name=str(st.session_state.get("model_name") or model_name),
+                                target_col=str(st.session_state.get("target_col") or ""),
+                                feature_cols=effective_feature_cols,
+                                model=st.session_state.get("model"),
+                                pipeline=st.session_state.get("pipeline"),
+                                scaler=st.session_state.get("scaler"),
+                                imputer=st.session_state.get("imputer"),
+                                metrics=metrics,
+                                extra=extra_export,
+                            )
+                            safe_name = (str(st.session_state.get("model_name") or model_name) or "model").replace(" ", "_")
+                            st.download_button(
+                                "⬇️ 下载模型文件",
+                                data=model_bytes,
+                                file_name=f"{safe_name}_artifact.joblib",
+                                mime="application/octet-stream",
+                                key="download_model_fallback"
+                            )
+                        except Exception as e:
+                            st.error(f"模型导出失败：{e}")
                         st.info("提示：若使用深度学习模型（TF/自定义网络），joblib 序列化可能失败。可改用【导出训练脚本】在目标环境复现训练。")
 
     # ============ 独立的异常样本检测功能（在训练代码块外） ============
@@ -11478,7 +11508,7 @@ def page_model_training():
 
                     # 显示异常样本表格
                     st.markdown("#### 📋 异常样本详情")
-                    st.dataframe(outlier_df, use_container_width=True, height=300)
+                    st.dataframe(outlier_df, width="stretch", height=300)
 
                     # 显示异常样本的完整特征
                     st.markdown("#### 🔬 异常样本完整数据")
@@ -11490,7 +11520,7 @@ def page_model_training():
 
                         if isinstance(current_df, pd.DataFrame) and not current_df.empty:
                             outlier_full_data = current_df.loc[outlier_indices]
-                            st.dataframe(outlier_full_data, use_container_width=True, height=400)
+                            st.dataframe(outlier_full_data, width="stretch", height=400)
 
                             # 导出异常样本
                             csv_outliers = outlier_full_data.to_csv(index=True).encode('utf-8-sig')
@@ -12135,7 +12165,7 @@ def page_model_interpretation():
 
                         c1, c2, c3 = st.columns([1, 6, 1])
                         with c2:
-                            st.pyplot(fig, use_container_width=True)
+                            st.pyplot(fig, width="stretch")
 
                             csv = df_perm.to_csv(index=False).encode("utf-8-sig")
                             st.download_button(
@@ -12177,7 +12207,7 @@ def page_model_interpretation():
             c1, c2, c3 = st.columns([1, 2, 1])
             with c2:
                 fig, df_res = visualizer.plot_residuals(y_test_from_result, y_pred, model_name)
-                st.pyplot(fig, use_container_width=True)
+                st.pyplot(fig, width="stretch")
 
                 if df_res is not None:
                     csv = df_res.to_csv(index=False).encode("utf-8-sig")
@@ -12247,14 +12277,14 @@ def page_model_interpretation():
                         fig, df_imp = visualizer.plot_feature_importance(
                             importances, feat_names, model_name, top_n=int(top_n)
                         )
-                        st.pyplot(fig, use_container_width=True)
+                        st.pyplot(fig, width="stretch")
 
                 elif chart_type == "条形图+饼图":
 
                     fig, df_imp = visualizer.plot_feature_importance(
                         importances, feat_names, model_name, top_n=int(top_n)
                     )
-                    st.pyplot(fig, use_container_width=True)
+                    st.pyplot(fig, width="stretch")
 
                     with st.container():
                         # 绘制饼图：按特征类型分组
@@ -12293,10 +12323,10 @@ def page_model_interpretation():
                         ax_pie.set_title(f'Top {top_n} 特征占比', fontsize=12, pad=20)
                         ax_pie.set_aspect('equal')
                         plt.tight_layout(rect=[0, 0, 0.84, 1])
-                        st.pyplot(fig_pie, use_container_width=True)
+                        st.pyplot(fig_pie, width="stretch")
                         if len(top_features) > len(pie_feature_df):
                             st.caption(f"仅在图例中展示前 {len(pie_feature_df) - 1} 个特征，其余已合并为“其他特征”。")
-                        st.dataframe(pie_feature_df, use_container_width=True, hide_index=True)
+                        st.dataframe(pie_feature_df, width="stretch", hide_index=True)
 
                 elif chart_type == "水平堆叠图":
 
@@ -12334,7 +12364,7 @@ def page_model_interpretation():
                     ax_stack.grid(axis='x', linestyle='--', alpha=0.3)
 
                     plt.tight_layout()
-                    st.pyplot(fig_stack, use_container_width=True)
+                    st.pyplot(fig_stack, width="stretch")
 
                     # 显示累积百分比
                     st.caption(f"前 {top_n} 个特征累积贡献: {cumsum_pct[-1]:.1f}%")
@@ -12441,7 +12471,7 @@ def page_model_interpretation():
                             plt.suptitle(f'{model_name} - 特征重要性对比 (Top {top_n})',
                                        fontsize=14, fontweight='bold', y=0.98)
                             plt.tight_layout()
-                            st.pyplot(fig_compare, use_container_width=True)
+                            st.pyplot(fig_compare, width="stretch")
 
                             # 显示排名对比表
                             st.markdown("#### 📊 排名对比表")
@@ -12472,7 +12502,7 @@ def page_model_interpretation():
                             # 显示表格
                             st.dataframe(
                                 comparison_df[['Feature', 'FI_Rank', 'SHAP_Rank', 'Rank_Diff']].head(20),
-                                use_container_width=True,
+                                width="stretch",
                                 height=400
                             )
 
@@ -12616,7 +12646,7 @@ def page_model_interpretation():
                                 plt.suptitle(f'{model_name} - 部分依赖图 (Top {len(top_pdp_features)} 特征)',
                                            fontsize=14, fontweight='bold', y=0.995)
                                 plt.tight_layout()
-                                st.pyplot(fig_pdp, use_container_width=True)
+                                st.pyplot(fig_pdp, width="stretch")
 
                                 # 导出功能
                                 _export_matplotlib_fig(fig_pdp, base_name="partial_dependence", key_prefix="pdp_fig")
@@ -12735,7 +12765,7 @@ def page_model_interpretation():
 
                                 fig_pdp2d.suptitle(f"{model_name} - 2D Partial Dependence: {pdp2d_x_feature} × {pdp2d_y_feature}", fontsize=14, fontweight="bold", y=0.98)
                                 fig_pdp2d.tight_layout()
-                                st.pyplot(fig_pdp2d, use_container_width=True)
+                                st.pyplot(fig_pdp2d, width="stretch")
 
                                 col_best_1, col_best_2, col_best_3 = st.columns(3)
                                 col_best_1.metric(f"{pdp2d_x_feature} 最优值", f"{best_x:.6g}")
@@ -12743,7 +12773,7 @@ def page_model_interpretation():
                                 col_best_3.metric("部分依赖值", f"{best_val:.6g}")
 
                                 pdp2d_grid_df = pd.DataFrame({pdp2d_x_feature: xx.ravel(), pdp2d_y_feature: yy.ravel(), "partial_dependence": z.ravel()})
-                                st.dataframe(pdp2d_grid_df, use_container_width=True, height=320)
+                                st.dataframe(pdp2d_grid_df, width="stretch", height=320)
                                 st.download_button(
                                     "📥 导出 2D-PDP 网格数据 (CSV)",
                                     pdp2d_grid_df.to_csv(index=False).encode("utf-8-sig"),
@@ -12845,7 +12875,7 @@ def page_model_interpretation():
                             f"{model_name} - Permutation",
                             top_n=int(top_n),
                         )
-                        st.pyplot(fig, use_container_width=True)
+                        st.pyplot(fig, width="stretch")
 
                         csv = df_perm.to_csv(index=False).encode("utf-8-sig")
                         st.download_button(
@@ -12960,10 +12990,10 @@ def page_model_interpretation():
                         with st.spinner("正在分析..."):
                             try:
                                 fig, df = analyzer.analyze_feature_correlations(top_n=top_n_corr)
-                                st.pyplot(fig, use_container_width=True)
+                                st.pyplot(fig, width="stretch")
 
                                 st.markdown("##### 数据表")
-                                st.dataframe(df, use_container_width=True)
+                                st.dataframe(df, width="stretch")
 
                                 csv = df.to_csv(index=False).encode("utf-8-sig")
                                 st.download_button(
@@ -13013,7 +13043,7 @@ def page_model_interpretation():
                                     max_samples=max_samples_dep
                                 )
 
-                                st.pyplot(fig, use_container_width=True)
+                                st.pyplot(fig, width="stretch")
 
                                 st.markdown("##### 解读提示")
                                 st.info("""
@@ -13053,7 +13083,7 @@ def page_model_interpretation():
                         with st.spinner("正在分析..."):
                             try:
                                 fig, df = analyzer.analyze_by_target_range(n_bins=n_bins)
-                                st.pyplot(fig, use_container_width=True)
+                                st.pyplot(fig, width="stretch")
 
                                 st.markdown("##### 解读提示")
                                 st.info("""
@@ -13064,7 +13094,7 @@ def page_model_interpretation():
 
                                 st.markdown("##### 详细数据")
                                 pivot_df = df.pivot(index='feature', columns='segment', values='mean_abs_shap')
-                                st.dataframe(pivot_df, use_container_width=True)
+                                st.dataframe(pivot_df, width="stretch")
 
                                 csv = df.to_csv(index=False).encode("utf-8-sig")
                                 st.download_button(
@@ -13092,7 +13122,7 @@ def page_model_interpretation():
                         with st.spinner("正在检测..."):
                             try:
                                 fig, df = analyzer.detect_feature_interactions(top_n=top_n_int)
-                                st.pyplot(fig, use_container_width=True)
+                                st.pyplot(fig, width="stretch")
 
                                 st.markdown("##### 解读提示")
                                 st.info("""
@@ -13102,7 +13132,7 @@ def page_model_interpretation():
                                 """)
 
                                 st.markdown("##### 交互对列表")
-                                st.dataframe(df, use_container_width=True)
+                                st.dataframe(df, width="stretch")
 
                                 csv = df.to_csv(index=False).encode("utf-8-sig")
                                 st.download_button(
@@ -13502,7 +13532,7 @@ def page_prediction():
         if uploaded_file is not None:
             try:
                 pred_df = load_data_file(uploaded_file)
-                st.dataframe(pred_df.head(), use_container_width=True)
+                st.dataframe(pred_df.head(), width="stretch")
                 _render_prediction_feature_check_panel(
                     input_df=pred_df,
                     required_features=feature_cols,
@@ -13536,7 +13566,7 @@ def page_prediction():
                         preds = model.predict(X_arr)
                     pred_df['prediction'] = preds
                     st.success("\u6279\u91cf\u9884\u6d4b\u5b8c\u6210")
-                    st.dataframe(pred_df.head(20), use_container_width=True)
+                    st.dataframe(pred_df.head(20), width="stretch")
                     csv = pred_df.to_csv(index=False).encode('utf-8')
                     st.download_button("Download predictions CSV", csv, "batch_predictions.csv", "text/csv")
 
@@ -13607,7 +13637,7 @@ def page_prediction():
                                 for i, sol in enumerate(solutions, 1):
                                     with st.expander(f"方案 {i}：预测值 {sol['predicted_value']:.4f} (误差: {sol['error']:.4f})", expanded=(i==1)):
                                         sol_df = pd.DataFrame([sol['features']])
-                                        st.dataframe(sol_df.T.rename(columns={0: "特征值"}), use_container_width=True)
+                                        st.dataframe(sol_df.T.rename(columns={0: "特征值"}), width="stretch")
                             else:
                                 st.warning("未找到合适的解决方案，请调整目标值")
                     except Exception as e:
@@ -13693,7 +13723,7 @@ def page_prediction():
                         try:
                             y_train = st.session_state.train_result.get("y_train") if st.session_state.get("train_result") else None
                             fig = analyzer.visualize_domain(X_new=X_input, y_train=y_train)
-                            st.pyplot(fig, use_container_width=True)
+                            st.pyplot(fig, width="stretch")
                         except Exception as e:
                             st.warning(f"可视化生成失败: {e}")
 
@@ -13747,8 +13777,8 @@ def page_prediction():
                                     except Exception:
                                         pass
 
-                                st.dataframe(top_df, use_container_width=True, height=200)
-                                st.pyplot(fig, use_container_width=True)
+                                st.dataframe(top_df, width="stretch", height=200)
+                                st.pyplot(fig, width="stretch")
 
                     except Exception as e:
                         st.error(f"分析失败: {e}")
@@ -13770,7 +13800,7 @@ def page_prediction():
                             out_df["in_domain"] = out_df["sim_max"] >= threshold
 
                             st.success("✅ 批量适用域分析完成")
-                            st.dataframe(out_df[["sim_max", "in_domain"]].head(20), use_container_width=True)
+                            st.dataframe(out_df[["sim_max", "in_domain"]].head(20), width="stretch")
 
                             # 可选：如果包含目标列，可画 |error| vs sim_max
                             if st.session_state.get("target_col") in out_df.columns:
@@ -13797,7 +13827,7 @@ def page_prediction():
                                         ax.set_title("|error| vs sim_max")
                                         ax.grid(True, linestyle="--", alpha=0.4)
                                         plt.tight_layout()
-                                        st.pyplot(fig, use_container_width=True)
+                                        st.pyplot(fig, width="stretch")
                                 except Exception:
                                     pass
 
@@ -14100,7 +14130,7 @@ def page_prediction():
                             fig_surface.colorbar(contour_fill, ax=ax_contour, fraction=0.046, pad=0.04, label="Prediction")
 
                             fig_surface.tight_layout()
-                            st.pyplot(fig_surface, use_container_width=True)
+                            st.pyplot(fig_surface, width="stretch")
                             plt.close(fig_surface)
 
                             st.markdown("#### 最优点完整参数")
@@ -14109,13 +14139,13 @@ def page_prediction():
                             )
                             st.dataframe(
                                 best_solution_df,
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                                 height=min(460, 35 * (len(best_solution_df) + 1)),
                             )
 
                             st.markdown("#### Top 网格候选")
-                            st.dataframe(top_candidates, use_container_width=True, hide_index=True)
+                            st.dataframe(top_candidates, width="stretch", hide_index=True)
                             csv = top_candidates.to_csv(index=False).encode("utf-8-sig")
                             st.download_button(
                                 "📜 下载 Top 候选 CSV",
@@ -14930,10 +14960,14 @@ def page_virtual_screening():
         def _fetch_pubchem_candidate_sets(
             resin_query,
             hardener_classes,
-            max_cids,
-            sample_each,
-            seed,
+            max_cids=1000,
+            sample_each=500,
+            seed=42,
             *,
+            max_cids_resin=None,
+            max_cids_hardener=None,
+            sample_each_resin=None,
+            sample_each_hardener=None,
             max_workers=4,
             progress_label="PubChem",
         ):
@@ -14941,7 +14975,7 @@ def page_virtual_screening():
             fetched_resin = []
             fetched_hard = []
             hard_errors = []
-            max_workers = max(1, min(int(max_workers), 6))
+            max_workers = max(1, min(int(max_workers), 12))
             hardener_jobs = [
                 (cls, query_text)
                 for cls in (hardener_classes or [])
@@ -14969,12 +15003,16 @@ def page_virtual_screening():
                     property_workers=int(max(1, property_workers)),
                 )
 
+            resin_max_cids = int(max_cids_resin) if max_cids_resin is not None else int(max_cids)
+            resin_sample = int(sample_each_resin) if sample_each_resin is not None else int(sample_each)
+            hardener_max_cids = int(max_cids_hardener) if max_cids_hardener is not None else int(max_cids)
+            hardener_sample = int(sample_each_hardener) if sample_each_hardener is not None else int(sample_each)
             if has_resin_query:
                 try:
                     resin_property_workers = max_workers if len(hardener_jobs) <= 1 else min(max_workers, 3)
                     resin_df = _fetch_pubchem_smiles_cached(
                         str(resin_query).strip(),
-                        int(max_cids),
+                        resin_max_cids,
                         property_workers=int(resin_property_workers),
                     )
                     if isinstance(resin_df, pd.DataFrame) and "smiles" in resin_df.columns:
@@ -14990,7 +15028,7 @@ def page_virtual_screening():
                     try:
                         df_tmp = _fetch_pubchem_smiles_cached(
                             query_text,
-                            int(max_cids),
+                            hardener_max_cids,
                             property_workers=int(hardener_property_workers),
                         )
                         if isinstance(df_tmp, pd.DataFrame) and "smiles" in df_tmp.columns:
@@ -15007,7 +15045,7 @@ def page_virtual_screening():
                         executor.submit(
                             _fetch_pubchem_smiles_direct,
                             query_text,
-                            int(max_cids),
+                            hardener_max_cids,
                             int(hardener_property_workers),
                         ): (cls, query_text)
                         for cls, query_text in hardener_jobs
@@ -15024,12 +15062,13 @@ def page_virtual_screening():
 
             fetched_resin = _dedupe_keep_order(_clean_smiles_list(fetched_resin))
             fetched_hard = _dedupe_keep_order(_clean_smiles_list(fetched_hard))
-            if int(sample_each) > 0:
+            if resin_sample > 0:
                 rng = np.random.default_rng(int(seed))
-                if len(fetched_resin) > int(sample_each):
-                    fetched_resin = rng.choice(fetched_resin, size=int(sample_each), replace=False).tolist()
-                if len(fetched_hard) > int(sample_each):
-                    fetched_hard = rng.choice(fetched_hard, size=int(sample_each), replace=False).tolist()
+                if len(fetched_resin) > resin_sample:
+                    fetched_resin = rng.choice(fetched_resin, size=resin_sample, replace=False).tolist()
+            if hardener_sample > 0:
+                if len(fetched_hard) > hardener_sample:
+                    fetched_hard = rng.choice(fetched_hard, size=hardener_sample, replace=False).tolist()
 
             progress_bar.progress(100)
             progress_text.success(
@@ -15044,6 +15083,27 @@ def page_virtual_screening():
                 + ", ".join(configured_primary_cols[:12])
                 + "。筛选按真正的特征输入列解释；若要筛环氧树脂，需要用 resin_smiles_* 重新提取并训练模型。"
             )
+            role_options = ["hardener", "resin"]
+            role_labels = {"resin": "树脂", "hardener": "固化剂"}
+            current_role = st.session_state.get("vs_role_override", primary_component_role)
+            chosen_role = st.selectbox(
+                "请选择当前模型实际对应的组分角色（覆盖自动检测结果）",
+                options=role_options,
+                format_func=lambda x: role_labels.get(x, x),
+                index=role_options.index(current_role) if current_role in role_options else 0,
+                key="vs_role_override_selector",
+                help="选择'树脂'会将当前模型视为树脂模型，主列使用树脂SMILES；选择'固化剂'则相反。",
+            )
+            if chosen_role != current_role:
+                st.session_state["vs_role_override"] = chosen_role
+                st.rerun()
+            # Apply override
+            primary_component_role = chosen_role
+            primary_role_label = role_labels.get(chosen_role, chosen_role)
+            primary_library_role = chosen_role if chosen_role in {"resin", "hardener"} else "resin"
+            secondary_role_label = "固化剂" if chosen_role != "hardener" else "第二组分"
+            hardener_formula_enabled = bool(chosen_role != "hardener" and hardener_required)
+            source_mapping_conflict = False  # resolved
         source_col1, source_col2 = st.columns(2)
         with source_col1:
             use_dataset_source = st.checkbox(f"使用当前数据中的{primary_role_label}库", value=True, key="vs_formula_use_dataset_v2")
@@ -15163,33 +15223,54 @@ def page_virtual_screening():
                 default=["胺", "酸酐"] if (hardener_formula_enabled or primary_component_role == "hardener") else [],
                 key="vs_formula_pubchem_hardener_classes_v4",
             )
-            pubchem_max_cids = st.number_input(
-                "每类最大 CID 数",
-                min_value=100,
-                max_value=10000,
-                value=1000,
-                step=100,
-                key="vs_formula_pubchem_max_cids_v4",
-            )
-            pubchem_sample_each = st.number_input(
-                "最终 PubChem 候选采样上限",
-                min_value=100,
-                max_value=5000,
-                value=500,
-                step=100,
-                key="vs_formula_pubchem_sample_each_v4",
-            )
+            cid_col1, cid_col2 = st.columns(2)
+            with cid_col1:
+                pubchem_resin_max_cids = st.number_input(
+                    f"{primary_role_label} 每类最大 CID 数",
+                    min_value=100,
+                    max_value=50000,
+                    value=1000,
+                    step=100,
+                    key="vs_formula_pubchem_resin_max_cids_v4",
+                )
+                pubchem_resin_sample_each = st.number_input(
+                    f"{primary_role_label} 最终采样上限",
+                    min_value=100,
+                    max_value=50000,
+                    value=500,
+                    step=100,
+                    key="vs_formula_pubchem_resin_sample_each_v4",
+                )
+            with cid_col2:
+                pubchem_hardener_max_cids = st.number_input(
+                    "固化剂 每类最大 CID 数",
+                    min_value=100,
+                    max_value=50000,
+                    value=1000,
+                    step=100,
+                    key="vs_formula_pubchem_hardener_max_cids_v4",
+                )
+                pubchem_hardener_sample_each = st.number_input(
+                    "固化剂 最终采样上限（每类）",
+                    min_value=100,
+                    max_value=50000,
+                    value=500,
+                    step=100,
+                    key="vs_formula_pubchem_hardener_sample_each_v4",
+                )
             pubchem_seed = st.number_input("PubChem 随机种子", 0, 10_000_000, 42, key="vs_formula_pubchem_seed_v4")
-            st.caption("已下载过的查询会从磁盘缓存秒级读取；所有缓存和在线结果都会再用 RDKit 复核子结构，并在进入 xTB 前采样。")
+            st.caption("已下载过的查询会从磁盘缓存秒级读取；所有缓存和在线结果都会再用 RDKit 复核子结构。")
             if st.button("🔎 从 PubChem 拉取候选", key="vs_formula_pubchem_fetch_v4"):
                 with st.spinner("正在从 PubChem 拉取候选..."):
                     fetched_resin, fetched_hard, hard_errors = _fetch_pubchem_candidate_sets(
                         pubchem_resin_smarts,
                         pubchem_hardener_classes if (hardener_formula_enabled or primary_component_role == "hardener") else [],
-                        int(pubchem_max_cids),
-                        int(pubchem_sample_each),
-                        int(pubchem_seed),
-                        max_workers=4,
+                        max_cids_resin=int(pubchem_resin_max_cids),
+                        max_cids_hardener=int(pubchem_hardener_max_cids),
+                        sample_each_resin=int(pubchem_resin_sample_each),
+                        sample_each_hardener=int(pubchem_hardener_sample_each),
+                        seed=int(pubchem_seed),
+                        max_workers=12,
                         progress_label="配方级 PubChem 拉取",
                     )
                     if hard_errors:
@@ -15203,6 +15284,7 @@ def page_virtual_screening():
                         st.success(
                             f"PubChem 查询完成：{primary_role_label} {len(primary_fetched)} 条"
                             + (f"，第二组分 {len(secondary_fetched)} 条。" if hardener_formula_enabled else "。")
+                            + f"（树脂采样至多 {pubchem_resin_sample_each} 条，固化剂每类采样至多 {pubchem_hardener_sample_each} 条）"
                         )
                     else:
                         st.warning("PubChem 查询完成，但未返回可用候选。请尝试放宽 SMARTS 或减少约束。")
@@ -15298,6 +15380,15 @@ def page_virtual_screening():
                     "off": "关闭规则",
                 }[x],
             )
+            with st.expander("规则强度说明", expanded=False):
+                st.markdown("""
+                | 规则 | 树脂过滤 | 固化剂过滤 | 适用场景 |
+                |------|---------|-----------|---------|
+                | **基础有效性** | 结构可解析 + 含环氧基 + 宽松尺寸边界（MW<=2000, 重原子<=150） | 结构可解析 + 宽松尺寸边界（MW<=1500, 重原子<=120） | 通用筛选，保留更多候选 |
+                | **角色专用规则** | 强制双官能芳香环氧（>=2环氧基 + >=1芳环），排除脂环族/小分子，禁胺/强酸，MW 150~2000 | 仅保留胺/酸酐/酚/硫醇/咪唑/叔胺六类，禁环氧/强酸，MW 40~1000，配比0.2~5.0 | 需要化学严格性，排除非常规组分 |
+                | **关闭规则** | 无任何化学过滤 | 无任何化学过滤 | 仅依赖模型自身判断 |
+                """)
+                st.caption("官能度滑块在基础有效性和角色专用规则下生效，关闭规则下禁用。")
             if primary_component_role == "resin":
                 formula_min_epoxide = st.slider(
                     "树脂最小环氧官能度",
@@ -15307,7 +15398,26 @@ def page_virtual_screening():
                     key="vs_formula_min_epoxide_v2",
                     disabled=formula_rule_profile == "off",
                 )
+                formula_min_hardener_func = st.slider(
+                    "固化剂最小活泼氢官能度",
+                    1,
+                    8,
+                    1,
+                    key="vs_formula_min_hardener_func_v2",
+                    disabled=formula_rule_profile == "off",
+                    help="胺类按活泼氢数（伯胺~2+仲胺~1），酸酐按酸酐基团数，酚类按酚羟基数，硫醇按巯基数，咪唑/叔胺按环/基数。低于此值会被过滤。",
+                )
             else:
+                formula_min_epoxide = 0
+                formula_min_hardener_func = st.slider(
+                    "固化剂最小活泼氢官能度",
+                    1,
+                    8,
+                    1,
+                    key="vs_formula_min_hardener_func_v2",
+                    disabled=formula_rule_profile == "off",
+                    help="胺类按活泼氢数（伯胺~2+仲胺~1），酸酐按酸酐基团数，酚类按酚羟基数，硫醇按巯基数，咪唑/叔胺按环/基数。低于此值会被过滤。",
+                )
                 formula_min_epoxide = 0
             if formula_rule_profile == "basic":
                 if primary_component_role == "resin":
@@ -15324,7 +15434,14 @@ def page_virtual_screening():
 
         formula_chem_rule_mode = "off" if formula_rule_profile == "off" else "pre"
         if primary_component_role == "resin":
-            formula_chem_rules = {"resin": {"min_epoxide": int(formula_min_epoxide)}}
+            formula_chem_rules = {
+                "resin": {
+                    "min_epoxide": int(formula_min_epoxide),
+                },
+                "hardener": {
+                    "min_active_hydrogen": int(formula_min_hardener_func),
+                },
+            }
         else:
             formula_chem_rules = {
                 "hardener": {
@@ -15332,6 +15449,7 @@ def page_virtual_screening():
                     "max_mw": 1500.0,
                     "min_heavy_atoms": 2,
                     "max_heavy_atoms": 120,
+                    "min_active_hydrogen": int(formula_min_hardener_func),
                     "ban_strong_acids": False,
                     "ban_epoxide": False,
                     "allowed_classes": None,
@@ -15358,6 +15476,7 @@ def page_virtual_screening():
                     "max_heavy_atoms": 100,
                     "ban_strong_acids": True,
                     "ban_epoxide": True,
+                    "min_active_hydrogen": int(formula_min_hardener_func),
                     "allowed_classes": ["amine", "anhydride", "phenol", "thiol", "imidazole", "tertiary_amine"],
                 },
                 "pair": {
@@ -15377,6 +15496,7 @@ def page_virtual_screening():
                     "max_heavy_atoms": 100,
                     "ban_strong_acids": True,
                     "ban_epoxide": True,
+                    "min_active_hydrogen": int(formula_min_hardener_func),
                     "allowed_classes": ["amine", "anhydride", "phenol", "thiol", "imidazole", "tertiary_amine"],
                 },
             }
@@ -15387,6 +15507,30 @@ def page_virtual_screening():
             else "resin_smiles" if primary_component_role != "resin"
             else None
         )
+
+        with st.expander("多组分配方控制", expanded=False):
+            st.caption("限制每个配方中树脂和固化剂的组分数量，保证配方多样性。")
+            comp_col1, comp_col2 = st.columns(2)
+            with comp_col1:
+                max_resin_components = st.slider(
+                    "树脂最大组分数量",
+                    1, 6, 2,
+                    key="vs_formula_max_resin_components",
+                    help="每个配方中最多包含几种不同的树脂组分。设为1=单树脂，2=最多2种树脂复配。"
+                )
+            with comp_col2:
+                max_hardener_components = st.slider(
+                    "固化剂最大组分数量",
+                    1, 6, 2,
+                    key="vs_formula_max_hardener_components",
+                    help="每个配方中最多包含几种不同的固化剂组分。设为1=单固化剂，2=最多2种固化剂复配。"
+                )
+            comp_diversity = st.checkbox(
+                "强制组分多样性（避免同一分子重复出现在不同组分列）",
+                value=True,
+                key="vs_formula_comp_diversity",
+            )
+            st.caption("例：树脂最大组分=2、固化剂最大组分=2时，最多生成 树脂A+树脂B / 固化剂C+固化剂D 的复配配方。")
 
         selected_design_cols = st.multiselect(
             "选择要枚举的配方/工艺特征",
@@ -15494,7 +15638,7 @@ def page_virtual_screening():
             with expensive_col2:
                 if screening_uses_xtb:
                     cpu_total = max(1, int(os.cpu_count() or 1))
-                    safe_job_max = min(32, 61 if os.name == "nt" else cpu_total, cpu_total)
+                    safe_job_max = min(128, 128 if os.name == "nt" else cpu_total, cpu_total)
                     default_xtb_jobs = min(8, safe_job_max)
                     screening_xtb_n_jobs = st.number_input(
                         "xTB 并行进程数",
@@ -15503,7 +15647,7 @@ def page_virtual_screening():
                         value=max(1, default_xtb_jobs),
                         step=1,
                         key="vs_xtb_n_jobs_v3",
-                        help="建议 4-8。进程过多会造成 CPU/内存争抢，并不一定更快。",
+                        help="建议 4-16。进程过多会造成 CPU/内存争抢，并不一定更快。",
                     )
                 else:
                     st.metric("当前昂贵特征方法", screening_feature_method)
@@ -15702,6 +15846,25 @@ def page_virtual_screening():
                 "单组分库": "paired",
             }
             formula_progress.progress(24)
+            # 分批控制与暂停按钮
+            col_batch, col_pause, col_batch_size = st.columns([2, 1, 1])
+            with col_batch:
+                st.caption("分批筛选：每批处理配方数")
+            with col_batch_size:
+                batch_process_size = st.number_input("每批配方数", min_value=1000, max_value=50000, value=5000, step=1000, key="vs_batch_size_v2", label_visibility="collapsed")
+            with col_pause:
+                pause_btn = st.button("暂停筛选", key="vs_pause_btn_v2", help="点击后，当前批处理完成后暂停。再次点击可继续。")
+                if pause_btn:
+                    st.session_state["vs_screening_paused"] = True
+            if st.session_state.get("vs_screening_paused", False):
+                resume_col1, resume_col2 = st.columns([3, 1])
+                with resume_col1:
+                    st.warning("筛选已暂停。点击右侧按钮继续。")
+                with resume_col2:
+                    if st.button("继续筛选", key="vs_resume_btn_v2"):
+                        st.session_state["vs_screening_paused"] = False
+                        st.rerun()
+            st.session_state["vs_batch_process_size"] = int(batch_process_size)
             formula_status.info("正在生成虚拟配方设计空间...")
             design_space = enumerate_formulation_candidates(
                 resin_library,
@@ -15712,6 +15875,9 @@ def page_virtual_screening():
                 feature_grid=formula_feature_grid,
                 max_formulations=int(max_formulations),
                 hardener_required=bool(hardener_formula_enabled),
+                max_resin_components=int(max_resin_components),
+                max_hardener_components=int(max_hardener_components),
+                comp_diversity=bool(comp_diversity),
             )
             pool_df = design_space.candidate_df
             observed_anchor_count = 0
@@ -16325,7 +16491,7 @@ def page_virtual_screening():
                     f"{nearest_text}。constraint_match=False，constraint_gap 越小越接近要求。"
                 )
                 with st.expander("筛选漏斗", expanded=False):
-                    st.dataframe(pd.DataFrame(formula_filter_trace), use_container_width=True, height=220)
+                    st.dataframe(pd.DataFrame(formula_filter_trace), width="stretch", height=220)
             elif not out_df.empty:
                 out_df = out_df.copy()
                 out_df["constraint_match"] = True
@@ -16476,13 +16642,17 @@ def page_virtual_screening():
 
             X_rank = X.loc[out_df.index].copy()
             if formula_diversity_enable:
-                final_df = select_diverse_top_candidates(
-                    out_df,
-                    feature_frame=X_rank,
-                    top_k=int(formula_top_k),
-                    score_col=selection_score_col,
-                    similarity_threshold=float(formula_similarity_thr),
-                )
+                try:
+                    final_df = select_diverse_top_candidates(
+                        out_df,
+                        feature_frame=X_rank,
+                        top_k=int(formula_top_k),
+                        score_col=selection_score_col,
+                        similarity_threshold=float(formula_similarity_thr),
+                    )
+                except Exception as _div_err:
+                    st.warning(f"多样性筛选失败: {_div_err}，已回退为直接取前N个候选。")
+                    final_df = out_df.head(int(formula_top_k)).copy()
             else:
                 final_df = out_df.head(int(formula_top_k)).copy()
 
@@ -16495,7 +16665,7 @@ def page_virtual_screening():
                 strategy_bias=model_profile.get("recommended_strategy_bias"),
             )
 
-            if final_df.empty:
+            if final_df is None or final_df.empty:
                 st.warning("⚠️ 多样性筛选后没有候选留下，请适当放宽相似度阈值。")
                 return
 
@@ -16579,7 +16749,7 @@ def page_virtual_screening():
                     st.caption("Top-K 候选来源分布")
                     st.dataframe(
                         origin_counts.value_counts(dropna=False).rename_axis("origin").reset_index(name="count"),
-                        use_container_width=True,
+                        width="stretch",
                     )
 
             if uncertainty_label:
@@ -16613,10 +16783,59 @@ def page_virtual_screening():
                 ] + role_formula_cols + selected_design_cols
                 if c in final_df.columns
             ]
+            # 中文字段名映射
+            _cn_cols = {
+                "formulation_id": "配方编号",
+                "component_role": "组分角色",
+                "primary_smiles": "主体SMILES",
+                "primary_formula": "主体分子式",
+                "resin_smiles": "树脂SMILES",
+                "resin_formula": "树脂分子式",
+                "hardener_smiles": "固化剂SMILES",
+                "hardener_formula": "固化剂分子式",
+                "combo_smiles": "组合SMILES",
+                "combo_formula": "组合分子式",
+                "prediction": "预测值",
+                "prediction_std": "预测标准差",
+                "uncertainty_source": "不确定度来源",
+                "constraint_match": "约束匹配",
+                "constraint_gap": "约束差距",
+                "chem_rule_pass": "化学规则通过",
+                "uncertainty_base_error": "不确定度基准误差",
+                "uncertainty_multiplier": "不确定度乘数",
+                "total_score": "综合评分",
+                "synth_score": "可合成性",
+                "feasibility_score": "可行性",
+                "reaction_score": "反应性",
+                "processability_score": "可加工性",
+                "availability_score": "可获得性",
+                "ad_score": "适用域评分",
+                "novelty_score": "新颖性",
+                "feature_score": "特征评分",
+                "chemistry_label": "化学类别标签",
+                "candidate_origin": "候选来源",
+                "recommended_reason": "推荐理由",
+                "recommended_batch": "推荐批次",
+                "recommended_batch_label": "推荐批次标签",
+                "Resin_Functionality": "树脂官能度",
+                "Hardener_Functionality": "固化剂官能度",
+                "EEW": "环氧当量",
+                "AHEW": "胺当量",
+                "Theoretical_PHR": "理论PHR",
+                "Actual_PHR": "实际PHR",
+                "Stoich_Ratio": "化学计量比",
+                "diversity_rank": "多样性排名",
+                "exploit_score": "开发评分",
+                "explore_score": "探索评分",
+                "target_error": "目标误差",
+                "target_error_prefilter": "预筛目标误差",
+                "prediction_prefilter": "预筛预测值",
+            }
             if show_cols:
-                st.dataframe(final_df[show_cols], use_container_width=True, height=420)
+                display_df = final_df[show_cols].rename(columns=_cn_cols)
+                st.dataframe(display_df, width="stretch", height=420)
             else:
-                st.dataframe(final_df, use_container_width=True, height=420)
+                st.dataframe(final_df, width="stretch", height=420)
 
             batch_frames = {
                 "稳妥冲高": recommendation_batches.get("exploit", pd.DataFrame()),
@@ -16633,9 +16852,10 @@ def page_virtual_screening():
                         extra_batch_cols = [c for c in ["recommended_reason", "recommended_batch"] if c in batch_df.columns]
                         merged_cols = batch_show_cols + [c for c in extra_batch_cols if c not in batch_show_cols]
                         if merged_cols:
-                            st.dataframe(batch_df[merged_cols], use_container_width=True, height=260)
+                            _batch_display = batch_df[merged_cols].rename(columns=_cn_cols)
+                            st.dataframe(_batch_display, width="stretch", height=260)
                         else:
-                            st.dataframe(batch_df, use_container_width=True, height=260)
+                            st.dataframe(batch_df, width="stretch", height=260)
                         batch_csv = batch_df.to_csv(index=False).encode("utf-8-sig")
                         batch_slug = re.sub(r"[^0-9a-zA-Z_]+", "_", batch_label).strip("_") or "batch"
                         batch_export_slug = f"{batch_idx:02d}_{batch_slug}"
@@ -16658,16 +16878,18 @@ def page_virtual_screening():
                 )
                 if preview_n_formula > 0:
                     try:
+                        _img_cols = st.columns(min(3, int(preview_n_formula)))
                         for i in range(int(preview_n_formula)):
                             row = final_df.iloc[i]
                             img = _render_formula_candidate_image(row, sub_size=(220, 220))
                             if img is None:
                                 continue
                             caption = (
-                                f"预测值: {row.get('prediction', np.nan):.4f} | "
+                                f"#{i+1} 预测值: {row.get('prediction', np.nan):.4f} | "
                                 f"总分: {row.get('total_score', np.nan):.2f}"
                             )
-                            st.image(img, caption=caption)
+                            with _img_cols[i % 3]:
+                                st.image(img, caption=caption)
                     except Exception:
                         st.info("未检测到 RDKit Draw，无法生成结构图。")
 
@@ -16752,14 +16974,14 @@ def page_virtual_screening():
                 st.caption("正向特征（Top）")
                 st.dataframe(
                     effect_df[effect_df["effect"] > 0].head(int(top_pos)),
-                    use_container_width=True,
+                    width="stretch",
                     height=240,
                 )
             with col_n:
                 st.caption("负向特征（Top）")
                 st.dataframe(
                     effect_df[effect_df["effect"] < 0].head(int(top_neg)),
-                    use_container_width=True,
+                    width="stretch",
                     height=240,
                 )
 
@@ -16900,7 +17122,7 @@ def page_virtual_screening():
                     st.session_state["vs_pubchem_resin_smiles"] = resin_list
                     st.session_state["vs_pubchem_hardener_smiles"] = hardener_list
                     if resin_list or hardener_list:
-                        st.success(f"PubChem 查询完成：树脂 {len(resin_list)} 条，固化剂 {len(hardener_list)} 条。")
+                        st.success(f"PubChem 查询完成：树脂 {len(resin_list)} 条，固化剂 {len(hardener_list)} 条（已从 PubChem 采样至多 {pubchem_sample_each_pool} 条/类）。")
                     else:
                         st.warning("PubChem 查询完成，但未返回可用候选。请尝试放宽 SMARTS 或减少约束。")
 
@@ -17318,9 +17540,9 @@ def page_virtual_screening():
         max_display_rows = 100
         if len(out_df) > max_display_rows:
             st.info(f"📊 数据集共 {len(out_df)} 行，仅显示前 {max_display_rows} 行")
-            st.dataframe(out_df.head(max_display_rows), use_container_width=True, height=360)
+            st.dataframe(out_df.head(max_display_rows), width="stretch", height=360)
         else:
-            st.dataframe(out_df, use_container_width=True, height=360)
+            st.dataframe(out_df, width="stretch", height=360)
 
         # 分子式图预览
         preview_max = min(12, len(out_df))
@@ -17608,7 +17830,7 @@ def page_hyperparameter_optimization():
                             yaxis_title='R² Score',
                             height=400
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
                     except:
                         pass
 
@@ -17676,7 +17898,7 @@ def page_hyperparameter_optimization():
                                 ax_heat.grid(True, alpha=0.3, linestyle='--')
 
                                 plt.tight_layout()
-                                st.pyplot(fig_heat, use_container_width=True)
+                                st.pyplot(fig_heat, width="stretch")
                             else:
                                 st.info("需要至少2个数值型参数才能绘制热力图")
                         else:
@@ -17764,7 +17986,7 @@ def page_hyperparameter_optimization():
                                 ax_right.grid(True, alpha=0.3, axis='x')
 
                                 plt.suptitle(f'{model_name} - 预测性能分布', fontsize=14, y=0.995)
-                                st.pyplot(fig_scatter, use_container_width=True)
+                                st.pyplot(fig_scatter, width="stretch")
 
                             except Exception as e:
                                 st.error(f"评估失败: {e}")
@@ -18047,9 +18269,9 @@ def page_active_learning():
         max_display_rows = 100
         if len(rec_df) > max_display_rows:
             st.info(f"📊 推荐列表共 {len(rec_df)} 行，仅显示前 {max_display_rows} 行")
-            st.dataframe(rec_df.head(max_display_rows), use_container_width=True)
+            st.dataframe(rec_df.head(max_display_rows), width="stretch")
         else:
-            st.dataframe(rec_df, use_container_width=True)
+            st.dataframe(rec_df, width="stretch")
 
         # 导出
         csv_bytes = rec_df.to_csv(index=False).encode('utf-8-sig')
@@ -18436,7 +18658,7 @@ def page_training_records():
 
             fold_key = "cv_folds.csv"
             if fold_key in extra_tables and not extra_tables[fold_key].empty:
-                st.dataframe(extra_tables[fold_key], use_container_width=True, height=220)
+                st.dataframe(extra_tables[fold_key], width="stretch", height=220)
                 shown_table_keys.add(fold_key)
     elif meta.get("cv_r2_mean") is not None or meta.get("oof_rmse") is not None:
         st.markdown("### 🧪 交叉验证概览")
@@ -18453,13 +18675,13 @@ def page_training_records():
 
         fold_key = "cv_folds.csv"
         if fold_key in extra_tables and not extra_tables[fold_key].empty:
-            st.dataframe(extra_tables[fold_key], use_container_width=True, height=220)
+            st.dataframe(extra_tables[fold_key], width="stretch", height=220)
             shown_table_keys.add(fold_key)
 
     st.markdown("---")
     st.markdown("### 📉 训练曲线")
     if payload.get("training_curve_png"):
-        st.image(payload["training_curve_png"], use_container_width=True)
+        st.image(payload["training_curve_png"], width="stretch")
     else:
         st.info("该记录未包含训练曲线图片（可能为旧版本记录）。")
 
@@ -18481,11 +18703,11 @@ def page_training_records():
                 st.markdown("### 📈 模型表现图")
                 shown = True
             st.markdown(f"**{title}**")
-            st.image(extra_pngs[fn], use_container_width=True)
+            st.image(extra_pngs[fn], width="stretch")
 
     if hist_df is not None and not hist_df.empty:
         st.markdown("### 🧾 训练历史数据")
-        st.dataframe(hist_df, use_container_width=True, height=260)
+        st.dataframe(hist_df, width="stretch", height=260)
         st.download_button(
             "📥 下载训练历史 CSV",
             data=hist_df.to_csv(index=False).encode("utf-8-sig"),
@@ -18518,7 +18740,7 @@ def page_training_records():
                     continue
                 st.markdown(f"**{table_labels.get(key, key)}**")
                 preview_df = df.head(200) if key.startswith("split_") else df
-                st.dataframe(preview_df, use_container_width=True, height=240)
+                st.dataframe(preview_df, width="stretch", height=240)
                 if key.startswith("split_") and len(df) > len(preview_df):
                     st.caption(f"仅预览前 {len(preview_df)} 行，完整数据请下载 CSV。")
                 st.download_button(
@@ -18648,7 +18870,7 @@ def page_training_records():
         with st.expander("🖼️ 其它图表", expanded=False):
             for fn, b in remaining_pngs.items():
                 st.markdown(f"**{fn}**")
-                st.image(b, use_container_width=True)
+                st.image(b, width="stretch")
 
 
 # ============================================================
@@ -18777,7 +18999,7 @@ def page_image_to_smiles():
         # Preview image (skip pdf)
         if uf.type and uf.type.startswith("image/"):
             try:
-                st.image(data, caption=uf.name, use_container_width=True)
+                st.image(data, caption=uf.name, width="stretch")
             except Exception:
                 pass
 
@@ -18820,7 +19042,7 @@ def page_image_to_smiles():
         st.markdown("---")
         st.markdown("### 📌 识别结果汇总")
         df_res = pd.DataFrame(results)
-        st.dataframe(df_res, use_container_width=True)
+        st.dataframe(df_res, width="stretch")
 
         csv_bytes = df_res.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
