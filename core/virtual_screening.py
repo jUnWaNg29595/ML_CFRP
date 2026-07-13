@@ -2,6 +2,8 @@
 """Virtual molecule generation + screening utilities."""
 
 from __future__ import annotations
+import signal
+import os
 
 import itertools
 import inspect
@@ -850,7 +852,18 @@ def _calc_rule_features(smiles: str, allowed_elements: Optional[set]) -> Dict[st
     except Exception:
         pass
 
-    out["epoxide"] = _count_smarts(mol, EPOXIDE_SMARTS)
+    # 对多组分SMILES（含.）拆分成单个分子分别检查官能度
+    # 确保每个单分子都满足官能度要求，而非组合分子累加
+    if "." in str(smiles):
+        parts = [s.strip() for s in str(smiles).split(".") if s.strip()]
+        epoxide_counts = []
+        for part in parts:
+            part_mol = _mol_from_smiles(part)
+            if part_mol is not None:
+                epoxide_counts.append(_count_smarts(part_mol, EPOXIDE_SMARTS))
+        out["epoxide"] = min(epoxide_counts) if epoxide_counts else 0
+    else:
+        out["epoxide"] = _count_smarts(mol, EPOXIDE_SMARTS)
     out["carboxylic_acid"] = _count_smarts(mol, "[CX3](=O)[OX2H1]")
     out["sulfonic_acid"] = _count_smarts(mol, "[SX4](=O)(=O)[OX2H1]")
     out["phosphoric_acid"] = _count_smarts(mol, "[PX4](=O)([OX2H1])([OX2H1])[OX2H1]")
@@ -2564,9 +2577,9 @@ def enumerate_formulation_candidates(
     hard_df = hard_df.dropna(subset=["smiles"]) if "smiles" in hard_df.columns else pd.DataFrame()
 
     if resin_df.empty:
-        return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": 0, "grid_size": 0, "total_possible": 0})
+        return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": total_pairs, "grid_size": 0, "total_possible": 0, "paused": True})
     if hardener_required and hard_df.empty:
-        return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": 0, "grid_size": 0, "total_possible": 0})
+        return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": total_pairs, "grid_size": 0, "total_possible": 0, "paused": True})
 
     use_hardener = not hard_df.empty
 
@@ -2596,6 +2609,7 @@ def enumerate_formulation_candidates(
     grid_keys, grid_values, grid_size = _compute_grid_spec(feature_grid)
     limit = max(1, int(max_formulations))
     total_pairs = 0
+    accumulated_count = 0
 
     all_batches = []
     for batch_result in batch_generate_formulation_pairs(
@@ -2630,11 +2644,6 @@ def enumerate_formulation_candidates(
         )
 
         all_batches.append(pair_df)
-        accumulated_count += len(pair_df)
-        if batch_callback is not None:
-            should_continue = batch_callback(batch_idx=batch_result.batch_idx, total_batches=batch_result.total_batches, batch_count=len(pair_df), total_count=accumulated_count)
-            if not should_continue:
-                break
 
     if not all_batches:
         return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": total_pairs, "grid_size": 0, "total_possible": 0, "paused": True})
@@ -3526,7 +3535,7 @@ def batch_generate_formulation_pairs(
     max_total: int = 50000,
     random_state: int = 42,
 ):
-    """分批生成树脂-固化剂配对，每次返回一批。"""
+    """并行分批生成树脂-固化剂配对，利用多核加速。"""
     batch_size = max(1, int(batch_size))
     max_total = max(1, int(max_total))
 
@@ -3542,7 +3551,6 @@ def batch_generate_formulation_pairs(
     n_h = len(hardener_list) if hardener_list else 0
 
     if hardener_list is None or n_h == 0:
-        # 无固化剂：分批返回树脂
         effective_max = min(n_r, max_total)
         total_batches = max(1, (effective_max + batch_size - 1) // batch_size)
         for batch_idx in range(total_batches):
@@ -3556,33 +3564,36 @@ def batch_generate_formulation_pairs(
                 "combo_smiles": resin_list[start:end],
             })
             yield BatchScreeningResult(
-                batch_idx=batch_idx,
-                pair_df=pair_df,
-                total_batches=total_batches,
+                batch_idx=batch_idx, pair_df=pair_df, total_batches=total_batches,
                 flat_indices_used=np.arange(start, end),
                 metadata={"n_resin": n_r, "n_hardener": 0, "total_pairs": n_r},
             )
         return
 
-    # 有固化剂：从flat索引空间采样
     total_pairs = n_r * n_h
     effective_max = min(total_pairs, max_total)
     total_batches = max(1, (effective_max + batch_size - 1) // batch_size)
 
     rng = np.random.default_rng(random_state)
-    # 只生成flat索引数组（内存占用很小）
     all_flat_indices = rng.choice(total_pairs, size=effective_max, replace=False)
 
-    for batch_idx in range(total_batches):
-        start = batch_idx * batch_size
-        end = min(start + batch_size, effective_max)
-        if start >= effective_max:
-            break
+    # 并行生成多批DataFrame
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import math
 
-        batch_flat = all_flat_indices[start:end]
+    num_workers = max(1, min(128, int(os.cpu_count() if hasattr(os, "cpu_count") else 64)))
+    batch_size_parallel = max(1, int(batch_size))
+
+    # 把所有flat索引切分成num_workers个任务
+    chunk_size = max(1, effective_max // num_workers)
+    chunks = []
+    for chk_start in range(0, effective_max, chunk_size):
+        chk_end = min(chk_start + chunk_size, effective_max)
+        chunks.append(all_flat_indices[chk_start:chk_end])
+
+    def _build_batch_df(batch_flat, batch_offset, n_h, resin_list, hardener_list):
         res_indices = batch_flat // n_h
         hard_indices = batch_flat % n_h
-
         pair_df = pd.DataFrame({
             "resin_smiles": [resin_list[i] for i in res_indices],
             "hardener_smiles": [hardener_list[j] for j in hard_indices],
@@ -3590,17 +3601,47 @@ def batch_generate_formulation_pairs(
         pair_df["combo_smiles"] = [
             _combine_smiles(r, h) for r, h in zip(pair_df["resin_smiles"], pair_df["hardener_smiles"])
         ]
+        return pair_df
 
-        yield BatchScreeningResult(
-            batch_idx=batch_idx,
-            pair_df=pair_df,
-            total_batches=total_batches,
-            flat_indices_used=batch_flat,
-            metadata={
-                "n_resin": n_r,
-                "n_hardener": n_h,
-                "total_pairs": total_pairs,
-                "batch_size": batch_size,
-                "effective_max": effective_max,
-            },
-        )
+    if num_workers <= 1 or total_batches <= 1:
+        # 单线程回退
+        for batch_idx in range(total_batches):
+            start = batch_idx * batch_size_parallel
+            end = min(start + batch_size_parallel, effective_max)
+            if start >= effective_max:
+                break
+            batch_flat = all_flat_indices[start:end]
+            pair_df = _build_batch_df(batch_flat, start, n_h, resin_list, hardener_list)
+            yield BatchScreeningResult(
+                batch_idx=batch_idx, pair_df=pair_df, total_batches=total_batches,
+                flat_indices_used=batch_flat,
+                metadata={"n_resin": n_r, "n_hardener": n_h, "total_pairs": total_pairs,
+                          "batch_size": batch_size_parallel, "effective_max": effective_max},
+            )
+    else:
+        # 多线程并行构建DataFrame
+        future_to_batch = {}
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            batch_offset = 0
+            for chk_idx, chunk in enumerate(chunks):
+                if len(chunk) == 0:
+                    continue
+                fut = executor.submit(_build_batch_df, chunk, batch_offset, n_h, resin_list, hardener_list)
+                future_to_batch[fut] = (chk_idx, chunk, batch_offset)
+                batch_offset += len(chunk)
+
+            results = {}
+            for fut in as_completed(future_to_batch):
+                chk_idx, chunk, offset = future_to_batch[fut]
+                pair_df = fut.result()
+                results[chk_idx] = (offset, chunk, pair_df)
+
+            # 按顺序yield
+            for chk_idx in sorted(results.keys()):
+                offset, chunk, pair_df = results[chk_idx]
+                yield BatchScreeningResult(
+                    batch_idx=chk_idx, pair_df=pair_df, total_batches=len(chunks),
+                    flat_indices_used=chunk,
+                    metadata={"n_resin": n_r, "n_hardener": n_h, "total_pairs": total_pairs,
+                              "batch_size": batch_size_parallel, "effective_max": effective_max},
+                )

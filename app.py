@@ -58,27 +58,6 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 # [关键] 设置 PyTorch CUDA 内存分配器
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
-# 消除 Streamlit ScriptRunContext 警告（在bare mode下无影响）
-for _logger_name in [
-    "streamlit.runtime.scriptrunner_utils.script_run_context",
-    "streamlit.runtime.scriptrunner.script_run_context",
-    "streamlit",
-]:
-    logging.getLogger(_logger_name).setLevel(logging.ERROR)
-
-# 补丁：彻底屏蔽 ScriptRunContext 的 warning 输出
-try:
-    from streamlit.runtime.scriptrunner_utils import script_run_context as _src_mod
-    if hasattr(_src_mod, 'logger'):
-        _src_mod.logger.setLevel(logging.ERROR)
-except Exception:
-    pass
-try:
-    from streamlit.runtime.scriptrunner import script_run_context as _src_mod2
-    if hasattr(_src_mod2, 'logger'):
-        _src_mod2.logger.setLevel(logging.ERROR)
-except Exception:
-    pass
 
 def _configure_thread_limits():
     """在导入任何库之前配置线程限制"""
@@ -127,7 +106,7 @@ if os.environ.get("CFRP_ENABLE_PERF_PATCHES", "0") == "1":
     except Exception as e:
         print(f"⚠️  性能加速器加载失败: {e}")
 else:
-    print("[DEBUG] Performance patches disabled for stability")
+    pass
 # ============================================
 
 # [新增] TensorFlow Sequential (TFS) 模型支持（即使未安装 TF 也要显示入口）
@@ -191,6 +170,29 @@ except ImportError:
     TORCHANI_AVAILABLE = False
 import streamlit as st
 import streamlit.components.v1 as components
+
+# 消除 Streamlit ScriptRunContext 警告（必须放在import之后）
+for _logger_name in [
+    "streamlit.runtime.scriptrunner_utils.script_run_context",
+    "streamlit.runtime.scriptrunner.script_run_context",
+    "streamlit.runtime.state.session_state_proxy",
+    "streamlit",
+]:
+    logging.getLogger(_logger_name).setLevel(logging.ERROR)
+
+# 补丁：彻底屏蔽 ScriptRunContext 的 warning 输出
+try:
+    from streamlit.runtime.scriptrunner_utils import script_run_context as _src_mod
+    if hasattr(_src_mod, 'logger'):
+        _src_mod.logger.setLevel(logging.ERROR)
+except Exception:
+    pass
+try:
+    from streamlit.runtime.scriptrunner import script_run_context as _src_mod2
+    if hasattr(_src_mod2, 'logger'):
+        _src_mod2.logger.setLevel(logging.ERROR)
+except Exception:
+    pass
 
 # =========================
 # Streamlit 性能优化配置
@@ -14991,8 +14993,10 @@ def page_virtual_screening():
             def _tick(message: str):
                 nonlocal query_done
                 query_done += 1
-                progress_bar.progress(min(100, int(query_done * 100 / total_queries)))
-                progress_text.info(f"{progress_label}: {message} ({query_done}/{total_queries})")
+                _pc_progress.progress(min(100, int(query_done * 100 / total_queries)))
+                _pc_status.write(f"{progress_label}: {message} ({query_done}/{total_queries})")
+                if query_done >= total_queries:
+                    _pc_progress.progress(100)
 
             def _fetch_pubchem_smiles_direct(query_text: str, query_max_cids: int, property_workers: int):
                 from core.pubchem_client import fetch_smiles_by_smarts
@@ -15261,7 +15265,9 @@ def page_virtual_screening():
             pubchem_seed = st.number_input("PubChem 随机种子", 0, 10_000_000, 42, key="vs_formula_pubchem_seed_v4")
             st.caption("已下载过的查询会从磁盘缓存秒级读取；所有缓存和在线结果都会再用 RDKit 复核子结构。")
             if st.button("🔎 从 PubChem 拉取候选", key="vs_formula_pubchem_fetch_v4"):
-                with st.spinner("正在从 PubChem 拉取候选..."):
+                _pc_status = st.status("正在从 PubChem 拉取候选...", expanded=True)
+                _pc_progress = st.progress(0)
+                with _pc_status:
                     fetched_resin, fetched_hard, hard_errors = _fetch_pubchem_candidate_sets(
                         pubchem_resin_smarts,
                         pubchem_hardener_classes if (hardener_formula_enabled or primary_component_role == "hardener") else [],
@@ -15281,12 +15287,16 @@ def page_virtual_screening():
                     st.session_state["vs_formula_pubchem_primary_smiles_v4"] = primary_fetched
                     st.session_state["vs_formula_pubchem_secondary_smiles_v4"] = secondary_fetched
                     if primary_fetched or secondary_fetched:
+                        _pc_status.update(label=f"✅ PubChem 查询完成：{primary_role_label} {len(primary_fetched)} 条" + (f"，第二组分 {len(secondary_fetched)} 条" if hardener_formula_enabled else ""), state="complete")
+                        _pc_progress.progress(100)
                         st.success(
                             f"PubChem 查询完成：{primary_role_label} {len(primary_fetched)} 条"
                             + (f"，第二组分 {len(secondary_fetched)} 条。" if hardener_formula_enabled else "。")
                             + f"（树脂采样至多 {pubchem_resin_sample_each} 条，固化剂每类采样至多 {pubchem_hardener_sample_each} 条）"
                         )
                     else:
+                        _pc_status.update(label="⚠️ PubChem 查询未返回候选", state="error")
+                        _pc_progress.progress(100)
                         st.warning("PubChem 查询完成，但未返回可用候选。请尝试放宽 SMARTS 或减少约束。")
 
             pubchem_resin_pool = st.session_state.get("vs_formula_pubchem_primary_smiles_v4") or []
@@ -15717,8 +15727,9 @@ def page_virtual_screening():
             formula_run_t0 = time.time()
             formula_status = st.empty()
             formula_progress = st.progress(1)
-            formula_status.info("正在初始化配方级高通量筛选...")
+            _vs_start_time = time.time()
             _vs_pause_flag = [False]
+            formula_status.info("正在初始化配方级高通量筛选...")
             resin_libraries = []
             hardener_libraries = []
 
@@ -15846,7 +15857,6 @@ def page_virtual_screening():
                 "按行配对": "paired",
                 "单组分库": "paired",
             }
-            formula_progress.progress(24)
             # 分批控制与暂停按钮
             col_batch, col_pause, col_batch_size = st.columns([2, 1, 1])
             with col_batch:
@@ -15868,10 +15878,8 @@ def page_virtual_screening():
                         _vs_pause_flag[0] = False
                         st.rerun()
             st.session_state["vs_batch_process_size"] = int(batch_process_size)
+            formula_progress.progress(24)
             formula_status.info("正在生成虚拟配方设计空间...")
-            batch_size = st.session_state.get("vs_batch_process_size", 5000)
-            total_pairs = len(resin_library) * (len(hardener_library) if hardener_formula_enabled and hardener_library is not None else 1)
-            total_batches = max(1, (min(total_pairs, int(max_pairs_formula)) + batch_size - 1) // batch_size)
             def _batch_callback(batch_idx, total_batches, batch_count, total_count):
                 return not _vs_pause_flag[0]
             design_space = enumerate_formulation_candidates(
@@ -17115,7 +17123,9 @@ def page_virtual_screening():
 
             fetch_btn = st.button("🔎 从 PubChem 获取候选", key="vs_pubchem_fetch")
             if fetch_btn:
-                with st.spinner("正在从 PubChem 拉取候选…"):
+                _pc_status2 = st.status("正在从 PubChem 拉取候选...", expanded=True)
+                _pc_progress2 = st.progress(0)
+                with _pc_status2:
                     resin_list, hardener_list, hardener_errors = _fetch_pubchem_candidate_sets(
                         resin_smarts,
                         hardener_classes,
@@ -17131,8 +17141,12 @@ def page_virtual_screening():
                     st.session_state["vs_pubchem_resin_smiles"] = resin_list
                     st.session_state["vs_pubchem_hardener_smiles"] = hardener_list
                     if resin_list or hardener_list:
+                        _pc_status2.update(label=f"✅ PubChem 查询完成：树脂 {len(resin_list)} 条，固化剂 {len(hardener_list)} 条", state="complete")
+                        _pc_progress2.progress(100)
                         st.success(f"PubChem 查询完成：树脂 {len(resin_list)} 条，固化剂 {len(hardener_list)} 条（已从 PubChem 采样至多 {pubchem_sample_each_pool} 条/类）。")
                     else:
+                        _pc_status2.update(label="⚠️ PubChem 查询未返回候选", state="error")
+                        _pc_progress2.progress(100)
                         st.warning("PubChem 查询完成，但未返回可用候选。请尝试放宽 SMARTS 或减少约束。")
 
             resin_list = st.session_state.get("vs_pubchem_resin_smiles") or []
