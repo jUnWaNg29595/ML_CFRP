@@ -15718,6 +15718,7 @@ def page_virtual_screening():
             formula_status = st.empty()
             formula_progress = st.progress(1)
             formula_status.info("正在初始化配方级高通量筛选...")
+            _vs_pause_flag = [False]
             resin_libraries = []
             hardener_libraries = []
 
@@ -15856,6 +15857,7 @@ def page_virtual_screening():
                 pause_btn = st.button("暂停筛选", key="vs_pause_btn_v2", help="点击后，当前批处理完成后暂停。再次点击可继续。")
                 if pause_btn:
                     st.session_state["vs_screening_paused"] = True
+                    _vs_pause_flag[0] = True
             if st.session_state.get("vs_screening_paused", False):
                 resume_col1, resume_col2 = st.columns([3, 1])
                 with resume_col1:
@@ -15863,9 +15865,15 @@ def page_virtual_screening():
                 with resume_col2:
                     if st.button("继续筛选", key="vs_resume_btn_v2"):
                         st.session_state["vs_screening_paused"] = False
+                        _vs_pause_flag[0] = False
                         st.rerun()
             st.session_state["vs_batch_process_size"] = int(batch_process_size)
             formula_status.info("正在生成虚拟配方设计空间...")
+            batch_size = st.session_state.get("vs_batch_process_size", 5000)
+            total_pairs = len(resin_library) * (len(hardener_library) if hardener_formula_enabled and hardener_library is not None else 1)
+            total_batches = max(1, (min(total_pairs, int(max_pairs_formula)) + batch_size - 1) // batch_size)
+            def _batch_callback(batch_idx, total_batches, batch_count, total_count):
+                return not _vs_pause_flag[0]
             design_space = enumerate_formulation_candidates(
                 resin_library,
                 hardener_library if hardener_formula_enabled else None,
@@ -15878,6 +15886,7 @@ def page_virtual_screening():
                 max_resin_components=int(max_resin_components),
                 max_hardener_components=int(max_hardener_components),
                 comp_diversity=bool(comp_diversity),
+                batch_callback=_batch_callback,
             )
             pool_df = design_space.candidate_df
             observed_anchor_count = 0

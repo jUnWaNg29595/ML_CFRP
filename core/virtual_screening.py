@@ -2551,8 +2551,11 @@ def enumerate_formulation_candidates(
     max_resin_components: int = 1,
     max_hardener_components: int = 1,
     comp_diversity: bool = True,
+    batch_callback: Optional[callable] = None,
 ) -> FormulaDesignSpace:
-    """Generate formulation design space via batched sampling to avoid OOM."""
+    """Generate formulation design space via batched sampling to avoid OOM.
+    Supports batch_callback(batch_idx, total_batches, batch_count, total_count) -> bool.
+    Return False from callback to pause/abort."""
     feature_grid = feature_grid or {}
     resin_df = resin_library.copy() if resin_library is not None else pd.DataFrame()
     hard_df = hardener_library.copy() if hardener_library is not None else pd.DataFrame()
@@ -2627,9 +2630,14 @@ def enumerate_formulation_candidates(
         )
 
         all_batches.append(pair_df)
+        accumulated_count += len(pair_df)
+        if batch_callback is not None:
+            should_continue = batch_callback(batch_idx=batch_result.batch_idx, total_batches=batch_result.total_batches, batch_count=len(pair_df), total_count=accumulated_count)
+            if not should_continue:
+                break
 
     if not all_batches:
-        return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": 0, "grid_size": 0, "total_possible": 0})
+        return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": total_pairs, "grid_size": 0, "total_possible": 0, "paused": True})
 
     base = pd.concat(all_batches, ignore_index=True)
     sampled_pairs = int(len(base))
