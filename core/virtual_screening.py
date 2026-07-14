@@ -3645,3 +3645,150 @@ def batch_generate_formulation_pairs(
                     metadata={"n_resin": n_r, "n_hardener": n_h, "total_pairs": total_pairs,
                               "batch_size": batch_size_parallel, "effective_max": effective_max},
                 )
+
+
+# =============================================================================
+# 工业级分子过滤：排除药物、试剂、不适用的化合物
+# =============================================================================
+
+def filter_industrial_candidates(
+    smiles_list: List[str],
+    *,
+    max_melting_point: float = 130.0,
+    min_melting_point: float = -50.0,
+    min_mol_wt: float = 80.0,
+    max_mol_wt: float = 800.0,
+    min_logp: float = -1.0,
+    max_logp: float = 6.0,
+    min_heavy_atoms: int = 4,
+    max_heavy_atoms: int = 60,
+    reject_lipinski_violators: bool = True,
+    reject_pains: bool = True,
+    max_rotatable_bonds: int = 15,
+    label: str = "分子",
+) -> Tuple[List[str], Dict[str, int]]:
+    """对SMILES列表应用工业级过滤，排除药品/试剂/不适用的化合物。
+    返回 (通过列表, 过滤统计)。"""
+    if not RDKIT_AVAILABLE or not smiles_list:
+        return list(smiles_list), {"total": len(smiles_list), "passed": len(smiles_list), "skipped_no_rdkit": len(smiles_list)}
+
+    passed = []
+    stats = {"total": len(smiles_list), "passed": 0, "failed_parse": 0, "failed_melting": 0, "failed_mol_wt": 0, "failed_logp": 0, "failed_heavy": 0, "failed_rotatable": 0, "failed_lipinski": 0, "failed_pains": 0}
+
+    # 常见PAINS子结构（简化版）
+    pains_smarts = [
+        "[#6]=[#6]-[#6]=[#6]-[#6]=[#6]",  # 过长共轭
+        "[CX3](=[OX1])[OX2][CX3](=[OX1])",  # 酸酐
+        "[#7][#7]=[#6]",  # 腙
+        "[#16][#6](=[#8])[#6]",  # 硫酯
+        "[#6](=[#8])[#6](=[#8])",  # 二酮
+        "[#7]=[#6]-[#6]#[#7]",  # 烯腈
+        "[#16]-[#16]",  # 二硫键
+        "[#6]=[#6]-[#6]#[#6]",  # 烯炔
+    ]
+    pains_mols = []
+    for sma in pains_smarts:
+        try:
+            pains_mols.append(Chem.MolFromSmarts(sma))
+        except Exception:
+            pains_mols.append(None)
+
+    for smi in smiles_list:
+        if not smi or not str(smi).strip():
+            stats["failed_parse"] += 1
+            continue
+        try:
+            mol = Chem.MolFromSmiles(str(smi).strip())
+            if mol is None:
+                stats["failed_parse"] += 1
+                continue
+        except Exception:
+            stats["failed_parse"] += 1
+            continue
+
+        # 分子量过滤
+        mw = Descriptors.MolWt(mol)
+        if mw < min_mol_wt or mw > max_mol_wt:
+            stats["failed_mol_wt"] += 1
+            continue
+
+        # 重原子数
+        heavy = mol.GetNumHeavyAtoms()
+        if heavy < min_heavy_atoms or heavy > max_heavy_atoms:
+            stats["failed_heavy"] += 1
+            continue
+
+        # 可旋转键
+        rot = Descriptors.NumRotatableBonds(mol)
+        if rot > max_rotatable_bonds:
+            stats["failed_rotatable"] += 1
+            continue
+
+        # LogP
+        logp = Descriptors.MolLogP(mol)
+        if logp < min_logp or logp > max_logp:
+            stats["failed_logp"] += 1
+            continue
+
+        # 熔点预测（Joback法简化：基于分子量+可旋转键的粗略估计）
+        # 真实熔点预测需要更复杂的模型，这里用RDKit描述符估算
+        # 使用经验公式：Tm ≈ 200 + 0.4*MW - 50*logP - 10*rot
+        est_tm = 200.0 + 0.4 * mw - 50.0 * logp - 10.0 * rot
+        if est_tm > max_melting_point or est_tm < min_melting_point:
+            stats["failed_melting"] += 1
+            continue
+
+        # Lipinski规则检查（排除药物特征）
+        if reject_lipinski_violators:
+            violations = 0
+            if mw > 500: violations += 1
+            if logp > 5: violations += 1
+            if Descriptors.NumHDonors(mol) > 5: violations += 1
+            if Descriptors.NumHAcceptors(mol) > 10: violations += 1
+            if violations >= 2:  # 违反2条及以上
+                stats["failed_lipinski"] += 1
+                continue
+
+        # PAINS过滤
+        if reject_pains:
+            is_pains = False
+            for p_mol in pains_mols:
+                if p_mol is not None and mol.HasSubstructMatch(p_mol):
+                    is_pains = True
+                    break
+            if is_pains:
+                stats["failed_pains"] += 1
+                continue
+
+        passed.append(str(smi).strip())
+        stats["passed"] += 1
+
+    # 去重
+    seen = set()
+    deduped = []
+    for s in passed:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    stats["passed"] = len(deduped)
+    stats["dedup_removed"] = len(passed) - len(deduped)
+
+    return deduped, stats
+
+
+def render_industrial_filter_ui(st_module, label: str = "固化剂"):
+    """在Streamlit中渲染工业过滤控件，返回过滤配置。"""
+    with st_module.expander(f"工业级候选过滤（{label}）", expanded=False):
+        st_module.caption("排除药品/试剂/不适用的化合物，保留工业可用候选")
+        col1, col2, col3 = st_module.columns(3)
+        with col1:
+            enable_filter = st_module.checkbox(f"启用{label}工业过滤", value=True, key=f"vs_ind_filter_enable_{label}")
+            max_mp = st_module.number_input(f"最高估算熔点(°C)", 0, 500, 130, key=f"vs_ind_max_mp_{label}")
+        with col2:
+            min_mw = st_module.number_input(f"最小分子量", 20, 500, 80, key=f"vs_ind_min_mw_{label}")
+            max_mw = st_module.number_input(f"最大分子量", 100, 2000, 800, key=f"vs_ind_max_mw_{label}")
+        with col3:
+            min_logp = st_module.number_input(f"最小LogP", -5, 5, -1, key=f"vs_ind_min_logp_{label}")
+            max_logp = st_module.number_input(f"最大LogP", 0, 15, 6, key=f"vs_ind_max_logp_{label}")
+        st_module.caption("已启用：PAINS排除 + Lipinski违规模块 + 重原子/可旋转键约束")
+    return enable_filter, {"max_melting_point": float(max_mp), "min_mol_wt": float(min_mw), "max_mol_wt": float(max_mw), "min_logp": float(min_logp), "max_logp": float(max_logp)}

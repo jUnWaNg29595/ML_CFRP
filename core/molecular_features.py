@@ -3544,11 +3544,9 @@ class XTBFeatureExtractor:
         use_pool = False
         if os.name == 'nt':
             if n_jobs > 61:
-                # Windows 下 ProcessPoolExecutor 限制 61，但 multiprocessing.Pool 可能支持更多
-                print(f"⚠️ Windows 环境：尝试使用 multiprocessing.Pool 支持 {n_jobs} 个进程")
-                use_pool = True
-            else:
-                use_pool = False
+                print(f"⚠️ Windows 环境：multiprocessing.Pool 最多支持 61 个进程，将 n_jobs 从 {n_jobs} 降为 61")
+                n_jobs = 61
+            use_pool = False
         else:
             # Linux 无限制，优先使用 ProcessPoolExecutor（更现代）
             use_pool = False
@@ -3566,7 +3564,7 @@ class XTBFeatureExtractor:
             print(f"🚀 使用 {n_jobs} 个进程并行计算 xTB 特征...")
 
             if use_pool:
-                # 使用 multiprocessing.Pool（可能支持 >61 进程）
+                # 使用 multiprocessing.Pool（仅Linux，Windows限制61）
                 try:
                     with mp.Pool(processes=n_jobs) as pool:
                         results = []

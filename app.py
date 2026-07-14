@@ -7466,7 +7466,7 @@ def page_molecular_features():
             # xTB 并行进程数：默认限制在 8，避免外部进程与 BLAS/OpenMP 线程争抢。
             cpu_count = os.cpu_count() or 1
             if os.name == 'nt':
-                max_workers = min(cpu_count, 128)
+                max_workers = min(cpu_count, 61)
                 default_jobs = min(cpu_count, 8)
                 help_text = f"检测到 {cpu_count} 个 CPU 核心。推荐 4-8 个进程；Windows 最多允许 61。"
             else:
@@ -14348,6 +14348,16 @@ def page_virtual_screening():
         summarize_smiles_stats,
     )
 
+    # 工业级过滤模块（二阶段智能过滤）
+    from core.industrial_filter import (
+        classify_hardener,
+        batch_classify,
+        pipeline_industrial_filter,
+        render_industrial_filter_ui,
+        filter_industrial_candidates,
+        extract_known_hardeners_from_training_data,
+    )
+
     hardener_required = bool(mf_cfg.get("hardener_col") or mf_cfg.get("hardener_component_cols"))
     hardener_formula_enabled = bool(hardener_required)
     primary_component_role = infer_primary_component_role(mf_cfg)
@@ -15263,6 +15273,9 @@ def page_virtual_screening():
                     key="vs_formula_pubchem_hardener_sample_each_v4",
                 )
             pubchem_seed = st.number_input("PubChem 随机种子", 0, 10_000_000, 42, key="vs_formula_pubchem_seed_v4")
+            # 工业级过滤配置
+            _ind_enable_resin, _ind_cfg_resin = render_industrial_filter_ui(st, "树脂")
+            _ind_enable_hard, _ind_cfg_hard = render_industrial_filter_ui(st, "固化剂")
             st.caption("已下载过的查询会从磁盘缓存秒级读取；所有缓存和在线结果都会再用 RDKit 复核子结构。")
             if st.button("🔎 从 PubChem 拉取候选", key="vs_formula_pubchem_fetch_v4"):
                 _pc_status = st.status("正在从 PubChem 拉取候选...", expanded=True)
@@ -15284,6 +15297,11 @@ def page_virtual_screening():
 
                     primary_fetched = fetched_hard if primary_component_role == "hardener" else fetched_resin
                     secondary_fetched = fetched_hard if primary_component_role != "hardener" else []
+                    # 应用工业过滤
+                    if _ind_enable_resin and primary_fetched:
+                        primary_fetched, _resin_stats = filter_industrial_candidates(primary_fetched, label="树脂", **_ind_cfg_resin)
+                    if _ind_enable_hard and secondary_fetched:
+                        secondary_fetched, _hard_stats = filter_industrial_candidates(secondary_fetched, label="固化剂", **_ind_cfg_hard)
                     st.session_state["vs_formula_pubchem_primary_smiles_v4"] = primary_fetched
                     st.session_state["vs_formula_pubchem_secondary_smiles_v4"] = secondary_fetched
                     if primary_fetched or secondary_fetched:
@@ -15648,7 +15666,7 @@ def page_virtual_screening():
             with expensive_col2:
                 if screening_uses_xtb:
                     cpu_total = max(1, int(os.cpu_count() or 1))
-                    safe_job_max = min(128, 128 if os.name == "nt" else cpu_total, cpu_total)
+                    safe_job_max = min(61 if os.name == "nt" else 128, cpu_total)
                     default_xtb_jobs = min(8, safe_job_max)
                     screening_xtb_n_jobs = st.number_input(
                         "xTB 并行进程数",
@@ -17120,6 +17138,9 @@ def page_virtual_screening():
                 42,
                 key="vs_pubchem_seed",
             )
+            # 工业级过滤配置
+            _ind_enable_resin2, _ind_cfg_resin2 = render_industrial_filter_ui(st, "树脂")
+            _ind_enable_hard2, _ind_cfg_hard2 = render_industrial_filter_ui(st, "固化剂")
 
             fetch_btn = st.button("🔎 从 PubChem 获取候选", key="vs_pubchem_fetch")
             if fetch_btn:
@@ -17138,6 +17159,11 @@ def page_virtual_screening():
                     if hardener_errors:
                         st.warning("部分固化剂 PubChem 查询失败：\n" + "\n".join(hardener_errors[:6]))
 
+                    # 应用工业过滤
+                    if _ind_enable_resin2 and resin_list:
+                        resin_list, _r_stats2 = filter_industrial_candidates(resin_list, label="树脂", **_ind_cfg_resin2)
+                    if _ind_enable_hard2 and hardener_list:
+                        hardener_list, _h_stats2 = filter_industrial_candidates(hardener_list, label="固化剂", **_ind_cfg_hard2)
                     st.session_state["vs_pubchem_resin_smiles"] = resin_list
                     st.session_state["vs_pubchem_hardener_smiles"] = hardener_list
                     if resin_list or hardener_list:
