@@ -24,7 +24,7 @@ except Exception:  # pragma: no cover - optional dependency
     rdMolDescriptors = None
     RDKIT_AVAILABLE = False
 
-from .smiles_utils import normalize_chemical_string
+from .smiles_utils import normalize_chemical_string, parse_chemical_string
 
 
 DEFAULT_EPOXY_RULES = {
@@ -152,6 +152,101 @@ def infer_primary_component_role(mf_cfg: Optional[Dict]) -> str:
     if resin_score > hardener_score:
         return "resin"
     return "neutral"
+
+
+def resolve_component_smiles_cols(
+    mf_cfg: Optional[Dict],
+    role: str,
+    available_columns: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Resolve source SMILES columns without confusing the model's primary role.
+
+    Older feature-process files sometimes stored curing-agent columns in
+    ``resin_component_cols`` because that field represented the model's
+    primary input rather than the chemical role.  Prefer explicit role
+    columns, then recover numbered columns from the source dataframe.
+    """
+    cfg = mf_cfg or {}
+    target_role = str(role or "").strip().lower()
+    if target_role not in {"resin", "hardener"}:
+        return []
+
+    hardener_tokens = (
+        "hardener",
+        "curing_agent",
+        "curingagent",
+        "curative",
+        "固化剂",
+        "交联剂",
+    )
+    resin_tokens = ("resin", "epoxy", "树脂", "基体")
+
+    def _role_score(name: Any, candidate_role: str) -> int:
+        text = str(name or "").lower()
+        own_tokens = resin_tokens if candidate_role == "resin" else hardener_tokens
+        other_tokens = hardener_tokens if candidate_role == "resin" else resin_tokens
+        own = sum(text.count(token) for token in own_tokens)
+        other = sum(text.count(token) for token in other_tokens)
+        return own - other
+
+    def _dedupe(values: Iterable[Any]) -> List[str]:
+        result = []
+        seen = set()
+        for value in values:
+            name = str(value or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            result.append(name)
+        return result
+
+    def _natural_key(name: str):
+        match = re.search(r"(\d+)(?:\D*)$", str(name))
+        return (str(name).lower() if not match else str(name)[: match.start()].lower(), int(match.group(1)) if match else -1)
+
+    if target_role == "resin":
+        configured = list(cfg.get("resin_component_cols") or [])
+        selector = cfg.get("smiles_col")
+    else:
+        configured = list(cfg.get("hardener_component_cols") or [])
+        selector = cfg.get("hardener_col")
+
+    configured = _dedupe(configured)
+    if selector:
+        configured = _dedupe([*configured, selector])
+
+    available = _dedupe(available_columns or [])
+    available_set = set(available)
+    role_columns = [name for name in configured if _role_score(name, target_role) > 0]
+    opposite_role = "hardener" if target_role == "resin" else "resin"
+    opposite_columns = [name for name in configured if _role_score(name, opposite_role) > 0]
+    if role_columns:
+        resolved = [name for name in role_columns if not available or name in available_set]
+        if resolved:
+            return sorted(resolved, key=_natural_key)
+    if opposite_columns:
+        if target_role == "hardener":
+            resolved = [name for name in opposite_columns if not available or name in available_set]
+            if resolved:
+                return sorted(resolved, key=_natural_key)
+    elif configured and not available:
+        return sorted(configured, key=_natural_key)
+
+    if target_role == "resin":
+        matches = [
+            name
+            for name in available
+            if _role_score(name, "resin") > 0
+            and re.search(r"(smiles|bigsmiles|smile)", str(name), flags=re.I)
+        ]
+    else:
+        matches = [
+            name
+            for name in available
+            if _role_score(name, "hardener") > 0
+            and re.search(r"(smiles|bigsmiles|smile)", str(name), flags=re.I)
+        ]
+    return sorted(matches, key=_natural_key)
 
 
 def _pick_matching_column(columns: Sequence[str], aliases: Sequence[str]) -> Optional[str]:
@@ -384,11 +479,8 @@ def calc_mol_formula(smiles: str) -> Optional[str]:
         return None
     if smiles is None:
         return None
-    s = normalize_chemical_string(smiles, canonicalize=False, repair=True, keep_largest_frag=False)
-    if not s:
-        return None
     try:
-        mol = Chem.MolFromSmiles(s)
+        mol = parse_chemical_string(smiles, repair=True, keep_largest_frag=False)
         if mol is None:
             return None
         return rdMolDescriptors.CalcMolFormula(mol)
@@ -759,13 +851,7 @@ def _mol_from_smiles(smiles: str):
         return None
     if smiles is None:
         return None
-    s = normalize_chemical_string(smiles, canonicalize=False, repair=True, keep_largest_frag=False)
-    if not s:
-        return None
-    try:
-        return Chem.MolFromSmiles(s)
-    except Exception:
-        return None
+    return parse_chemical_string(smiles, repair=True, keep_largest_frag=False)
 
 
 _SMARTS_CACHE: Dict[str, Optional["Chem.Mol"]] = {}
@@ -1394,7 +1480,9 @@ def build_feature_matrix(
         fp_cols = [c for c in X.columns if ("maccs" in c.lower()) or ("morgan" in c.lower())]
         if fp_cols:
             X[fp_cols] = X[fp_cols].fillna(0)
-    return X
+    for col in X.columns:
+        X[col] = pd.to_numeric(X[col], errors="coerce")
+    return X.replace([np.inf, -np.inf], np.nan).astype(float)
 
 
 def add_candidate_equivalent_metrics(
@@ -1636,6 +1724,10 @@ def predict_with_model(
     imputer=None,
     scaler=None,
 ) -> np.ndarray:
+    X = build_feature_matrix(
+        list(X.columns) if isinstance(X, pd.DataFrame) else [],
+        X if isinstance(X, pd.DataFrame) else pd.DataFrame(X),
+    )
     if pipeline is not None:
         return pipeline.predict(X)
     X_arr = X.values
@@ -2753,6 +2845,8 @@ def _predict_with_uncertainty_impl(
     scaler=None,
     mc_samples: Optional[int] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], str]:
+    if isinstance(X, pd.DataFrame):
+        X = build_feature_matrix(list(X.columns), X)
     mean = np.asarray(predict_with_model(model, X, pipeline=pipeline, imputer=imputer, scaler=scaler), dtype=float).reshape(-1)
 
     if pipeline is not None and hasattr(pipeline, "predict_with_uncertainty"):
@@ -3697,12 +3791,8 @@ def filter_industrial_candidates(
         if not smi or not str(smi).strip():
             stats["failed_parse"] += 1
             continue
-        try:
-            mol = Chem.MolFromSmiles(str(smi).strip())
-            if mol is None:
-                stats["failed_parse"] += 1
-                continue
-        except Exception:
+        mol = parse_chemical_string(smi, repair=True, keep_largest_frag=False)
+        if mol is None:
             stats["failed_parse"] += 1
             continue
 

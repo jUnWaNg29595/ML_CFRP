@@ -11,20 +11,20 @@ from typing import Optional
 
 _APPLIED = False
 
-# ── 配色方案 ──
-TRAIN_COLOR = "#4C78A8"   # 沉稳蓝
-TEST_COLOR  = "#E45756"   # 柔和红
-OOF_COLOR   = "#72B7B2"   # 青绿
-ACCENT_COLOR = "#F58518"  # 橙色强调
-GRID_COLOR  = "#E0E0E0"   # 浅灰网格
-BG_COLOR    = "#FAFAFA"   # 微灰背景
-TEXT_COLOR  = "#333333"    # 深灰文字
+# ── 配色方案（科研风格）────────────────────────────────────────
+TRAIN_COLOR = "#2563EB"    # 主蓝色
+TEST_COLOR  = "#DC2626"    # 红色
+OOF_COLOR   = "#059669"    # 绿色
+ACCENT_COLOR = "#0891B2"   # 青绿
+GRID_COLOR  = "#E2E8F0"    # 浅灰网格
+BG_COLOR    = "#FFFFFF"    # 白色背景
+TEXT_COLOR  = "#1E293B"    # 深灰文字
 
-# 多色调色板（用于特征重要性等）
+# 多色调色板（科研风格）
 PALETTE = [
-    "#4C78A8", "#F58518", "#E45756", "#72B7B2",
-    "#54A24B", "#EECA3B", "#B279A2", "#FF9DA6",
-    "#9D755D", "#BAB0AC",
+    "#2563EB", "#0891B2", "#059669", "#D97706",
+    "#DC2626", "#7C3AED", "#DB2777", "#0284C7",
+    "#65A30D", "#64748B",
 ]
 
 

@@ -15,6 +15,8 @@ from __future__ import annotations
 from . import thread_config
 
 import re
+import threading
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import List, Optional, Tuple, Dict, Any
 
@@ -22,14 +24,57 @@ import numpy as np
 import pandas as pd
 
 try:
-    from rdkit import Chem
+    from rdkit import Chem, RDLogger
     from rdkit.Chem.SaltRemover import SaltRemover
 
     RDKIT_AVAILABLE = True
 except Exception:
     RDKIT_AVAILABLE = False
     Chem = None
+    RDLogger = None
     SaltRemover = None
+
+if RDKIT_AVAILABLE and RDLogger is not None:
+    try:
+        RDLogger.DisableLog('rdApp.error')
+    except Exception:
+        pass
+
+_RDKIT_PARSE_LOCK = threading.RLock()
+
+
+@contextmanager
+def quiet_rdkit_parse():
+    """Temporarily silence expected RDKit parse diagnostics."""
+    if not RDKIT_AVAILABLE or RDLogger is None:
+        yield
+        return
+
+    with _RDKIT_PARSE_LOCK:
+        try:
+            RDLogger.DisableLog('rdApp.error')
+        except Exception:
+            pass
+        try:
+            yield
+        finally:
+            try:
+                RDLogger.DisableLog('rdApp.error')
+            except Exception:
+                pass
+
+
+def parse_smiles_quiet(smiles: str, *, sanitize: bool = True):
+    """Parse a SMILES string without emitting expected RDKit error spam."""
+    if not RDKIT_AVAILABLE or smiles is None:
+        return None
+    try:
+        with quiet_rdkit_parse():
+            if sanitize:
+                return Chem.MolFromSmiles(str(smiles).strip())
+            return Chem.MolFromSmiles(str(smiles).strip(), sanitize=False)
+    except Exception:
+        return None
 
 # -----------------------------------------------------------------------------
 # Optional deps: SELFIES / BigSMILES
@@ -707,6 +752,32 @@ def normalize_chemical_string(
     return s
 
 
+def parse_chemical_string(
+    text,
+    *,
+    fmt: str = "auto",
+    repair: bool = True,
+    keep_largest_frag: bool = False,
+):
+    """Convert SMILES/SELFIES/BigSMILES and return a quiet RDKit molecule."""
+    if not RDKIT_AVAILABLE or text is None:
+        return None
+    try:
+        with quiet_rdkit_parse():
+            normalized = normalize_chemical_string(
+                text,
+                fmt=fmt,
+                canonicalize=False,
+                repair=repair,
+                keep_largest_frag=keep_largest_frag,
+            )
+            if not normalized:
+                return None
+            return parse_smiles_quiet(normalized)
+    except Exception:
+        return None
+
+
 def diagnose_chemical_string(text: str) -> Dict[str, Any]:
     """Diagnose whether a SMILES / BigSMILES string is directly parseable, proxy-parseable, or invalid."""
     result: Dict[str, Any] = {
@@ -782,7 +853,7 @@ def diagnose_chemical_string(text: str) -> Dict[str, Any]:
 
     if RDKIT_AVAILABLE:
         try:
-            direct_mol = Chem.MolFromSmiles(s)
+            direct_mol = parse_smiles_quiet(s)
             result["rdkit_direct_ok"] = direct_mol is not None and direct_mol.GetNumAtoms() >= 1
         except Exception:
             result["rdkit_direct_ok"] = False
@@ -795,7 +866,7 @@ def diagnose_chemical_string(text: str) -> Dict[str, Any]:
 
     if proxy_smiles and RDKIT_AVAILABLE:
         try:
-            proxy_mol = Chem.MolFromSmiles(proxy_smiles)
+            proxy_mol = parse_smiles_quiet(proxy_smiles)
             result["proxy_smiles_ok"] = proxy_mol is not None and proxy_mol.GetNumAtoms() >= 1
         except Exception:
             result["proxy_smiles_ok"] = False
@@ -1435,7 +1506,7 @@ def canonicalize_smiles(smiles: str) -> Optional[str]:
         return None
 
     try:
-        mol = Chem.MolFromSmiles(s)
+        mol = parse_smiles_quiet(s)
         if mol is None:
             return None
         # isomericSmiles=True 有助于保留立体信息
@@ -1453,17 +1524,18 @@ def _canonicalize_smiles_relaxed(smiles: str) -> Optional[str]:
         return None
 
     try:
-        mol = Chem.MolFromSmiles(s, sanitize=False)
+        mol = parse_smiles_quiet(s, sanitize=False)
     except Exception:
         return None
     if mol is None or mol.GetNumAtoms() < 1:
         return None
 
     try:
-        Chem.SanitizeMol(
-            mol,
-            sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE,
-        )
+        with quiet_rdkit_parse():
+            Chem.SanitizeMol(
+                mol,
+                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE,
+            )
     except Exception:
         pass
 

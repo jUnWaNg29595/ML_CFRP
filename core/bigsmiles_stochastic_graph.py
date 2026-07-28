@@ -14,7 +14,12 @@ except Exception:
     Chem = None
     RDKIT_AVAILABLE = False
 
-from .smiles_utils import canonicalize_smiles, detect_chem_string_format
+from .smiles_utils import (
+    canonicalize_smiles,
+    detect_chem_string_format,
+    parse_smiles_quiet,
+    quiet_rdkit_parse,
+)
 
 
 _BIGSMILES_PREFIX_RE = re.compile(r"^BIGSMILES\s*[:：]\s*", flags=re.I)
@@ -430,18 +435,16 @@ def _weighted_choice_block(blocks: List[BigSMILESBlock], rng: random.Random) -> 
 def _mol_from_smiles_with_dummies(smiles: str):
     if not RDKIT_AVAILABLE or not smiles:
         return None
-    try:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is not None:
-            return mol
-    except Exception:
-        pass
-    try:
-        mol = Chem.MolFromSmiles(smiles, sanitize=False)
-        if mol is None:
-            return None
-        Chem.SanitizeMol(mol)
+    mol = parse_smiles_quiet(smiles)
+    if mol is not None:
         return mol
+    try:
+        with quiet_rdkit_parse():
+            mol = parse_smiles_quiet(smiles, sanitize=False)
+            if mol is None:
+                return None
+            Chem.SanitizeMol(mol)
+            return mol
     except Exception:
         return None
 
@@ -468,7 +471,8 @@ def _remove_all_dummies(mol):
                 rw.AddBond(neighbors[0], neighbors[1], Chem.rdchem.BondType.SINGLE)
             rw.RemoveAtom(idx)
         out = rw.GetMol()
-        Chem.SanitizeMol(out)
+        with quiet_rdkit_parse():
+            Chem.SanitizeMol(out)
         return out
     except Exception:
         return mol
@@ -500,7 +504,8 @@ def _connect_mols_via_dummies(left, right):
         for idx in sorted([left_dummy_rw, right_dummy_rw], reverse=True):
             rw.RemoveAtom(idx)
         out = rw.GetMol()
-        Chem.SanitizeMol(out)
+        with quiet_rdkit_parse():
+            Chem.SanitizeMol(out)
         return out
     except Exception:
         return None

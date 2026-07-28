@@ -75,6 +75,8 @@ from .task_manager import (
 from .smiles_utils import (
     convert_to_smiles,
     normalize_chemical_string,
+    parse_chemical_string,
+    parse_smiles_quiet,
     split_smiles_cell,
     canonicalize_smiles,
     detect_chem_string_format,
@@ -139,7 +141,11 @@ try:
             ok_frags = 0
             for frag in frags[:5]:
                 info.setdefault("fragments", []).append(frag[:120])
-                mol = Chem.MolFromSmiles(normalize_chemical_string(frag, canonicalize=False, repair=True, keep_largest_frag=False) or "")
+                mol = parse_chemical_string(
+                    frag,
+                    repair=True,
+                    keep_largest_frag=False,
+                )
                 if mol is None:
                     info.setdefault("frag_parse_failed", []).append(frag[:120])
                     continue
@@ -423,7 +429,7 @@ def _extract_bigsmiles_graph_sample_features(
 
     for item in normalized_samples:
         try:
-            mol = Chem.MolFromSmiles(item)
+            mol = parse_smiles_quiet(item)
         except Exception:
             mol = None
         if mol is None:
@@ -556,7 +562,11 @@ def extract_polymer_string_features(smiles_like_list, prefix=None, include_bigsm
         if RDKIT_AVAILABLE and candidates:
             for cand in candidates:
                 try:
-                    mol = Chem.MolFromSmiles(cand)
+                    mol = parse_chemical_string(
+                        cand,
+                        repair=True,
+                        keep_largest_frag=False,
+                    )
                     if mol is not None:
                         valid_mols.append(mol)
                 except Exception:
@@ -624,7 +634,11 @@ def _safe_fragment_mol_from_text(fragment: str):
     if not frag:
         return None
     try:
-        mol = Chem.MolFromSmiles(frag)
+        mol = parse_chemical_string(
+            frag,
+            repair=True,
+            keep_largest_frag=False,
+        )
         if mol is not None:
             return mol
     except Exception:
@@ -632,7 +646,11 @@ def _safe_fragment_mol_from_text(fragment: str):
     try:
         alt = _replace_common_ion_aliases(frag)
         if alt != frag:
-            mol = Chem.MolFromSmiles(alt)
+            mol = parse_chemical_string(
+                alt,
+                repair=True,
+                keep_largest_frag=False,
+            )
             if mol is not None:
                 return mol
     except Exception:
@@ -995,7 +1013,11 @@ def _generate_3d_data_worker(smiles):
         supported_species = {1, 6, 7, 8, 9, 16, 17}  # H,C,N,O,F,S,Cl (ANI2x)
 
         for frag in frags:
-            mol = Chem.MolFromSmiles(normalize_chemical_string(frag, canonicalize=False, repair=True, keep_largest_frag=False) or "")
+            mol = parse_chemical_string(
+                frag,
+                repair=True,
+                keep_largest_frag=False,
+            )
             if mol is None:
                 # 片段解析失败：跳过该片段（不放弃整个样本）
                 fail_reasons.append('parse_failed')
@@ -1113,7 +1135,11 @@ def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
         eig_all = []
 
         for frag in frags:
-            mol = Chem.MolFromSmiles(normalize_chemical_string(frag, canonicalize=False, repair=True, keep_largest_frag=False) or "")
+            mol = parse_chemical_string(
+                frag,
+                repair=True,
+                keep_largest_frag=False,
+            )
             if mol is None:
                 continue  # 解析失败跳过该片段，不要直接返回 None
 
@@ -1692,8 +1718,10 @@ class RDKitFeatureExtractor:
 
         for idx, smiles in enumerate(tqdm(smiles_list, desc="RDKit提取")):
             try:
-                mol = Chem.MolFromSmiles(
-                    normalize_chemical_string(smiles, keep_largest_frag=False) or ""
+                mol = parse_chemical_string(
+                    smiles,
+                    repair=True,
+                    keep_largest_frag=False,
                 )
                 if mol is None:
                     continue
@@ -1760,7 +1788,7 @@ def _rdkit_single_smiles_worker(smiles, start_idx):
             keep_largest_frag=False,
         ) or s
 
-        mol = Chem.MolFromSmiles(s)
+        mol = parse_smiles_quiet(s)
         if mol is None:
             s_simple = normalize_chemical_string(
                 s,
@@ -1768,7 +1796,11 @@ def _rdkit_single_smiles_worker(smiles, start_idx):
                 repair=False,
                 keep_largest_frag=False,
             ) or s.replace('@', '').replace('/', '').replace('\\', '')
-            mol = Chem.MolFromSmiles(s_simple)
+            mol = parse_chemical_string(
+                s_simple,
+                repair=True,
+                keep_largest_frag=False,
+            )
             if mol is None:
                 return None, start_idx
         
@@ -1964,10 +1996,18 @@ class OptimizedRDKitFeatureExtractor:
                     frags = [f.strip() for f in s.split('.') if f.strip()]
                     s = max(frags, key=len) if frags else s
                 
-                mol = Chem.MolFromSmiles(s)
+                mol = parse_chemical_string(
+                    s,
+                    repair=True,
+                    keep_largest_frag=False,
+                )
                 if mol is None:
                     s = s.replace('@', '').replace('/', '').replace('\\', '')
-                    mol = Chem.MolFromSmiles(s)
+                    mol = parse_chemical_string(
+                        s,
+                        repair=True,
+                        keep_largest_frag=False,
+                    )
                 
                 if mol is None:
                     continue
@@ -2027,8 +2067,10 @@ class MemoryEfficientRDKitExtractor:
             batch = smiles_list[batch_start:batch_start + self.batch_size]
             for i, smiles in enumerate(batch):
                 try:
-                    mol = Chem.MolFromSmiles(
-                        normalize_chemical_string(smiles, keep_largest_frag=False) or ""
+                    mol = parse_chemical_string(
+                        smiles,
+                        repair=True,
+                        keep_largest_frag=False,
                     )
                     if mol is None:
                         continue
@@ -2075,16 +2117,18 @@ class AdvancedMolecularFeatureExtractor:
                 return None
             if lightweight:
                 s = str(smiles).strip()
-                mol = Chem.MolFromSmiles(s)
+                mol = parse_smiles_quiet(s)
                 if mol is not None:
                     return mol
                 # 轻量回退：只做基础清理，不做 repair
                 cleaned = normalize_chemical_string(s, repair=False, canonicalize=False, keep_largest_frag=False)
                 if cleaned:
-                    return Chem.MolFromSmiles(cleaned)
+                    return parse_smiles_quiet(cleaned)
                 return None
-            return Chem.MolFromSmiles(
-                normalize_chemical_string(smiles, keep_largest_frag=False) or ""
+            return parse_chemical_string(
+                smiles,
+                repair=True,
+                keep_largest_frag=False,
             )
         except:
             return None
@@ -2932,8 +2976,10 @@ def _quick_ff_calc_features(
 
     frag_mols = []
     for frag in frags:
-        mol = Chem.MolFromSmiles(
-            normalize_chemical_string(frag, canonicalize=False, repair=True, keep_largest_frag=False) or ""
+        mol = parse_chemical_string(
+            frag,
+            repair=True,
+            keep_largest_frag=False,
         )
         if mol is None or mol.GetNumAtoms() == 0:
             continue
@@ -3417,8 +3463,10 @@ class XTBFeatureExtractor:
 
         frag_mols = []
         for frag in frags:
-            mol = Chem.MolFromSmiles(
-                normalize_chemical_string(frag, canonicalize=False, repair=True, keep_largest_frag=False) or ""
+            mol = parse_chemical_string(
+                frag,
+                repair=True,
+                keep_largest_frag=False,
             )
             if mol is None or mol.GetNumAtoms() == 0:
                 continue
@@ -3873,11 +3921,15 @@ class EpoxyDomainFeatureExtractor:
                         error_samples.append(f"样本 {idx}: 树脂或固化剂 SMILES 为空")
                     continue
 
-                mol_r = Chem.MolFromSmiles(
-                    normalize_chemical_string(smi_r, keep_largest_frag=False) or ""
+                mol_r = parse_chemical_string(
+                    smi_r,
+                    repair=True,
+                    keep_largest_frag=False,
                 )
-                mol_h = Chem.MolFromSmiles(
-                    normalize_chemical_string(smi_h, keep_largest_frag=False) or ""
+                mol_h = parse_chemical_string(
+                    smi_h,
+                    repair=True,
+                    keep_largest_frag=False,
                 )
 
                 if mol_r is None or mol_h is None:
@@ -4045,8 +4097,10 @@ class FingerprintExtractor:
         for idx, smi1 in enumerate(tqdm(smiles_list, desc="指纹提取")):
             try:
                 # 1. 处理第一个分子
-                mol1 = Chem.MolFromSmiles(
-                    normalize_chemical_string(smi1, keep_largest_frag=False) or ""
+                mol1 = parse_chemical_string(
+                    smi1,
+                    repair=True,
+                    keep_largest_frag=False,
                 )
                 if mol1 is None:
                     continue
@@ -4062,8 +4116,10 @@ class FingerprintExtractor:
                 # 2. 处理第二个分子 (如果有)
                 if is_dual:
                     smi2 = smiles_list_2[idx]
-                    mol2 = Chem.MolFromSmiles(
-                        normalize_chemical_string(smi2, keep_largest_frag=False) or ""
+                    mol2 = parse_chemical_string(
+                        smi2,
+                        repair=True,
+                        keep_largest_frag=False,
                     )
                     if mol2 is None:
                         # 如果固化剂SMILES无效，您可以选择跳过该样本，或者填0
@@ -4417,8 +4473,10 @@ class FGDFeatureExtractor:
         if self.cache_size > 0 and smi in self._mol_cache:
             self._mol_cache.move_to_end(smi)
             return self._mol_cache[smi]
-        mol = Chem.MolFromSmiles(
-            normalize_chemical_string(smi, canonicalize=False, repair=True, keep_largest_frag=False) or ""
+        mol = parse_chemical_string(
+            smi,
+            repair=True,
+            keep_largest_frag=False,
         )
         if mol is None:
             return None

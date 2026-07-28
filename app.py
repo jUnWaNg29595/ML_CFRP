@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 碳纤维复合材料智能预测平台 v1.3.0
 更新内容：
@@ -1037,13 +1037,28 @@ try:
 except Exception:
     pass
 
+
+# 注入科研风格主题
+try:
+    from core.theme import inject_theme
+    inject_theme()
+except Exception:
+    pass
 # 页面配置已在文件开头设置，此处无需重复
 
 # 导入核心模块
 from core.data_processor import AdvancedDataCleaner, SparseDataHandler, DataEnhancer
 from core.data_explorer import EnhancedDataExplorer
 from core.model_trainer import EnhancedModelTrainer, AutoGluonWrapper, GRAPH_MODEL_NAMES, CLASSIFICATION_MODEL_NAMES  # 确保引入 Wrapper
-from core.model_interpreter import ModelInterpreter, EnhancedModelInterpreter, compute_xgboost_native_shap
+# 延迟导入 model_interpreter 以避免 SHAP 兼容性问题
+try:
+    from core.model_interpreter import ModelInterpreter, EnhancedModelInterpreter, compute_xgboost_native_shap
+except Exception as _shap_err:
+    ModelInterpreter = None
+    EnhancedModelInterpreter = None
+    compute_xgboost_native_shap = None
+    import warnings
+    warnings.warn(f'SHAP 模块导入失败，模型解释功能将受限: {_shap_err}')
 from core.molecular_features import AdvancedMolecularFeatureExtractor, RDKitFeatureExtractor
 from core.feature_selector import SmartFeatureSelector, SmartSparseDataSelector, show_robust_feature_selection
 from core.optimizer import HyperparameterOptimizer, InverseDesigner, generate_tuning_suggestions
@@ -2434,31 +2449,69 @@ def render_sidebar():
     with st.sidebar:
         st.title(f"🔬 {APP_NAME}")
         st.caption(f"版本 {VERSION}")
-        st.markdown("---")
 
-        page = st.radio(
-            "📌 功能导航",
-            [
-                "🏠 首页",
-                "📤 数据上传",
-                "🔍 数据探索",
-                "🧹 数据清洗",
-                "✨ 数据增强",
-                "🧬 分子特征",
-                "🖼️ 图像转SMILES",
-                "🎯 特征选择",
-                "🤖 模型训练",
-                "📈 训练记录",
-                "📊 模型解释",
-                "🔮 预测应用",
-                "🔧 模型补齐数据",
-                "🧪 虚拟分子筛选",
-                "⚙️ 超参优化",
-                "🧠 主动学习",
-                "📋 状态条记录",
-            ],
-            label_visibility="collapsed"
-        )
+        # 分组折叠导航
+        page = None
+        
+        # 数据准备（默认展开）
+        with st.expander("📊 数据准备", expanded=True):
+            data_page = st.radio(
+                "数据准备",
+                ["🏠 首页", "📤 数据上传", "🔍 数据探索", "🧹 数据清洗", "✨ 数据增强"],
+                label_visibility="collapsed",
+                key="nav_data",
+            )
+            if data_page != st.session_state.get("_last_data_page", ""):
+                page = data_page
+                st.session_state["_last_data_page"] = data_page
+        
+        # 特征工程（默认折叠）
+        with st.expander("🧬 特征工程", expanded=False):
+            feature_page = st.radio(
+                "特征工程",
+                ["🧬 分子特征", "🖼️ 图像转SMILES", "🎯 特征选择"],
+                label_visibility="collapsed",
+                key="nav_feature",
+            )
+            if feature_page != st.session_state.get("_last_feature_page", ""):
+                page = feature_page
+                st.session_state["_last_feature_page"] = feature_page
+        
+        # 建模分析（默认展开）
+        with st.expander("🤖 建模分析", expanded=True):
+            model_page = st.radio(
+                "建模分析",
+                ["🤖 模型训练", "📈 训练记录", "📊 模型解释", "⚙️ 超参优化", "🧠 主动学习"],
+                label_visibility="collapsed",
+                key="nav_model",
+            )
+            if model_page != st.session_state.get("_last_model_page", ""):
+                page = model_page
+                st.session_state["_last_model_page"] = model_page
+        
+        # 应用预测（默认折叠）
+        with st.expander("🔮 应用预测", expanded=False):
+            app_page = st.radio(
+                "应用预测",
+                ["🔮 预测应用", "🔧 模型补齐数据", "🧪 虚拟分子筛选"],
+                label_visibility="collapsed",
+                key="nav_app",
+            )
+            if app_page != st.session_state.get("_last_app_page", ""):
+                page = app_page
+                st.session_state["_last_app_page"] = app_page
+        
+        # 状态条记录（单独显示）
+        if st.checkbox("📋 状态条记录", key="nav_status_toggle"):
+            page = "📋 状态条记录"
+        
+        # 确定最终页面
+        if page is None:
+            page = st.session_state.get("_last_active_page", "🏠 首页")
+        else:
+            st.session_state["_last_active_page"] = page
+
+        st.markdown("---")
 
         st.markdown("---")
         st.markdown("### 📊 数据状态")
@@ -2761,103 +2814,130 @@ def render_top_status_bar():
 # 页面：首页
 # ============================================================
 def page_home():
-    """首页"""
-    st.title("🔬 碳纤维复合材料智能预测平台")
-    st.markdown(f"**版本 {VERSION}** ")
-
+    """首页：综合门户型"""
+    # Header
+    st.markdown("""
+    <div style="text-align: center; padding: 30px 0 20px 0;">
+      <h1 style="font-size: 1.75rem; font-weight: 700; color: #1E293B; margin-bottom: 8px;">
+        🔬 碳纤维复合材料智能预测平台
+      </h1>
+      <p style="font-size: 0.95rem; color: #64748B; margin: 0;">
+        基于机器学习的环氧树脂体系性能预测与配方优化
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
     st.markdown("---")
-
-    # [新增] 数据库规模展示（PPT用）- 紧凑横向布局
+    
+    # 统计卡片区
+    col1, col2, col3, col4 = st.columns(4)
+    
+    trained_models = st.session_state.get("_trained_models_count", 0)
+    samples_count = 0
+    features_count = 0
+    predictions_count = st.session_state.get("_predictions_count", 0)
+    
     if st.session_state.data is not None:
         df = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
-
-        # 导入紧凑展示模块
-        from database_showcase_compact import render_database_showcase_compact
-        render_database_showcase_compact(df)
-
-        st.markdown("---")
-
-    # 功能卡片
-    col1, col2, col3 = st.columns(3)
-
+        samples_count = len(df)
+        features_count = len(df.columns)
+    
     with col1:
-        st.markdown("""
-        <div class="metric-card">
-            <div class="metric-label">数据处理</div>
-            <div class="metric-value">📊</div>
-            <p>智能清洗 · VAE增强 · 类别平衡</p>
+        st.markdown(f"""
+        <div style="text-align: center; padding: 24px 16px; background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px;">
+          <div style="font-size: 1.5rem; font-weight: 700; color: #2563EB;">{trained_models}</div>
+          <div style="font-size: 0.75rem; color: #64748B; margin-top: 4px;">已训练模型</div>
         </div>
         """, unsafe_allow_html=True)
-
+    
     with col2:
-        st.markdown("""
-        <div class="metric-card metric-card-success">
-            <div class="metric-label">分子特征</div>
-            <div class="metric-value">🧬</div>
-            <p>RDKit · 指纹(MACCS) · 图特征</p>
+        st.markdown(f"""
+        <div style="text-align: center; padding: 24px 16px; background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px;">
+          <div style="font-size: 1.5rem; font-weight: 700; color: #0891B2;">{samples_count:,}</div>
+          <div style="font-size: 0.75rem; color: #64748B; margin-top: 4px;">数据样本数</div>
         </div>
         """, unsafe_allow_html=True)
-
+    
     with col3:
-        st.markdown("""
-        <div class="metric-card metric-card-warning">
-            <div class="metric-label">模型训练</div>
-            <div class="metric-value">🤖</div>
-            <p>15+模型 · 手动调参 · Optuna优化</p>
+        st.markdown(f"""
+        <div style="text-align: center; padding: 24px 16px; background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px;">
+          <div style="font-size: 1.5rem; font-weight: 700; color: #059669;">{features_count}</div>
+          <div style="font-size: 0.75rem; color: #64748B; margin-top: 4px;">特征维度</div>
         </div>
         """, unsafe_allow_html=True)
-
+    
+    with col4:
+        st.markdown(f"""
+        <div style="text-align: center; padding: 24px 16px; background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px;">
+          <div style="font-size: 1.5rem; font-weight: 700; color: #D97706;">{predictions_count}</div>
+          <div style="font-size: 0.75rem; color: #64748B; margin-top: 4px;">预测记录</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
     st.markdown("---")
-
-    # 核心功能介绍
-    st.markdown("## 🚀 核心功能")
-
-    col1, col2 = st.columns(2)
-
+    
+    # 系统架构图区
+    st.markdown("### 系统工作流程")
+    
+    cols = st.columns(4)
+    steps = [
+        ("数据准备", "📤", "上传、清洗、增强"),
+        ("特征工程", "🧬", "分子特征、选择"),
+        ("模型训练", "🤖", "训练、优化"),
+        ("预测应用", "🔮", "预测、筛选"),
+    ]
+    
+    for i, (title, icon, desc) in enumerate(steps):
+        with cols[i]:
+            st.markdown(f"""
+            <div style="text-align: center; padding: 20px; background: #F8FAFC; border-radius: 8px; border: 1px solid #E2E8F0;">
+              <div style="font-size: 1.75rem; margin-bottom: 8px;">{icon}</div>
+              <div style="font-weight: 600; color: #1E293B;">{title}</div>
+              <div style="font-size: 0.75rem; color: #64748B; margin-top: 4px;">{desc}</div>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    # 快速入口区
+    st.markdown("### 快速开始")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
     with col1:
-        st.markdown("""
-        ### 📊 数据处理
-        - **智能数据清洗**: 缺失值处理、异常值检测、数据类型修复
-        - **VAE数据增强**: 基于变分自编码器的表格数据生成
-        - **类别平衡**: 解决化学单体样本不平衡问题
-
-        ### 🧬 分子特征提取
-        - **分子指纹**: MACCS Keys, Morgan (ECFP) 指纹
-        - **RDKit标准版**: 200+分子描述符
-        - **图神经网络特征**: 分子拓扑结构特征
-        - **ML力场特征**: ANI-2x 高精度能量/力
-        """)
-
+        if st.button("📤 上传数据", width='stretch'):
+            st.session_state["_nav_to"] = "数据上传"
+            st.rerun()
+    
     with col2:
-        st.markdown("""
-        ### 🤖 模型训练
-        - **集成模型**: 随机森林、XGBoost、LightGBM、CatBoost
-        - **AutoML**: AutoGluon 自动建模
-        - **手动调参**: 可视化参数配置界面
-
-        ### 📊 模型解释
-        - **SHAP分析**: 特征重要性可视化
-        - **学习曲线**: 模型收敛分析
-        - **适用域分析**: PCA凸包边界检测
-        """)
-
+        if st.button("🧬 提取特征", width='stretch'):
+            st.session_state["_nav_to"] = "分子特征"
+            st.rerun()
+    
+    with col3:
+        if st.button("🤖 训练模型", width='stretch'):
+            st.session_state["_nav_to"] = "模型训练"
+            st.rerun()
+    
+    with col4:
+        if st.button("🔮 开始预测", width='stretch'):
+            st.session_state["_nav_to"] = "预测应用"
+            st.rerun()
+    
     st.markdown("---")
+    
+    # 核心功能介绍（折叠）
+    with st.expander("📋 详细功能说明", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("""**📊 数据处理**
+            - 智能数据清洗、缺失值处理、异常值检测
+            - VAE数据增强、类别平衡""")
+        with col2:
+            st.markdown("""**🤖 模型训练**
+            - 集成模型（RF、XGBoost、LightGBM）
+            - AutoML、超参数优化""")
 
-    # 快速开始
-    st.markdown("## ⚡ 快速开始")
-    st.info("""
-    1. **上传数据** → 支持CSV、Excel格式
-    2. **数据清洗** → 使用"类别平衡"处理高频单体
-    3. **分子特征** → 提取SMILES指纹或描述符
-    4. **特征选择** → 选择目标变量和输入特征
-    5. **模型训练** → 选择模型并调整参数
-    6. **模型解释** → SHAP分析和性能评估
-    """)
-
-
-# ============================================================
-# 页面：数据上传
-# ============================================================
 def page_data_upload():
     """数据上传页面"""
     st.title("📤 数据上传")
@@ -14343,6 +14423,7 @@ def page_virtual_screening():
         predict_with_uncertainty_info,
         predict_with_model,
         rank_screening_candidates,
+        resolve_component_smiles_cols,
         select_diverse_top_candidates,
         summarize_model_screening_profile,
         summarize_smiles_stats,
@@ -14357,8 +14438,20 @@ def page_virtual_screening():
         filter_industrial_candidates,
         extract_known_hardeners_from_training_data,
     )
+    from core.structure_filter import pipeline_structure_filter
 
-    hardener_required = bool(mf_cfg.get("hardener_col") or mf_cfg.get("hardener_component_cols"))
+    hardener_required = bool(
+        mf_cfg.get("hardener_col")
+        or mf_cfg.get("hardener_component_cols")
+        or any(
+            re.search(
+                r"(hardener|curing[_ ]?agent|curative|固化剂|交联剂).*smiles",
+                str(name),
+                flags=re.I,
+            )
+            for name in (mf_cfg.get("feature_names") or [])
+        )
+    )
     hardener_formula_enabled = bool(hardener_required)
     primary_component_role = infer_primary_component_role(mf_cfg)
     primary_role_label = {
@@ -14450,18 +14543,8 @@ def page_virtual_screening():
                 smiles_list.append(".".join(parts))
         return smiles_list
 
-    def _resolve_smiles_cols(cfg: dict, role: str):
-        if not cfg:
-            return []
-        if role == "resin":
-            cols = cfg.get("resin_component_cols") or []
-            if not cols and cfg.get("smiles_col"):
-                cols = [cfg.get("smiles_col")]
-        else:
-            cols = cfg.get("hardener_component_cols") or []
-            if not cols and cfg.get("hardener_col"):
-                cols = [cfg.get("hardener_col")]
-        return [c for c in cols if c]
+    def _resolve_smiles_cols(cfg: dict, role: str, available_columns=None):
+        return resolve_component_smiles_cols(cfg, role, available_columns=available_columns)
 
     def _clean_smiles_list(items):
         out = []
@@ -14855,13 +14938,20 @@ def page_virtual_screening():
                 c for c in df_ref_design.columns
                 if (df_ref_design[c].dtype == object or str(df_ref_design[c].dtype).startswith("string"))
             ]
-        auto_hard_cols_global = _resolve_smiles_cols(mf_cfg, "hardener")
-        if not auto_hard_cols_global and primary_component_role != "hardener":
-            for cand in ["curing_agent_smiles_key", "hardener_smiles_key", "curing_agent_smiles", "hardener_smiles"]:
-                if cand in text_cols_design:
-                    auto_hard_cols_global = [cand]
-                    break
-        hardener_formula_enabled_default = bool(hardener_required or auto_hard_cols_global)
+        available_design_columns = list(text_cols_design)
+        auto_resin_cols_global = _resolve_smiles_cols(
+            mf_cfg,
+            "resin",
+            available_columns=available_design_columns,
+        )
+        auto_hard_cols_global = _resolve_smiles_cols(
+            mf_cfg,
+            "hardener",
+            available_columns=available_design_columns,
+        )
+        resin_channel_available = bool(auto_resin_cols_global)
+        hardener_channel_available = bool(auto_hard_cols_global or hardener_required)
+        hardener_formula_enabled_default = hardener_channel_available
         numeric_design_cols = []
         if isinstance(df_ref_design, pd.DataFrame):
             numeric_design_cols = [
@@ -14920,10 +15010,27 @@ def page_virtual_screening():
             if not isinstance(df_in, pd.DataFrame) or df_in.empty:
                 return df_in
             out = df_in.copy()
+            text_columns = {
+                "_molecule_key",
+                "resin_smiles",
+                "hardener_smiles",
+                "combo_smiles",
+                "resin_source",
+                "hardener_source",
+                "candidate_origin",
+                "formulation_id",
+            }
             for col in out.columns:
                 try:
+                    if str(col) in text_columns:
+                        continue
                     if pd.api.types.is_numeric_dtype(out[col]):
                         out[col] = pd.to_numeric(out[col], errors="coerce", downcast="float")
+                        continue
+                    converted = pd.to_numeric(out[col], errors="coerce")
+                    non_empty = out[col].notna() & out[col].astype(str).str.strip().ne("")
+                    if bool(non_empty.any()) and bool(converted.loc[non_empty].notna().all()):
+                        out[col] = converted.astype(float)
                 except Exception:
                     continue
             return out
@@ -15092,49 +15199,28 @@ def page_virtual_screening():
         st.markdown("### 2) 组分候选来源")
         st.caption(f"根据模型保存的源列自动识别：当前主要筛选对象为 {primary_role_label}。")
         if source_mapping_conflict:
-            st.error(
-                "模型的特征源记录存在角色冲突：主列名称看起来是树脂，但真正合并计算的列是 "
+            st.warning(
+                "模型的主特征输入实际对应固化剂列（"
                 + ", ".join(configured_primary_cols[:12])
-                + "。筛选按真正的特征输入列解释；若要筛环氧树脂，需要用 resin_smiles_* 重新提取并训练模型。"
+                + "）。这只影响模型特征解释，不会关闭树脂通道；候选库仍按树脂/固化剂两个化学角色分别建立。"
             )
-            role_options = ["hardener", "resin"]
-            role_labels = {"resin": "树脂", "hardener": "固化剂"}
-            current_role = st.session_state.get("vs_role_override", primary_component_role)
-            chosen_role = st.selectbox(
-                "请选择当前模型实际对应的组分角色（覆盖自动检测结果）",
-                options=role_options,
-                format_func=lambda x: role_labels.get(x, x),
-                index=role_options.index(current_role) if current_role in role_options else 0,
-                key="vs_role_override_selector",
-                help="选择'树脂'会将当前模型视为树脂模型，主列使用树脂SMILES；选择'固化剂'则相反。",
-            )
-            if chosen_role != current_role:
-                st.session_state["vs_role_override"] = chosen_role
-                st.rerun()
-            # Apply override
-            primary_component_role = chosen_role
-            primary_role_label = role_labels.get(chosen_role, chosen_role)
-            primary_library_role = chosen_role if chosen_role in {"resin", "hardener"} else "resin"
-            secondary_role_label = "固化剂" if chosen_role != "hardener" else "第二组分"
-            hardener_formula_enabled = bool(chosen_role != "hardener" and hardener_required)
-            source_mapping_conflict = False  # resolved
         source_col1, source_col2 = st.columns(2)
         with source_col1:
             use_dataset_source = st.checkbox(f"使用当前数据中的{primary_role_label}库", value=True, key="vs_formula_use_dataset_v2")
             use_guided_source = st.checkbox("叠加虚拟组分", value=False, key="vs_formula_use_guided_v2")
         with source_col2:
             hardener_formula_enabled = st.checkbox(
-                f"配方中包含{secondary_role_label}",
+                "配方中包含固化剂",
                 value=hardener_formula_enabled_default,
                 key="vs_formula_include_hardener",
-                disabled=primary_component_role == "hardener" and not hardener_required,
+                disabled=not hardener_channel_available,
                 help=(
-                    "当前模型只保存了一个固化剂输入，额外第二组分不会进入特征流程。"
-                    if primary_component_role == "hardener" and not hardener_required
+                    "当前模型/数据未发现固化剂输入列，无法建立双组分配方。"
+                    if not hardener_channel_available
                     else None
                 ),
             )
-            if primary_component_role == "hardener" and not hardener_required:
+            if not hardener_channel_available:
                 hardener_formula_enabled = False
             use_pubchem_source = st.checkbox("叠加 PubChem 候选", value=True, key="vs_formula_use_pubchem_v2")
             use_upload_source = st.checkbox("叠加上传候选库", value=False, key="vs_formula_use_upload")
@@ -15149,27 +15235,19 @@ def page_virtual_screening():
             if not text_cols_design:
                 st.warning("⚠️ 当前数据中未检测到文本/SMILES 列，无法从数据集提取候选库。")
             else:
-                auto_resin_cols = _resolve_smiles_cols(mf_cfg, "resin")
-                if not auto_resin_cols:
-                    for cand in ["resin_smiles_key", "resin_smiles"]:
-                        if cand in text_cols_design:
-                            auto_resin_cols = [cand]
-                            break
+                auto_resin_cols = auto_resin_cols_global
                 dataset_resin_cols = st.multiselect(
-                    f"{primary_role_label} SMILES 列（当前数据）",
+                    "树脂 SMILES 列（当前数据）",
                     options=text_cols_design,
-                    default=[c for c in auto_resin_cols if c in text_cols_design] or text_cols_design[:1],
+                    default=[c for c in auto_resin_cols if c in text_cols_design],
                     key="vs_formula_dataset_resin_cols",
                 )
+                if not auto_resin_cols:
+                    st.info("未自动识别树脂列；请手动选择 `resin_smiles_*` 或环氧树脂 SMILES 列。")
                 if hardener_formula_enabled:
-                    auto_hard_cols = _resolve_smiles_cols(mf_cfg, "hardener")
-                    if not auto_hard_cols and primary_component_role != "hardener":
-                        for cand in ["curing_agent_smiles_key", "hardener_smiles_key", "curing_agent_smiles", "hardener_smiles"]:
-                            if cand in text_cols_design:
-                                auto_hard_cols = [cand]
-                                break
+                    auto_hard_cols = auto_hard_cols_global
                     dataset_hard_cols = st.multiselect(
-                        f"{secondary_role_label} SMILES 列（当前数据）",
+                        "固化剂 SMILES 列（当前数据）",
                         options=text_cols_design,
                         default=[c for c in auto_hard_cols if c in text_cols_design],
                         key="vs_formula_dataset_hard_cols",
@@ -15196,14 +15274,14 @@ def page_virtual_screening():
                     ]
                     if upload_text_cols:
                         upload_resin_col = st.selectbox(
-                            f"上传库中的{primary_role_label}列",
+                            "上传库中的树脂列",
                             options=upload_text_cols,
                             index=0,
                             key="vs_formula_upload_resin_col",
                         )
                         if hardener_formula_enabled:
                             upload_hard_col = st.selectbox(
-                                f"上传库中的{secondary_role_label}列",
+                                "上传库中的固化剂列",
                                 options=["无"] + upload_text_cols,
                                 index=0,
                                 key="vs_formula_upload_hard_col",
@@ -15222,15 +15300,11 @@ def page_virtual_screening():
         if use_pubchem_source:
             st.markdown("#### PubChem 子结构扩库")
             hardener_class_options = ["胺", "酸酐", "酚", "硫醇", "咪唑", "叔胺"]
-            if primary_component_role == "hardener":
-                pubchem_resin_smarts = ""
-                st.caption("当前模型学习的是固化剂空间，PubChem 将按固化剂类别扩库，不执行默认环氧子结构查询。")
-            else:
-                pubchem_resin_smarts = st.text_input(
-                    f"{primary_role_label} SMARTS / SMILES 查询",
-                    value="C1CO1" if primary_component_role == "resin" else "",
-                    key="vs_formula_pubchem_primary_smarts_v4",
-                )
+            pubchem_resin_smarts = st.text_input(
+                "树脂 SMARTS / SMILES 查询",
+                value="C1CO1",
+                key="vs_formula_pubchem_primary_smarts_v4",
+            )
             pubchem_hardener_classes = st.multiselect(
                 "固化剂类别（作为主体或第二组分）",
                 options=hardener_class_options,
@@ -15240,7 +15314,7 @@ def page_virtual_screening():
             cid_col1, cid_col2 = st.columns(2)
             with cid_col1:
                 pubchem_resin_max_cids = st.number_input(
-                    f"{primary_role_label} 每类最大 CID 数",
+                    "树脂每类最大 CID 数",
                     min_value=100,
                     max_value=50000,
                     value=1000,
@@ -15248,7 +15322,7 @@ def page_virtual_screening():
                     key="vs_formula_pubchem_resin_max_cids_v4",
                 )
                 pubchem_resin_sample_each = st.number_input(
-                    f"{primary_role_label} 最终采样上限",
+                    "树脂最终采样上限",
                     min_value=100,
                     max_value=50000,
                     value=500,
@@ -15283,7 +15357,7 @@ def page_virtual_screening():
                 with _pc_status:
                     fetched_resin, fetched_hard, hard_errors = _fetch_pubchem_candidate_sets(
                         pubchem_resin_smarts,
-                        pubchem_hardener_classes if (hardener_formula_enabled or primary_component_role == "hardener") else [],
+                        pubchem_hardener_classes if hardener_channel_available else [],
                         max_cids_resin=int(pubchem_resin_max_cids),
                         max_cids_hardener=int(pubchem_hardener_max_cids),
                         sample_each_resin=int(pubchem_resin_sample_each),
@@ -15295,21 +15369,38 @@ def page_virtual_screening():
                     if hard_errors:
                         st.warning("部分固化剂 PubChem 查询失败：\n" + "\n".join(hard_errors[:6]))
 
-                    primary_fetched = fetched_hard if primary_component_role == "hardener" else fetched_resin
-                    secondary_fetched = fetched_hard if primary_component_role != "hardener" else []
-                    # 应用工业过滤
-                    if _ind_enable_resin and primary_fetched:
-                        primary_fetched, _resin_stats = filter_industrial_candidates(primary_fetched, label="树脂", **_ind_cfg_resin)
-                    if _ind_enable_hard and secondary_fetched:
-                        secondary_fetched, _hard_stats = filter_industrial_candidates(secondary_fetched, label="固化剂", **_ind_cfg_hard)
-                    st.session_state["vs_formula_pubchem_primary_smiles_v4"] = primary_fetched
-                    st.session_state["vs_formula_pubchem_secondary_smiles_v4"] = secondary_fetched
-                    if primary_fetched or secondary_fetched:
-                        _pc_status.update(label=f"✅ PubChem 查询完成：{primary_role_label} {len(primary_fetched)} 条" + (f"，第二组分 {len(secondary_fetched)} 条" if hardener_formula_enabled else ""), state="complete")
+                    # 应用二阶段工业过滤
+                    _known_set = extract_known_hardeners_from_training_data(
+                        df_ref_design if isinstance(df_ref_design, pd.DataFrame) else pd.DataFrame(),
+                        [c for c in feature_cols if c.startswith("curing_agent_smiles_")],
+                    ) if use_dataset_source else set()
+                    if _ind_enable_resin and fetched_resin:
+                        fetched_resin, _resin_stats, _resin_scores = pipeline_industrial_filter(
+                            fetched_resin, _known_set,
+                            stage1_max_mp=_ind_cfg_resin.get("max_melting_point", 130),
+                            workers=12, label="树脂",
+                        )
+                    if _ind_enable_hard and fetched_hard:
+                        fetched_hard, _hard_stats, _hard_scores = pipeline_industrial_filter(
+                            fetched_hard, _known_set,
+                            stage1_max_mp=_ind_cfg_hard.get("max_melting_point", 130),
+                            workers=12, label="固化剂",
+                        )
+                    st.session_state["vs_formula_pubchem_resin_smiles_v4"] = fetched_resin
+                    st.session_state["vs_formula_pubchem_hardener_smiles_v4"] = fetched_hard
+                    if fetched_resin or fetched_hard:
+                        # 显示工业过滤统计
+                        if _ind_enable_resin and fetched_resin:
+                            st.caption(f"树脂工业过滤: 通过 {len(fetched_resin)} 条")
+                        if _ind_enable_hard and fetched_hard:
+                            st.caption(f"固化剂工业过滤: 通过 {len(fetched_hard)} 条")
+                        _pc_status.update(
+                            label=f"✅ PubChem 查询完成：树脂 {len(fetched_resin)} 条，固化剂 {len(fetched_hard)} 条",
+                            state="complete",
+                        )
                         _pc_progress.progress(100)
                         st.success(
-                            f"PubChem 查询完成：{primary_role_label} {len(primary_fetched)} 条"
-                            + (f"，第二组分 {len(secondary_fetched)} 条。" if hardener_formula_enabled else "。")
+                            f"PubChem 查询完成：树脂 {len(fetched_resin)} 条，固化剂 {len(fetched_hard)} 条。"
                             + f"（树脂采样至多 {pubchem_resin_sample_each} 条，固化剂每类采样至多 {pubchem_hardener_sample_each} 条）"
                         )
                     else:
@@ -15317,10 +15408,16 @@ def page_virtual_screening():
                         _pc_progress.progress(100)
                         st.warning("PubChem 查询完成，但未返回可用候选。请尝试放宽 SMARTS 或减少约束。")
 
-            pubchem_resin_pool = st.session_state.get("vs_formula_pubchem_primary_smiles_v4") or []
-            pubchem_hard_pool = st.session_state.get("vs_formula_pubchem_secondary_smiles_v4") or []
+            pubchem_resin_pool = st.session_state.get("vs_formula_pubchem_resin_smiles_v4")
+            pubchem_hard_pool = st.session_state.get("vs_formula_pubchem_hardener_smiles_v4")
+            if pubchem_resin_pool is None and primary_component_role == "resin":
+                pubchem_resin_pool = st.session_state.get("vs_formula_pubchem_primary_smiles_v4")
+            if pubchem_hard_pool is None and primary_component_role == "resin":
+                pubchem_hard_pool = st.session_state.get("vs_formula_pubchem_secondary_smiles_v4")
+            pubchem_resin_pool = pubchem_resin_pool or []
+            pubchem_hard_pool = pubchem_hard_pool or []
             if pubchem_resin_pool:
-                st.caption(f"PubChem {primary_role_label}候选: {len(pubchem_resin_pool)}")
+                st.caption(f"PubChem 树脂候选: {len(pubchem_resin_pool)}")
             if pubchem_hard_pool:
                 st.caption(f"PubChem 固化剂候选: {len(pubchem_hard_pool)}")
 
@@ -15417,73 +15514,45 @@ def page_virtual_screening():
                 | **关闭规则** | 无任何化学过滤 | 无任何化学过滤 | 仅依赖模型自身判断 |
                 """)
                 st.caption("官能度滑块在基础有效性和角色专用规则下生效，关闭规则下禁用。")
-            if primary_component_role == "resin":
-                formula_min_epoxide = st.slider(
-                    "树脂最小环氧官能度",
-                    1,
-                    6,
-                    1,
-                    key="vs_formula_min_epoxide_v2",
-                    disabled=formula_rule_profile == "off",
-                )
-                formula_min_hardener_func = st.slider(
-                    "固化剂最小活泼氢官能度",
-                    1,
-                    8,
-                    1,
-                    key="vs_formula_min_hardener_func_v2",
-                    disabled=formula_rule_profile == "off",
-                    help="胺类按活泼氢数（伯胺~2+仲胺~1），酸酐按酸酐基团数，酚类按酚羟基数，硫醇按巯基数，咪唑/叔胺按环/基数。低于此值会被过滤。",
-                )
-            else:
-                formula_min_epoxide = 0
-                formula_min_hardener_func = st.slider(
-                    "固化剂最小活泼氢官能度",
-                    1,
-                    8,
-                    1,
-                    key="vs_formula_min_hardener_func_v2",
-                    disabled=formula_rule_profile == "off",
-                    help="胺类按活泼氢数（伯胺~2+仲胺~1），酸酐按酸酐基团数，酚类按酚羟基数，硫醇按巯基数，咪唑/叔胺按环/基数。低于此值会被过滤。",
-                )
-                formula_min_epoxide = 0
+            formula_min_epoxide = st.slider(
+                "树脂最小环氧官能度",
+                1,
+                6,
+                1,
+                key="vs_formula_min_epoxide_v2",
+                disabled=formula_rule_profile == "off",
+            )
+            formula_min_hardener_func = st.slider(
+                "固化剂最小活泼氢官能度",
+                1,
+                8,
+                1,
+                key="vs_formula_min_hardener_func_v2",
+                disabled=formula_rule_profile == "off" or not hardener_channel_available,
+                help="胺类按活泼氢数（伯胺~2+仲胺~1），酸酐按酸酐基团数，酚类按酚羟基数，硫醇按巯基数，咪唑/叔胺按环/基数。低于此值会被过滤。",
+            )
             if formula_rule_profile == "basic":
-                if primary_component_role == "resin":
-                    st.caption("仅要求结构可解析、主体含环氧基，并采用宽松尺寸边界；不强制芳环或双官能。")
-                elif primary_component_role == "hardener":
-                    st.caption("仅要求结构可解析并采用宽松尺寸边界；不强制限定为胺、酸酐等传统固化剂类别。")
-                else:
-                    st.caption("仅检查结构可解析性和宽松尺寸边界，不附加环氧或固化剂类别假设。")
+                st.caption("树脂仅要求结构可解析、含环氧基并采用宽松尺寸边界；固化剂采用宽松尺寸边界。")
             elif formula_rule_profile == "strict":
-                if primary_component_role == "resin":
-                    st.caption("要求传统双官能芳香环氧结构，会排除脂环族与小分子候选。")
-                else:
-                    st.caption("仅保留常见胺、酸酐、酚、硫醇、咪唑或叔胺固化组分，并收紧尺寸与电荷限制。")
+                st.caption("树脂与固化剂分别执行角色专用规则；模型主输入角色不会关闭另一条通道。")
 
         formula_chem_rule_mode = "off" if formula_rule_profile == "off" else "pre"
-        if primary_component_role == "resin":
-            formula_chem_rules = {
-                "resin": {
-                    "min_epoxide": int(formula_min_epoxide),
-                },
-                "hardener": {
-                    "min_active_hydrogen": int(formula_min_hardener_func),
-                },
-            }
-        else:
-            formula_chem_rules = {
-                "hardener": {
-                    "min_mw": 25.0,
-                    "max_mw": 1500.0,
-                    "min_heavy_atoms": 2,
-                    "max_heavy_atoms": 120,
-                    "min_active_hydrogen": int(formula_min_hardener_func),
-                    "ban_strong_acids": False,
-                    "ban_epoxide": False,
-                    "allowed_classes": None,
-                }
-            }
-        if formula_rule_profile == "strict" and primary_component_role == "resin":
+        formula_chem_rules = {
+            "resin": {
+                "min_epoxide": int(formula_min_epoxide),
+            },
+            "hardener": {
+                "min_mw": 25.0,
+                "max_mw": 1500.0,
+                "min_heavy_atoms": 2,
+                "max_heavy_atoms": 120,
+                "min_active_hydrogen": int(formula_min_hardener_func),
+                "ban_strong_acids": False,
+                "ban_epoxide": False,
+                "allowed_classes": None,
+            },
+        }
+        if formula_rule_profile == "strict":
             formula_chem_rules = {
                 "global": {"reject_charged": True},
                 "resin": {
@@ -15514,27 +15583,8 @@ def page_virtual_screening():
                     "thiol_ratio": (0.2, 5.0),
                 },
             }
-        elif formula_rule_profile == "strict":
-            formula_chem_rules = {
-                "global": {"reject_charged": True},
-                "hardener": {
-                    "min_mw": 40.0,
-                    "max_mw": 1000.0,
-                    "min_heavy_atoms": 3,
-                    "max_heavy_atoms": 100,
-                    "ban_strong_acids": True,
-                    "ban_epoxide": True,
-                    "min_active_hydrogen": int(formula_min_hardener_func),
-                    "allowed_classes": ["amine", "anhydride", "phenol", "thiol", "imidazole", "tertiary_amine"],
-                },
-            }
-
-        formula_rule_resin_col = "resin_smiles" if primary_component_role == "resin" else None
-        formula_rule_hardener_col = (
-            "hardener_smiles" if primary_component_role == "resin" and hardener_formula_enabled
-            else "resin_smiles" if primary_component_role != "resin"
-            else None
-        )
+        formula_rule_resin_col = "resin_smiles"
+        formula_rule_hardener_col = "hardener_smiles" if hardener_formula_enabled else None
 
         with st.expander("多组分配方控制", expanded=False):
             st.caption("限制每个配方中树脂和固化剂的组分数量，保证配方多样性。")
@@ -15757,7 +15807,7 @@ def page_virtual_screening():
                     resin_libraries.append(
                         build_component_library(
                             dataset_resin_pool,
-                            role=primary_library_role,
+                            role="resin",
                             source="train_data",
                             max_items=int(dataset_pool_limit),
                             random_state=int(formula_random_state),
@@ -15782,7 +15832,7 @@ def page_virtual_screening():
                     resin_libraries.append(
                         build_component_library(
                             upload_resin_pool,
-                            role=primary_library_role,
+                            role="resin",
                             source="uploaded",
                             max_items=int(upload_pool_limit),
                             random_state=int(formula_random_state),
@@ -15805,7 +15855,7 @@ def page_virtual_screening():
                 resin_libraries.append(
                     build_component_library(
                         pubchem_resin_pool,
-                        role=primary_library_role,
+                        role="resin",
                         source="pubchem",
                         random_state=int(formula_random_state),
                     )
@@ -15825,7 +15875,7 @@ def page_virtual_screening():
 
             if use_guided_source:
                 guided_resin_library = generate_virtual_component_library(
-                    role=primary_library_role,
+                    role="resin",
                     n_samples=int(guided_n_generate),
                     pos_tags=pos_tags,
                     neg_tags=neg_tags,
@@ -15849,12 +15899,12 @@ def page_virtual_screening():
                     hardener_libraries.append(guided_hardener_library)
 
             formula_progress.progress(12)
-            formula_status.info(f"正在构建{primary_role_label}候选库与配方空间...")
+            formula_status.info("正在构建树脂/固化剂候选库与配方空间...")
             resin_library = merge_component_libraries(*resin_libraries)
             hardener_library = merge_component_libraries(*hardener_libraries) if hardener_formula_enabled else pd.DataFrame()
 
             if resin_library.empty:
-                st.error(f"❌ {primary_role_label}候选库为空，请至少提供一种候选来源。")
+                st.error("❌ 树脂候选库为空，请至少提供一种树脂候选来源。")
                 return
             if hardener_formula_enabled and hardener_library.empty:
                 if hardener_required:
@@ -15864,8 +15914,8 @@ def page_virtual_screening():
                 return
 
             st.info(
-                f"{primary_role_label}候选 {len(resin_library)} 个"
-                + (f" | {secondary_role_label}候选 {len(hardener_library)} 个" if hardener_formula_enabled else "")
+                f"树脂候选 {len(resin_library)} 个"
+                + (f" | 固化剂候选 {len(hardener_library)} 个" if hardener_formula_enabled else "")
                 + f" | 工艺网格 {estimated_grid_size}"
             )
 
@@ -15942,7 +15992,7 @@ def page_virtual_screening():
                         pool_df["formulation_id"] = np.arange(1, len(pool_df) + 1)
                         design_space.metadata["observed_anchor_count"] = observed_anchor_count
                         design_space.metadata["sampled"] = int(len(pool_df))
-                        st.caption(f"已强制加入 {observed_anchor_count} 个原始实测{primary_role_label}配方，避免高性能训练样本在随机组合中丢失。")
+                        st.caption(f"已强制加入 {observed_anchor_count} 个原始实测树脂/固化剂配方，避免高性能训练样本在随机组合中丢失。")
             if pool_df.empty:
                 st.warning("⚠️ 未生成任何虚拟配方，请检查候选库和组合设置。")
                 return
@@ -15967,7 +16017,7 @@ def page_virtual_screening():
 
             if apply_formula_chem_rules_pre:
                 formula_progress.progress(34)
-                formula_status.info(f"正在执行{primary_role_label}角色化学规则筛选...")
+                formula_status.info("正在执行树脂/固化剂角色化学规则筛选...")
                 _pool_before_chem = int(len(pool_df))
                 _pool_before_chem_df = pool_df.copy()
                 _pool_before_chem_df["_chem_row_id"] = np.arange(len(_pool_before_chem_df))
@@ -17159,11 +17209,23 @@ def page_virtual_screening():
                     if hardener_errors:
                         st.warning("部分固化剂 PubChem 查询失败：\n" + "\n".join(hardener_errors[:6]))
 
-                    # 应用工业过滤
+                    # 应用二阶段工业过滤
+                    _known_set2 = extract_known_hardeners_from_training_data(
+                        df_ref_design if isinstance(df_ref_design, pd.DataFrame) else pd.DataFrame(),
+                        [c for c in feature_cols if c.startswith("curing_agent_smiles_")],
+                    ) if use_dataset_source else set()
                     if _ind_enable_resin2 and resin_list:
-                        resin_list, _r_stats2 = filter_industrial_candidates(resin_list, label="树脂", **_ind_cfg_resin2)
+                        resin_list, _r_stats2, _r_scores2 = pipeline_industrial_filter(
+                            resin_list, _known_set2,
+                            stage1_max_mp=_ind_cfg_resin2.get("max_melting_point", 130),
+                            workers=12, label="树脂",
+                        )
                     if _ind_enable_hard2 and hardener_list:
-                        hardener_list, _h_stats2 = filter_industrial_candidates(hardener_list, label="固化剂", **_ind_cfg_hard2)
+                        hardener_list, _h_stats2, _h_scores2 = pipeline_industrial_filter(
+                            hardener_list, _known_set2,
+                            stage1_max_mp=_ind_cfg_hard2.get("max_melting_point", 130),
+                            workers=12, label="固化剂",
+                        )
                     st.session_state["vs_pubchem_resin_smiles"] = resin_list
                     st.session_state["vs_pubchem_hardener_smiles"] = hardener_list
                     if resin_list or hardener_list:
