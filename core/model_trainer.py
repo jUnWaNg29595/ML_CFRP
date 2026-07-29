@@ -454,6 +454,287 @@ def _make_y_bins(y: np.ndarray, n_bins: int = 10):
             return None
 
 
+def _build_target_balance_info(
+    y_train,
+    enabled=True,
+    n_bins=10,
+    max_weight=3.0,
+    random_state=42,
+):
+    y_arr = pd.to_numeric(
+        pd.Series(np.asarray(y_train).ravel()),
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    valid_mask = np.isfinite(y_arr)
+    y_arr = y_arr[valid_mask]
+    info = {
+        "enabled": bool(enabled),
+        "method": "disabled",
+        "n_bins": int(max(1, n_bins)),
+        "max_weight": float(max(1.0, max_weight)),
+        "random_state": int(random_state),
+        "weights": np.ones(len(y_arr), dtype=float),
+        "bin_ids": np.zeros(len(y_arr), dtype=int),
+        "bin_edges": [],
+        "bin_counts": [],
+        "bin_mean_weights": [],
+        "train_sample_count": int(len(y_arr)),
+        "resampled_sample_count": int(len(y_arr)),
+        "fallback_reason": None,
+    }
+
+    def disable(reason):
+        info["enabled"] = False
+        info["fallback_reason"] = reason
+        return info
+
+    if not enabled:
+        return disable("用户关闭目标分布平衡")
+    if len(y_arr) < 20:
+        return disable("有效训练样本少于20，跳过分箱")
+    if np.unique(y_arr).size < 2 or np.isclose(np.ptp(y_arr), 0.0):
+        return disable("目标值近似常量，无法建立密度差异")
+
+    requested_bins = int(np.clip(n_bins, 4, 20))
+    finite_min = float(np.min(y_arr))
+    finite_max = float(np.max(y_arr))
+    raw_edges = np.linspace(finite_min, finite_max, requested_bins + 1)
+    edges = np.unique(raw_edges)
+    if len(edges) < 3:
+        return disable("目标值边界不足，无法形成至少两个分箱")
+
+    bin_ids = np.digitize(y_arr, edges[1:-1], right=False)
+    counts = np.bincount(bin_ids, minlength=len(edges) - 1).astype(int)
+    nonempty = counts > 0
+    if int(nonempty.sum()) < 2:
+        return disable("有效非空分箱少于2个")
+
+    occupied_ids = np.flatnonzero(nonempty)
+    remap = {old_id: new_id for new_id, old_id in enumerate(occupied_ids)}
+    bin_ids = np.asarray([remap[int(value)] for value in bin_ids], dtype=int)
+    occupied_edges = np.concatenate(
+        ([edges[occupied_ids[0]]], edges[occupied_ids + 1])
+    )
+    counts = np.bincount(bin_ids, minlength=len(occupied_ids)).astype(int)
+
+    if len(counts) > 2:
+        while len(counts) > 2 and int(np.min(counts)) < 2:
+            sparse_id = int(np.argmin(counts))
+            if sparse_id == 0:
+                bin_ids[bin_ids == sparse_id] = 1
+                bin_ids[bin_ids > sparse_id] -= 1
+                boundary_index = sparse_id + 1
+            else:
+                merge_to = sparse_id - 1
+                bin_ids[bin_ids == sparse_id] = merge_to
+                bin_ids[bin_ids > sparse_id] -= 1
+                boundary_index = sparse_id
+            counts = np.bincount(
+                bin_ids,
+                minlength=int(np.max(bin_ids)) + 1,
+            ).astype(int)
+            occupied_edges = np.delete(occupied_edges, boundary_index)
+
+    density = counts.astype(float) / max(1, len(y_arr))
+    smoothed_density = density + (1.0 / max(1, len(y_arr)))
+    raw_weights_by_bin = 1.0 / smoothed_density
+    raw_weights_by_bin /= np.average(raw_weights_by_bin, weights=counts)
+
+    weight_cap = float(max(1.0, max_weight))
+    weights_by_bin = raw_weights_by_bin.copy()
+    capped = np.zeros(len(weights_by_bin), dtype=bool)
+    total_weight = float(np.sum(counts))
+    while True:
+        uncapped = ~capped
+        fixed_weight = float(np.sum(counts[capped] * weight_cap))
+        remaining_weight = max(0.0, total_weight - fixed_weight)
+        raw_uncapped_weight = float(np.sum(counts[uncapped] * raw_weights_by_bin[uncapped]))
+        scale = remaining_weight / max(raw_uncapped_weight, 1e-12)
+        weights_by_bin[uncapped] = raw_weights_by_bin[uncapped] * scale
+        weights_by_bin[capped] = weight_cap
+        newly_capped = uncapped & (weights_by_bin > weight_cap)
+        if not np.any(newly_capped):
+            break
+        capped[newly_capped] = True
+
+    weights = weights_by_bin[bin_ids]
+    info.update(
+        {
+            "method": "ready",
+            "weights": weights.astype(float),
+            "bin_ids": bin_ids,
+            "bin_edges": occupied_edges.astype(float).tolist(),
+            "bin_counts": counts.astype(int).tolist(),
+            "bin_mean_weights": [
+                float(np.mean(weights[bin_ids == bin_id]))
+                for bin_id in range(len(counts))
+            ],
+        }
+    )
+    return info
+
+
+def _weighted_resample_indices(weights, random_state=42):
+    weights_arr = np.asarray(weights, dtype=float).ravel()
+    if len(weights_arr) == 0:
+        return np.asarray([], dtype=int)
+    probabilities = np.where(
+        np.isfinite(weights_arr) & (weights_arr > 0),
+        weights_arr,
+        0.0,
+    )
+    if float(probabilities.sum()) <= 0.0:
+        probabilities = np.ones(len(weights_arr), dtype=float)
+    probabilities /= probabilities.sum()
+    rng = np.random.default_rng(int(random_state))
+    indices = rng.choice(
+        np.arange(len(weights_arr), dtype=int),
+        size=len(weights_arr),
+        replace=True,
+        p=probabilities,
+    )
+    if (
+        len(indices) > 1
+        and len(np.unique(indices)) == len(indices)
+        and np.ptp(probabilities) > 1e-12
+    ):
+        highest_probability_index = int(np.argmax(probabilities))
+        lowest_sample_position = int(
+            np.argmin(probabilities[indices])
+        )
+        indices[lowest_sample_position] = highest_probability_index
+    return indices
+
+
+def _model_accepts_sample_weight(model):
+    try:
+        signature = inspect.signature(model.fit)
+    except Exception:
+        return False
+    parameters = signature.parameters
+    return (
+        "sample_weight" in parameters
+        or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
+
+
+def _prepare_balanced_fit_data(model, X_train, y_train, balance_info, random_state=42):
+    y_arr = np.asarray(y_train).ravel()
+    method = balance_info.get("method")
+    if method not in {"ready", "disabled"}:
+        raise ValueError("balance_info 只接受 method 为 ready 或 disabled")
+
+    weights = np.asarray(
+        balance_info.get("weights", np.ones(len(y_arr))),
+        dtype=float,
+    ).ravel()
+    if len(weights) != len(y_arr):
+        weights = np.ones(len(y_arr), dtype=float)
+
+    if method == "disabled":
+        return {
+            "X": X_train,
+            "y": y_arr,
+            "sample_weight": None,
+            "method": "disabled",
+            "resampled_indices": np.arange(len(y_arr), dtype=int),
+            "fallback_reason": balance_info.get("fallback_reason"),
+        }
+
+    if _model_accepts_sample_weight(model):
+        return {
+            "X": X_train,
+            "y": y_arr,
+            "sample_weight": weights,
+            "method": "sample_weight",
+            "resampled_indices": np.arange(len(y_arr), dtype=int),
+            "fallback_reason": None,
+        }
+
+    indices = _weighted_resample_indices(weights, random_state=random_state)
+    if isinstance(X_train, pd.DataFrame):
+        X_resampled = X_train.iloc[indices].reset_index(drop=True)
+    else:
+        X_resampled = np.asarray(X_train)[indices]
+    return {
+        "X": X_resampled,
+        "y": y_arr[indices],
+        "sample_weight": None,
+        "method": "weighted_resample",
+        "resampled_indices": indices,
+        "fallback_reason": None,
+    }
+
+
+def _compute_regression_bin_metrics(y_true, y_pred, bin_edges):
+    y_true_arr = np.asarray(y_true, dtype=float).ravel()
+    y_pred_arr = np.asarray(y_pred, dtype=float).ravel()
+    edges = np.asarray(bin_edges, dtype=float).ravel()
+    if len(edges) < 2:
+        return []
+
+    bin_ids = np.digitize(y_true_arr, edges[1:-1], right=False)
+    rows = []
+    for bin_id in range(len(edges) - 1):
+        mask = (
+            (bin_ids == bin_id)
+            & np.isfinite(y_true_arr)
+            & np.isfinite(y_pred_arr)
+        )
+        if not np.any(mask):
+            continue
+        y_bin = y_true_arr[mask]
+        pred_bin = y_pred_arr[mask]
+        rows.append(
+            {
+                "bin": f"[{edges[bin_id]:.6g}, {edges[bin_id + 1]:.6g})",
+                "sample_count": int(mask.sum()),
+                "r2": (
+                    float(r2_score(y_bin, pred_bin))
+                    if len(y_bin) >= 2
+                    else float("nan")
+                ),
+                "rmse": float(np.sqrt(mean_squared_error(y_bin, pred_bin))),
+                "mae": float(mean_absolute_error(y_bin, pred_bin)),
+            }
+        )
+    return rows
+
+
+def _finalize_target_balance_result(
+    balance_info,
+    actual_method=None,
+    fit_sample_count=None,
+    early_stopping_validation_count=0,
+):
+    """压缩目标平衡元数据，避免把逐样本数组写入模型结果。"""
+    result = {
+        key: value
+        for key, value in dict(balance_info or {}).items()
+        if key not in {"weights", "bin_ids"}
+    }
+    weights = np.asarray((balance_info or {}).get("weights", []), dtype=float)
+    result["method"] = actual_method or result.get("method", "disabled")
+    result["weights"] = None
+    result["weight_min"] = (
+        float(np.min(weights)) if len(weights) else 1.0
+    )
+    result["weight_max"] = (
+        float(np.max(weights)) if len(weights) else 1.0
+    )
+    result["fit_sample_count"] = int(
+        len(weights) if fit_sample_count is None else fit_sample_count
+    )
+    result["resampled_sample_count"] = int(result["fit_sample_count"])
+    result["early_stopping_validation_count"] = int(
+        early_stopping_validation_count
+    )
+    return result
+
+
 def _sanitize_feature_frame(df_in: pd.DataFrame, model_name_in: str) -> pd.DataFrame:
     """Replace inf/too-large values with NaN for safer model fitting."""
     df_out = df_in.copy()
@@ -2131,6 +2412,12 @@ class EnhancedModelTrainer:
 
         groups=None,
 
+        target_balance_enabled=True,
+
+        balance_n_bins=10,
+
+        balance_max_weight=3.0,
+
         **params
 
     ):
@@ -2188,6 +2475,14 @@ class EnhancedModelTrainer:
 
         y_test = y_arr[test_idx]
 
+        balance_info = _build_target_balance_info(
+            y_train,
+            enabled=target_balance_enabled,
+            n_bins=balance_n_bins,
+            max_weight=balance_max_weight,
+            random_state=random_state,
+        )
+
 
         params.pop('train_n_jobs', None)
 
@@ -2205,7 +2500,17 @@ class EnhancedModelTrainer:
 
         start_time = time.time()
 
-        model.fit(X_train_raw, y_train)
+        fit_data = _prepare_balanced_fit_data(
+            model,
+            X_train_raw,
+            y_train,
+            balance_info,
+            random_state=random_state,
+        )
+        fit_kwargs = {}
+        if fit_data["sample_weight"] is not None:
+            fit_kwargs["sample_weight"] = fit_data["sample_weight"]
+        model.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
 
         train_time = time.time() - start_time
 
@@ -2253,6 +2558,17 @@ class EnhancedModelTrainer:
 
         )
 
+        balance_result = _finalize_target_balance_result(
+            balance_info,
+            actual_method=fit_data["method"],
+            fit_sample_count=len(fit_data["y"]),
+        )
+        test_bin_metrics = _compute_regression_bin_metrics(
+            y_test,
+            y_pred_test,
+            balance_info.get("bin_edges", []),
+        )
+
 
         return {
             'model': model,
@@ -2283,6 +2599,8 @@ class EnhancedModelTrainer:
             'test_indices': test_idx,
             'training_history': training_history,
             'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
+            'target_balance': balance_result,
+            'test_bin_metrics': test_bin_metrics,
 
 
         }
@@ -2308,6 +2626,9 @@ class EnhancedModelTrainer:
         split_strategy="random",
         n_bins=10,
         groups=None,
+        target_balance_enabled=True,
+        balance_n_bins=10,
+        balance_max_weight=3.0,
         **params,
     ):
         if not isinstance(X, pd.DataFrame):
@@ -2342,6 +2663,13 @@ class EnhancedModelTrainer:
         X_test_raw = X_df.iloc[test_idx].reset_index(drop=True)
         y_train = y_arr[train_idx]
         y_test = y_arr[test_idx]
+        balance_info = _build_target_balance_info(
+            y_train,
+            enabled=target_balance_enabled,
+            n_bins=balance_n_bins,
+            max_weight=balance_max_weight,
+            random_state=random_state,
+        )
 
         train_n_jobs = params.pop("train_n_jobs", -1)
         model_params = params.copy()
@@ -2354,7 +2682,17 @@ class EnhancedModelTrainer:
         model = self._get_model(model_name, random_state=int(random_state), **model_params)
 
         start_time = time.time()
-        model.fit(X_train_raw, y_train)
+        fit_data = _prepare_balanced_fit_data(
+            model,
+            X_train_raw,
+            y_train,
+            balance_info,
+            random_state=random_state,
+        )
+        fit_kwargs = {}
+        if fit_data["sample_weight"] is not None:
+            fit_kwargs["sample_weight"] = fit_data["sample_weight"]
+        model.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
         train_time = time.time() - start_time
 
         pipeline = Pipeline(steps=[("model", model)])
@@ -2374,6 +2712,16 @@ class EnhancedModelTrainer:
             )
 
         r2_val, rmse_val, mae_val = _safe_metrics(y_test, y_pred_test)
+        balance_result = _finalize_target_balance_result(
+            balance_info,
+            actual_method=fit_data["method"],
+            fit_sample_count=len(fit_data["y"]),
+        )
+        test_bin_metrics = _compute_regression_bin_metrics(
+            y_test,
+            y_pred_test,
+            balance_info.get("bin_edges", []),
+        )
 
         return {
             "model": model,
@@ -2399,6 +2747,8 @@ class EnhancedModelTrainer:
             "test_indices": test_idx,
             "training_history": None,
             "training_history_df": pd.DataFrame(),
+            "target_balance": balance_result,
+            "test_bin_metrics": test_bin_metrics,
         }
 
     def _train_raw_frame_model(
@@ -2411,6 +2761,9 @@ class EnhancedModelTrainer:
         split_strategy="random",
         n_bins=10,
         groups=None,
+        target_balance_enabled=True,
+        balance_n_bins=10,
+        balance_max_weight=3.0,
         **params,
     ):
         if isinstance(X, pd.DataFrame):
@@ -2455,6 +2808,29 @@ class EnhancedModelTrainer:
         X_test_raw = X_df.iloc[test_idx].reset_index(drop=True)
         y_train = y_arr[train_idx]
         y_test = y_arr[test_idx]
+        if len(y_train) >= 20:
+            fit_idx, early_idx = train_test_split(
+                np.arange(len(y_train), dtype=int),
+                test_size=0.15,
+                random_state=random_state,
+            )
+            if len(early_idx) < 4:
+                fit_idx = np.arange(len(y_train), dtype=int)
+                early_idx = np.asarray([], dtype=int)
+        else:
+            fit_idx = np.arange(len(y_train), dtype=int)
+            early_idx = np.asarray([], dtype=int)
+        X_fit_raw = X_train_raw.iloc[fit_idx].reset_index(drop=True)
+        X_early_valid_raw = X_train_raw.iloc[early_idx].reset_index(drop=True)
+        y_fit = y_train[fit_idx]
+        y_early_valid = y_train[early_idx]
+        balance_info = _build_target_balance_info(
+            y_fit,
+            enabled=target_balance_enabled,
+            n_bins=balance_n_bins,
+            max_weight=balance_max_weight,
+            random_state=random_state,
+        )
 
         if _should_pass_target_name(model_name) and "target_name" not in model_params and hasattr(y, "name"):
             model_params["target_name"] = getattr(y, "name", None)
@@ -2462,13 +2838,23 @@ class EnhancedModelTrainer:
         model = self._get_model(model_name, random_state=int(random_state), **model_params)
 
         try:
-            if hasattr(model, "validation_data") and model_name != "Transformer + BNN":
-                setattr(model, "validation_data", (X_test_raw, y_test))
+            if hasattr(model, "validation_data") and len(early_idx) >= 4:
+                setattr(model, "validation_data", (X_early_valid_raw, y_early_valid))
         except Exception:
             pass
 
         start_time = time.time()
-        model.fit(X_train_raw, y_train)
+        fit_data = _prepare_balanced_fit_data(
+            model,
+            X_fit_raw,
+            y_fit,
+            balance_info,
+            random_state=random_state,
+        )
+        fit_kwargs = {}
+        if fit_data["sample_weight"] is not None:
+            fit_kwargs["sample_weight"] = fit_data["sample_weight"]
+        model.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
         train_time = time.time() - start_time
 
         pipeline = Pipeline(steps=[("model", model)])
@@ -2535,6 +2921,17 @@ class EnhancedModelTrainer:
             X_test_scaled=None,
             y_test=np.asarray(y_test),
         )
+        balance_result = _finalize_target_balance_result(
+            balance_info,
+            actual_method=fit_data["method"],
+            fit_sample_count=len(fit_data["y"]),
+            early_stopping_validation_count=len(y_early_valid),
+        )
+        test_bin_metrics = _compute_regression_bin_metrics(
+            y_test,
+            y_pred_test,
+            balance_info.get("bin_edges", []),
+        )
 
         return {
             "model": model,
@@ -2560,6 +2957,8 @@ class EnhancedModelTrainer:
             "test_indices": test_idx,
             "training_history": training_history,
             "training_history_df": history_to_frame(training_history) if training_history else pd.DataFrame(),
+            "target_balance": balance_result,
+            "test_bin_metrics": test_bin_metrics,
         }
 
 
@@ -2986,6 +3385,9 @@ class EnhancedModelTrainer:
         n_bins=10,
         groups=None,
         drop_missing_rows=True,
+        target_balance_enabled=True,
+        balance_n_bins=10,
+        balance_max_weight=3.0,
         **params
     ):
         """训练单个模型（支持随机/分层/分组划分）"""
@@ -3000,6 +3402,9 @@ class EnhancedModelTrainer:
                 split_strategy=split_strategy,
                 n_bins=n_bins,
                 groups=groups,
+                target_balance_enabled=target_balance_enabled,
+                balance_n_bins=balance_n_bins,
+                balance_max_weight=balance_max_weight,
                 **params
             )
 
@@ -3027,6 +3432,9 @@ class EnhancedModelTrainer:
                 split_strategy=split_strategy,
                 n_bins=n_bins,
                 groups=groups,
+                target_balance_enabled=target_balance_enabled,
+                balance_n_bins=balance_n_bins,
+                balance_max_weight=balance_max_weight,
                 **params,
             )
 
@@ -3040,6 +3448,9 @@ class EnhancedModelTrainer:
                 split_strategy=split_strategy,
                 n_bins=n_bins,
                 groups=groups,
+                target_balance_enabled=target_balance_enabled,
+                balance_n_bins=balance_n_bins,
+                balance_max_weight=balance_max_weight,
                 **params,
             )
 
@@ -3134,6 +3545,34 @@ class EnhancedModelTrainer:
         X_test_raw = X_arr[test_idx]
         y_train = y_arr[train_idx]
         y_test = y_arr[test_idx]
+
+        early_stop_models = {"XGBoost", "LightGBM", "CatBoost"}
+        use_internal_validation = (
+            model_name in early_stop_models
+            and len(y_train) >= 20
+        )
+        if use_internal_validation:
+            fit_idx, early_idx = train_test_split(
+                np.arange(len(y_train), dtype=int),
+                test_size=0.15,
+                random_state=random_state,
+            )
+            if len(early_idx) < 4:
+                fit_idx = np.arange(len(y_train), dtype=int)
+                early_idx = np.asarray([], dtype=int)
+        else:
+            fit_idx = np.arange(len(y_train), dtype=int)
+            early_idx = np.asarray([], dtype=int)
+
+        y_fit = y_train[fit_idx]
+        y_early_valid = y_train[early_idx]
+        balance_info = _build_target_balance_info(
+            y_fit,
+            enabled=target_balance_enabled,
+            n_bins=balance_n_bins,
+            max_weight=balance_max_weight,
+            random_state=random_state,
+        )
 
 
         # 3) 模型参数注入 random_state（对不支持的模型跳过）
@@ -3344,6 +3783,32 @@ class EnhancedModelTrainer:
             if np.isinf(y_train_fit).any():
                 raise ValueError("目标变量归一化后产生无穷大值，可能是目标变量方差为0或存在极端值，请检查数据")
 
+        X_fit_proc = X_train_proc[fit_idx]
+        X_early_valid_proc = (
+            X_train_proc[early_idx] if len(early_idx) >= 4 else None
+        )
+        y_fit_model = (
+            y_train_fit[fit_idx]
+            if model_name == "人工神经网络"
+            else y_fit
+        )
+        y_early_valid_model = (
+            y_train_fit[early_idx]
+            if model_name == "人工神经网络" and len(early_idx) >= 4
+            else y_early_valid
+        )
+        fit_data = _prepare_balanced_fit_data(
+            base_model,
+            X_fit_proc,
+            y_fit_model,
+            balance_info,
+            random_state=random_state,
+        )
+        X_model_fit = fit_data["X"]
+        y_model_fit = fit_data["y"]
+        sample_weight = fit_data["sample_weight"]
+        actual_balance_method = fit_data["method"]
+
         # TensorFlow Sequential: 预先转为 float32 以降低内存峰值
         if model_name == "TensorFlow Sequential":
             X_train_proc = np.asarray(X_train_proc, dtype=np.float32)
@@ -3446,33 +3911,31 @@ class EnhancedModelTrainer:
         try:
             if model_name == "XGBoost" and XGBOOST_AVAILABLE:
                 # XGBoost: 支持 eval_set + eval_metric，训练后可读取 evals_result
-                eval_train = str(os.environ.get("XGB_EVAL_TRAIN", "1")).strip().lower() in {"1", "true", "yes"}  # 默认启用训练集评估
                 early_stop = xgb_fit_params.get("early_stopping_rounds")
                 verbose_eval = xgb_fit_params.get("verbose_eval") or 10  # 每10轮显示一次
 
-                # 构建eval_set：同时包含训练集和测试集
                 eval_sets = []
-                if eval_train:
-                    eval_sets.append((X_train_proc, y_train))
-                eval_sets.append((X_test_proc, y_test))
+                if len(y_early_valid_model) >= 4 and X_early_valid_proc is not None:
+                    eval_sets.append((X_early_valid_proc, y_early_valid_model))
 
                 # 使用单个内置指标，避免部分 XGBoost 版本在预测阶段解析多指标失败
                 eval_metric = "rmse"
 
                 fit_kwargs = {
-                    "eval_set": eval_sets,
                     "eval_metric": eval_metric,
                     "verbose": int(verbose_eval) if int(verbose_eval) > 0 else False,
                 }
+                if eval_sets:
+                    fit_kwargs["eval_set"] = eval_sets
 
                 print(f"✓ 训练指标: RMSE (MAE和R²将从预测结果计算)")
 
                 # 早停配置：默认启用，50轮不提升则停止
                 early_stop_rounds = 500  # 默认500轮早停
-                if early_stop is not None and int(early_stop) > 0:
+                if eval_sets and early_stop is not None and int(early_stop) > 0:
                     early_stop_rounds = int(early_stop)
                     print(f"✓ 启用早停机制: {early_stop_rounds} 轮不提升则停止训练")
-                else:
+                elif eval_sets:
                     print(f"✓ 启用默认早停机制: {early_stop_rounds} 轮不提升则停止训练")
 
                 # 检测XGBoost版本,使用正确的早停方式
@@ -3480,7 +3943,7 @@ class EnhancedModelTrainer:
                     import xgboost
                     xgb_version = tuple(map(int, xgboost.__version__.split('.')[:2]))
 
-                    if xgb_version >= (2, 0):
+                    if eval_sets and xgb_version >= (2, 0):
                         # XGBoost 2.0+: 使用callbacks
                         print(f"[DEBUG] XGBoost {xgboost.__version__}: 使用callbacks方式")
                         try:
@@ -3492,63 +3955,70 @@ class EnhancedModelTrainer:
                         except ImportError:
                             print(f"[WARNING] 无法导入EarlyStopping,尝试传统方式")
                             fit_kwargs["early_stopping_rounds"] = early_stop_rounds
-                    else:
+                    elif eval_sets:
                         # XGBoost 1.x: 使用fit参数
                         print(f"[DEBUG] XGBoost {xgboost.__version__}: 使用fit参数方式")
                         fit_kwargs["early_stopping_rounds"] = early_stop_rounds
                 except Exception as e:
-                    print(f"[WARNING] 无法检测XGBoost版本: {e}, 使用传统方式")
-                    fit_kwargs["early_stopping_rounds"] = early_stop_rounds
+                    if eval_sets:
+                        print(f"[WARNING] 无法检测XGBoost版本: {e}, 使用传统方式")
+                        fit_kwargs["early_stopping_rounds"] = early_stop_rounds
+                if sample_weight is not None:
+                    fit_kwargs["sample_weight"] = sample_weight
             elif model_name == "LightGBM" and LIGHTGBM_AVAILABLE:
-                # LightGBM: 同时记录训练集和测试集
-                # LightGBM原生支持R²指标
-                fit_kwargs = {
-                    "eval_set": [(X_train_proc, y_train), (X_test_proc, y_test)],
-                    "eval_names": ["training", "valid_1"],
-                    "eval_metric": ["rmse", "mae", "l2"],  # l2可以用来计算R²
-                    "callbacks": [
-                        # 早停 + 日志回调将在下方添加
-                    ]
-                }
-                # LightGBM的早停和日志需要通过callbacks
-                try:
-                    from lightgbm import early_stopping, log_evaluation
-                    fit_kwargs["callbacks"].append(early_stopping(stopping_rounds=50, verbose=True))
-                    fit_kwargs["callbacks"].append(log_evaluation(period=10))
-                    print(f"✓ 启用LightGBM早停机制: 50 轮不提升则停止训练")
-                    print(f"✓ 启用LightGBM日志输出: 每10轮显示一次")
-                except ImportError:
-                    # 旧版本LightGBM可能没有early_stopping/log_evaluation函数
-                    fit_kwargs["early_stopping_rounds"] = 50
-                    fit_kwargs["verbose"] = 10
-                    print(f"✓ 启用LightGBM早停机制(旧版): 50 轮不提升则停止训练")
+                fit_kwargs = {}
+                if len(y_early_valid_model) >= 4 and X_early_valid_proc is not None:
+                    fit_kwargs = {
+                        "eval_set": [(X_early_valid_proc, y_early_valid_model)],
+                        "eval_names": ["internal_validation"],
+                        "eval_metric": ["rmse", "mae", "l2"],
+                        "callbacks": [],
+                    }
+                    try:
+                        from lightgbm import early_stopping, log_evaluation
+                        fit_kwargs["callbacks"].append(early_stopping(stopping_rounds=50, verbose=True))
+                        fit_kwargs["callbacks"].append(log_evaluation(period=10))
+                        print(f"✓ 启用LightGBM内部验证早停机制: 50 轮不提升则停止训练")
+                    except ImportError:
+                        fit_kwargs["early_stopping_rounds"] = 50
+                        fit_kwargs["verbose"] = 10
+                if sample_weight is not None:
+                    fit_kwargs["sample_weight"] = sample_weight
             elif model_name == "CatBoost" and CATBOOST_AVAILABLE:
-                # CatBoost: 同时记录训练集和测试集
-                # CatBoost原生支持R²指标
-                from catboost import Pool
-                train_pool = Pool(X_train_proc, y_train)
-                test_pool = Pool(X_test_proc, y_test)
                 fit_kwargs = {
-                    "eval_set": test_pool,
-                    "verbose": 10,  # 每10轮显示一次
+                    "verbose": 10,
                     "plot": False,
-                    "metric_period": 10,  # 每10轮输出指标
-                    "early_stopping_rounds": 50,  # 早停：50轮不提升则停止
+                    "metric_period": 10,
                 }
-                print(f"✓ 启用CatBoost早停机制: 50 轮不提升则停止训练")
+                if len(y_early_valid_model) >= 4 and X_early_valid_proc is not None:
+                    from catboost import Pool
+                    fit_kwargs["eval_set"] = Pool(
+                        X_early_valid_proc,
+                        y_early_valid_model,
+                    )
+                    fit_kwargs["early_stopping_rounds"] = 50
+                    print(f"✓ 启用CatBoost内部验证早停机制: 50 轮不提升则停止训练")
+                if sample_weight is not None:
+                    fit_kwargs["sample_weight"] = sample_weight
         except Exception:
             fit_kwargs = {}
 
+        if (
+            sample_weight is not None
+            and model_name not in {"XGBoost", "LightGBM", "CatBoost"}
+        ):
+            fit_kwargs["sample_weight"] = sample_weight
+
         # 有些模型不接受额外 kwargs，做一次安全回退
-        # 对神经网络类模型：把测试集作为 validation_data，便于记录 Test 的 MAE/MSE 曲线
+        # 神经网络验证数据只来自训练集内部切分
         try:
             if model_name in {
                 "人工神经网络",
                 "TensorFlow Sequential",
                 "Bayesian Neural Network (BNN)",
                 "FT-Transformer",
-            }:
-                setattr(base_model, "validation_data", (X_test_proc, y_test))
+            } and len(y_early_valid_model) >= 4 and X_early_valid_proc is not None:
+                setattr(base_model, "validation_data", (X_early_valid_proc, y_early_valid_model))
                 # TF 模型内部若使用 validation_split，会导致 Test 曲线不是同一批数据；这里优先用外部 validation_data
                 if model_name == "TensorFlow Sequential" and hasattr(base_model, "validation_split"):
                     base_model.validation_split = 0.0
@@ -3562,23 +4032,33 @@ class EnhancedModelTrainer:
             # 直接调用fit,不使用_safe_xgb_fit(它会过滤掉early_stopping)
             try:
                 # 方法1: 直接传入所有参数
-                base_model.fit(X_train_proc, y_train, **fit_kwargs)
+                base_model.fit(X_model_fit, y_model_fit, **fit_kwargs)
                 print("[DEBUG] ✓ XGBoost训练成功(方法1: 直接fit)")
             except TypeError as e:
                 print(f"[DEBUG] 方法1失败: {e}")
+                if "sample_weight" in fit_kwargs:
+                    fallback_indices = _weighted_resample_indices(
+                        balance_info.get("weights", []),
+                        random_state=random_state,
+                    )
+                    X_model_fit = X_fit_proc[fallback_indices]
+                    y_model_fit = y_fit_model[fallback_indices]
+                    fit_kwargs.pop("sample_weight", None)
+                    actual_balance_method = "weighted_resample"
+                    balance_info["fallback_reason"] = f"模型拒绝sample_weight: {e}"
                 # 方法2: 移除eval_metric,保留early_stopping
                 try:
                     fit_kwargs_backup = dict(fit_kwargs)
                     eval_metric = fit_kwargs_backup.pop("eval_metric", None)
                     if eval_metric:
                         base_model.set_params(eval_metric=eval_metric)
-                    base_model.fit(X_train_proc, y_train, **fit_kwargs_backup)
+                    base_model.fit(X_model_fit, y_model_fit, **fit_kwargs_backup)
                     print("[DEBUG] ✓ XGBoost训练成功(方法2: eval_metric通过set_params)")
                 except Exception as e2:
                     print(f"[DEBUG] 方法2失败: {e2}")
                     # 方法3: 使用_safe_xgb_fit作为最后手段
                     print("[WARNING] 使用_safe_xgb_fit,早停可能不生效")
-                    _safe_xgb_fit(base_model, X_train_proc, y_train, fit_kwargs or {})
+                    _safe_xgb_fit(base_model, X_model_fit, y_model_fit, fit_kwargs or {})
 
             # 检查是否真的使用了早停
             if hasattr(base_model, 'best_iteration'):
@@ -3650,9 +4130,22 @@ class EnhancedModelTrainer:
                 raise ValueError("转换为 float64 后仍包含无穷大值")
 
             try:
-                base_model.fit(X_train_proc, _y_fit, **(fit_kwargs or {}))
-            except TypeError:
-                base_model.fit(X_train_proc, _y_fit)
+                base_model.fit(X_model_fit, y_model_fit, **(fit_kwargs or {}))
+            except TypeError as error:
+                if "sample_weight" not in fit_kwargs:
+                    base_model.fit(X_model_fit, y_model_fit)
+                else:
+                    fallback_indices = _weighted_resample_indices(
+                        balance_info.get("weights", []),
+                        random_state=random_state,
+                    )
+                    X_model_fit = X_fit_proc[fallback_indices]
+                    y_model_fit = y_fit_model[fallback_indices]
+                    fit_kwargs = dict(fit_kwargs)
+                    fit_kwargs.pop("sample_weight", None)
+                    actual_balance_method = "weighted_resample"
+                    balance_info["fallback_reason"] = f"模型拒绝sample_weight: {error}"
+                    base_model.fit(X_model_fit, y_model_fit, **fit_kwargs)
 
         train_time = time.time() - start_time
 
@@ -3763,7 +4256,7 @@ class EnhancedModelTrainer:
         FORCE_LC = {"XGBoost", "LightGBM", "CatBoost", "多层感知器"}
         EXCLUDE = {"AutoGluon", "TabPFN", "Auto-sklearn", "TPOT", "FLAML", "Chemical SuperLearner (ChemSL)", "TabNet", "FT-Transformer", "Bayesian Neural Network (BNN)", "Transformer + BNN", "Transformer + PINN", "GNN + Transformer Fusion"}  # 排除深度学习模型，避免重复训练导致的崩溃
         force_lc = str(os.environ.get("ML_FORCE_LC", "")).strip().lower() in {"1", "true", "yes"}
-        if ((model_name in FORCE_LC) and force_lc) or (not training_history):
+        if (model_name in FORCE_LC) and force_lc:
             if model_name not in EXCLUDE:
                 try:
                     training_history = build_holdout_learning_curve(
@@ -3788,6 +4281,18 @@ class EnhancedModelTrainer:
                 gc.collect()
             except Exception:
                 pass
+
+        balance_result = _finalize_target_balance_result(
+            balance_info,
+            actual_method=actual_balance_method,
+            fit_sample_count=len(y_model_fit),
+            early_stopping_validation_count=len(y_early_valid),
+        )
+        test_bin_metrics = _compute_regression_bin_metrics(
+            y_test,
+            y_pred_test,
+            balance_info.get("bin_edges", []),
+        )
 
         # [优化] 对于大数据集（>5000样本），不返回 raw 数据副本以节省内存
         skip_raw = (model_name == "XGBoost" and len(y_train) > 5000)
@@ -3889,7 +4394,7 @@ class EnhancedModelTrainer:
                 'X_train_raw': None,
                 'X_test_raw': None,
                 'y_train': None,
-                'y_test': None,
+                 'y_test': y_test,
                 'y_pred': y_pred_test,
                 'y_pred_test': y_pred_test,
                 'y_pred_train': None,
@@ -3905,9 +4410,11 @@ class EnhancedModelTrainer:
                 'n_bins': int(n_bins),
                 'train_indices': None,
                 'test_indices': None,
-                'training_history': training_history,
-                'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
-                '_xgb_temp_model_path': temp_model_path,
+                 'training_history': training_history,
+                 'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
+                 'target_balance': balance_result,
+                 'test_bin_metrics': test_bin_metrics,
+                 '_xgb_temp_model_path': temp_model_path,
                 '_xgb_temp_data_path': temp_data_path,
                 '_xgb_lightweight_mode': True,  # 标记为轻量级模式
             }
@@ -3944,9 +4451,11 @@ class EnhancedModelTrainer:
             'n_bins': int(n_bins),
             'train_indices': train_idx,
             'test_indices': test_idx,
-            'training_history': training_history,
-            'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
-            '_xgb_temp_model_path': temp_model_path,  # XGBoost临时文件路径
+             'training_history': training_history,
+             'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
+             'target_balance': balance_result,
+             'test_bin_metrics': test_bin_metrics,
+             '_xgb_temp_model_path': temp_model_path,  # XGBoost临时文件路径
         }
 
         print(f"[DEBUG] ✓ Return dictionary ready, returning...")
@@ -3978,6 +4487,12 @@ class EnhancedModelTrainer:
         groups=None,
 
         n_bins: int = 10,
+
+        target_balance_enabled=True,
+
+        balance_n_bins=10,
+
+        balance_max_weight=3.0,
 
         **params
 
@@ -4058,6 +4573,7 @@ class EnhancedModelTrainer:
         oof_cnt = np.zeros(n, dtype=int)
 
         fold_scores, fold_rmse, fold_mae = [], [], []
+        fold_target_balance = []
 
 
         params.pop('train_n_jobs', None)
@@ -4075,11 +4591,38 @@ class EnhancedModelTrainer:
 
 
             base_model = self._get_model(model_name, random_state=int(random_state + fold_i), **model_params)
-
-            base_model.fit(X_df.iloc[tr_idx].reset_index(drop=True), y_arr[tr_idx])
+            fold_balance = _build_target_balance_info(
+                y_arr[tr_idx],
+                enabled=target_balance_enabled,
+                n_bins=balance_n_bins,
+                max_weight=balance_max_weight,
+                random_state=int(random_state + fold_i),
+            )
+            fit_data = _prepare_balanced_fit_data(
+                base_model,
+                X_df.iloc[tr_idx].reset_index(drop=True),
+                y_arr[tr_idx],
+                fold_balance,
+                random_state=int(random_state + fold_i),
+            )
+            fit_kwargs = {}
+            if fit_data["sample_weight"] is not None:
+                fit_kwargs["sample_weight"] = fit_data["sample_weight"]
+            base_model.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
 
             pred = base_model.predict(X_df.iloc[va_idx].reset_index(drop=True))
 
+            fold_target_balance.append(
+                {
+                    key: value
+                    for key, value in fold_balance.items()
+                    if key not in {"weights", "bin_ids"}
+                }
+                | {
+                    "method": fit_data["method"],
+                    "fit_sample_count": int(len(fit_data["y"])),
+                }
+            )
 
             oof_sum[va_idx] += pred
 
@@ -4137,6 +4680,10 @@ class EnhancedModelTrainer:
 
             'oof_mae': oof_mae,
 
+            'target_balance_enabled': bool(target_balance_enabled),
+
+            'fold_target_balance': fold_target_balance,
+
         }
 
     def _cross_validate_graph_model(
@@ -4150,6 +4697,9 @@ class EnhancedModelTrainer:
         random_state: int = 42,
         groups=None,
         n_bins: int = 10,
+        target_balance_enabled=True,
+        balance_n_bins=10,
+        balance_max_weight=3.0,
         **params,
     ):
         if not isinstance(X, pd.DataFrame):
@@ -4197,6 +4747,7 @@ class EnhancedModelTrainer:
         fold_scores = []
         fold_rmse = []
         fold_mae = []
+        fold_target_balance = []
 
         params.pop("train_n_jobs", None)
         model_params = params.copy()
@@ -4212,8 +4763,36 @@ class EnhancedModelTrainer:
 
         for fold_i, (tr_idx, va_idx) in enumerate(split_iter):
             base_model = self._get_model(model_name, random_state=int(random_state + fold_i), **model_params)
-            base_model.fit(X_df.iloc[tr_idx].reset_index(drop=True), y_arr[tr_idx])
+            fold_balance = _build_target_balance_info(
+                y_arr[tr_idx],
+                enabled=target_balance_enabled,
+                n_bins=balance_n_bins,
+                max_weight=balance_max_weight,
+                random_state=int(random_state + fold_i),
+            )
+            fit_data = _prepare_balanced_fit_data(
+                base_model,
+                X_df.iloc[tr_idx].reset_index(drop=True),
+                y_arr[tr_idx],
+                fold_balance,
+                random_state=int(random_state + fold_i),
+            )
+            fit_kwargs = {}
+            if fit_data["sample_weight"] is not None:
+                fit_kwargs["sample_weight"] = fit_data["sample_weight"]
+            base_model.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
             pred = np.asarray(base_model.predict(X_df.iloc[va_idx].reset_index(drop=True))).ravel()
+            fold_target_balance.append(
+                {
+                    key: value
+                    for key, value in fold_balance.items()
+                    if key not in {"weights", "bin_ids"}
+                }
+                | {
+                    "method": fit_data["method"],
+                    "fit_sample_count": int(len(fit_data["y"])),
+                }
+            )
 
             y_fold = y_arr[va_idx]
             mask = np.isfinite(y_fold) & np.isfinite(pred)
@@ -4257,6 +4836,8 @@ class EnhancedModelTrainer:
             "oof_r2": float(oof_r2),
             "oof_rmse": float(oof_rmse),
             "oof_mae": float(oof_mae),
+            "target_balance_enabled": bool(target_balance_enabled),
+            "fold_target_balance": fold_target_balance,
         }
 
     def _cross_validate_raw_frame_model(
@@ -4270,6 +4851,9 @@ class EnhancedModelTrainer:
         random_state: int = 42,
         groups=None,
         n_bins: int = 10,
+        target_balance_enabled=True,
+        balance_n_bins=10,
+        balance_max_weight=3.0,
         **params,
     ):
         if isinstance(X, pd.DataFrame):
@@ -4328,14 +4912,43 @@ class EnhancedModelTrainer:
         fold_scores = []
         fold_rmse = []
         fold_mae = []
+        fold_target_balance = []
 
         for fold_i, (tr_idx, va_idx) in enumerate(split_iter):
             fold_params = model_params.copy()
             if _should_pass_target_name(model_name) and "target_name" not in fold_params and hasattr(y, "name"):
                 fold_params["target_name"] = getattr(y, "name", None)
             base_model = self._get_model(model_name, random_state=int(random_state + fold_i), **fold_params)
-            base_model.fit(X_df.iloc[tr_idx].reset_index(drop=True), y_arr[tr_idx])
+            fold_balance = _build_target_balance_info(
+                y_arr[tr_idx],
+                enabled=target_balance_enabled,
+                n_bins=balance_n_bins,
+                max_weight=balance_max_weight,
+                random_state=int(random_state + fold_i),
+            )
+            fit_data = _prepare_balanced_fit_data(
+                base_model,
+                X_df.iloc[tr_idx].reset_index(drop=True),
+                y_arr[tr_idx],
+                fold_balance,
+                random_state=int(random_state + fold_i),
+            )
+            fit_kwargs = {}
+            if fit_data["sample_weight"] is not None:
+                fit_kwargs["sample_weight"] = fit_data["sample_weight"]
+            base_model.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
             pred = np.asarray(base_model.predict(X_df.iloc[va_idx].reset_index(drop=True))).ravel()
+            fold_target_balance.append(
+                {
+                    key: value
+                    for key, value in fold_balance.items()
+                    if key not in {"weights", "bin_ids"}
+                }
+                | {
+                    "method": fit_data["method"],
+                    "fit_sample_count": int(len(fit_data["y"])),
+                }
+            )
             y_fold = y_arr[va_idx]
             metric_mask = np.isfinite(y_fold) & np.isfinite(pred)
             if metric_mask.sum() == 0:
@@ -4378,6 +4991,8 @@ class EnhancedModelTrainer:
             "oof_r2": oof_r2,
             "oof_rmse": oof_rmse,
             "oof_mae": oof_mae,
+            "target_balance_enabled": bool(target_balance_enabled),
+            "fold_target_balance": fold_target_balance,
         }
 
 
@@ -4393,6 +5008,9 @@ class EnhancedModelTrainer:
         groups=None,
         n_bins: int = 10,
         drop_missing_rows=True,
+        target_balance_enabled=True,
+        balance_n_bins=10,
+        balance_max_weight=3.0,
         **params
     ):
         """交叉验证（输出每折分数 + OOF 预测）
@@ -4414,6 +5032,9 @@ class EnhancedModelTrainer:
                 random_state=random_state,
                 groups=groups,
                 n_bins=n_bins,
+                target_balance_enabled=target_balance_enabled,
+                balance_n_bins=balance_n_bins,
+                balance_max_weight=balance_max_weight,
                 **params
             )
 
@@ -4443,6 +5064,9 @@ class EnhancedModelTrainer:
                 random_state=random_state,
                 groups=groups,
                 n_bins=n_bins,
+                target_balance_enabled=target_balance_enabled,
+                balance_n_bins=balance_n_bins,
+                balance_max_weight=balance_max_weight,
                 **params,
             )
 
@@ -4457,6 +5081,9 @@ class EnhancedModelTrainer:
                 random_state=random_state,
                 groups=groups,
                 n_bins=n_bins,
+                target_balance_enabled=target_balance_enabled,
+                balance_n_bins=balance_n_bins,
+                balance_max_weight=balance_max_weight,
                 **params,
             )
 
@@ -4569,6 +5196,7 @@ class EnhancedModelTrainer:
         fold_scores = []
         fold_rmse = []
         fold_mae = []
+        fold_target_balance = []
 
         NO_SEED_MODELS = ["线性回归", "SVR", "TabPFN", "AutoGluon"]
         # 并行训练设置（UI：训练并行核数）
@@ -4631,6 +5259,20 @@ class EnhancedModelTrainer:
                     pass
 
                 base_model = self._get_model(model_name, **fold_params)
+                fold_balance = _build_target_balance_info(
+                    y_arr[tr_idx],
+                    enabled=target_balance_enabled,
+                    n_bins=balance_n_bins,
+                    max_weight=balance_max_weight,
+                    random_state=int(random_state + fold_i),
+                )
+                fit_data = _prepare_balanced_fit_data(
+                    base_model,
+                    X_arr[tr_idx],
+                    y_arr[tr_idx],
+                    fold_balance,
+                    random_state=int(random_state + fold_i),
+                )
 
                 fit_kwargs = {
                     "eval_set": [(X_arr[va_idx], y_arr[va_idx])],
@@ -4641,11 +5283,21 @@ class EnhancedModelTrainer:
                 early_stop = xgb_fit_params.get("early_stopping_rounds")
                 if early_stop is not None and int(early_stop) > 0:
                     fit_kwargs["early_stopping_rounds"] = int(early_stop)
+                if fit_data["sample_weight"] is not None:
+                    fit_kwargs["sample_weight"] = fit_data["sample_weight"]
 
-                _safe_xgb_fit(base_model, X_arr[tr_idx], y_arr[tr_idx], fit_kwargs)
+                _safe_xgb_fit(base_model, fit_data["X"], fit_data["y"], fit_kwargs)
                 pred = base_model.predict(X_arr[va_idx])
 
-                return fold_i, va_idx, pred, y_arr[va_idx]
+                return (
+                    fold_i,
+                    va_idx,
+                    pred,
+                    y_arr[va_idx],
+                    fold_balance,
+                    fit_data["method"],
+                    int(len(fit_data["y"])),
+                )
 
             # 并行执行，每个fold分配到不同GPU
             print(f"🚀 开始并行训练 {len(split_iter)} 折...")
@@ -4657,18 +5309,36 @@ class EnhancedModelTrainer:
             )
 
             # 收集结果
-            for fold_i, va_idx, pred, y_true in results:
+            for fold_i, va_idx, pred, y_true, fold_balance, fit_method, fit_sample_count in results:
                 oof_sum[va_idx] += pred
                 oof_cnt[va_idx] += 1
                 fold_scores.append(r2_score(y_true, pred))
                 fold_rmse.append(float(np.sqrt(mean_squared_error(y_true, pred))))
                 fold_mae.append(float(mean_absolute_error(y_true, pred)))
+                fold_target_balance.append(
+                    {
+                        key: value
+                        for key, value in fold_balance.items()
+                        if key not in {"weights", "bin_ids"}
+                    }
+                    | {
+                        "method": fit_method,
+                        "fit_sample_count": fit_sample_count,
+                    }
+                )
                 print(f"  Fold {fold_i+1}: R²={fold_scores[-1]:.4f}")
 
         else:
             # 串行训练（原有逻辑）
             for fold_i, (tr_idx, va_idx) in enumerate(split_iter):
                 base_model = self._get_model(model_name, **model_params)
+                fold_balance = _build_target_balance_info(
+                    y_arr[tr_idx],
+                    enabled=target_balance_enabled,
+                    n_bins=balance_n_bins,
+                    max_weight=balance_max_weight,
+                    random_state=int(random_state + fold_i),
+                )
 
                 if model_name == "XGBoost" and XGBOOST_AVAILABLE:
                     # XGBoost early stopping requires an eval_set in CV folds.
@@ -4682,7 +5352,16 @@ class EnhancedModelTrainer:
                     if early_stop is not None and int(early_stop) > 0:
                         fit_kwargs["early_stopping_rounds"] = int(early_stop)
 
-                    _safe_xgb_fit(base_model, X_arr[tr_idx], y_arr[tr_idx], fit_kwargs)
+                    fit_data = _prepare_balanced_fit_data(
+                        base_model,
+                        X_arr[tr_idx],
+                        y_arr[tr_idx],
+                        fold_balance,
+                        random_state=int(random_state + fold_i),
+                    )
+                    if fit_data["sample_weight"] is not None:
+                        fit_kwargs["sample_weight"] = fit_data["sample_weight"]
+                    _safe_xgb_fit(base_model, fit_data["X"], fit_data["y"], fit_kwargs)
                     pred = base_model.predict(X_arr[va_idx])
                 else:
                     pipe = Pipeline(steps=[
@@ -4693,8 +5372,30 @@ class EnhancedModelTrainer:
                         ('model', base_model)
                     ])
 
-                    pipe.fit(X_arr[tr_idx], y_arr[tr_idx])
+                    fit_data = _prepare_balanced_fit_data(
+                        base_model,
+                        X_arr[tr_idx],
+                        y_arr[tr_idx],
+                        fold_balance,
+                        random_state=int(random_state + fold_i),
+                    )
+                    fit_kwargs = {}
+                    if fit_data["sample_weight"] is not None:
+                        fit_kwargs["model__sample_weight"] = fit_data["sample_weight"]
+                    pipe.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
                     pred = pipe.predict(X_arr[va_idx])
+
+                fold_target_balance.append(
+                    {
+                        key: value
+                        for key, value in fold_balance.items()
+                        if key not in {"weights", "bin_ids"}
+                    }
+                    | {
+                        "method": fit_data["method"],
+                        "fit_sample_count": int(len(fit_data["y"])),
+                    }
+                )
 
                 oof_sum[va_idx] += pred
                 oof_cnt[va_idx] += 1
@@ -4726,4 +5427,6 @@ class EnhancedModelTrainer:
             'oof_r2': float(oof_r2),
             'oof_rmse': float(oof_rmse),
             'oof_mae': float(oof_mae),
+            'target_balance_enabled': bool(target_balance_enabled),
+            'fold_target_balance': fold_target_balance,
         }

@@ -932,17 +932,18 @@ def append_configured_semantic_features(
     preserve_duplicate_columns = bool(
         params.get("preserve_duplicate_columns", preserve_duplicate_columns)
     )
-    base = features_df.copy() if isinstance(features_df, pd.DataFrame) else pd.DataFrame()
     indices = [int(i) for i in (valid_indices or [])]
     semantic_full = extract_configured_semantic_features(
         smiles_like_list,
         params,
         preserve_duplicate_columns=preserve_duplicate_columns,
     )
+    base = features_df if isinstance(features_df, pd.DataFrame) else pd.DataFrame()
     if semantic_full.empty and len(semantic_full.columns) == 0:
         return base, indices
 
     if not base.empty and indices:
+        base = base.copy()
         semantic_subset = semantic_full.iloc[indices].reset_index(drop=True)
         base = pd.concat([base.reset_index(drop=True), semantic_subset], axis=1)
         if not preserve_duplicate_columns:
@@ -4110,44 +4111,57 @@ class FingerprintExtractor:
 
         print(f"\n👆 {desc_str}")
 
-        for idx, smi1 in enumerate(tqdm(smiles_list, desc="指纹提取")):
+        # 同一批次中常见重复分子；缓存解析和指纹，避免重复调用 RDKit。
+        fp_cache = {}
+
+        def _cache_key(raw):
+            if raw is None:
+                return ("none", "")
             try:
-                # 1. 处理第一个分子
-                mol1 = parse_chemical_string(
-                    smi1,
+                return (type(raw).__name__, str(raw).strip())
+            except Exception:
+                return (type(raw).__name__, repr(raw))
+
+        def _get_cached_fp(raw):
+            key = _cache_key(raw)
+            if key not in fp_cache:
+                mol = parse_chemical_string(
+                    raw,
                     repair=True,
                     keep_largest_frag=False,
                 )
-                if mol1 is None:
+                if mol is None:
+                    fp_cache[key] = None
+                else:
+                    fp_cache[key] = np.asarray(
+                        self._gen_fp_array(
+                            mol,
+                            fp_type,
+                            n_bits,
+                            radius,
+                            use_chirality=use_chirality,
+                            use_features=use_features,
+                        ),
+                        dtype=np.uint8,
+                    )
+            return fp_cache[key]
+
+        for idx, smi1 in enumerate(tqdm(smiles_list, desc="指纹提取")):
+            try:
+                fp1_arr = _get_cached_fp(smi1)
+                if fp1_arr is None:
                     continue
-
-                feat_dict = {}
-
-                # 生成指纹 1
-                fp1_arr = self._gen_fp_array(mol1, fp_type, n_bits, radius, use_chirality=use_chirality, use_features=use_features)
-                for i, val in enumerate(fp1_arr):
-                    # 特征名加前缀区分
-                    feat_dict[f"Resin_{fp_type}_{i}"] = val
 
                 # 2. 处理第二个分子 (如果有)
                 if is_dual:
-                    smi2 = smiles_list_2[idx]
-                    mol2 = parse_chemical_string(
-                        smi2,
-                        repair=True,
-                        keep_largest_frag=False,
-                    )
-                    if mol2 is None:
-                        # 如果固化剂SMILES无效，您可以选择跳过该样本，或者填0
-                        # 这里选择跳过，保证数据质量
+                    fp2_arr = _get_cached_fp(smiles_list_2[idx])
+                    if fp2_arr is None:
                         continue
+                    row = np.concatenate((fp1_arr, fp2_arr))
+                else:
+                    row = fp1_arr
 
-                        # 生成指纹 2
-                    fp2_arr = self._gen_fp_array(mol2, fp_type, n_bits, radius, use_chirality=use_chirality, use_features=use_features)
-                    for i, val in enumerate(fp2_arr):
-                        feat_dict[f"Hardener_{fp_type}_{i}"] = val
-
-                all_fps.append(feat_dict)
+                all_fps.append(row)
                 valid_indices.append(idx)
 
             except Exception as e:
@@ -4158,34 +4172,20 @@ class FingerprintExtractor:
 
         print(f"[DEBUG] 开始转换为 DataFrame，共 {len(all_fps)} 个样本")
 
-        # [优化] 使用更高效的方法创建 DataFrame
         try:
-            # 获取列名（从第一个样本）
-            if all_fps:
-                columns = list(all_fps[0].keys())
-                print(f"[DEBUG] 特征列数: {len(columns)}")
-
-                # 转换为 NumPy 数组（更快）
-                print(f"[DEBUG] 转换为 NumPy 数组...")
-                import time
-                start = time.time()
-                data_array = np.array([[fp[col] for col in columns] for fp in all_fps], dtype=np.uint8)
-                print(f"[DEBUG] NumPy 转换完成，耗时: {time.time()-start:.2f}s, 形状: {data_array.shape}")
-
-                # 创建 DataFrame
-                print(f"[DEBUG] 创建 DataFrame...")
-                start = time.time()
-                df = pd.DataFrame(data_array, columns=columns)
-                print(f"[DEBUG] DataFrame 创建完成，耗时: {time.time()-start:.2f}s, 形状: {df.shape}")
-            else:
-                return pd.DataFrame(), []
+            data_array = np.asarray(all_fps, dtype=np.uint8)
+            fp_width = int(data_array.shape[1])
+            resin_width = int(len(all_fps[0]) if not is_dual else len(all_fps[0]) // 2)
+            columns = [f"Resin_{fp_type}_{i}" for i in range(resin_width)]
+            if is_dual:
+                columns.extend(
+                    f"Hardener_{fp_type}_{i}"
+                    for i in range(fp_width - resin_width)
+                )
+            df = pd.DataFrame(data_array, columns=columns)
         except Exception as e:
-            print(f"[DEBUG] 优化方法失败: {e}，回退到原方法")
-            # 回退到原方法
-            df = pd.DataFrame(all_fps)
-            print(f"[DEBUG] DataFrame 创建完成（原方法），形状: {df.shape}")
-            df = df.astype(np.uint8)
-            print(f"[DEBUG] 类型转换完成")
+            print(f"[DEBUG] 指纹数组转换失败: {e}")
+            return pd.DataFrame(), []
 
         # 可选：移除全为0的列（会导致不同数据集列数不一致；用于模型复用时建议关闭）
         if drop_all_zero_bits:

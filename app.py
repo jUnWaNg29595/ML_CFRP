@@ -1090,6 +1090,7 @@ from core.applicability_domain import ApplicabilityDomainAnalyzer, TanimotoADAna
 from core.ui_config import (
     MANUAL_TUNING_PARAMS,
     MODEL_PARAMETERS,
+    REGRESSION_BALANCE_DEFAULTS,
     MODEL_SCOPE_GUIDE,
     DEFAULT_OPTUNA_TRIALS,
     DEFAULT_TEST_SIZE,
@@ -8561,7 +8562,7 @@ def page_molecular_features():
         # --- [新增] 批量模式处理 ---
         if batch_mode and batch_smiles_cols:
             from core.molecular_feature_workflow import (
-                build_workflow_from_training_state,
+                append_training_workflow,
                 find_duplicate_feature_names,
                 merge_feature_name_lists_in_order,
                 validate_feature_frame_contract,
@@ -9224,10 +9225,16 @@ def page_molecular_features():
                         else "one or more batch steps failed or returned no features"
                     ),
                 })
-                st.session_state["molecular_feature_trace"] = workflow_trace
+                previous_trace = st.session_state.get(
+                    "molecular_feature_trace"
+                ) or []
+                st.session_state["molecular_feature_trace"] = (
+                    list(previous_trace) + workflow_trace
+                )
 
             if batch_success:
-                workflow = build_workflow_from_training_state(
+                workflow = append_training_workflow(
+                    st.session_state.get("molecular_feature_workflow"),
                     {
                         "mode": "multi_batch",
                         "selected_source_columns": list(batch_smiles_cols),
@@ -9256,7 +9263,12 @@ def page_molecular_features():
                 st.session_state["molecular_feature_config"] = (
                     workflow.to_legacy_config()
                 )
-                st.session_state["molecular_feature_trace"] = workflow_trace
+                previous_trace = st.session_state.get(
+                    "molecular_feature_trace"
+                ) or []
+                st.session_state["molecular_feature_trace"] = (
+                    list(previous_trace) + workflow_trace
+                )
             
             return  # 批量模式处理完成后返回
         
@@ -9314,7 +9326,12 @@ def page_molecular_features():
             if previous_workflow is None and previous_config is None:
                 st.session_state["molecular_feature_workflow"] = None
                 st.session_state["molecular_feature_config"] = None
-            st.session_state["molecular_feature_trace"] = [{
+            previous_trace = st.session_state.get(
+                "molecular_feature_trace"
+            ) or []
+            st.session_state["molecular_feature_trace"] = list(
+                previous_trace
+            ) + [{
                 "step_id": "single_1",
                 "mode": "training_single",
                 "status": "error",
@@ -10077,42 +10094,23 @@ def page_molecular_features():
                         + ", ".join(emitted_duplicates)
                     )
 
-                if 'keep_all_rows_3d' in locals() and keep_all_rows_3d:
-                    base_df = df.reset_index(drop=True)
+                from core.molecular_feature_workflow import merge_extracted_features
 
-                    # 防止列名冲突：如果新特征名已存在，先删除旧的
-                    cols_to_drop = [col for col in features_df.columns if col in base_df.columns]
-                    if cols_to_drop:
-                        base_df = base_df.drop(columns=cols_to_drop)
+                base_df = df.reset_index(drop=True)
+                cols_to_drop = [
+                    col for col in features_df.columns if col in base_df.columns
+                ]
+                if cols_to_drop:
+                    base_df = base_df.drop(columns=cols_to_drop)
 
-                    # 构建全量特征表并按 valid_indices 回填
-                    full_feat = pd.DataFrame(index=range(len(base_df)), columns=features_df.columns, dtype=float)
-                    if valid_indices:
-                        # [修复] 过滤掉超出范围的索引
-                        valid_indices_filtered = [idx for idx in valid_indices if idx < len(base_df)]
-                        if len(valid_indices_filtered) != len(valid_indices):
-                            st.warning(f"⚠️ 检测到 {len(valid_indices) - len(valid_indices_filtered)} 个超出范围的索引，已自动过滤")
-
-                        # [修复] 确保 features_df 的行数与过滤后的索引数量匹配
-                        if len(valid_indices_filtered) != len(features_df):
-                            st.warning(f"⚠️ 索引数量 ({len(valid_indices_filtered)}) 与特征数量 ({len(features_df)}) 不匹配，使用较小值")
-                            n_rows = min(len(valid_indices_filtered), len(features_df))
-                            valid_indices_filtered = valid_indices_filtered[:n_rows]
-                            features_df_subset = features_df.iloc[:n_rows]
-                            full_feat.iloc[valid_indices_filtered, :] = features_df_subset.values
-                        else:
-                            full_feat.iloc[valid_indices_filtered, :] = features_df.values
-
-                    merged_df = pd.concat([base_df, full_feat], axis=1)
-                else:
-                    df_valid = df.iloc[valid_indices].reset_index(drop=True)
-
-                    # 防止列名冲突：如果新特征名已存在，先删除旧的
-                    cols_to_drop = [col for col in features_df.columns if col in df_valid.columns]
-                    if cols_to_drop:
-                        df_valid = df_valid.drop(columns=cols_to_drop)
-
-                    merged_df = pd.concat([df_valid, features_df], axis=1)
+                merged_df = merge_extracted_features(
+                    base_df,
+                    features_df,
+                    valid_indices,
+                    keep_all_rows=bool(
+                        locals().get("keep_all_rows_3d", False)
+                    ),
+                )
 
                 # 可选：追加组分数量特征
                 if resin_mix_mode and add_component_count_features:
@@ -10133,7 +10131,7 @@ def page_molecular_features():
                 
                 # ✅ 累积保存分子特征名（而不是覆盖）
                 from core.molecular_feature_workflow import (
-                    build_workflow_from_training_state,
+                    append_training_workflow,
                     merge_feature_name_lists_in_order,
                 )
 
@@ -10227,7 +10225,8 @@ def page_molecular_features():
                             ),
                         },
                     }
-                    workflow = build_workflow_from_training_state(
+                    workflow = append_training_workflow(
+                        st.session_state.get("molecular_feature_workflow"),
                         {
                             "mode": "single_batch",
                             "selected_source_columns": workflow_source_columns,
@@ -10279,8 +10278,18 @@ def page_molecular_features():
                     st.session_state["molecular_feature_config"] = (
                         workflow.to_legacy_config()
                     )
-                    st.session_state["molecular_feature_trace"] = [{
-                        "step_id": "single_1",
+                    recorded_step_id = (
+                        workflow.steps[-1].get("step_id")
+                        if workflow.steps
+                        else "single_1"
+                    )
+                    previous_trace = st.session_state.get(
+                        "molecular_feature_trace"
+                    ) or []
+                    st.session_state["molecular_feature_trace"] = list(
+                        previous_trace
+                    ) + [{
+                        "step_id": recorded_step_id,
                         "mode": "training_single",
                         "input_count": len(df),
                         "valid_count": len(valid_indices),
@@ -11685,6 +11694,40 @@ def page_model_training():
                 elif group_key == "curing_agent_smiles":
                     groups = df["curing_agent_smiles"].astype(str)
 
+        # --- [P0-5] 回归目标分布平衡 ---
+        st.markdown("### ⚖️ 目标分布平衡")
+        if str(model_name).endswith("分类"):
+            target_balance_enabled = False
+            balance_n_bins = int(REGRESSION_BALANCE_DEFAULTS["n_bins"])
+            balance_max_weight = float(REGRESSION_BALANCE_DEFAULTS["max_weight"])
+            st.caption("分类模型继续使用现有 class_weight，不启用回归目标分布平衡。")
+        else:
+            target_balance_enabled = st.checkbox(
+                "启用目标分布平衡",
+                value=bool(REGRESSION_BALANCE_DEFAULTS["enabled"]),
+                help="只作用于训练集内部；分层划分控制 train/test 覆盖范围，二者互不替代。测试集保持原始分布。",
+            )
+            balance_n_bins = st.slider(
+                "训练平衡分箱数",
+                min_value=4,
+                max_value=20,
+                value=int(REGRESSION_BALANCE_DEFAULTS["n_bins"]),
+                step=1,
+                help="使用训练集目标密度建立平衡分箱；与上方的分层划分分箱数独立。",
+            )
+            balance_max_weight = st.slider(
+                "最高样本权重",
+                min_value=1.0,
+                max_value=5.0,
+                value=float(REGRESSION_BALANCE_DEFAULTS["max_weight"]),
+                step=0.1,
+                help="限制稀有目标区间的最大影响力，避免极少数异常值主导训练。",
+            )
+            st.info(
+                "支持 sample_weight 的模型直接加权；其他回归模型使用训练集内分层加权抽样。"
+                "最终测试集不重采样、不加权。"
+            )
+
         # --- [P0-4 / P1-1] 交叉验证 ---
         st.markdown("### 🧪 交叉验证 (CV)")
         disable_cv_models = {"TPOT", "Chemical SuperLearner (ChemSL)"}
@@ -12321,6 +12364,9 @@ def page_model_training():
                             n_bins=int(n_bins),
                             groups=groups,
                             drop_missing_rows=(missing_strategy == target_missing_option),
+                            target_balance_enabled=bool(target_balance_enabled),
+                            balance_n_bins=int(balance_n_bins),
+                            balance_max_weight=float(balance_max_weight),
                             **params
                         )
                     finally:
@@ -12393,6 +12439,9 @@ def page_model_training():
                             random_state=int(random_state),
                             groups=groups,
                             n_bins=int(n_bins),
+                            target_balance_enabled=bool(target_balance_enabled),
+                            balance_n_bins=int(balance_n_bins),
+                            balance_max_weight=float(balance_max_weight),
                             **params
                         )
 
@@ -12506,6 +12555,39 @@ def page_model_training():
                     if res.get("best_iteration") is not None:
                         st.caption(f"Early stopping: best_iter={res.get('best_iteration')} | best_score={res.get('best_score')}")
 
+                    balance_result = res.get("target_balance") or {}
+                    if balance_result:
+                        method_labels = {
+                            "sample_weight": "sample_weight 直接加权",
+                            "weighted_resample": "训练集内分层加权抽样",
+                            "disabled": "未应用（样本不足或无法分箱）",
+                        }
+                        st.markdown("### ⚖️ 目标分布平衡诊断")
+                        st.write(
+                            f"实际方式：{method_labels.get(balance_result.get('method'), balance_result.get('method', '未知'))}；"
+                            f"训练样本：{balance_result.get('train_sample_count', 0)}；"
+                            f"拟合样本：{balance_result.get('fit_sample_count', 0)}；"
+                            f"内部验证样本：{balance_result.get('early_stopping_validation_count', 0)}"
+                        )
+                        if balance_result.get("fallback_reason"):
+                            st.warning(f"目标平衡未完全应用：{balance_result['fallback_reason']}")
+                        interval_metrics = res.get("test_bin_metrics") or []
+                        if interval_metrics:
+                            display_interval_metrics = pd.DataFrame(interval_metrics).rename(
+                                columns={
+                                    "bin": "目标区间",
+                                    "sample_count": "样本数",
+                                    "r2": "R²",
+                                    "rmse": "RMSE",
+                                    "mae": "MAE",
+                                }
+                            )
+                            st.dataframe(
+                                display_interval_metrics,
+                                width="stretch",
+                                hide_index=True,
+                            )
+
                     st.markdown("### 🖼️ 论文风结果图")
                     try:
                         if fig_paper is None:
@@ -12556,6 +12638,25 @@ def page_model_training():
                             "fold_mae": cv_res.get("fold_mae", []),
                         })
                         st.dataframe(fold_df, width="stretch", height=200)
+                        fold_balance_df = pd.DataFrame(cv_res.get("fold_target_balance", []))
+                        if not fold_balance_df.empty:
+                            fold_balance_columns = [
+                                column
+                                for column in [
+                                    "method",
+                                    "fit_sample_count",
+                                    "train_sample_count",
+                                    "fallback_reason",
+                                ]
+                                if column in fold_balance_df.columns
+                            ]
+                            if fold_balance_columns:
+                                st.caption("各折目标平衡方式")
+                                st.dataframe(
+                                    fold_balance_df[fold_balance_columns],
+                                    width="stretch",
+                                    hide_index=True,
+                                )
 
                     def _compute_metrics(y_true, y_pred):
                         try:

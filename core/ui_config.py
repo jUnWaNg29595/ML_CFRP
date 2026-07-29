@@ -562,6 +562,13 @@ TABNET_DEFAULTS = {
     "seed": 42,
 }
 
+REGRESSION_BALANCE_DEFAULTS = {
+    "enabled": True,
+    "n_bins": 10,
+    "max_weight": 3.0,
+    "unsupported_model_strategy": "训练集内分层加权抽样",
+}
+
 
 MODEL_PARAMETERS = {
     "线性回归": dict(LINEAR_REGRESSION_DEFAULTS),

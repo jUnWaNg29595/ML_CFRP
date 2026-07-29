@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -11,6 +12,7 @@ from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 
 
@@ -37,6 +39,49 @@ def _deduplicate(values: list[Any]) -> list[Any]:
         if value not in result:
             result.append(value)
     return result
+
+
+def merge_extracted_features(
+    base_df: pd.DataFrame,
+    features_df: pd.DataFrame,
+    valid_indices: Sequence[int] | None,
+    *,
+    keep_all_rows: bool = True,
+) -> pd.DataFrame:
+    """Merge extracted rows while avoiding an unnecessary full-table backfill."""
+    base = base_df.reset_index(drop=True)
+    features = features_df.reset_index(drop=True)
+    indices = [
+        int(index)
+        for index in (valid_indices or [])
+        if 0 <= int(index) < len(base)
+    ]
+
+    if not keep_all_rows:
+        return pd.concat(
+            [base.iloc[indices].reset_index(drop=True), features.iloc[: len(indices)]],
+            axis=1,
+            copy=False,
+        )
+
+    if (
+        len(base) == len(features) == len(indices)
+        and indices == list(range(len(base)))
+    ):
+        return pd.concat([base, features], axis=1, copy=False)
+
+    n_rows = min(len(indices), len(features))
+    full_features = pd.DataFrame(
+        np.nan,
+        index=range(len(base)),
+        columns=features.columns,
+        dtype=float,
+    )
+    if n_rows:
+        full_features.iloc[indices[:n_rows], :] = features.iloc[
+            :n_rows
+        ].to_numpy(copy=False)
+    return pd.concat([base, full_features], axis=1, copy=False)
 
 
 _FEATURE_COMPONENT_ROLE_TOKENS = {
@@ -790,6 +835,134 @@ def build_workflow_from_training_state(
         "missing_items": _sequence_copy(state.get("missing_items")),
     }
     return MolecularFeatureWorkflow.from_dict(payload)
+
+
+def _unique_training_step_id(existing_ids: set[str], requested_id: Any) -> str:
+    requested = str(requested_id or "").strip() or "step"
+    if requested not in existing_ids:
+        return requested
+
+    match = re.match(r"^(.*?)(?:_(\d+))?$", requested)
+    prefix = (match.group(1) if match else requested) or "step"
+    start = int(match.group(2) or 1) + 1 if match else 2
+    candidate = f"{prefix}_{start}"
+    while candidate in existing_ids:
+        start += 1
+        candidate = f"{prefix}_{start}"
+    return candidate
+
+
+def append_training_workflow(
+    existing_payload: Mapping[str, Any] | None,
+    state: Mapping[str, Any],
+    feature_names: Sequence[str],
+) -> MolecularFeatureWorkflow:
+    """Append a completed extraction run without discarding prior steps."""
+    incoming = build_workflow_from_training_state(state, feature_names)
+    if not existing_payload:
+        return incoming
+
+    existing = MolecularFeatureWorkflow.from_dict(existing_payload)
+    merged_steps = copy.deepcopy(existing.steps)
+    existing_ids = {
+        str(step.get("step_id")).strip()
+        for step in merged_steps
+        if isinstance(step, Mapping) and str(step.get("step_id") or "").strip()
+    }
+    incoming_id_map: dict[str, str] = {}
+
+    for incoming_step in incoming.steps:
+        step = copy.deepcopy(incoming_step)
+        original_id = str(step.get("step_id") or "").strip()
+        step_id = _unique_training_step_id(existing_ids, original_id)
+        step["step_id"] = step_id
+        step["order"] = len(merged_steps)
+        merged_steps.append(step)
+        existing_ids.add(step_id)
+        if original_id:
+            incoming_id_map[original_id] = step_id
+
+    merged_merge_order = [
+        str(step_id)
+        for step_id in existing.merge_order
+        if str(step_id).strip()
+    ]
+    for step in merged_steps[len(existing.steps):]:
+        step_id = str(step.get("step_id") or "").strip()
+        if step_id and step_id not in merged_merge_order:
+            merged_merge_order.append(step_id)
+
+    merged_feature_names = merge_feature_name_lists_in_order(
+        existing.final_feature_names,
+        incoming.final_feature_names,
+    )
+    merged_feature_names = merge_feature_name_lists_in_order(
+        merged_feature_names,
+        feature_names,
+    )
+
+    merged_feature_source_map = copy.deepcopy(existing.feature_source_map)
+    for feature_name, original_step_id in incoming.feature_source_map.items():
+        mapped_step_id = incoming_id_map.get(
+            str(original_step_id),
+            str(original_step_id),
+        )
+        if mapped_step_id in existing_ids:
+            merged_feature_source_map[str(feature_name)] = mapped_step_id
+    for step in merged_steps[len(existing.steps):]:
+        step_id = str(step.get("step_id") or "").strip()
+        for feature_name in step.get("feature_names") or []:
+            if str(feature_name):
+                merged_feature_source_map[str(feature_name)] = step_id
+
+    merged_input_contract = copy.deepcopy(existing.input_contract or {})
+    incoming_input_contract = incoming.input_contract or {}
+    union_fields = {
+        "selected_source_columns",
+        "resin_component_cols",
+        "hardener_component_cols",
+    }
+    for field_name, value in incoming_input_contract.items():
+        if field_name in union_fields:
+            merged_input_contract[field_name] = merge_feature_name_lists_in_order(
+                merged_input_contract.get(field_name) or [],
+                value or [],
+            )
+        elif field_name == "legacy_fields" and isinstance(value, Mapping):
+            legacy_fields = dict(merged_input_contract.get(field_name) or {})
+            legacy_fields.update(copy.deepcopy(dict(value)))
+            merged_input_contract[field_name] = legacy_fields
+        else:
+            merged_input_contract[field_name] = copy.deepcopy(value)
+
+    merged_derived_steps = list(existing.derived_feature_steps or [])
+    merged_derived_steps.extend(copy.deepcopy(incoming.derived_feature_steps or []))
+    merged_random_seeds = dict(existing.random_seeds or {})
+    merged_random_seeds.update(copy.deepcopy(incoming.random_seeds or {}))
+
+    merged_payload = existing.to_dict()
+    merged_payload.update(
+        {
+            "model_fingerprint": (
+                existing.model_fingerprint or incoming.model_fingerprint
+            ),
+            "mode": (
+                "multi_batch"
+                if len(merged_steps) > 1
+                else incoming.mode or existing.mode
+            ),
+            "input_contract": merged_input_contract,
+            "steps": merged_steps,
+            "merge_order": merged_merge_order,
+            "final_feature_names": merged_feature_names,
+            "feature_source_map": merged_feature_source_map,
+            "derived_feature_steps": merged_derived_steps,
+            "random_seeds": merged_random_seeds,
+            "legacy": False,
+            "missing_items": [],
+        }
+    )
+    return MolecularFeatureWorkflow.from_dict(merged_payload)
 
 
 @dataclass

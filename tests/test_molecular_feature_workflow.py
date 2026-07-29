@@ -6,6 +6,7 @@ import core.molecular_features as molecular_features
 
 from core.molecular_feature_workflow import (
     MolecularFeatureWorkflow,
+    append_training_workflow,
     append_workflow_step,
     build_workflow_from_training_state,
     build_workflow_diff,
@@ -676,6 +677,93 @@ def test_append_workflow_step_skips_existing_generated_id_and_keeps_custom_field
     assert appended["steps"][-1]["method"] == "xTB"
     assert appended["steps"][-1]["feature_names"] == ["resin_2_gap"]
     assert appended["merge_order"][-1] == "step_4"
+
+
+def test_append_training_workflow_preserves_previous_extraction_steps():
+    existing = _workflow_payload()
+
+    appended = append_training_workflow(
+        existing,
+        {
+            "mode": "single_batch",
+            "selected_source_columns": ["resin_smiles_2"],
+            "input_contract": {
+                "selected_source_columns": ["resin_smiles_2"],
+                "source_row_count": 3,
+            },
+            "workflow_steps": [
+                {
+                    "step_id": "single_1",
+                    "order": 0,
+                    "role": "resin",
+                    "source_columns": ["resin_smiles_2"],
+                    "method": "MACCS",
+                    "prefix": "resin_2",
+                    "feature_names": ["resin_2_maccs_1"],
+                }
+            ],
+        },
+        ["resin_2_maccs_1"],
+    )
+
+    assert [step["step_id"] for step in appended.steps] == [
+        "resin_1",
+        "hardener_1",
+        "single_1",
+    ]
+    assert appended.merge_order == [
+        "resin_1",
+        "hardener_1",
+        "single_1",
+    ]
+    assert appended.final_feature_names == [
+        "resin_1_xtb_gap",
+        "hardener_1_xtb_gap",
+        "resin_2_maccs_1",
+    ]
+    assert appended.steps[-1]["source_columns"] == ["resin_smiles_2"]
+
+
+def test_append_training_workflow_generates_unique_ids_for_repeated_single_steps():
+    existing = {
+        "schema_version": 2,
+        "mode": "single_batch",
+        "steps": [
+            {
+                "step_id": "single_1",
+                "order": 0,
+                "source_columns": ["resin_smiles_1"],
+                "method": "xTB",
+                "feature_names": ["resin_1_gap"],
+            }
+        ],
+        "merge_order": ["single_1"],
+        "final_feature_names": ["resin_1_gap"],
+    }
+
+    appended = append_training_workflow(
+        existing,
+        {
+            "mode": "single_batch",
+            "workflow_steps": [
+                {
+                    "step_id": "single_1",
+                    "order": 0,
+                    "source_columns": ["hardener_smiles_1"],
+                    "method": "MACCS",
+                    "feature_names": ["hardener_1_maccs"],
+                }
+            ],
+        },
+        ["hardener_1_maccs"],
+    )
+
+    assert [step["step_id"] for step in appended.steps] == [
+        "single_1",
+        "single_2",
+    ]
+    assert appended.steps[-1]["source_columns"] == ["hardener_smiles_1"]
+    assert appended.mode == "multi_batch"
 
 
 def test_normalization_deduplicates_lists_without_changing_order():
