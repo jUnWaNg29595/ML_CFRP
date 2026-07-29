@@ -2462,7 +2462,7 @@ class EnhancedModelTrainer:
         model = self._get_model(model_name, random_state=int(random_state), **model_params)
 
         try:
-            if hasattr(model, "validation_data"):
+            if hasattr(model, "validation_data") and model_name != "Transformer + BNN":
                 setattr(model, "validation_data", (X_test_raw, y_test))
         except Exception:
             pass
@@ -3142,6 +3142,7 @@ class EnhancedModelTrainer:
         train_n_jobs = params.pop('train_n_jobs', -1)
         train_n_jobs = _normalize_train_n_jobs(train_n_jobs)
         model_params = params.copy()
+        progress_callback = model_params.get("epoch_callback")
         xgb_fit_params = {}
         if model_name == "XGBoost":
             # 提取XGBoost的fit参数，如果没有设置则使用默认值
@@ -3153,18 +3154,44 @@ class EnhancedModelTrainer:
         if model_name not in NO_SEED_MODELS:
             model_params.setdefault('random_state', random_state)
 
+        model_handles_preprocessing = model_name == "Transformer + BNN"
+        if model_handles_preprocessing:
+            model_params.setdefault("missing_value_strategy", "mask_zero")
+            model_params.setdefault("loss_name", "mse")
+
         base_model = self._get_model(model_name, **model_params)
+
+        def emit_transformer_postprocessing(message, progress_ratio, **extra):
+            if model_name != "Transformer + BNN" or not callable(progress_callback):
+                return
+            payload = {
+                "phase": "postprocessing",
+                "message": str(message),
+                "progress_ratio": float(progress_ratio),
+            }
+            payload.update(extra)
+            try:
+                progress_callback(payload)
+            except Exception:
+                pass
 
         # 4) 预处理：按模型类型选择（树模型可跳过标准化，部分模型原生支持缺失值）
         missing_tolerant_models = {"XGBoost", "LightGBM", "CatBoost"}
         scale_free_models = {"XGBoost", "LightGBM", "CatBoost", "随机森林", "Extra Trees", "梯度提升树", "决策树"}
 
-        use_scaler = model_name not in scale_free_models
+        use_scaler = model_name not in scale_free_models and not model_handles_preprocessing
         bnn_missing_strategy = str(model_params.get("missing_value_strategy", "median") or "median").strip().lower()
         bnn_missing_max_iter = model_params.get("missing_imputer_max_iter", 15)
         bnn_missing_n_imputations = model_params.get("missing_n_imputations", 5)
 
-        if model_name == "Bayesian Neural Network (BNN)":
+        if model_handles_preprocessing:
+            # Transformer + BNN 内部必须看到原始 NaN 和 missing mask。
+            # 外层 SimpleImputer/StandardScaler 会破坏 mask_zero 的语义，
+            # 还会让模型内部再次缩放，造成重复预处理。
+            imputer = None
+            scaler = None
+            print("🧩 Transformer + BNN: 保留原始缺失值，由模型内部 mask_zero/缩放流程处理")
+        elif model_name == "Bayesian Neural Network (BNN)":
             imputer = _build_missing_value_imputer(
                 strategy=bnn_missing_strategy,
                 random_state=random_state,
@@ -3216,7 +3243,7 @@ class EnhancedModelTrainer:
 
         # [修复] 检查并删除全NaN列（确保训练集和测试集特征数一致）
         # 这可能发生在数据划分后，某些列在训练集或测试集中全是NaN
-        if X_train_proc.shape[1] > 0:
+        if X_train_proc.shape[1] > 0 and not model_handles_preprocessing:
             # 检查训练集中的全NaN列
             train_all_nan_mask = np.isnan(X_train_proc).all(axis=0)
             if train_all_nan_mask.any():
@@ -3520,7 +3547,6 @@ class EnhancedModelTrainer:
                 "TensorFlow Sequential",
                 "Bayesian Neural Network (BNN)",
                 "FT-Transformer",
-                "Transformer + BNN",
             }:
                 setattr(base_model, "validation_data", (X_test_proc, y_test))
                 # TF 模型内部若使用 validation_split，会导致 Test 曲线不是同一批数据；这里优先用外部 validation_data
@@ -3654,8 +3680,20 @@ class EnhancedModelTrainer:
         pipeline = Pipeline(steps=steps)
 
         # 7) 预测与评估（用 pipeline 预测，保证一致）
+        emit_transformer_postprocessing(
+            "running deterministic evaluation",
+            0.91,
+            epochs_completed=int(getattr(model, "epochs_completed_", 0) or 0),
+            total_epochs=int(getattr(model, "epochs", 0) or 0),
+        )
         y_pred_test = pipeline.predict(X_test_raw)
         y_pred_train = pipeline.predict(X_train_raw)
+        emit_transformer_postprocessing(
+            "deterministic evaluation completed",
+            0.94,
+            epochs_completed=int(getattr(model, "epochs_completed_", 0) or 0),
+            total_epochs=int(getattr(model, "epochs", 0) or 0),
+        )
 
         y_std_test = None
         y_std_train = None
@@ -3668,8 +3706,34 @@ class EnhancedModelTrainer:
                 y_std_train = None
         elif hasattr(model, "predict_with_uncertainty"):
             try:
-                _, y_std_test = model.predict_with_uncertainty(X_test_proc)
-                _, y_std_train = model.predict_with_uncertainty(X_train_proc)
+                # 训练后的不确定度只用于评估展示，不应默认重复 50 次完整前向。
+                # 保留用户较小的 mc_samples 设置，默认上限为 8 次以避免早停后长时间无反馈。
+                evaluation_mc_samples = max(
+                    1,
+                    min(int(getattr(model, "mc_samples", 8) or 8), 8),
+                )
+                emit_transformer_postprocessing(
+                    "estimating predictive uncertainty",
+                    0.95,
+                    mc_samples=int(evaluation_mc_samples),
+                    epochs_completed=int(getattr(model, "epochs_completed_", 0) or 0),
+                    total_epochs=int(getattr(model, "epochs", 0) or 0),
+                )
+                _, y_std_test = model.predict_with_uncertainty(
+                    X_test_proc,
+                    n_samples=evaluation_mc_samples,
+                )
+                _, y_std_train = model.predict_with_uncertainty(
+                    X_train_proc,
+                    n_samples=evaluation_mc_samples,
+                )
+                emit_transformer_postprocessing(
+                    "evaluation completed",
+                    0.98,
+                    mc_samples=int(evaluation_mc_samples),
+                    epochs_completed=int(getattr(model, "epochs_completed_", 0) or 0),
+                    total_epochs=int(getattr(model, "epochs", 0) or 0),
+                )
             except Exception:
                 y_std_test = None
                 y_std_train = None

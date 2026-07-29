@@ -429,7 +429,7 @@ TRANSFORMER_BNN_DEFAULTS = {
     "epochs": 200,
     "patience": 30,
     "mc_samples": 50,
-    "loss_name": "gaussian_nll",
+    "loss_name": "mse",
     "min_logvar": -6.0,
     "max_logvar": 3.0,
     "scheduler_factor": 0.6,

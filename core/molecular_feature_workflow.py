@@ -121,7 +121,11 @@ def get_feature_component_column_options(
 
     dedicated = _feature_component_columns(dedicated_columns)
     if dedicated:
-        base = [column for column in dedicated if column in available_set or not available_set]
+        base = [
+            column
+            for column in _deduplicate(dedicated + detected)
+            if column in available_set or not available_set
+        ]
     else:
         base = detected
         if smiles_candidates is None:
@@ -138,12 +142,6 @@ def get_feature_component_column_options(
         if _feature_component_role_score(column, target_role)
         >= _feature_component_role_score(column, opposite_role)
     ]
-    if target_role == "hardener":
-        filtered = [
-            column
-            for column in filtered
-            if column != str(primary_column or "").strip()
-        ]
     return sorted(_feature_component_columns(filtered), key=_feature_component_natural_key)
 
 
@@ -172,6 +170,11 @@ def resolve_feature_component_columns(
         if dedicated
         else []
     )
+    if dedicated:
+        dedicated_set = set(dedicated)
+        dedicated_options = [
+            column for column in dedicated_options if column in dedicated_set
+        ]
     if str(mode or "").strip().lower() != "manual":
         if dedicated_options:
             return dedicated_options

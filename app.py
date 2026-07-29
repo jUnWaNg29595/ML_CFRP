@@ -6861,12 +6861,26 @@ def page_molecular_features():
             with st.expander("BigSMILES 解析预览", expanded=False):
                 st.dataframe(pd.DataFrame(preview_rows), width="stretch", hide_index=True)
 
-    # --- 多组分设置（树脂侧） ---
-    st.markdown("#### 🧩 多组分/混合物设置 (可选)")
+    # --- 多组分设置（当前处理种类） ---
+    component_role_for_selection = (
+        selected_primary_role
+        if selected_primary_role in {"resin", "hardener"}
+        else "resin"
+    )
+    component_name_for_selection = {
+        "resin": "树脂",
+        "hardener": "固化剂",
+    }[component_role_for_selection]
+    st.markdown(
+        f"#### 🧩 {component_name_for_selection}多组分/混合物设置 (可选)"
+    )
     resin_mix_mode = st.checkbox(
-        "树脂为多组分（或单元格内包含多个SMILES）",
+        f"{component_name_for_selection}为多组分（或单元格内包含多个SMILES）",
         value=True,
-        help="如果你的树脂列里出现 'A;B' 这种写法，或有 resin_smiles_1/resin_smiles_2 这种多列组分，请开启。"
+        help=(
+            f"如果你的{component_name_for_selection}列里出现 'A;B' 这种写法，"
+            "或有带编号的多列组分，请开启。"
+        ),
     )
 
     resin_component_cols = [smiles_col]
@@ -6875,25 +6889,42 @@ def page_molecular_features():
 
     if resin_mix_mode:
         resin_mix_layout = st.radio(
-            "树脂组分在表格中的组织方式",
+            f"{component_name_for_selection}组分在表格中的组织方式",
             ["单列（同一单元格用分隔符表示多个组分，如 A;B）", "多列（每列一个组分，如 resin_smiles_1/resin_smiles_2…）"],
             index=1
         )
 
         if resin_mix_layout.startswith("多列"):
             # 缓存列检测结果，避免重复计算
-            cache_key = f"resin_auto_cols_{id(text_cols)}"
+            cache_key = (
+                f"{component_role_for_selection}_auto_cols_{id(text_cols)}"
+            )
             if cache_key not in st.session_state:
-                # 修改正则：只匹配 resin_smiles_数字，排除 resin_smiles_n_components 等
-                # 同时排除不带数字的 resin_smiles（单列模式）
-                pattern = re.compile(r"^resin_smiles_\d+$")
-                auto_cols = sorted([c for c in text_cols if pattern.match(c)])
-
-                # 如果没有找到 resin_smiles_数字 格式的列，尝试查找其他模式
-                if not auto_cols:
-                    # 查找 resin_1, resin_2 等格式
-                    pattern_alt = re.compile(r"^resin_\d+$")
-                    auto_cols = sorted([c for c in text_cols if pattern_alt.match(c)])
+                if component_role_for_selection == "hardener":
+                    auto_patterns = [
+                        r"^curing_agent_smiles_?\d+$",
+                        r"^hardener_smiles_?\d+$",
+                        r"^curer_smiles_?\d+$",
+                        r"^curing_smiles_?\d+$",
+                        r"^hardener_?\d+$",
+                        r"^curing_agent_?\d+$",
+                    ]
+                else:
+                    auto_patterns = [
+                        r"^resin_smiles_?\d+$",
+                        r"^epoxy_smiles_?\d+$",
+                        r"^resin_?\d+$",
+                    ]
+                auto_cols = sorted(
+                    [
+                        c
+                        for c in text_cols
+                        if any(
+                            re.match(pattern, str(c), flags=re.IGNORECASE)
+                            for pattern in auto_patterns
+                        )
+                    ]
+                )
 
                 st.session_state[cache_key] = auto_cols
             else:
@@ -6902,7 +6933,7 @@ def page_molecular_features():
             resin_component_options = get_feature_component_column_options(
                 text_cols,
                 smiles_candidates=detected_smiles,
-                role="resin",
+                role=component_role_for_selection,
                 primary_column=smiles_col,
                 dedicated_columns=auto_cols,
             )
@@ -6911,56 +6942,48 @@ def page_molecular_features():
             auto_detect_cols = st.checkbox(
                 "🔍 自动检测组分列数",
                 value=True,
-                help="自动识别所有符合命名规则的组分列（如 resin_smiles_1, resin_smiles_2...）",
-                key="resin_auto_detect"
+                help="自动识别所有符合当前处理种类命名规则的组分列。",
+                key=f"{component_role_for_selection}_auto_detect"
             )
 
             if auto_detect_cols:
                 # 自动检测模式：显示检测到的列数和列名
                 if auto_cols:
                     st.caption(f"✅ 检测到 {len(auto_cols)} 个组分列: {', '.join(auto_cols[:5])}{' ...' if len(auto_cols) > 5 else ''}")
-                    resin_component_cols = resolve_feature_component_columns(
-                        text_cols,
-                        role="resin",
-                        primary_column=smiles_col,
-                        dedicated_columns=auto_cols,
-                        smiles_candidates=detected_smiles,
-                        mode="auto",
-                    )
                 else:
                     st.caption("⚠️ 未检测到符合命名规则的组分列，使用默认列")
-                    resin_component_cols = resolve_feature_component_columns(
-                        text_cols,
-                        role="resin",
-                        primary_column=smiles_col,
-                        dedicated_columns=[],
-                        smiles_candidates=detected_smiles,
-                        mode="auto",
-                    )
-            else:
-                # 手动选择模式
-                manual_default = [
-                    column
-                    for column in (auto_cols if auto_cols else [smiles_col])
-                    if column in resin_component_options
-                ]
-                selected_resin_component_cols = st.multiselect(
-                    "选择树脂组分列",
-                    options=resin_component_options,
-                    default=manual_default,
-                    help="仅显示树脂兼容的SMILES列；上方主列也会保留，可与 resin_smiles_2、resin_smiles_3 等组分一起选择。"
+
+            # 自动检测结果只作为默认值，仍允许用户选择其他兼容的 SMILES 列。
+            manual_default = [
+                column
+                for column in (auto_cols if auto_detect_cols and auto_cols else [smiles_col])
+                if column in resin_component_options
+            ]
+            selected_resin_component_cols = st.multiselect(
+                f"选择{component_name_for_selection}组分列（可调整自动检测结果）",
+                options=resin_component_options,
+                default=manual_default,
+                key=f"molecular_feature_{component_role_for_selection}_component_cols",
+                help="可选择带编号的组分列以及其他兼容的 SMILES 列，不会被固定前缀硬性限制。",
+            )
+            resin_component_cols = resolve_feature_component_columns(
+                text_cols,
+                role=component_role_for_selection,
+                primary_column=smiles_col,
+                dedicated_columns=auto_cols,
+                selected_columns=selected_resin_component_cols,
+                smiles_candidates=detected_smiles,
+                mode="manual",
+            )
+            if not resin_component_options:
+                st.warning(
+                    f"⚠️ 未找到可用于{component_name_for_selection}多组分提取的 SMILES 列，"
+                    "请检查列名或关闭多列模式。"
                 )
-                resin_component_cols = resolve_feature_component_columns(
-                    text_cols,
-                    role="resin",
-                    primary_column=smiles_col,
-                    dedicated_columns=auto_cols,
-                    selected_columns=selected_resin_component_cols,
-                    smiles_candidates=detected_smiles,
-                    mode="manual",
+            elif not resin_component_cols:
+                st.warning(
+                    f"⚠️ 请至少选择一个{component_name_for_selection}组分 SMILES 列。"
                 )
-                if not resin_component_options:
-                    st.warning("⚠️ 未找到可用于树脂多组分提取的SMILES列，请检查列名或关闭多列模式。")
         else:
             st.caption("将自动把 ';'、'；'、'|'、以及带空格的 ' + ' 转换为多组分分隔，并用 '.' 连接。")
 
@@ -7416,12 +7439,12 @@ def page_molecular_features():
 
         # 自动检测常见的固化剂列名模式
         hardener_patterns = [
-            r"^curing_agent_smiles_\d+$",
-            r"^hardener_smiles_\d+$",
-            r"^curer_smiles_\d+$",
-            r"^curing_smiles_\d+$",
-            r"^hardener_\d+$",
-            r"^curing_agent_\d+$",
+            r"^curing_agent_smiles_?\d+$",
+            r"^hardener_smiles_?\d+$",
+            r"^curer_smiles_?\d+$",
+            r"^curing_smiles_?\d+$",
+            r"^hardener_?\d+$",
+            r"^curing_agent_?\d+$",
         ]
 
         # 单列候选（不带数字后缀）
@@ -7509,12 +7532,12 @@ def page_molecular_features():
 
         # 自动检测常见的固化剂列名模式
         hardener_patterns = [
-            r"^curing_agent_smiles_\d+$",
-            r"^hardener_smiles_\d+$",
-            r"^curer_smiles_\d+$",
-            r"^curing_smiles_\d+$",
-            r"^hardener_\d+$",
-            r"^curing_agent_\d+$",
+            r"^curing_agent_smiles_?\d+$",
+            r"^hardener_smiles_?\d+$",
+            r"^curer_smiles_?\d+$",
+            r"^curing_smiles_?\d+$",
+            r"^hardener_?\d+$",
+            r"^curing_agent_?\d+$",
         ]
 
         # 单列候选（不带数字后缀）
@@ -12106,6 +12129,8 @@ def page_model_training():
                         params.setdefault("missing_value_strategy", "median")
                         params.setdefault("missing_imputer_max_iter", 15)
                         params.setdefault("missing_n_imputations", 5)
+                    elif model_name == "Transformer + BNN":
+                        params.setdefault("missing_value_strategy", "mask_zero")
 
                     # GPU设备设置
                     if 'gpu_device_id' in locals() and gpu_device_id is not None:
@@ -12153,8 +12178,13 @@ def page_model_training():
                                     progress_ratio,
                                     text=f"Transformer + BNN | {message}",
                                 )
+                                phase_title = {
+                                    "preprocessing": "Transformer + BNN preprocessing",
+                                    "postprocessing": "Transformer + BNN evaluating",
+                                    "completed": "Transformer + BNN completed",
+                                }.get(phase, f"Transformer + BNN {phase}")
                                 tbnn_status.markdown(
-                                    f"**Transformer + BNN preparing**  \n"
+                                    f"**{phase_title}**  \n"
                                     f"`stage` {message}"
                                 )
 
@@ -12173,7 +12203,18 @@ def page_model_training():
                                     detail_parts.append(f"effective_imputer={effective_strategy}")
                                 if note:
                                     detail_parts.append(note)
+                                if info.get("mc_samples") is not None:
+                                    detail_parts.append(
+                                        f"MC samples={int(info.get('mc_samples'))}"
+                                    )
                                 tbnn_detail.caption(" | ".join(detail_parts) if detail_parts else "preparing training inputs")
+                                try:
+                                    task_mgr.update_progress(
+                                        current_task_id,
+                                        int(round(progress_ratio * task_total_items)),
+                                    )
+                                except Exception:
+                                    pass
                                 return
 
                             epoch = max(1, int(info.get("epoch", 1) or 1))

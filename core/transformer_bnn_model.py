@@ -216,7 +216,7 @@ class TransformerBNNRegressor(BaseEstimator, RegressorMixin):
         patience: int = 30,
         validation_split: float = 0.1,
         mc_samples: int = 50,
-        loss_name: str = "gaussian_nll",
+        loss_name: str = "mse",
         min_logvar: float = -6.0,
         max_logvar: float = 3.0,
         gradient_clip_norm: float = 1.0,
@@ -924,18 +924,43 @@ class TransformerBNNRegressor(BaseEstimator, RegressorMixin):
                 if stale_epochs >= int(self.patience):
                     break
 
+            early_stopped = self.epochs_completed_ < int(self.epochs)
+            self._emit_status(
+                "postprocessing",
+                "restoring best model",
+                progress_ratio=0.90,
+                epochs_completed=int(self.epochs_completed_),
+                total_epochs=int(self.epochs),
+                early_stopped=bool(early_stopped),
+            )
             if best_state is not None and core_model is not None:
                 core_model.load_state_dict(best_state)
 
             _raise_if_cancelled()
             self.model_.eval()
             core_model = self._unwrap_model()
+            self._emit_status(
+                "postprocessing",
+                "computing feature importance",
+                progress_ratio=0.95,
+                epochs_completed=int(self.epochs_completed_),
+                total_epochs=int(self.epochs),
+                early_stopped=bool(early_stopped),
+            )
             with torch.no_grad():
                 probe_rows = min(len(X_fit), max(64, min(512, int(self.effective_batch_size_) * 4)))
                 probe = torch.from_numpy(X_fit[:probe_rows]).float().to(device)
                 probe_mask = torch.from_numpy(mask_fit[:probe_rows]).float().to(device)
                 _, gates = core_model.backbone.encode(probe, missing_mask=probe_mask, return_gates=True)
                 self.feature_importances_ = gates.mean(dim=0).detach().cpu().numpy()
+            self._emit_status(
+                "postprocessing",
+                "training model is ready for evaluation",
+                progress_ratio=0.98,
+                epochs_completed=int(self.epochs_completed_),
+                total_epochs=int(self.epochs),
+                early_stopped=bool(early_stopped),
+            )
         finally:
             if self.model_ is not None:
                 if isinstance(self.model_, nn.DataParallel):
@@ -1096,7 +1121,7 @@ class TransformerBNNRegressor(BaseEstimator, RegressorMixin):
         return self._predict_raw(X, mc_samples=n_samples)
 
     def predict(self, X):
-        mean, _ = self._predict_raw(X, mc_samples=self.mc_samples)
+        mean, _ = self._predict_raw(X, mc_samples=1)
         return mean
 
     def get_training_history(self) -> dict:

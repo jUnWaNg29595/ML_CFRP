@@ -832,13 +832,18 @@ def test_multicomponent_manual_options_exclude_primary_hardener_and_metadata_col
 
     options = get_feature_component_column_options(
         columns,
-        smiles_candidates=columns,
+        smiles_candidates=[
+            "resin_smiles",
+            "resin_smiles_1",
+            "resin_smiles_2",
+            "curing_agent_smiles_1",
+        ],
         role="resin",
         primary_column="resin_smiles",
         dedicated_columns=["resin_smiles_1", "resin_smiles_2"],
     )
 
-    assert options == ["resin_smiles_1", "resin_smiles_2"]
+    assert options == ["resin_smiles", "resin_smiles_1", "resin_smiles_2"]
 
 
 def test_multicomponent_manual_selection_filters_invalid_columns_and_duplicates():
@@ -852,7 +857,12 @@ def test_multicomponent_manual_selection_filters_invalid_columns_and_duplicates(
 
     resolved = resolve_feature_component_columns(
         columns,
-        smiles_candidates=columns,
+        smiles_candidates=[
+            "resin_smiles",
+            "resin_smiles_1",
+            "resin_smiles_2",
+            "curing_agent_smiles_1",
+        ],
         role="resin",
         primary_column="resin_smiles",
         dedicated_columns=["resin_smiles_1", "resin_smiles_2"],
@@ -866,6 +876,52 @@ def test_multicomponent_manual_selection_filters_invalid_columns_and_duplicates(
     )
 
     assert resolved == ["resin_smiles_2"]
+
+
+def test_multicomponent_manual_options_include_other_smiles_columns():
+    columns = [
+        "resin_smiles_1",
+        "resin_smiles_2",
+        "additive_smiles_1",
+        "curing_agent_smiles_1",
+        "temperature",
+    ]
+
+    options = get_feature_component_column_options(
+        columns,
+        smiles_candidates=[
+            "resin_smiles_1",
+            "resin_smiles_2",
+            "additive_smiles_1",
+            "curing_agent_smiles_1",
+        ],
+        role="resin",
+        primary_column="resin_smiles_1",
+        dedicated_columns=["resin_smiles_1", "resin_smiles_2"],
+    )
+
+    assert options == [
+        "additive_smiles_1",
+        "resin_smiles_1",
+        "resin_smiles_2",
+    ]
+
+    resolved = resolve_feature_component_columns(
+        columns,
+        role="resin",
+        primary_column="resin_smiles_1",
+        dedicated_columns=["resin_smiles_1", "resin_smiles_2"],
+        selected_columns=["additive_smiles_1"],
+        smiles_candidates=[
+            "resin_smiles_1",
+            "resin_smiles_2",
+            "additive_smiles_1",
+            "curing_agent_smiles_1",
+        ],
+        mode="manual",
+    )
+
+    assert resolved == ["additive_smiles_1"]
 
 
 def test_multicomponent_without_dedicated_columns_falls_back_to_primary_column():
@@ -884,6 +940,23 @@ def test_multicomponent_without_dedicated_columns_falls_back_to_primary_column()
     )
 
     assert resolved == ["resin_smiles"]
+
+
+def test_hardener_role_keeps_selected_primary_hardener_column_available():
+    columns = [
+        "curing_agent_smiles",
+        "resin_smiles",
+        "temperature",
+    ]
+
+    options = get_feature_component_column_options(
+        columns,
+        smiles_candidates=["curing_agent_smiles", "resin_smiles"],
+        role="hardener",
+        primary_column="curing_agent_smiles",
+    )
+
+    assert options == ["curing_agent_smiles"]
 
 
 def test_explicit_component_role_overrides_column_name_inference():
