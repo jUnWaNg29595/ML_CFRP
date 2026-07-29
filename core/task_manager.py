@@ -51,6 +51,11 @@ class TaskInfo:
     processed_items: int = 0
     error_message: str = ""
     task_type: str = "unknown"  # 'process_pool', 'thread_pool', 'subprocess'
+    task_key: str = ""
+    message: str = ""
+    result: Any = field(default=None, repr=False)
+    metadata: Dict[str, Any] = field(default_factory=dict, repr=False)
+    heartbeat_at: Optional[datetime] = None
     
 
 # =============================================================================
@@ -306,7 +311,7 @@ class BackgroundTaskManager:
         self._processes: List[mp.Process] = []
         self._futures: Dict[str, List[Future]] = {}  # task_id -> futures
         self._task_counter = 0
-        self._manager_lock = threading.Lock()
+        self._manager_lock = threading.RLock()
         self._initialized = True
         
         # 清除之前的取消状态
@@ -319,7 +324,8 @@ class BackgroundTaskManager:
             return f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self._task_counter:04d}"
     
     def register_task(self, name: str, task_type: str = "unknown", 
-                      total_items: int = 0) -> str:
+                      total_items: int = 0,
+                      task_key: Optional[str] = None) -> str:
         """
         注册新任务
         
@@ -344,7 +350,8 @@ class BackgroundTaskManager:
             status=TaskStatus.PENDING,
             created_at=datetime.now(),
             task_type=task_type,
-            total_items=total_items
+            total_items=total_items,
+            task_key=str(task_key or "").strip(),
         )
         
         with self._manager_lock:
@@ -352,6 +359,112 @@ class BackgroundTaskManager:
             self._futures[task_id] = []
         
         return task_id
+
+    def acquire_task(
+        self,
+        name: str,
+        task_type: str = "unknown",
+        total_items: int = 0,
+        task_key: Optional[str] = None,
+    ):
+        """Atomically reuse an active task instead of starting a duplicate run.
+
+        Streamlit reruns the script after every widget interaction. A stable
+        task key lets a page reconnect to the already-running task rather than
+        submitting the same expensive operation again.
+        """
+        normalized_key = str(task_key or "").strip()
+        with self._manager_lock:
+            if normalized_key:
+                active = [
+                    task
+                    for task in self._tasks.values()
+                    if task.task_key == normalized_key
+                    and task.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+                ]
+                if active:
+                    active.sort(key=lambda task: task.created_at, reverse=True)
+                    return active[0].task_id, False
+
+            if not any(
+                task.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+                for task in self._tasks.values()
+            ):
+                clear_cancel()
+
+            task_id = self._generate_task_id()
+            task_info = TaskInfo(
+                task_id=task_id,
+                name=name,
+                status=TaskStatus.PENDING,
+                created_at=datetime.now(),
+                task_type=task_type,
+                total_items=total_items,
+                task_key=normalized_key,
+            )
+            self._tasks[task_id] = task_info
+            self._futures[task_id] = []
+            return task_id, True
+
+    def get_task_snapshot(self, task_id: str) -> Optional[TaskInfo]:
+        """Return a stable snapshot that can be rendered after a rerun."""
+        with self._manager_lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            return TaskInfo(
+                task_id=task.task_id,
+                name=task.name,
+                status=task.status,
+                created_at=task.created_at,
+                started_at=task.started_at,
+                finished_at=task.finished_at,
+                progress=float(task.progress),
+                total_items=int(task.total_items),
+                processed_items=int(task.processed_items),
+                error_message=str(task.error_message or ""),
+                task_type=task.task_type,
+                task_key=task.task_key,
+                message=str(task.message or ""),
+                result=task.result,
+                metadata=dict(task.metadata or {}),
+                heartbeat_at=task.heartbeat_at,
+            )
+
+    def get_task_by_key(self, task_key: str) -> Optional[TaskInfo]:
+        """Return the newest task registered with ``task_key``."""
+        normalized_key = str(task_key or "").strip()
+        if not normalized_key:
+            return None
+        with self._manager_lock:
+            matches = [
+                task
+                for task in self._tasks.values()
+                if task.task_key == normalized_key
+            ]
+            if not matches:
+                return None
+            matches.sort(key=lambda task: task.created_at, reverse=True)
+            task = matches[0]
+            return self.get_task_snapshot(task.task_id)
+
+    def update_task(
+        self,
+        task_id: str,
+        *,
+        message: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Update human-readable status without touching Streamlit from workers."""
+        with self._manager_lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            if message is not None:
+                task.message = str(message)
+            if metadata:
+                task.metadata.update(dict(metadata))
+            task.heartbeat_at = datetime.now()
     
     def start_task(self, task_id: str):
         """标记任务开始"""
@@ -368,9 +481,10 @@ class BackgroundTaskManager:
                 task.processed_items = processed
                 if task.total_items > 0:
                     task.progress = (processed / task.total_items) * 100
+                task.heartbeat_at = datetime.now()
     
-    def complete_task(self, task_id: str, success: bool = True, 
-                      error_message: str = ""):
+    def complete_task(self, task_id: str, success: bool = True,
+                      error_message: str = "", result: Any = None):
         """标记任务完成"""
         with self._manager_lock:
             if task_id in self._tasks:
@@ -384,10 +498,14 @@ class BackgroundTaskManager:
                 if cancelled:
                     task.status = TaskStatus.CANCELLED
                     task.error_message = error_message or task.error_message or "用户取消"
+                    task.heartbeat_at = datetime.now()
                     return
                 task.progress = 100.0 if success else task.progress
                 task.status = TaskStatus.COMPLETED if success else TaskStatus.FAILED
                 task.error_message = error_message
+                if result is not None:
+                    task.result = result
+                task.heartbeat_at = datetime.now()
     
     def register_executor(self, executor):
         """注册执行器（ProcessPoolExecutor 或 ThreadPoolExecutor）"""

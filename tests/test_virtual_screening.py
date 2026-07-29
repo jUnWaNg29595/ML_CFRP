@@ -34,6 +34,9 @@ from core.virtual_screening import (
     resolve_workflow_source_columns_by_role,
     legacy_config_to_workflow,
     materialize_workflow_source_columns,
+    rebalance_screening_weights,
+    iter_pair_indices,
+    sample_pair_indices,
 )
 
 
@@ -826,6 +829,121 @@ class VirtualScreeningSamplingTests(unittest.TestCase):
         self.assertGreaterEqual(limited["resin_source"].nunique(), 2)
         self.assertEqual(metadata["before_unique"], 20)
         self.assertEqual(metadata["after_unique"], 6)
+
+
+def test_enumeration_callback_can_pause_after_one_batch():
+    resin = build_component_library(
+        ["C1CO1", "COCC1CO1", "CCCCOCC1CO1"],
+        role="resin",
+        source="test",
+    )
+    hardener = build_component_library(
+        ["NCCN", "NCCCN"],
+        role="hardener",
+        source="test",
+    )
+    calls = []
+
+    def pause_after_first_batch(batch_idx, total_batches, batch_count, total_count):
+        calls.append((batch_idx, total_batches, batch_count, total_count))
+        return False
+
+    design = enumerate_formulation_candidates(
+        resin,
+        hardener,
+        max_pairs=6,
+        feature_grid={"temperature": [80, 120]},
+        max_formulations=12,
+        random_state=7,
+        batch_callback=pause_after_first_batch,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == 0
+    assert calls[0][2] > 0
+    assert design.metadata["paused"] is True
+    assert len(design.candidate_df) == calls[0][3]
+
+
+def test_enumeration_stops_pair_generation_at_formulation_limit():
+    resin = build_component_library(
+        [f"C1CO1CC{'C' * index}" for index in range(1, 8)],
+        role="resin",
+        source="test",
+    )
+    hardener = build_component_library(
+        [f"NCC{'C' * index}N" for index in range(1, 8)],
+        role="hardener",
+        source="test",
+    )
+    calls = []
+
+    design = enumerate_formulation_candidates(
+        resin,
+        hardener,
+        max_pairs=49,
+        max_formulations=4,
+        batch_size=10,
+        random_state=7,
+        batch_callback=lambda **kwargs: calls.append(kwargs) or True,
+    )
+
+    assert len(design.candidate_df) == 4
+    assert len(calls) == 1
+    assert calls[0]["total_count"] == 4
+
+
+def test_iter_pair_indices_does_not_require_full_cartesian_index_array():
+    batches = list(
+        iter_pair_indices(
+            total_pairs=10**12,
+            sample_size=257,
+            batch_size=64,
+            random_state=7,
+        )
+    )
+    sampled = np.concatenate(batches)
+
+    assert len(sampled) == 257
+    assert len(set(sampled.tolist())) == 257
+    assert int(sampled.min()) >= 0
+    assert int(sampled.max()) < 10**12
+
+
+def test_manual_weight_change_rebalances_other_weights_proportionally():
+    base = {
+        "performance": 0.40,
+        "synth": 0.15,
+        "feasibility": 0.15,
+        "applicability": 0.12,
+        "uncertainty": 0.10,
+        "novelty": 0.05,
+        "feature_guidance": 0.03,
+    }
+
+    updated = rebalance_screening_weights(
+        base,
+        changed_key="performance",
+        new_value=0.60,
+    )
+
+    assert updated["performance"] == pytest.approx(0.60)
+    assert sum(updated.values()) == pytest.approx(1.0)
+    assert updated["synth"] == pytest.approx(0.15 * 0.40 / 0.60)
+    assert updated["feature_guidance"] == pytest.approx(0.03 * 0.40 / 0.60)
+
+
+def test_pair_sampling_handles_huge_cartesian_space_without_materializing_it():
+    sampled = sample_pair_indices(
+        total_pairs=10**12,
+        sample_size=128,
+        random_state=7,
+    )
+
+    assert len(sampled) == 128
+    assert len(set(sampled.tolist())) == 128
+    assert int(sampled.min()) >= 0
+    assert int(sampled.max()) < 10**12
 
 
 if __name__ == "__main__":

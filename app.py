@@ -25,6 +25,7 @@ import subprocess
 import time
 import copy
 import hashlib
+import functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -1076,6 +1077,8 @@ from core.post_feature_mapping import (
     create_mapping_draft,
     mapping_snapshot,
     mapping_snapshot_restore_policy,
+    normalize_mapping,
+    sanitize_feature_columns,
     validate_mapping,
     validate_mapping_for_prediction,
 )
@@ -1165,27 +1168,20 @@ def load_data_file(uploaded_file):
 
 
 def _normalize_feature_name(name):
-    return re.sub(r"\s+", "", str(name or "").strip()).lower()
+    if not isinstance(name, str):
+        return ""
+    return re.sub(r"\s+", "", name.strip()).lower()
 
 
 def _deduplicate_feature_list(features):
-    ordered = []
-    seen = set()
-    for feature in features or []:
-        text = str(feature).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        ordered.append(text)
-    return ordered
+    return sanitize_feature_columns(features)
 
 
 def _deduplicate_feature_list_normalized(features):
     ordered = []
     seen_text = set()
     seen_norm = set()
-    for feature in features or []:
-        text = str(feature).strip()
+    for text in sanitize_feature_columns(features):
         if not text:
             continue
         norm = _normalize_feature_name(text)
@@ -1360,7 +1356,7 @@ def _build_screening_reference_export(
 ):
     """Build portable screening references from the best available training state."""
     tr = train_result if isinstance(train_result, dict) else {}
-    feature_cols = [str(col) for col in (effective_feature_cols or [])]
+    feature_cols = sanitize_feature_columns(effective_feature_cols)
     max_rows = max(1, int(max_rows))
 
     def _coerce_frame(value):
@@ -1583,7 +1579,7 @@ def _resolve_prediction_feature_cols(model=None, pipeline=None, session_feature_
 
 def _build_feature_alignment_report(input_df: pd.DataFrame, required_features):
     required_features = _deduplicate_feature_list(required_features)
-    available_columns = [str(col) for col in input_df.columns]
+    available_columns = sanitize_feature_columns(input_df.columns)
     available_map = {}
     for col in available_columns:
         available_map.setdefault(_normalize_feature_name(col), []).append(col)
@@ -1880,17 +1876,15 @@ def load_and_train():
     X = df[FEATURE_COLS].values
     y = df[TARGET_COL].values
     y = pd.to_numeric(y, errors='coerce')
-    mask = ~np.isnan(y)
+    mask = np.isfinite(y)
     X, y = X[mask], y[mask]
 
-    # 删除包含缺失值或无穷大值的行
+    # 输入特征缺失行保留在训练视图中，仅将无穷大视为缺失值并插补
     X = np.where(np.isinf(X), np.nan, X)
-    complete_mask = ~np.isnan(X).any(axis=1)
-    X, y = X[complete_mask], y[complete_mask]
-    print(f"删除缺失值后保留 {{len(y)}} 个完整样本")
+    print(f"仅排除目标列缺失/无效样本后保留 {{len(y)}} 个样本")
 
     if len(y) < 10:
-        print("❌ 删除缺失值后样本数过少，无法训练")
+        print("❌ 目标列有效样本数过少，无法训练")
         return
 
     if MODEL_NAME in UNSUPPORTED_MODELS:
@@ -1899,7 +1893,12 @@ def load_and_train():
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # 标准化（不再需要 imputer，因为已删除所有缺失值）
+    # 仅在训练视图中插补输入特征，不修改原始数据
+    imputer = SimpleImputer(strategy='median')
+    X_train = imputer.fit_transform(X_train)
+    X_test = imputer.transform(X_test)
+
+    # 标准化
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
@@ -2176,7 +2175,7 @@ def _clear_post_feature_mapping_session_metadata():
 
 
 def _post_feature_mapping_model_fingerprint(model_feature_cols):
-    payload = [str(column) for column in (model_feature_cols or [])]
+    payload = sanitize_feature_columns(model_feature_cols)
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -2200,7 +2199,12 @@ def _restore_post_feature_mapping_metadata(payload, model_feature_cols=None):
     if not isinstance(default, dict):
         return
 
-    default = copy.deepcopy(default)
+    raw_default = copy.deepcopy(default)
+    default = normalize_mapping(raw_default)
+    for metadata_key in ("mapping_hash", "confirmed_at"):
+        metadata_value = raw_default.get(metadata_key)
+        if isinstance(metadata_value, str):
+            default[metadata_key] = metadata_value
     model_fingerprint = _post_feature_mapping_model_fingerprint(
         model_feature_cols or default.get("model_feature_cols") or []
     )
@@ -2332,7 +2336,16 @@ def _render_post_feature_mapping_panel(
         excluded_columns=excluded_columns,
     )
     catalog_fp = catalog_fingerprint(catalog)
-    model_cols = [str(column) for column in (model_feature_cols or []) if str(column).strip()]
+    model_cols, rejected_types = sanitize_feature_columns(
+        model_feature_cols,
+        return_rejected=True,
+    )
+    if rejected_types:
+        st.warning(
+            "检测到无效的模型特征列，已忽略后再继续："
+            + "、".join(rejected_types)
+            + "。请检查模型导出文件或会话快照中的特征列记录。"
+        )
     if not model_cols:
         return None, {
             "ok": True, "status": "not_required", "errors": [], "warnings": [],
@@ -2533,6 +2546,7 @@ def _restore_molecular_feature_metadata(payload, model_feature_cols=None):
         resolve_molecular_feature_workflow,
     )
 
+    model_feature_cols = sanitize_feature_columns(model_feature_cols)
     _clear_molecular_feature_session_metadata()
     _restore_versioned_molecular_feature_metadata(payload)
     _restore_post_feature_mapping_metadata(
@@ -2949,12 +2963,15 @@ def render_sidebar():
         if pending_page or selected_page not in NAVIGATION_PAGES:
             st.session_state["nav_page"] = current_page
 
+        active_task_lock = bool(get_task_manager().get_active_tasks())
+
         st.markdown("### 页面导航")
         page = st.selectbox(
             "页面导航",
             NAVIGATION_PAGES,
             key="nav_page",
             label_visibility="collapsed",
+            disabled=active_task_lock,
         )
         page = resolve_navigation_page(page)
         st.session_state["_last_active_page"] = page
@@ -2998,11 +3015,21 @@ def render_sidebar():
         col1, col2 = st.columns(2)
 
         with col1:
-            if st.button("🔄 刷新页面", help="重新加载当前页面", width="stretch"):
+            if st.button(
+                "🔄 刷新页面",
+                help="任务运行期间已禁用，避免中断或重复提交",
+                width="stretch",
+                disabled=active_task_lock,
+            ):
                 st.rerun()
 
         with col2:
-            if st.button("🗑️ 清除缓存", help="清除模型缓存", width="stretch"):
+            if st.button(
+                "🗑️ 清除缓存",
+                help="任务运行期间已禁用，避免清掉任务依赖的模型/特征缓存",
+                width="stretch",
+                disabled=active_task_lock,
+            ):
                 try:
                     # 清除XGBoost缓存
                     xgb_cache = get_xgboost_cache()
@@ -3036,12 +3063,14 @@ def render_sidebar():
             "自动保存",
             value=st.session_state.get("_autosave_enabled", True),
             key="autosave_enabled_toggle",
+            disabled=active_task_lock,
         )
         st.session_state["_autosave_enabled"] = autosave
         auto_restore = st.checkbox(
             "自动恢复",
             value=st.session_state.get("_auto_restore_enabled", True),
             key="auto_restore_toggle",
+            disabled=active_task_lock,
         )
         st.session_state["_auto_restore_enabled"] = auto_restore
         interval = st.slider(
@@ -3050,6 +3079,7 @@ def render_sidebar():
             300,
             int(st.session_state.get("_autosave_interval_sec", 120) or 120),
             key="autosave_interval_slider",
+            disabled=active_task_lock,
         )
         st.session_state["_autosave_interval_sec"] = int(interval)
 
@@ -3088,14 +3118,18 @@ def render_sidebar():
 
         col_s1, col_s2 = st.columns(2)
         with col_s1:
-            if st.button("立即保存", key="snapshot_save_btn"):
+            if st.button("立即保存", key="snapshot_save_btn", disabled=active_task_lock):
                 ok, _ = _save_session_snapshot("latest")
                 if ok:
                     st.success("✅ 已保存快照")
                 else:
                     st.warning("⚠️ 保存失败或无数据")
         with col_s2:
-            if st.button("恢复快照", key="snapshot_restore_btn", disabled=meta is None):
+            if st.button(
+                "恢复快照",
+                key="snapshot_restore_btn",
+                disabled=meta is None or active_task_lock,
+            ):
                 ok, _ = _restore_session_snapshot("latest", override=True)
                 if ok:
                     st.success("✅ 已恢复快照")
@@ -3144,6 +3178,7 @@ def render_sidebar():
             index=_idx,
             help="auto=自动选择（检测到 GPU 就用）；cuda:0/cuda:1=指定 GPU；cpu=强制 CPU。",
             key="compute_device_selectbox",
+            disabled=active_task_lock,
         )
 
         # --- 设备探测（CUDA vs ROCm/HIP） ---
@@ -3211,7 +3246,35 @@ def render_sidebar():
 
         # [增强] 在侧边栏始终显示状态条入口（即使暂无记录，也避免"功能存在但界面不显示"）
         render_status_sidebar(st.session_state.get('fe_tracker', None))
-        return page
+        if active_task_lock:
+            st.caption("🔒 主页面操作已锁定；请使用上方后台任务控制停止或等待完成。")
+    return page
+
+
+def _render_global_task_lock(page):
+    """Prevent accidental page actions while a managed task is active."""
+    if page == "📋 状态条记录":
+        return False
+
+    active_tasks = get_task_manager().get_active_tasks()
+    if not active_tasks:
+        return False
+
+    st.warning("🔒 后台任务正在运行，主页面控件已暂时锁定。")
+    st.caption("请等待任务完成，或在左侧“后台任务”中选择停止/强制终止。")
+    for task in active_tasks[:5]:
+        progress_text = (
+            f"{task.progress:.1f}%"
+            if task.total_items > 0
+            else "进行中"
+        )
+        detail = f"{task.name}：{progress_text}"
+        if task.message:
+            detail += f"｜{task.message}"
+        st.info(detail)
+    if len(active_tasks) > 5:
+        st.caption(f"还有 {len(active_tasks) - 5} 个后台任务未展开。")
+    return True
 
 
 def render_top_status_bar():
@@ -6187,6 +6250,12 @@ def page_data_enhancement():
 # ============================================================
 def page_molecular_features():
     """分子特征提取页面 - 完整还原5种方法 + 分子指纹 (适配双组分)"""
+    from core.molecular_feature_workflow import (
+        get_feature_component_column_options,
+        resolve_feature_component_columns,
+        resolve_feature_component_role,
+    )
+
     st.title("🧬 分子特征提取")
 
     if st.session_state.data is None:
@@ -6271,12 +6340,12 @@ def page_molecular_features():
     
     detected_smiles = _detect_smiles_cols_smart(df, exclude_features=True)
     
-    # 合并所有候选列（已过滤分子特征）
-    all_smiles_candidates = list(set(text_cols + detected_smiles))
-    all_smiles_candidates = [c for c in all_smiles_candidates if c in df.columns and not _is_extracted_feature_col(c)]
-    
-    # 用于显示的候选列（优先显示 SMILES 相关的）
-    smiles_candidates = [col for col in all_smiles_candidates if 'smiles' in col.lower() or 'smi' in col.lower()]
+    detected_smiles = [
+        col
+        for col in df.columns
+        if col in detected_smiles and not _is_extracted_feature_col(col)
+    ]
+    all_smiles_candidates = list(detected_smiles)
 
     if not all_smiles_candidates:
         st.warning("⚠️ 数据中未检测到文本列或SMILES列，无法提取分子特征。\n"
@@ -6288,6 +6357,14 @@ def page_molecular_features():
         all_smiles_candidates = [c for c in df.columns.tolist() if not _is_extracted_feature_col(c)]
         if not all_smiles_candidates:
             return
+        detected_smiles = list(all_smiles_candidates)
+
+    # 用于显示的候选列（优先显示 SMILES 相关的）
+    smiles_candidates = [
+        col
+        for col in all_smiles_candidates
+        if "smiles" in str(col).lower() or "smi" in str(col).lower()
+    ]
     
     # 更新 text_cols 为合并后的候选列
     text_cols = all_smiles_candidates
@@ -6303,6 +6380,29 @@ def page_molecular_features():
         while "__" in s:
             s = s.replace("__", "_")
         return s.strip("_")
+
+    def _infer_selected_component_role(columns):
+        names = " ".join(str(col).lower() for col in (columns or []) if col)
+        hard_score = sum(
+            names.count(token)
+            for token in (
+                "curing_agent",
+                "curingagent",
+                "hardener",
+                "curative",
+                "固化剂",
+                "交联剂",
+            )
+        )
+        resin_score = sum(
+            names.count(token)
+            for token in ("resin", "epoxy", "树脂", "基体")
+        )
+        if resin_score > hard_score:
+            return "resin"
+        if hard_score > resin_score:
+            return "hardener"
+        return "neutral"
 
     def _add_prefix_safe(df, prefix):
         """安全地给 DataFrame 列名添加前缀"""
@@ -6657,7 +6757,7 @@ def page_molecular_features():
 
             # 这里明确这是第一组分（通常是树脂）
             smiles_col = st.selectbox(
-                "选择包含SMILES的列 (树脂/主体)",
+                "选择包含 SMILES 的列（主输入）",
                 text_cols,
                 index=default_idx
             )
@@ -6689,6 +6789,65 @@ def page_molecular_features():
                     key="vs_formula_batch_export_all",
                 )
             return
+
+    role_labels = {
+        "resin": "树脂",
+        "hardener": "固化剂",
+        "neutral": "中性/其他",
+    }
+    role_options = ["resin", "hardener", "neutral"]
+    batch_component_roles = {}
+
+    st.markdown("#### 🧭 当前处理种类")
+    st.caption(
+        "此选择与“分子特征工程复现”中的 workflow 角色一致，"
+        "手动选择优先于列名推断，不会因为列名被强制记为树脂。"
+    )
+    if batch_mode:
+        if batch_smiles_cols:
+            st.caption("批量模式下请为每个输入列分别指定角色：")
+            for batch_idx, batch_column in enumerate(batch_smiles_cols):
+                role_key = f"molecular_feature_batch_role_{batch_idx}"
+                inferred_role = _infer_selected_component_role([batch_column])
+                current_role = st.session_state.get(role_key, inferred_role)
+                if current_role not in role_options:
+                    current_role = inferred_role
+                batch_component_roles[batch_column] = st.radio(
+                    f"`{batch_column}` 当前处理种类",
+                    role_options,
+                    index=role_options.index(current_role),
+                    format_func=lambda value: role_labels[value],
+                    horizontal=True,
+                    key=role_key,
+                )
+        else:
+            st.info("请先选择要批量处理的 SMILES 列。")
+    else:
+        inferred_role = _infer_selected_component_role([smiles_col])
+        current_role = st.session_state.get(
+            "molecular_feature_component_role",
+            inferred_role,
+        )
+        if current_role not in role_options:
+            current_role = inferred_role
+        selected_component_role = st.radio(
+            "当前处理种类（与分子特征工程复现一致）",
+            role_options,
+            index=role_options.index(current_role),
+            format_func=lambda value: role_labels[value],
+            horizontal=True,
+            key="molecular_feature_component_role",
+        )
+        batch_component_roles[smiles_col] = selected_component_role
+
+    st.session_state["molecular_feature_component_roles"] = dict(
+        batch_component_roles
+    )
+    selected_primary_role = (
+        selected_component_role
+        if not batch_mode
+        else batch_component_roles.get(smiles_col)
+    )
 
     preview_source = []
     if smiles_col in df.columns:
@@ -6740,6 +6899,14 @@ def page_molecular_features():
             else:
                 auto_cols = st.session_state[cache_key]
 
+            resin_component_options = get_feature_component_column_options(
+                text_cols,
+                smiles_candidates=detected_smiles,
+                role="resin",
+                primary_column=smiles_col,
+                dedicated_columns=auto_cols,
+            )
+
             # 新增：自动检测列数选项
             auto_detect_cols = st.checkbox(
                 "🔍 自动检测组分列数",
@@ -6752,18 +6919,48 @@ def page_molecular_features():
                 # 自动检测模式：显示检测到的列数和列名
                 if auto_cols:
                     st.caption(f"✅ 检测到 {len(auto_cols)} 个组分列: {', '.join(auto_cols[:5])}{' ...' if len(auto_cols) > 5 else ''}")
-                    resin_component_cols = auto_cols
+                    resin_component_cols = resolve_feature_component_columns(
+                        text_cols,
+                        role="resin",
+                        primary_column=smiles_col,
+                        dedicated_columns=auto_cols,
+                        smiles_candidates=detected_smiles,
+                        mode="auto",
+                    )
                 else:
                     st.caption("⚠️ 未检测到符合命名规则的组分列，使用默认列")
-                    resin_component_cols = [smiles_col]
+                    resin_component_cols = resolve_feature_component_columns(
+                        text_cols,
+                        role="resin",
+                        primary_column=smiles_col,
+                        dedicated_columns=[],
+                        smiles_candidates=detected_smiles,
+                        mode="auto",
+                    )
             else:
                 # 手动选择模式
-                resin_component_cols = st.multiselect(
+                manual_default = [
+                    column
+                    for column in (auto_cols if auto_cols else [smiles_col])
+                    if column in resin_component_options
+                ]
+                selected_resin_component_cols = st.multiselect(
                     "选择树脂组分列",
-                    options=text_cols,
-                    default=auto_cols if auto_cols else [smiles_col],
-                    help="系统会把这些列的所有非空组分合并为一个多片段SMILES（用 '.' 连接）"
+                    options=resin_component_options,
+                    default=manual_default,
+                    help="仅显示树脂兼容的SMILES列；上方主列也会保留，可与 resin_smiles_2、resin_smiles_3 等组分一起选择。"
                 )
+                resin_component_cols = resolve_feature_component_columns(
+                    text_cols,
+                    role="resin",
+                    primary_column=smiles_col,
+                    dedicated_columns=auto_cols,
+                    selected_columns=selected_resin_component_cols,
+                    smiles_candidates=detected_smiles,
+                    mode="manual",
+                )
+                if not resin_component_options:
+                    st.warning("⚠️ 未找到可用于树脂多组分提取的SMILES列，请检查列名或关闭多列模式。")
         else:
             st.caption("将自动把 ';'、'；'、'|'、以及带空格的 ' + ' 转换为多组分分隔，并用 '.' 连接。")
 
@@ -6785,7 +6982,7 @@ def page_molecular_features():
     st.markdown("---")
 
     # 🔥 核心功能：5种提取方法选择
-    st.markdown("### 🛠️ 提取方法选择")
+    st.markdown("### 🛠️ 分子特征提取方法")
 
     extraction_method = st.radio(
         "选择分子特征提取方法",
@@ -6810,8 +7007,10 @@ def page_molecular_features():
             "⚗️ 环氧树脂反应特征 (基于领域知识)",
             "📑 FGD 官能团区分",
         ],
-        help="不同方法适用于不同场景"
+        key="molecular_feature_extraction_method",
+        help="当前处理种类请在上方“当前处理种类”按钮中选择；这里仅选择特征提取算法。"
     )
+    st.caption(f"当前特征提取方法：{extraction_method}")
 
     # [新增] 显示各方法对多组分的支持情况
     st.markdown("---")
@@ -7189,6 +7388,12 @@ def page_molecular_features():
     
     # 初始化变量
     hardener_component_cols = []
+    hardener_column_options = get_feature_component_column_options(
+        text_cols,
+        smiles_candidates=detected_smiles,
+        role="hardener",
+        primary_column=smiles_col,
+    )
     
     # 根据方法类型显示不同的UI
     if _is_single_only:
@@ -7263,8 +7468,8 @@ def page_molecular_features():
                 if manual_adjust:
                     hardener_component_cols = st.multiselect(
                         "选择固化剂列",
-                        options=[c for c in text_cols if c != smiles_col],
-                        default=auto_hardener_cols,
+                        options=hardener_column_options,
+                        default=[c for c in auto_hardener_cols if c in hardener_column_options],
                         help="可以添加或删除列",
                         key="fp_hardener_cols_manual"
                     )
@@ -7280,7 +7485,7 @@ def page_molecular_features():
                 st.warning("⚠️ 未检测到固化剂列，请手动选择")
                 hardener_component_cols = st.multiselect(
                     "手动选择固化剂列",
-                    options=[c for c in text_cols if c != smiles_col],
+                    options=hardener_column_options,
                     default=[],
                     help="选择包含固化剂 SMILES 的列",
                     key="fp_hardener_cols_fallback"
@@ -7357,8 +7562,8 @@ def page_molecular_features():
                 if manual_adjust_concat:
                     hardener_component_cols = st.multiselect(
                         "选择固化剂列",
-                        options=[c for c in text_cols if c != smiles_col],
-                        default=auto_hardener_cols,
+                        options=hardener_column_options,
+                        default=[c for c in auto_hardener_cols if c in hardener_column_options],
                         help="可以添加或删除列",
                         key="concat_hardener_cols_manual"
                     )
@@ -7374,7 +7579,7 @@ def page_molecular_features():
                 st.warning("⚠️ 未检测到固化剂列，请手动选择")
                 hardener_component_cols = st.multiselect(
                     "手动选择固化剂列",
-                    options=[c for c in text_cols if c != smiles_col],
+                    options=hardener_column_options,
                     default=[],
                     help="选择包含固化剂 SMILES 的列",
                     key="concat_hardener_cols_fallback"
@@ -7526,20 +7731,27 @@ def page_molecular_features():
         # ============== 树脂选择 ==============
         st.markdown("#### 🧪 树脂组分选择")
 
-        # 自动识别树脂列
-        auto_resin_cols = []
-        for i in range(1, 7):
-            col_name = f"resin_smiles_{i}"
-            if col_name in df.columns:
-                auto_resin_cols.append(col_name)
+        # 自动识别全部编号树脂列，不再限制为 resin_smiles_1~6
+        resin_column_pattern = re.compile(r"^resin_smiles_\d+$")
+        auto_resin_cols = sorted(
+            [col for col in text_cols if resin_column_pattern.match(str(col))],
+            key=lambda col: (
+                str(col).lower().rsplit("_", 1)[0],
+                int(str(col).rsplit("_", 1)[1]),
+            ),
+        )
 
         # 如果没找到，尝试其他格式
         if not auto_resin_cols:
             for prefix in ["epoxy_smiles", "resin"]:
-                for i in range(1, 7):
-                    col_name = f"{prefix}_{i}"
-                    if col_name in df.columns:
-                        auto_resin_cols.append(col_name)
+                prefix_pattern = re.compile(rf"^{re.escape(prefix)}_\d+$")
+                auto_resin_cols = sorted(
+                    [col for col in text_cols if prefix_pattern.match(str(col))],
+                    key=lambda col: (
+                        str(col).lower().rsplit("_", 1)[0],
+                        int(str(col).rsplit("_", 1)[1]),
+                    ),
+                )
                 if auto_resin_cols:
                     break
 
@@ -7564,7 +7776,7 @@ def page_molecular_features():
             options=text_cols,
             default=valid_resin_defaults,
             key="epoxy_resin_cols_select",
-            help="✨ 已自动识别 resin_smiles_1~6 列。可手动调整或添加其他列。"
+            help="✨ 自动识别所有 resin_smiles_数字 列（包括 resin_smiles_1）。可手动调整或添加其他列。"
         )
 
         # 更新 session_state
@@ -8081,22 +8293,13 @@ def page_molecular_features():
         if n_jobs > 8:
             st.warning("⚠️ 进程数 > 8 可能导致线程争抢，建议使用 4-8 个进程")
 
-    def _infer_selected_component_role(columns):
-        names = " ".join(str(col).lower() for col in (columns or []) if col)
-        hard_score = sum(names.count(token) for token in ("curing_agent", "curingagent", "hardener", "curative", "固化剂"))
-        resin_score = sum(names.count(token) for token in ("resin", "epoxy", "树脂"))
-        if resin_score > hard_score:
-            return "resin"
-        if hard_score > resin_score:
-            return "hardener"
-        return "neutral"
-
-    primary_source_role = _infer_selected_component_role(resin_component_cols)
+    inferred_primary_role = _infer_selected_component_role(resin_component_cols)
+    primary_source_role = resolve_feature_component_role(
+        selected_primary_role,
+        inferred_role=inferred_primary_role,
+    )
     selector_source_role = _infer_selected_component_role([smiles_col])
-    # 当 resin_component_cols 和 smiles_col 的角色推断冲突时，以 smiles_col 为准
-    if primary_source_role in {"resin", "hardener"} and selector_source_role in {"resin", "hardener"} and primary_source_role != selector_source_role:
-        primary_source_role = selector_source_role
-    source_role_label = {"resin": "树脂", "hardener": "固化剂", "neutral": "主体组分"}[primary_source_role]
+    source_role_label = role_labels[primary_source_role]
     st.info(
         f"本次真正用于分子特征计算的是：{source_role_label}列 "
         + ", ".join(str(col) for col in (resin_component_cols or [smiles_col]))
@@ -8105,8 +8308,8 @@ def page_molecular_features():
     source_role_conflict = (primary_source_role != selector_source_role and selector_source_role in {"resin", "hardener"})
     if source_role_conflict:
         st.warning(
-            f"列名提示：主列选择器是 `{smiles_col}`，但实际多组分列名被识别为其他角色。"
-            "系统已以主列选择器角色为准继续处理。"
+            f"主列选择器是 `{smiles_col}`，但实际提取列属于“{source_role_label}”。"
+            "主列仅用于选择和预览，不会覆盖实际多组分输入角色。"
         )
         confirm_source_role_conflict = st.checkbox(
             "我确认使用上述角色设置提取特征",
@@ -8384,7 +8587,12 @@ def page_molecular_features():
                 workflow_step = {
                     "step_id": f"batch_{batch_idx + 1}",
                     "order": batch_idx,
-                    "role": _infer_selected_component_role([current_smiles_col]),
+                    "role": resolve_feature_component_role(
+                        batch_component_roles.get(current_smiles_col),
+                        inferred_role=_infer_selected_component_role(
+                            [current_smiles_col]
+                        ),
+                    ),
                     "source_columns": [current_smiles_col],
                     "method": extraction_method,
                     "prefix": col_prefix,
@@ -10011,6 +10219,7 @@ def page_molecular_features():
                             "hardener_fusion_mode": hardener_fusion_mode,
                             "resin_mix_mode": resin_mix_mode,
                             "primary_component_role": primary_source_role,
+                            "component_roles": dict(batch_component_roles),
                             "input_contract": {
                                 "selected_source_columns": workflow_source_columns,
                                 "source_row_count": len(df),
@@ -10029,6 +10238,7 @@ def page_molecular_features():
                                 "hardener_fusion_mode": hardener_fusion_mode,
                                 "resin_mix_mode": resin_mix_mode,
                                 "primary_component_role": primary_source_role,
+                                "component_roles": dict(batch_component_roles),
                                 "skip_ionic_compounds": bool(skip_ionic_compounds),
                                 "ionic_filter_behavior": (
                                     "exclude_rows_preserve_source_rows"
@@ -10239,11 +10449,9 @@ def page_molecular_feature_reproduction():
         return
 
     current_model = get_current_model()
-    model_feature_cols = [
-        str(column)
-        for column in (st.session_state.get("feature_cols") or [])
-        if str(column).strip()
-    ]
+    model_feature_cols = sanitize_feature_columns(
+        st.session_state.get("feature_cols")
+    )
     molecular_model_cols = [
         column for column in model_feature_cols
         if column in set(workflow.final_feature_names)
@@ -11301,13 +11509,21 @@ def page_model_training():
         st.markdown("### ⚙️ 训练设置")
 
         # 缺失值处理策略
-        missing_strategy_options = ["删除样本（保真）", "中位数填充（保留样本）"]
-        missing_strategy_help = "删除样本：只使用完整样本训练，避免填充失真，但可能减少样本数。中位数填充：保留所有样本，但可能导致数据失真。"
+        target_missing_option = "仅排除目标缺失（输入缺失保留）"
+        missing_strategy_options = [target_missing_option, "中位数填充（保留样本）"]
+        missing_strategy_help = (
+            "两种策略都不会修改原始数据。第一项只让目标列为 NaN/Inf 的样本不参与训练，"
+            "输入特征缺失行继续保留，由模型原生缺失能力或训练器插补；第二项明确使用中位数填充输入特征。"
+        )
         missing_strategy_default = 0
         missing_strategy_key = f"missing_strategy_{model_name}"
         if model_name == "Bayesian Neural Network (BNN)":
-            missing_strategy_options = ["删除样本（保真）", "模型插补（按BNN参数）"]
-            missing_strategy_help = "删除样本：只使用完整样本训练。模型插补：保留所有样本，并按 BNN 参数面板中的缺失值策略执行中位数、贝叶斯或多重贝叶斯插补。"
+            missing_strategy_options = [target_missing_option, "模型插补（按BNN参数）"]
+            missing_strategy_help = (
+                "目标列为 NaN/Inf 的样本始终不参与训练，原始数据不会被删除。"
+                "输入特征缺失行会保留，并按 BNN 参数面板中的缺失值策略处理；"
+                "若使用目标缺失策略，训练器仍会采用可运行的插补流程以满足 BNN 输入要求。"
+            )
             missing_strategy_default = 1
             missing_strategy_key = "missing_strategy_bnn"
 
@@ -11324,16 +11540,6 @@ def page_model_training():
             key=missing_strategy_key,
             help=missing_strategy_help
         )
-
-        if model_name == "Bayesian Neural Network (BNN)" and missing_strategy == "删除样本（保真）":
-            bnn_imputer_choice = st.session_state.get(
-                f"param_{model_name}_missing_value_strategy",
-                "median",
-            )
-            st.warning(
-                f"当前仍在按“删除样本（保真）”训练，BNN 面板里的 `{bnn_imputer_choice}` 插补不会生效。"
-                "如需启用贝叶斯/多重贝叶斯/中位数插补，请将这里切换为“模型插补（按BNN参数）”。"
-            )
 
         test_size = st.slider("测试集比例", 0.1, 0.4, 0.2)
         random_state = st.number_input("随机种子", 0, 1000000, 42)
@@ -11762,21 +11968,18 @@ def page_model_training():
                         from sklearn.preprocessing import StandardScaler
                         from sklearn.impute import SimpleImputer
 
-                        # 处理缺失值
-                        if missing_strategy == "删除样本（保真）":
-                            # 删除包含缺失值的行
-                            mask = ~(X.isna().any(axis=1) | y.isna())
-                            X_clean = X[mask].copy()
-                            y_clean = y[mask].copy()
-                        else:
-                            # 使用中位数填充
-                            imputer = SimpleImputer(strategy='median')
-                            X_clean = pd.DataFrame(
-                                imputer.fit_transform(X),
-                                columns=X.columns,
-                                index=X.index
-                            )
-                            y_clean = y.copy()
+                        # 目标缺失样本不参与训练；输入缺失行保留并由 LazyPredict 前的
+                        # 中位数插补处理，原始 DataFrame 不做原地修改。
+                        y_numeric = pd.to_numeric(y, errors="coerce").replace([np.inf, -np.inf], np.nan)
+                        target_mask = y_numeric.notna()
+                        X_target_valid = X.loc[target_mask].copy()
+                        y_clean = y_numeric.loc[target_mask].copy()
+                        imputer = SimpleImputer(strategy="median")
+                        X_clean = pd.DataFrame(
+                            imputer.fit_transform(X_target_valid),
+                            columns=X_target_valid.columns,
+                            index=X_target_valid.index,
+                        )
 
                         st.info(f"数据准备完成：{len(X_clean)} 个样本，{len(X_clean.columns)} 个特征")
 
@@ -12062,24 +12265,6 @@ def page_model_training():
                             return
                         X_model = df[raw_cols].copy()
 
-                    if model_name == "Bayesian Neural Network (BNN)" and missing_strategy == "删除样本（保真）":
-                        try:
-                            X_missing_mask = X_model.isna().any(axis=1).to_numpy()
-                            y_valid_mask = pd.to_numeric(pd.Series(y), errors="coerce").notna().to_numpy()
-                            complete_count = int((~X_missing_mask & y_valid_mask).sum())
-                            if complete_count <= 0:
-                                requested_bnn_imputer = str(
-                                    params.get("missing_value_strategy", "median") or "median"
-                                ).strip().lower()
-                                st.error(
-                                    "❌ 当前上方缺失值处理策略仍是“删除样本（保真）”，"
-                                    f"因此 BNN 的 `{requested_bnn_imputer}` 插补不会执行；"
-                                    "删除缺失样本后已没有可训练样本。请改为“模型插补（按BNN参数）”。"
-                                )
-                                return
-                        except Exception:
-                            pass
-
                     # 训练（支持 split_strategy / n_bins / groups）
                     print(f"[DEBUG APP] About to call trainer.train_model...")
                     import sys
@@ -12094,7 +12279,7 @@ def page_model_training():
                             split_strategy=split_strategy,
                             n_bins=int(n_bins),
                             groups=groups,
-                            drop_missing_rows=(missing_strategy == "删除样本（保真）"),
+                            drop_missing_rows=(missing_strategy == target_missing_option),
                             **params
                         )
                     finally:
@@ -14799,12 +14984,17 @@ def page_prediction():
                     # 写入 session_state（用于后续页面复用）
                     st.session_state.model_name = artifact.get("model_name") or "ImportedModel"
                     st.session_state.target_col = artifact.get("target_col") or st.session_state.get("target_col", "")
-                    st.session_state.feature_cols = _resolve_effective_feature_cols(
+                    imported_feature_cols = _resolve_effective_feature_cols(
                         selected_feature_cols=artifact.get("feature_cols") or st.session_state.get("feature_cols", []),
                         model=artifact.get("model", None) or artifact.get("pipeline", None),
                         pipeline=artifact.get("pipeline", None),
                         imported_artifact=artifact,
-                    )[0] or artifact.get("feature_cols") or st.session_state.get("feature_cols", [])
+                    )[0]
+                    st.session_state.feature_cols = (
+                        imported_feature_cols
+                        or sanitize_feature_columns(artifact.get("feature_cols"))
+                        or sanitize_feature_columns(st.session_state.get("feature_cols"))
+                    )
                     st.session_state.pipeline = artifact.get("pipeline", None)
 
                     # 关键修复：XGBoost模型使用cache_resource
@@ -15782,10 +15972,112 @@ def page_model_imputation():
         except Exception as e:
             st.error(f"❌ 错误: {str(e)}")
 
+def _mark_virtual_screening_run_requested():
+    """Record the click before Streamlit reruns the script."""
+    st.session_state["_vs_formula_run_requested"] = True
+
+
+def _virtual_screening_task_guard(page_func):
+    """Keep a formula screening run connected across Streamlit reruns."""
+    @functools.wraps(page_func)
+    def _guarded_page():
+        manager = get_task_manager()
+        session_key = str(st.session_state.get("_sid") or "default")
+        task_key = f"virtual_screening_formula:{session_key}"
+        run_requested = bool(
+            st.session_state.pop("_vs_formula_run_requested", False)
+        )
+        task_id = st.session_state.get("_vs_formula_task_id")
+        task_created = False
+
+        if run_requested:
+            task_id, task_created = manager.acquire_task(
+                name="配方级高通量筛选",
+                task_type="virtual_screening",
+                task_key=task_key,
+            )
+            st.session_state["_vs_formula_task_id"] = task_id
+            if task_created:
+                clear_cancel()
+                manager.start_task(task_id)
+            else:
+                task = manager.get_task_snapshot(task_id)
+                st.warning("已有配方级筛选正在运行，本次重复点击已忽略。")
+                if task is not None and task.message:
+                    st.info(task.message)
+                return
+
+        try:
+            result = page_func()
+        except BaseException as exc:
+            if task_created:
+                manager.complete_task(
+                    task_id,
+                    success=False,
+                    error_message=str(exc),
+                )
+            raise
+        else:
+            if task_created:
+                manager.complete_task(
+                    task_id,
+                    success=True,
+                    result=st.session_state.get("vs_formula_result_df"),
+                )
+            return result
+
+    return _guarded_page
+
+
+@_virtual_screening_task_guard
 def page_virtual_screening():
     """虚拟分子生成与高通量筛选"""
     st.title("🧪 虚拟分子筛选")
     st.caption("基于当前模型与分子特征流程，批量生成候选并进行高通量预测筛选。")
+
+    saved_vs_formula_result = st.session_state.get("vs_formula_result_df")
+    if isinstance(saved_vs_formula_result, pd.DataFrame) and not saved_vs_formula_result.empty:
+        saved_result_columns = {
+            "formulation_id": "配方编号",
+            "component_role": "组分角色",
+            "primary_smiles": "主体SMILES",
+            "hardener_smiles": "固化剂SMILES",
+            "prediction": "预测值",
+            "prediction_std": "预测标准差",
+            "total_score": "综合评分",
+            "candidate_origin": "候选来源",
+            "recommended_batch": "推荐批次",
+        }
+        saved_display_columns = [
+            column
+            for column in saved_result_columns
+            if column in saved_vs_formula_result.columns
+        ]
+        saved_display = (
+            saved_vs_formula_result[saved_display_columns].rename(
+                columns=saved_result_columns
+            )
+            if saved_display_columns
+            else saved_vs_formula_result
+        )
+        saved_at = st.session_state.get("vs_formula_result_updated_at")
+        saved_at_text = (
+            datetime.fromtimestamp(float(saved_at)).strftime("%Y-%m-%d %H:%M:%S")
+            if saved_at
+            else "当前会话"
+        )
+        st.info(
+            f"已恢复上次配方级筛选结果：{len(saved_vs_formula_result):,} 条"
+            f"（更新时间：{saved_at_text}）。页面控件重跑不会清除该结果。"
+        )
+        st.dataframe(saved_display, width="stretch", height=300)
+        st.download_button(
+            "⬇️ 下载已保存的配方筛选结果",
+            data=saved_vs_formula_result.to_csv(index=False).encode("utf-8-sig"),
+            file_name="virtual_formula_screening_results_saved.csv",
+            mime="text/csv",
+            key="vs_saved_formula_result_download",
+        )
 
     # [关键修复] 检查模型是否存在
     current_model = get_current_model()
@@ -15808,12 +16100,17 @@ def page_virtual_screening():
 
                     st.session_state.model_name = artifact.get("model_name") or "ImportedModel"
                     st.session_state.target_col = artifact.get("target_col") or st.session_state.get("target_col", "")
-                    st.session_state.feature_cols = _resolve_effective_feature_cols(
+                    imported_feature_cols = _resolve_effective_feature_cols(
                         selected_feature_cols=artifact.get("feature_cols") or st.session_state.get("feature_cols", []),
                         model=artifact.get("model", None) or artifact.get("pipeline", None),
                         pipeline=artifact.get("pipeline", None),
                         imported_artifact=artifact,
-                    )[0] or artifact.get("feature_cols") or st.session_state.get("feature_cols", [])
+                    )[0]
+                    st.session_state.feature_cols = (
+                        imported_feature_cols
+                        or sanitize_feature_columns(artifact.get("feature_cols"))
+                        or sanitize_feature_columns(st.session_state.get("feature_cols"))
+                    )
                     st.session_state.pipeline = artifact.get("pipeline", None)
 
                     # 关键修复：XGBoost模型使用cache_resource
@@ -15857,7 +16154,18 @@ def page_virtual_screening():
     pipeline = st.session_state.get("pipeline", None)
     scaler = st.session_state.get("scaler", None)
     imputer = st.session_state.get("imputer", None)
-    feature_cols = st.session_state.get("feature_cols") or []
+    feature_cols, rejected_feature_types = sanitize_feature_columns(
+        st.session_state.get("feature_cols"),
+        return_rejected=True,
+    )
+    if rejected_feature_types:
+        st.session_state.feature_cols = feature_cols
+        st.session_state.multiselect_features = feature_cols.copy()
+        st.warning(
+            "检测到会话中的特征列记录包含无效对象，已自动清理："
+            + "、".join(rejected_feature_types)
+            + "。这些对象不是模型输入列，已不会参与筛选。"
+        )
 
     if not feature_cols:
         st.warning("⚠️ 未检测到模型所需特征列，请先训练或导入模型")
@@ -15952,6 +16260,7 @@ def page_virtual_screening():
         predict_with_uncertainty_info,
         predict_with_model,
         rank_screening_candidates,
+        rebalance_screening_weights,
         resolve_component_smiles_cols,
         resolve_molecular_feature_workflow,
         resolve_workflow_source_columns_by_role,
@@ -16035,22 +16344,18 @@ def page_virtual_screening():
 
     workflow_feature_names = []
     if screening_workflow is not None:
-        workflow_feature_names = [
-            str(name)
-            for name in (screening_workflow.final_feature_names or [])
-            if str(name).strip()
-        ]
+        workflow_feature_names = sanitize_feature_columns(
+            screening_workflow.final_feature_names
+        )
     configured_molecular_feature_cols = list(workflow_feature_names)
     if not configured_molecular_feature_cols:
-        configured_molecular_feature_cols = [
-            str(name)
-            for name in (mf_cfg.get("feature_names") or [])
-            if str(name).strip()
-        ]
+        configured_molecular_feature_cols = sanitize_feature_columns(
+            mf_cfg.get("feature_names")
+        )
     post_feature_model_cols = [
-        str(column)
+        column
         for column in feature_cols
-        if str(column) not in set(configured_molecular_feature_cols)
+        if column not in set(configured_molecular_feature_cols)
     ]
 
     workflow_resin_source_cols, workflow_hardener_source_cols = (
@@ -16946,36 +17251,40 @@ def page_virtual_screening():
                 pubchem_resin_max_cids = st.number_input(
                     "树脂每类最大 CID 数",
                     min_value=100,
-                    max_value=50000,
-                    value=1000,
-                    step=100,
+                    max_value=5000000,
+                    value=50000,
+                    step=1000,
                     key="vs_formula_pubchem_resin_max_cids_v4",
                 )
                 pubchem_resin_sample_each = st.number_input(
                     "树脂最终采样上限",
                     min_value=100,
-                    max_value=50000,
-                    value=500,
-                    step=100,
+                    max_value=2000000,
+                    value=20000,
+                    step=1000,
                     key="vs_formula_pubchem_resin_sample_each_v4",
                 )
             with cid_col2:
                 pubchem_hardener_max_cids = st.number_input(
                     "固化剂 每类最大 CID 数",
                     min_value=100,
-                    max_value=50000,
-                    value=1000,
-                    step=100,
+                    max_value=5000000,
+                    value=50000,
+                    step=1000,
                     key="vs_formula_pubchem_hardener_max_cids_v4",
                 )
                 pubchem_hardener_sample_each = st.number_input(
                     "固化剂 最终采样上限（每类）",
                     min_value=100,
-                    max_value=50000,
-                    value=500,
-                    step=100,
+                    max_value=2000000,
+                    value=20000,
+                    step=1000,
                     key="vs_formula_pubchem_hardener_sample_each_v4",
                 )
+            st.caption(
+                "CID 上限控制每个 PubChem 查询最多拉取的 CID；最终采样上限控制进入候选库的分子数。"
+                "两者分开设置，增大后会增加网络请求、RDKit 复核和缓存体积；建议先提高采样上限，再逐步提高 CID 上限。"
+            )
             pubchem_seed = st.number_input("PubChem 随机种子", 0, 10_000_000, 42, key="vs_formula_pubchem_seed_v4")
             # 工业级过滤配置
             _ind_enable_resin, _ind_cfg_resin = render_industrial_filter_ui(st, "树脂")
@@ -17108,20 +17417,24 @@ def page_virtual_screening():
             max_pairs_formula = st.number_input(
                 "组分组合采样上限",
                 min_value=100,
-                max_value=500000,
-                value=50000,
-                step=1000,
+                max_value=100000000,
+                value=5000000,
+                step=100000,
                 key="vs_formula_max_pairs_v2",
             )
         with limit_col2:
             max_formulations = st.number_input(
                 "模型评估配方上限",
                 min_value=500,
-                max_value=1000000,
-                value=100000,
-                step=5000,
+                max_value=100000000,
+                value=5000000,
+                step=100000,
                 key="vs_formula_max_formulations_v2",
             )
+        st.caption(
+            "组分组合采样上限控制树脂/固化剂配对数量；模型评估配方上限控制叠加工艺网格后实际送入模型的行数。"
+            "后端按批次采样，不创建完整笛卡尔积；上限越大，运行时间和内存占用也会线性增加。"
+        )
 
         with st.expander("化学有效性规则", expanded=False):
             formula_rule_profile = st.selectbox(
@@ -17463,15 +17776,71 @@ def page_virtual_screening():
         formula_similarity_thr = st.slider("候选相似度上限", 0.50, 0.99, 0.92, 0.01, key="vs_formula_similarity_thr_v2")
         formula_mc_samples = st.slider("不确定度采样次数（若模型支持）", 5, 200, 50, 5, key="vs_formula_mc_samples_v2")
         with st.expander("综合评分权重", expanded=False):
-            w_perf = st.slider("性能权重", 0.0, 1.0, 0.40, 0.05, key="vs_formula_w_perf_v2")
-            w_synth = st.slider("可合成性权重", 0.0, 1.0, 0.15, 0.05, key="vs_formula_w_synth_v2")
-            w_feas = st.slider("化学/工艺可行性权重", 0.0, 1.0, 0.15, 0.05, key="vs_formula_w_feas_v2")
-            w_ad = st.slider("适用域权重", 0.0, 1.0, 0.12, 0.02, key="vs_formula_w_ad_v2")
-            w_unc = st.slider("不确定度权重", 0.0, 1.0, 0.10, 0.02, key="vs_formula_w_unc_v2")
-            w_novel = st.slider("新颖性权重", 0.0, 1.0, 0.05, 0.01, key="vs_formula_w_novel_v2")
-            w_feat = st.slider("特征方向一致性权重", 0.0, 1.0, 0.03, 0.01, key="vs_formula_w_feat_v2")
+            weight_linked = st.checkbox(
+                "手动调整时自动平衡其他权重（总和保持 100%，推荐）",
+                value=True,
+                key="vs_formula_weights_linked_v2",
+                help="改变一个权重后，其余权重按当前比例缩放；关闭后各权重可独立调整。",
+            )
+            weight_specs = (
+                ("performance", "vs_formula_w_perf_v2", "性能权重", 0.40, 0.05),
+                ("synth", "vs_formula_w_synth_v2", "可合成性权重", 0.15, 0.05),
+                ("feasibility", "vs_formula_w_feas_v2", "化学/工艺可行性权重", 0.15, 0.05),
+                ("applicability", "vs_formula_w_ad_v2", "适用域权重", 0.12, 0.02),
+                ("uncertainty", "vs_formula_w_unc_v2", "不确定度权重", 0.10, 0.02),
+                ("novelty", "vs_formula_w_novel_v2", "新颖性权重", 0.05, 0.01),
+                ("feature_guidance", "vs_formula_w_feat_v2", "特征方向一致性权重", 0.03, 0.01),
+            )
 
-        if st.button("🚀 开始配方级高通量筛选", type="primary", key="vs_formula_run"):
+            def _on_formula_weight_change(changed_key):
+                if not bool(st.session_state.get("vs_formula_weights_linked_v2", True)):
+                    return
+                raw_weights = {
+                    name: float(st.session_state.get(state_key, default))
+                    for name, state_key, _, default, _ in weight_specs
+                }
+                changed_value = raw_weights.get(changed_key, 0.0)
+                adjusted = rebalance_screening_weights(
+                    raw_weights,
+                    changed_key=changed_key,
+                    new_value=changed_value,
+                )
+                for name, state_key, _, _, _ in weight_specs:
+                    st.session_state[state_key] = adjusted[name]
+
+            weight_values = {}
+            for name, state_key, label, default, step in weight_specs:
+                weight_values[name] = st.slider(
+                    label,
+                    0.0,
+                    1.0,
+                    default,
+                    step,
+                    key=state_key,
+                    on_change=_on_formula_weight_change,
+                    args=(name,),
+                )
+            weight_total = float(sum(weight_values.values()))
+            if weight_linked:
+                st.caption(f"当前联合评分权重总和：{weight_total:.0%}")
+            else:
+                st.caption(
+                    f"当前权重总和：{weight_total:.3f}；评分时会按有效权重重新归一化。"
+                )
+            w_perf = weight_values["performance"]
+            w_synth = weight_values["synth"]
+            w_feas = weight_values["feasibility"]
+            w_ad = weight_values["applicability"]
+            w_unc = weight_values["uncertainty"]
+            w_novel = weight_values["novelty"]
+            w_feat = weight_values["feature_guidance"]
+
+        if st.button(
+            "🚀 开始配方级高通量筛选",
+            type="primary",
+            key="vs_formula_run",
+            on_click=_mark_virtual_screening_run_requested,
+        ):
             formula_run_t0 = time.time()
             formula_status = st.empty()
             formula_progress = st.progress(1)
@@ -17610,7 +17979,7 @@ def page_virtual_screening():
             with col_batch:
                 st.caption("分批筛选：每批处理配方数")
             with col_batch_size:
-                batch_process_size = st.number_input("每批配方数", min_value=1000, max_value=50000, value=5000, step=1000, key="vs_batch_size_v2", label_visibility="collapsed")
+                batch_process_size = st.number_input("每批配方数", min_value=1000, max_value=100000, value=20000, step=5000, key="vs_batch_size_v2", label_visibility="collapsed")
             with col_pause:
                 pause_btn = st.button("暂停筛选", key="vs_pause_btn_v2", help="点击后，当前批处理完成后暂停。再次点击可继续。")
                 if pause_btn:
@@ -17629,6 +17998,14 @@ def page_virtual_screening():
             formula_progress.progress(24)
             formula_status.info("正在生成虚拟配方设计空间...")
             def _batch_callback(batch_idx, total_batches, batch_count, total_count):
+                progress_span = max(1, int(max_formulations))
+                generated_ratio = min(1.0, float(total_count) / progress_span)
+                formula_progress.progress(min(52, 24 + int(28 * generated_ratio)))
+                formula_status.info(
+                    "正在生成虚拟配方设计空间："
+                    f"第 {int(batch_idx) + 1}/{int(total_batches)} 批，"
+                    f"本批 {int(batch_count):,} 条，累计 {int(total_count):,} 条..."
+                )
                 return not _vs_pause_flag[0]
             design_space = enumerate_formulation_candidates(
                 resin_library,
@@ -17638,6 +18015,7 @@ def page_virtual_screening():
                 random_state=int(formula_random_state),
                 feature_grid=formula_feature_grid,
                 max_formulations=int(max_formulations),
+                batch_size=int(batch_process_size),
                 hardener_required=bool(hardener_formula_enabled),
                 max_resin_components=int(max_resin_components),
                 max_hardener_components=int(max_hardener_components),
@@ -18767,6 +19145,14 @@ def page_virtual_screening():
                 mime="text/csv",
             )
 
+            st.session_state["vs_formula_result_df"] = final_df.copy()
+            st.session_state["vs_formula_recommendation_batches"] = {
+                key: value.copy()
+                for key, value in recommendation_batches.items()
+                if isinstance(value, pd.DataFrame)
+            }
+            st.session_state["vs_formula_result_updated_at"] = time.time()
+
             return
 
         # 统一配方级工作流已经覆盖下方旧版功能，避免继续渲染重复控件。
@@ -18934,17 +19320,17 @@ def page_virtual_screening():
             max_cids_each = st.number_input(
                 "每类最大 CID",
                 min_value=100,
-                max_value=50000,
-                value=2000,
-                step=100,
+                max_value=5000000,
+                value=50000,
+                step=1000,
                 key="vs_pubchem_max_cids",
             )
             sample_each = st.number_input(
                 "每类采样数量（0=不采样）",
                 min_value=0,
-                max_value=50000,
-                value=2000,
-                step=100,
+                max_value=2000000,
+                value=20000,
+                step=1000,
                 key="vs_pubchem_sample_each",
             )
             pubchem_seed = st.number_input(
@@ -18997,7 +19383,7 @@ def page_virtual_screening():
                     if resin_list or hardener_list:
                         _pc_status2.update(label=f"✅ PubChem 查询完成：树脂 {len(resin_list)} 条，固化剂 {len(hardener_list)} 条", state="complete")
                         _pc_progress2.progress(100)
-                        st.success(f"PubChem 查询完成：树脂 {len(resin_list)} 条，固化剂 {len(hardener_list)} 条（已从 PubChem 采样至多 {pubchem_sample_each_pool} 条/类）。")
+                        st.success(f"PubChem 查询完成：树脂 {len(resin_list)} 条，固化剂 {len(hardener_list)} 条（已从 PubChem 采样至多 {sample_each} 条/类）。")
                     else:
                         _pc_status2.update(label="⚠️ PubChem 查询未返回候选", state="error")
                         _pc_progress2.progress(100)
@@ -19047,7 +19433,7 @@ def page_virtual_screening():
 
         st.markdown("#### 组合策略（旧版）")
         dedupe_inputs = st.checkbox("去重候选SMILES（建议）", value=True)
-        max_candidates = st.slider("最大候选数量", 100, 50000, 5000, step=100)
+        max_candidates = st.slider("最大候选数量", 100, 100000000, 5000000, step=100000)
         random_state = st.number_input("随机种子", 0, 10_000_000, 42, key="vs_pool_seed")
 
         mode_options = ["按行配对"]
@@ -21018,6 +21404,10 @@ st.session_state["_prev_page"] = page
 
 # [增强] 顶部轻量状态条：避免侧边栏折叠后找不到 TFS 入口/操作记录
 render_top_status_bar()
+
+if _render_global_task_lock(page):
+    _maybe_autosave_session()
+    st.stop()
 
 if page == "🏠 首页":
     page_home()

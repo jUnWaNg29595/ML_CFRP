@@ -15,8 +15,54 @@ from core.post_feature_mapping import (
     mapping_fingerprint,
     mapping_snapshot,
     mapping_snapshot_restore_policy,
+    normalize_mapping,
+    sanitize_feature_columns,
     validate_mapping,
 )
+
+
+class _FakeStreamlitDeltaGenerator:
+    def __str__(self):
+        return "DeltaGenerator(_root_container=0)"
+
+
+def test_feature_column_sanitization_rejects_streamlit_objects_without_stringifying_them():
+    polluted = [
+        "temperature",
+        _FakeStreamlitDeltaGenerator(),
+        "pressure",
+        "temperature",
+        None,
+    ]
+
+    assert sanitize_feature_columns(polluted) == ["temperature", "pressure"]
+
+
+def test_feature_column_sanitization_rejects_persisted_streamlit_repr_text():
+    polluted_text = (
+        "page_virtual_screening() DeltaGenerator "
+        "DeltaGenerator(_provided_cursor=LockedCursor(...))"
+    )
+
+    assert sanitize_feature_columns(["temperature", polluted_text]) == ["temperature"]
+
+
+def test_mapping_normalization_removes_polluted_feature_and_rule_keys():
+    polluted = _FakeStreamlitDeltaGenerator()
+    mapping = {
+        "model_feature_cols": ["temperature", polluted],
+        "rules": {
+            "temperature": {"source_type": "unused", "confirmed": True},
+            polluted: {"source_type": "candidate", "source_column": polluted},
+        },
+        "confirmed": True,
+    }
+
+    normalized = normalize_mapping(mapping)
+
+    assert normalized["model_feature_cols"] == ["temperature"]
+    assert list(normalized["rules"]) == ["temperature"]
+    assert normalized["rules"]["temperature"]["source_type"] == "unused"
 
 
 def test_candidate_metrics_expose_stable_computed_columns_and_legacy_aliases():

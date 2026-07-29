@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -36,6 +37,173 @@ def _deduplicate(values: list[Any]) -> list[Any]:
         if value not in result:
             result.append(value)
     return result
+
+
+_FEATURE_COMPONENT_ROLE_TOKENS = {
+    "resin": ("resin", "epoxy", "树脂", "基体"),
+    "hardener": (
+        "hardener",
+        "curing_agent",
+        "curingagent",
+        "curative",
+        "固化剂",
+        "交联剂",
+    ),
+}
+
+
+def resolve_feature_component_role(
+    selected_role: Any = None,
+    *,
+    inferred_role: Any = None,
+    default: str = "neutral",
+) -> str:
+    """Return the explicit workflow role, falling back to inference only when absent."""
+    valid_roles = {"resin", "hardener", "neutral"}
+    selected = str(selected_role or "").strip().lower()
+    if selected in valid_roles:
+        return selected
+    inferred = str(inferred_role or "").strip().lower()
+    if inferred in valid_roles:
+        return inferred
+    fallback = str(default or "").strip().lower()
+    return fallback if fallback in valid_roles else "neutral"
+
+
+def _feature_component_role_score(column: Any, role: str) -> int:
+    target_role = str(role or "").strip().lower()
+    opposite_role = "hardener" if target_role == "resin" else "resin"
+    text = str(column or "").strip().lower()
+    target_score = sum(text.count(token) for token in _FEATURE_COMPONENT_ROLE_TOKENS.get(target_role, ()))
+    opposite_score = sum(text.count(token) for token in _FEATURE_COMPONENT_ROLE_TOKENS.get(opposite_role, ()))
+    return target_score - opposite_score
+
+
+def _feature_component_natural_key(column: str) -> tuple[str, int]:
+    match = re.search(r"(\d+)(?:\D*)$", str(column))
+    if not match:
+        return str(column).lower(), -1
+    return str(column)[: match.start()].lower(), int(match.group(1))
+
+
+def _feature_component_columns(values: Sequence[Any] | str | None) -> list[str]:
+    if isinstance(values, str):
+        values = [values]
+    result = []
+    seen = set()
+    for value in values or []:
+        column = str(value or "").strip()
+        if column and column not in seen:
+            seen.add(column)
+            result.append(column)
+    return result
+
+
+def get_feature_component_column_options(
+    available_columns: Sequence[Any] | None,
+    *,
+    smiles_candidates: Sequence[Any] | None = None,
+    role: str = "resin",
+    primary_column: str | None = None,
+    dedicated_columns: Sequence[Any] | None = None,
+) -> list[str]:
+    """Return role-compatible source columns for multi-component extraction."""
+    target_role = str(role or "").strip().lower()
+    if target_role not in {"resin", "hardener"}:
+        target_role = "resin"
+
+    available = _feature_component_columns(available_columns)
+    available_set = set(available)
+    detected = _feature_component_columns(
+        smiles_candidates if smiles_candidates is not None else available
+    )
+    detected = [column for column in detected if column in available_set or not available_set]
+
+    dedicated = _feature_component_columns(dedicated_columns)
+    if dedicated:
+        base = [column for column in dedicated if column in available_set or not available_set]
+    else:
+        base = detected
+        if smiles_candidates is None:
+            base = [
+                column
+                for column in base
+                if re.search(r"(smiles|bigsmiles|smile|smi|molecule|structure)", column, flags=re.I)
+            ]
+
+    opposite_role = "hardener" if target_role == "resin" else "resin"
+    filtered = [
+        column
+        for column in base
+        if _feature_component_role_score(column, target_role)
+        >= _feature_component_role_score(column, opposite_role)
+    ]
+    if target_role == "hardener":
+        filtered = [
+            column
+            for column in filtered
+            if column != str(primary_column or "").strip()
+        ]
+    return sorted(_feature_component_columns(filtered), key=_feature_component_natural_key)
+
+
+def resolve_feature_component_columns(
+    available_columns: Sequence[Any] | None,
+    *,
+    role: str = "resin",
+    primary_column: str | None = None,
+    dedicated_columns: Sequence[Any] | None = None,
+    selected_columns: Sequence[Any] | str | None = None,
+    smiles_candidates: Sequence[Any] | None = None,
+    mode: str = "auto",
+) -> list[str]:
+    """Resolve the actual extraction columns for a single feature workflow."""
+    available = _feature_component_columns(available_columns)
+    available_set = set(available)
+    dedicated = _feature_component_columns(dedicated_columns)
+    dedicated_options = (
+        get_feature_component_column_options(
+            available,
+            smiles_candidates=smiles_candidates,
+            role=role,
+            primary_column=primary_column,
+            dedicated_columns=dedicated,
+        )
+        if dedicated
+        else []
+    )
+    if str(mode or "").strip().lower() != "manual":
+        if dedicated_options:
+            return dedicated_options
+        primary = str(primary_column or "").strip()
+        if primary and (not available_set or primary in available_set):
+            if _feature_component_role_score(primary, role) >= 0:
+                return [primary]
+        return []
+
+    options = set(
+        get_feature_component_column_options(
+            available,
+            smiles_candidates=smiles_candidates,
+            role=role,
+            primary_column=primary_column,
+            dedicated_columns=dedicated if dedicated else None,
+        )
+    )
+    selected = [
+        column
+        for column in _feature_component_columns(selected_columns)
+        if column in options
+    ]
+    if selected:
+        return selected
+    if dedicated_options:
+        return dedicated_options
+    primary = str(primary_column or "").strip()
+    if primary and (not available_set or primary in available_set):
+        if _feature_component_role_score(primary, role) >= 0:
+            return [primary]
+    return []
 
 
 def merge_feature_name_lists_in_order(
@@ -423,6 +591,10 @@ class MolecularFeatureWorkflow:
             "primary_component_role",
             input_contract.get("primary_component_role"),
         )
+        config.setdefault(
+            "component_roles",
+            dict(input_contract.get("component_roles") or {}),
+        )
         config.setdefault("prefix", first_step.get("prefix") or "")
         params = dict(first_step.get("params") or {})
         params.update(dict(first_step.get("semantic_params") or {}))
@@ -583,6 +755,7 @@ def build_workflow_from_training_state(
         "hardener_fusion_mode",
         "resin_mix_mode",
         "primary_component_role",
+        "component_roles",
         "valid_row_behavior",
         "legacy_fields",
     ):

@@ -10,7 +10,7 @@ import inspect
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,6 +30,7 @@ from .molecular_feature_workflow import (
     MolecularFeatureWorkflow,
     materialize_workflow_source_columns,
 )
+from .post_feature_mapping import sanitize_feature_columns
 
 
 DEFAULT_EPOXY_RULES = {
@@ -137,9 +138,7 @@ def _dedupe_keep_order(items: Iterable[str]) -> List[str]:
 
 
 def _as_column_list(value: Any) -> List[str]:
-    if isinstance(value, str):
-        return [value] if value.strip() else []
-    return [str(item) for item in (value or []) if str(item).strip()]
+    return sanitize_feature_columns(value)
 
 
 def _smiles_lookup_key(value: Any) -> str:
@@ -149,7 +148,9 @@ def _smiles_lookup_key(value: Any) -> str:
 
 
 def _normalize_feature_key(name: Any) -> str:
-    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+    if not isinstance(name, str):
+        return ""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
 
 
 def _is_fingerprint_bit_column(name: Any) -> bool:
@@ -198,18 +199,15 @@ def legacy_config_to_workflow(
 ) -> MolecularFeatureWorkflow:
     """Adapt a legacy single-step config without claiming batch completeness."""
     config = dict(payload) if isinstance(payload, dict) else {}
-    feature_names = [
-        str(name)
-        for name in (config.get("feature_names") or model_feature_cols or [])
-        if str(name).strip()
-    ]
+    feature_names = sanitize_feature_columns(
+        config.get("feature_names") or model_feature_cols or []
+    )
     source_columns = []
     for key in ("smiles_col", "resin_component_cols", "hardener_component_cols"):
         value = config.get(key)
-        values = [value] if isinstance(value, str) else list(value or [])
-        for column in values:
-            if column and str(column) not in source_columns:
-                source_columns.append(str(column))
+        for column in _as_column_list(value):
+            if column not in source_columns:
+                source_columns.append(column)
 
     step = {
         "step_id": "legacy_molecular_features",
@@ -217,10 +215,11 @@ def legacy_config_to_workflow(
         "role": config.get("primary_component_role") or "neutral",
         "source_columns": source_columns
         + [
-            str(config["hardener_col"])
+            config["hardener_col"]
             for _ in [0]
-            if config.get("hardener_col")
-            and str(config["hardener_col"]) not in source_columns
+            if isinstance(config.get("hardener_col"), str)
+            and config["hardener_col"].strip()
+            and config["hardener_col"] not in source_columns
         ],
         "method": config.get("method"),
         "prefix": config.get("prefix") or "",
@@ -311,12 +310,8 @@ def validate_molecular_feature_contract(
     extracted_feature_cols: Optional[Sequence[Any]] = None,
 ) -> Dict[str, Any]:
     """Validate that the saved molecular-feature workflow feeds the model columns."""
-    model_cols = [str(col).strip() for col in (model_feature_cols or []) if str(col).strip()]
-    config_cols = [
-        str(col).strip()
-        for col in ((mf_cfg or {}).get("feature_names") or [])
-        if str(col).strip()
-    ]
+    model_cols = sanitize_feature_columns(model_feature_cols)
+    config_cols = sanitize_feature_columns((mf_cfg or {}).get("feature_names"))
     if not model_cols or not config_cols:
         return {
             "ok": True,
@@ -342,7 +337,7 @@ def validate_molecular_feature_contract(
         extracted_cols = {
             _normalize_feature_key(col)
             for col in (extracted_feature_cols or [])
-            if str(col).strip()
+            if isinstance(col, str) and col.strip()
         }
         missing = [col for col in overlap if _normalize_feature_key(col) not in extracted_cols]
         if missing:
@@ -2236,6 +2231,117 @@ def _normalize_screening_weights(weights: Dict[str, float]) -> Dict[str, float]:
     return {k: cleaned[k] / total for k in keys}
 
 
+def rebalance_screening_weights(
+    weights: Dict[str, float],
+    *,
+    changed_key: str,
+    new_value: float,
+) -> Dict[str, float]:
+    """Change one score weight while proportionally preserving the 100% total."""
+    keys = (
+        "performance",
+        "synth",
+        "feasibility",
+        "applicability",
+        "uncertainty",
+        "novelty",
+        "feature_guidance",
+    )
+    current = _normalize_screening_weights(weights or {})
+    if changed_key not in keys:
+        return current
+
+    try:
+        requested = float(new_value)
+    except (TypeError, ValueError):
+        requested = current[changed_key]
+    requested = float(np.clip(requested, 0.0, 1.0))
+
+    other_keys = [key for key in keys if key != changed_key]
+    other_total = float(sum(current[key] for key in other_keys))
+    remaining = 1.0 - requested
+    if other_total > 1e-12:
+        for key in other_keys:
+            current[key] = current[key] / other_total * remaining
+    else:
+        equal_share = remaining / max(1, len(other_keys))
+        for key in other_keys:
+            current[key] = equal_share
+    current[changed_key] = requested
+    return {key: float(current[key]) for key in keys}
+
+
+def sample_pair_indices(
+    total_pairs: int,
+    sample_size: int,
+    *,
+    random_state: int = 42,
+) -> np.ndarray:
+    """Sample unique flat pair indices without allocating the full index space."""
+    batches = iter_pair_indices(
+        total_pairs,
+        sample_size,
+        batch_size=max(1, min(int(sample_size), 100_000)),
+        random_state=int(random_state),
+    )
+    chunks = list(batches)
+    if not chunks:
+        return np.asarray([], dtype=np.int64)
+    return np.concatenate(chunks).astype(np.int64, copy=False)
+
+
+def iter_pair_indices(
+    total_pairs: int,
+    sample_size: int,
+    *,
+    batch_size: int = 50_000,
+    random_state: int = 42,
+) -> Iterator[np.ndarray]:
+    """Yield unique flat pair indices in bounded-size batches.
+
+    A modular permutation is used instead of materializing a full
+    ``range(total_pairs)`` or a random-choice index array. This keeps memory
+    proportional to one batch even when the Cartesian space is very large.
+    """
+    total_pairs = int(total_pairs)
+    sample_size = min(max(0, int(sample_size)), max(0, total_pairs))
+    batch_size = max(1, int(batch_size))
+    if total_pairs <= 0 or sample_size <= 0:
+        return
+    if total_pairs > int(np.iinfo(np.int64).max):
+        raise ValueError("total_pairs exceeds the supported int64 index range")
+
+    if sample_size == total_pairs:
+        for start in range(0, sample_size, batch_size):
+            yield np.arange(
+                start,
+                min(start + batch_size, sample_size),
+                dtype=np.int64,
+            )
+        return
+
+    from math import gcd
+
+    rng = np.random.default_rng(int(random_state))
+    offset = int(rng.integers(0, total_pairs))
+    stride = int(rng.integers(1, total_pairs))
+    stride = max(1, stride)
+    while gcd(stride, total_pairs) != 1:
+        stride += 1
+        if stride >= total_pairs:
+            stride = 1
+
+    for start in range(0, sample_size, batch_size):
+        end = min(start + batch_size, sample_size)
+        yield np.asarray(
+            [
+                (offset + int(position) * stride) % total_pairs
+                for position in range(start, end)
+            ],
+            dtype=np.int64,
+        )
+
+
 def _predict_supports_return_std(estimator) -> bool:
     if estimator is None or not hasattr(estimator, "predict"):
         return False
@@ -2993,7 +3099,7 @@ def generate_virtual_component_library(
 def _generate_multicomponent_pool(
     smiles_list: List[str],
     max_components: int = 2,
-    max_samples: int = 5000,
+    max_samples: int = 5000000,
     random_state: int = 42,
     dedupe: bool = True,
 ) -> List[str]:
@@ -3043,10 +3149,11 @@ def enumerate_formulation_candidates(
     hardener_library: Optional[pd.DataFrame] = None,
     *,
     pair_mode: str = "cartesian",
-    max_pairs: int = 5000,
+    max_pairs: int = 5000000,
     random_state: int = 42,
     feature_grid: Optional[Dict[str, Iterable]] = None,
-    max_formulations: int = 50000,
+    max_formulations: int = 5000000,
+    batch_size: int = 5000,
     hardener_required: bool = False,
     max_resin_components: int = 1,
     max_hardener_components: int = 1,
@@ -3097,12 +3204,13 @@ def enumerate_formulation_candidates(
     grid_keys, grid_values, grid_size = _compute_grid_spec(feature_grid)
     limit = max(1, int(max_formulations))
     accumulated_count = 0
+    paused = False
 
     all_batches = []
     for batch_result in batch_generate_formulation_pairs(
         resin_smiles_list,
         hardener_smiles_list,
-        batch_size=min(5000, int(max_pairs)),
+        batch_size=max(1, int(batch_size)),
         max_total=int(max_pairs),
         random_state=int(random_state),
     ):
@@ -3124,6 +3232,12 @@ def enumerate_formulation_candidates(
             pair_df["hardener_source"] = None
             pair_df["hardener_availability_score"] = np.nan
 
+        remaining_limit = max(0, limit - accumulated_count)
+        if remaining_limit <= 0:
+            break
+        if grid_size <= 1 and len(pair_df) > remaining_limit:
+            pair_df = pair_df.iloc[:remaining_limit].copy()
+
         pair_df["formulation_id"] = np.arange(1, len(pair_df) + 1) + batch_result.batch_idx * batch_result.metadata.get("batch_size", 5000)
         pair_df["candidate_origin"] = (
             pair_df["resin_source"].fillna("custom").astype(str)
@@ -3131,9 +3245,34 @@ def enumerate_formulation_candidates(
         )
 
         all_batches.append(pair_df)
+        batch_count = min(
+            len(pair_df) * max(1, grid_size),
+            max(0, limit - accumulated_count),
+        )
+        accumulated_count += int(batch_count)
+        if batch_callback is not None:
+            should_continue = batch_callback(
+                batch_idx=batch_result.batch_idx,
+                total_batches=batch_result.total_batches,
+                batch_count=int(batch_count),
+                total_count=int(accumulated_count),
+            )
+            if not should_continue:
+                paused = True
+                break
+        if accumulated_count >= limit:
+            break
 
     if not all_batches:
-        return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": total_pairs, "grid_size": 0, "total_possible": 0, "paused": True})
+        return FormulaDesignSpace(
+            candidate_df=pd.DataFrame(),
+            metadata={
+                "total_pairs": total_pairs,
+                "grid_size": 0,
+                "total_possible": 0,
+                "paused": bool(paused),
+            },
+        )
 
     base = pd.concat(all_batches, ignore_index=True)
     sampled_pairs = int(len(base))
@@ -3165,6 +3304,7 @@ def enumerate_formulation_candidates(
         "effective_total_possible": effective_total_possible,
         "total_possible": full_total_possible,
         "sampled": int(len(base)),
+        "paused": bool(paused),
     }
     return FormulaDesignSpace(candidate_df=base, metadata=metadata)
 
@@ -4027,10 +4167,10 @@ def batch_generate_formulation_pairs(
     hardener_smiles_list: list = None,
     *,
     batch_size: int = 5000,
-    max_total: int = 50000,
+    max_total: int = 5000000,
     random_state: int = 42,
 ):
-    """并行分批生成树脂-固化剂配对，利用多核加速。"""
+    """按批次生成树脂-固化剂配对，避免物化完整笛卡尔积。"""
     batch_size = max(1, int(batch_size))
     max_total = max(1, int(max_total))
 
@@ -4069,22 +4209,7 @@ def batch_generate_formulation_pairs(
     effective_max = min(total_pairs, max_total)
     total_batches = max(1, (effective_max + batch_size - 1) // batch_size)
 
-    rng = np.random.default_rng(random_state)
-    all_flat_indices = rng.choice(total_pairs, size=effective_max, replace=False)
-
-    # 并行生成多批DataFrame
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import math
-
-    num_workers = max(1, min(128, int(os.cpu_count() if hasattr(os, "cpu_count") else 64)))
     batch_size_parallel = max(1, int(batch_size))
-
-    # 把所有flat索引切分成num_workers个任务
-    chunk_size = max(1, effective_max // num_workers)
-    chunks = []
-    for chk_start in range(0, effective_max, chunk_size):
-        chk_end = min(chk_start + chunk_size, effective_max)
-        chunks.append(all_flat_indices[chk_start:chk_end])
 
     def _build_batch_df(batch_flat, batch_offset, n_h, resin_list, hardener_list):
         res_indices = batch_flat // n_h
@@ -4098,48 +4223,34 @@ def batch_generate_formulation_pairs(
         ]
         return pair_df
 
-    if num_workers <= 1 or total_batches <= 1:
-        # 单线程回退
-        for batch_idx in range(total_batches):
-            start = batch_idx * batch_size_parallel
-            end = min(start + batch_size_parallel, effective_max)
-            if start >= effective_max:
-                break
-            batch_flat = all_flat_indices[start:end]
-            pair_df = _build_batch_df(batch_flat, start, n_h, resin_list, hardener_list)
-            yield BatchScreeningResult(
-                batch_idx=batch_idx, pair_df=pair_df, total_batches=total_batches,
-                flat_indices_used=batch_flat,
-                metadata={"n_resin": n_r, "n_hardener": n_h, "total_pairs": total_pairs,
-                          "batch_size": batch_size_parallel, "effective_max": effective_max},
-            )
-    else:
-        # 多线程并行构建DataFrame
-        future_to_batch = {}
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            batch_offset = 0
-            for chk_idx, chunk in enumerate(chunks):
-                if len(chunk) == 0:
-                    continue
-                fut = executor.submit(_build_batch_df, chunk, batch_offset, n_h, resin_list, hardener_list)
-                future_to_batch[fut] = (chk_idx, chunk, batch_offset)
-                batch_offset += len(chunk)
-
-            results = {}
-            for fut in as_completed(future_to_batch):
-                chk_idx, chunk, offset = future_to_batch[fut]
-                pair_df = fut.result()
-                results[chk_idx] = (offset, chunk, pair_df)
-
-            # 按顺序yield
-            for chk_idx in sorted(results.keys()):
-                offset, chunk, pair_df = results[chk_idx]
-                yield BatchScreeningResult(
-                    batch_idx=chk_idx, pair_df=pair_df, total_batches=len(chunks),
-                    flat_indices_used=chunk,
-                    metadata={"n_resin": n_r, "n_hardener": n_h, "total_pairs": total_pairs,
-                              "batch_size": batch_size_parallel, "effective_max": effective_max},
-                )
+    for batch_idx, batch_flat in enumerate(
+        iter_pair_indices(
+            total_pairs,
+            effective_max,
+            batch_size=batch_size_parallel,
+            random_state=int(random_state),
+        )
+    ):
+        pair_df = _build_batch_df(
+            batch_flat,
+            batch_idx * batch_size_parallel,
+            n_h,
+            resin_list,
+            hardener_list,
+        )
+        yield BatchScreeningResult(
+            batch_idx=batch_idx,
+            pair_df=pair_df,
+            total_batches=total_batches,
+            flat_indices_used=batch_flat,
+            metadata={
+                "n_resin": n_r,
+                "n_hardener": n_h,
+                "total_pairs": total_pairs,
+                "batch_size": batch_size_parallel,
+                "effective_max": effective_max,
+            },
+        )
 
 
 # =============================================================================

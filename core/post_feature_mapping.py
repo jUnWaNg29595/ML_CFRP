@@ -13,6 +13,14 @@ import pandas as pd
 
 POST_FEATURE_MAPPING_SCHEMA_VERSION = 1
 SOURCE_TYPES = ("pending", "computed", "candidate", "constant", "unused")
+_UNSAFE_FEATURE_TEXT_MARKERS = (
+    "DeltaGenerator",
+    "LockedCursor",
+    "RunningCursor",
+    "ScriptRunContext",
+    "page_virtual_screening()",
+    "<function ",
+)
 MAPPING_SESSION_KEYS = frozenset(
     {
         "post_feature_mapping_default",
@@ -23,6 +31,52 @@ MAPPING_SESSION_KEYS = frozenset(
         "post_feature_mapping_snapshot",
     }
 )
+
+
+def sanitize_feature_columns(
+    values: Any,
+    *,
+    return_rejected: bool = False,
+) -> list[str] | tuple[list[str], list[str]]:
+    """Keep only stable text column names and never stringify arbitrary objects."""
+    if values is None:
+        raw_values = []
+    elif isinstance(values, str):
+        raw_values = [values]
+    else:
+        try:
+            raw_values = list(values)
+        except TypeError:
+            raw_values = []
+
+    columns: list[str] = []
+    rejected_types: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        if not isinstance(value, str):
+            type_name = type(value).__name__
+            if type_name not in rejected_types:
+                rejected_types.append(type_name)
+            continue
+        column = value.strip()
+        if any(marker in column for marker in _UNSAFE_FEATURE_TEXT_MARKERS):
+            if "Streamlit内部对象文本" not in rejected_types:
+                rejected_types.append("Streamlit内部对象文本")
+            continue
+        if column and column not in seen:
+            seen.add(column)
+            columns.append(column)
+
+    if return_rejected:
+        return columns, rejected_types
+    return columns
+
+
+def _safe_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
 
 
 def _canonical_json(payload: Any) -> str:
@@ -36,7 +90,7 @@ def _canonical_json(payload: Any) -> str:
 
 
 def _feature_cols(values: Any) -> list[str]:
-    return [str(value) for value in (values or []) if str(value).strip()]
+    return sanitize_feature_columns(values)
 
 
 def _finite_numeric(value: Any) -> float | None:
@@ -48,17 +102,13 @@ def _finite_numeric(value: Any) -> float | None:
 
 def _normalize_rule(rule: Any) -> dict[str, Any]:
     rule = rule if isinstance(rule, dict) else {}
-    source_type = rule.get("source_type")
+    source_type = _safe_text(rule.get("source_type"))
     return {
-        "source_type": str(source_type) if source_type is not None else None,
-        "source_column": (
-            str(rule["source_column"])
-            if rule.get("source_column") is not None
-            else None
-        ),
+        "source_type": source_type,
+        "source_column": _safe_text(rule.get("source_column")),
         "constant_value": rule.get("constant_value"),
-        "unit": rule.get("unit"),
-        "definition": rule.get("definition"),
+        "unit": _safe_text(rule.get("unit")),
+        "definition": _safe_text(rule.get("definition")),
         "confirmed": bool(rule.get("confirmed", False)),
     }
 
@@ -70,15 +120,23 @@ def normalize_mapping(mapping: dict[str, Any]) -> dict[str, Any]:
     source_rules = payload.get("rules")
     source_rules = source_rules if isinstance(source_rules, dict) else {}
     rules = {column: _normalize_rule(source_rules.get(column)) for column in model_cols}
+    try:
+        schema_version = int(payload.get("schema_version") or POST_FEATURE_MAPPING_SCHEMA_VERSION)
+    except (TypeError, ValueError):
+        schema_version = POST_FEATURE_MAPPING_SCHEMA_VERSION
+    status = _safe_text(payload.get("status"))
+    model_fingerprint = _safe_text(payload.get("model_fingerprint"))
+    workflow_fingerprint = _safe_text(payload.get("workflow_fingerprint"))
+    catalog_fingerprint_value = _safe_text(payload.get("catalog_fingerprint"))
     return {
-        "schema_version": int(payload.get("schema_version") or POST_FEATURE_MAPPING_SCHEMA_VERSION),
+        "schema_version": schema_version,
         "model_feature_cols": model_cols,
         "rules": rules,
         "confirmed": bool(payload.get("confirmed", False)),
-        "status": payload.get("status") or ("confirmed" if payload.get("confirmed") else "draft"),
-        "model_fingerprint": payload.get("model_fingerprint"),
-        "workflow_fingerprint": payload.get("workflow_fingerprint"),
-        "catalog_fingerprint": payload.get("catalog_fingerprint"),
+        "status": status or ("confirmed" if payload.get("confirmed") else "draft"),
+        "model_fingerprint": model_fingerprint,
+        "workflow_fingerprint": workflow_fingerprint,
+        "catalog_fingerprint": catalog_fingerprint_value,
     }
 
 
@@ -92,11 +150,13 @@ def build_post_feature_catalog(
     if not isinstance(candidate_df, pd.DataFrame):
         raise TypeError("candidate_df must be a pandas DataFrame")
     definitions = computed_definitions if isinstance(computed_definitions, dict) else {}
-    excluded = {str(column) for column in (excluded_columns or set())}
+    excluded = set(sanitize_feature_columns(excluded_columns or set()))
     rows: list[dict[str, Any]] = []
     row_count = len(candidate_df)
     for column in candidate_df.columns:
-        column = str(column)
+        column = _safe_text(column)
+        if column is None:
+            continue
         if column in excluded:
             continue
         definition = definitions.get(column) or {}

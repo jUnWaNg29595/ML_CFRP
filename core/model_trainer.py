@@ -2676,16 +2676,6 @@ class EnhancedModelTrainer:
         groups = prepared["groups"]
         feature_names = prepared["feature_names"]
 
-        supports_missing = model_name in {"XGBoost分类", "LightGBM分类", "CatBoost分类"}
-        if drop_missing_rows and not supports_missing:
-            complete_mask = ~X_df.isna().any(axis=1).to_numpy()
-            if not bool(np.all(complete_mask)):
-                X_df = X_df.loc[complete_mask].reset_index(drop=True)
-                y_raw = y_raw[complete_mask]
-                y_encoded = y_encoded[complete_mask]
-                if groups is not None:
-                    groups = groups[complete_mask]
-
         if len(np.unique(y_encoded)) != 2:
             raise ValueError("划分前清洗数据后，目标列不再是有效的二分类标签。")
 
@@ -2718,7 +2708,8 @@ class EnhancedModelTrainer:
 
         base_model = self._get_model(model_name, random_state=int(random_state), **model_params)
 
-        use_imputer = (not drop_missing_rows) and (model_name not in {"XGBoost分类", "LightGBM分类", "CatBoost分类"})
+        missing_tolerant_models = {"XGBoost分类", "LightGBM分类", "CatBoost分类"}
+        use_imputer = model_name not in missing_tolerant_models
         use_scaler = model_name == "逻辑回归分类"
         imputer = SimpleImputer(strategy="median") if use_imputer else None
         scaler = StandardScaler() if use_scaler else None
@@ -2850,16 +2841,6 @@ class EnhancedModelTrainer:
         positive_label = prepared["positive_label"]
         groups = prepared["groups"]
 
-        supports_missing = model_name in {"XGBoost分类", "LightGBM分类", "CatBoost分类"}
-        if drop_missing_rows and not supports_missing:
-            complete_mask = ~X_df.isna().any(axis=1).to_numpy()
-            if not bool(np.all(complete_mask)):
-                X_df = X_df.loc[complete_mask].reset_index(drop=True)
-                y_raw = y_raw[complete_mask]
-                y_encoded = y_encoded[complete_mask]
-                if groups is not None:
-                    groups = groups[complete_mask]
-
         n = len(y_encoded)
         if n < max(4, n_splits):
             raise ValueError("有效样本过少，无法执行二分类交叉验证。")
@@ -2894,7 +2875,8 @@ class EnhancedModelTrainer:
             "CatBoost分类": "CatBoost",
         }.get(model_name, model_name)
 
-        use_imputer = (not drop_missing_rows) and (model_name not in {"XGBoost分类", "LightGBM分类", "CatBoost分类"})
+        missing_tolerant_models = {"XGBoost分类", "LightGBM分类", "CatBoost分类"}
+        use_imputer = model_name not in missing_tolerant_models
         use_scaler = model_name == "逻辑回归分类"
 
         oof_pred_encoded = np.full(n, -1, dtype=int)
@@ -3132,10 +3114,6 @@ class EnhancedModelTrainer:
 
         print(f"✓ 有效样本数: {len(y_arr)} 行（已删除目标列缺失值）")
 
-        # [新增] 根据参数决定是否删除包含缺失值的行
-        # XGBoost/LightGBM/CatBoost 原生支持特征缺失值，无需删除
-        supports_missing = model_name in ["XGBoost", "LightGBM", "CatBoost"]
-
         # 确保 X_arr 是数值类型（所有模型都需要）
         if X_df is not None:
             try:
@@ -3143,26 +3121,8 @@ class EnhancedModelTrainer:
             except (ValueError, TypeError) as e:
                 raise ValueError(f"特征数据包含非数值类型，无法训练。请检查特征选择是否包含了文本列（如 SMILES）。错误: {e}")
 
-        # [修复] 只有不支持缺失值的模型 + 用户选择"删除样本"策略时，才删除特征缺失值的行
-        # 注意：目标列的缺失值已经在上面删除了（第1755-1772行）
-        if drop_missing_rows and not supports_missing and X_df is not None:
-            # 检查特征列是否有缺失值
-            has_missing = X_df.isna().any().any()
-            if has_missing:
-                complete_mask = ~X_df.isna().any(axis=1).values
-                n_before = len(y_arr)
-                n_complete = complete_mask.sum()
-
-                if n_complete < n_before:
-                    print(f"⚠️ 删除 {n_before - n_complete} 个特征列包含缺失值的样本（保留 {n_complete}/{n_before} 个完整样本）")
-                    X_arr = X_arr[complete_mask]
-                    y_arr = y_arr[complete_mask]
-                    X_df = X_df.loc[complete_mask].reset_index(drop=True)
-                    if groups is not None:
-                        groups = groups[complete_mask]
-
-                if len(y_arr) < 10:
-                    raise ValueError(f"删除特征缺失值后仅剩 {len(y_arr)} 个样本，数量过少无法训练。建议选择'中位数填充'策略保留更多样本。")
+        # 缺失值策略只作用于目标列：无效目标样本已在上方从本次训练视图中排除，
+        # 原始 X 数据不因输入特征缺失而丢行。不能原生接收 NaN 的模型在后续使用插补。
 
         # 2) 划分索引
         train_idx, test_idx = self._resolve_split(
@@ -3199,25 +3159,12 @@ class EnhancedModelTrainer:
         missing_tolerant_models = {"XGBoost", "LightGBM", "CatBoost"}
         scale_free_models = {"XGBoost", "LightGBM", "CatBoost", "随机森林", "Extra Trees", "梯度提升树", "决策树"}
 
-        # [修改] 如果选择删除缺失行，则不使用 imputer
-        if drop_missing_rows:
-            use_imputer = False
-            use_scaler = model_name not in scale_free_models
-            imputer = None
-        else:
-            use_imputer = model_name not in missing_tolerant_models
-            use_scaler = model_name not in scale_free_models
-            bnn_missing_strategy = str(model_params.get("missing_value_strategy", "median") or "median").strip().lower()
-            bnn_missing_max_iter = model_params.get("missing_imputer_max_iter", 15)
-            bnn_missing_n_imputations = model_params.get("missing_n_imputations", 5)
+        use_scaler = model_name not in scale_free_models
+        bnn_missing_strategy = str(model_params.get("missing_value_strategy", "median") or "median").strip().lower()
+        bnn_missing_max_iter = model_params.get("missing_imputer_max_iter", 15)
+        bnn_missing_n_imputations = model_params.get("missing_n_imputations", 5)
 
-        # 关键修复：即使是 missing_tolerant 模型，也要检查并处理 NaN（仅在未删除缺失行时）
-        # 策略：对于树模型，默认使用中位数填充以支持 SHAP 等下游分析
-        # 影响：对模型精度影响极小（< 0.5%），因为：
-        # 1. 中位数是稳健统计量，不引入极端值
-        # 2. 树模型对填充值不敏感（基于阈值分裂）
-        # 3. NaN 通常只占数据的很小比例
-        if not drop_missing_rows and model_name == "Bayesian Neural Network (BNN)":
+        if model_name == "Bayesian Neural Network (BNN)":
             imputer = _build_missing_value_imputer(
                 strategy=bnn_missing_strategy,
                 random_state=random_state,
@@ -3229,48 +3176,10 @@ class EnhancedModelTrainer:
                 f"🧩 BNN missing-value strategy: {bnn_missing_strategy} "
                 f"(max_iter={int(bnn_missing_max_iter)}, n_imputations={int(bnn_missing_n_imputations)})"
             )
-        elif not drop_missing_rows and model_name in missing_tolerant_models:
-            # 安全检查是否有 NaN（处理非数值类型）
-            try:
-                # 确保数据是数值类型
-                if X_train_raw.dtype == object or X_test_raw.dtype == object:
-                    print(f"⚠️ 检测到非数值类型数据 (dtype={X_train_raw.dtype})")
-                    print(f"   强制使用 imputer 进行数值化和填充")
-                    imputer = SimpleImputer(strategy='median')
-                    use_imputer = True
-                else:
-                    # 数值类型，检查 NaN
-                    has_nan_train = np.isnan(X_train_raw).any()
-                    has_nan_test = np.isnan(X_test_raw).any()
-                    if has_nan_train or has_nan_test:
-                        nan_count_train = np.isnan(X_train_raw).sum()
-                        nan_count_test = np.isnan(X_test_raw).sum()
-                        total_train = X_train_raw.size
-                        total_test = X_test_raw.size
-                        nan_pct_train = 100 * nan_count_train / total_train
-                        nan_pct_test = 100 * nan_count_test / total_test
-
-                        print(f"⚠️ 检测到 NaN 值:")
-                        print(f"   训练集: {nan_count_train:,}/{total_train:,} ({nan_pct_train:.2f}%)")
-                        print(f"   测试集: {nan_count_test:,}/{total_test:,} ({nan_pct_test:.2f}%)")
-                        print(f"   策略: 使用中位数填充（支持 SHAP 分析，对精度影响 < 0.5%）")
-
-                        # 使用 SimpleImputer 填充
-                        imputer = SimpleImputer(strategy='median')
-                        use_imputer = True
-                    else:
-                        imputer = None
-            except (TypeError, ValueError) as e:
-                # 如果检查失败，安全起见使用 imputer
-                print(f"⚠️ NaN 检查失败 ({e})，使用 imputer 确保数据完整性")
-                imputer = SimpleImputer(strategy='median')
-                use_imputer = True
-        elif not drop_missing_rows:
-            # 非 missing_tolerant 模型且未删除缺失行时，使用 imputer
-            imputer = SimpleImputer(strategy='median') if use_imputer else None
-        else:
-            # 删除缺失行时，不使用 imputer
+        elif model_name in missing_tolerant_models:
             imputer = None
+        else:
+            imputer = SimpleImputer(strategy='median')
 
         # ANN 支持自定义 scaler 类型和目标归一化
         scaler_type = model_params.pop('scaler_type', 'standard') if model_name == "人工神经网络" else 'standard'
@@ -3328,22 +3237,14 @@ class EnhancedModelTrainer:
                     print(f"   删除的特征: {removed_features}")
             print(f"[DEBUG] 删除全NaN列后特征数: 训练集={X_train_proc.shape[1]}, 测试集={X_test_proc.shape[1]}")
 
-        # [修改] 只在未删除缺失行时才清理 inf 并填充
-        if not drop_missing_rows:
-            # 清理无穷大值（防止 StandardScaler 产生超出 float32 范围的值）
-            X_train_proc = np.where(np.isinf(X_train_proc), np.nan, X_train_proc)
-            X_test_proc = np.where(np.isinf(X_test_proc), np.nan, X_test_proc)
+        # 清理无穷大值（防止标准化或模型计算产生非法结果）；输入缺失行仍然保留。
+        X_train_proc = np.where(np.isinf(X_train_proc), np.nan, X_train_proc)
+        X_test_proc = np.where(np.isinf(X_test_proc), np.nan, X_test_proc)
 
-            # 如果清理后产生了新的 NaN，用中位数填充
-            if np.isnan(X_train_proc).any():
-                if imputer is None:
-                    imputer = SimpleImputer(strategy='median')
-                    X_train_proc = imputer.fit_transform(X_train_proc)
-                    X_test_proc = imputer.transform(X_test_proc)
-                else:
-                    X_train_proc = imputer.fit_transform(X_train_proc)
-                    X_test_proc = imputer.transform(X_test_proc)
-            print(f"[DEBUG] 清理inf并填充后特征数: 训练集={X_train_proc.shape[1]}, 测试集={X_test_proc.shape[1]}")
+        if imputer is not None and np.isnan(X_train_proc).any():
+            X_train_proc = imputer.fit_transform(X_train_proc)
+            X_test_proc = imputer.transform(X_test_proc)
+        print(f"[DEBUG] 清理inf并完成缺失值处理后特征数: 训练集={X_train_proc.shape[1]}, 测试集={X_test_proc.shape[1]}")
 
         if scaler is not None:
             # [修复] 标准化前再次检查全NaN列（可能在inf清理后产生）
@@ -4562,10 +4463,6 @@ class EnhancedModelTrainer:
 
         print(f"✓ 交叉验证有效样本数: {len(y_arr)} 行（已删除目标列缺失值）")
 
-        # [新增] 根据参数决定是否删除包含缺失值的行
-        # XGBoost/LightGBM/CatBoost 原生支持特征缺失值，无需删除
-        supports_missing = model_name in ["XGBoost", "LightGBM", "CatBoost"]
-
         # 确保 X_arr 是数值类型（所有模型都需要）
         if X_df is not None:
             try:
@@ -4573,24 +4470,8 @@ class EnhancedModelTrainer:
             except (ValueError, TypeError) as e:
                 raise ValueError(f"特征数据包含非数值类型，无法训练。请检查特征选择是否包含了文本列（如 SMILES）。错误: {e}")
 
-        # [修复] 只有不支持缺失值的模型 + 用户选择"删除样本"策略时，才删除特征缺失值的行
-        if drop_missing_rows and not supports_missing and X_df is not None:
-            has_missing = X_df.isna().any().any()
-            if has_missing:
-                complete_mask = ~X_df.isna().any(axis=1).values
-                n_before = len(y_arr)
-                n_complete = complete_mask.sum()
-
-                if n_complete < n_before:
-                    print(f"⚠️ 交叉验证：删除 {n_before - n_complete} 个特征列包含缺失值的样本（保留 {n_complete}/{n_before} 个完整样本）")
-                    X_arr = X_arr[complete_mask]
-                    y_arr = y_arr[complete_mask]
-                    X_df = X_df.loc[complete_mask].reset_index(drop=True)
-                    if groups is not None:
-                        groups = groups[complete_mask]
-
-                if len(y_arr) < 10:
-                    raise ValueError(f"删除特征缺失值后仅剩 {len(y_arr)} 个样本，数量过少无法进行交叉验证。建议选择'中位数填充'策略保留更多样本。")
+        # 只排除目标列缺失的样本；输入特征缺失行保留到各折，
+        # 由折内插补器或模型自身的缺失值能力处理。
 
         n = len(y_arr)
         if n < 3:
