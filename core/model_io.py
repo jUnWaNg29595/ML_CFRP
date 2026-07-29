@@ -15,12 +15,31 @@ from typing import Any, Dict, List, Optional
 import io
 import time
 
+from .molecular_feature_workflow import MolecularFeatureWorkflow
+
 try:
     import joblib  # sklearn dependency, but import defensively
 except Exception as e:  # pragma: no cover
     joblib = None  # type: ignore
 
 ARTIFACT_VERSION = "1.0"
+
+
+def workflow_to_artifact_extra(workflow: Any) -> Dict[str, Any]:
+    """Return workflow metadata fields shared by model and process exports."""
+    if workflow is None:
+        return {}
+    if isinstance(workflow, dict):
+        workflow = MolecularFeatureWorkflow.from_dict(workflow)
+    if not isinstance(workflow, MolecularFeatureWorkflow):
+        raise TypeError("workflow must be a MolecularFeatureWorkflow or mapping")
+    return {
+        "molecular_feature_workflow": workflow.to_dict(),
+        "final_feature_names": list(workflow.final_feature_names),
+        "feature_source_map": dict(workflow.feature_source_map),
+        "workflow_hash": workflow.workflow_hash,
+        "workflow_schema_version": workflow.schema_version,
+    }
 
 def create_model_artifact(
     *,

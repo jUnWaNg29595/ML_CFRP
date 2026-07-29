@@ -874,9 +874,13 @@ def extract_configured_semantic_features(
     params=None,
     *,
     prefix=None,
+    preserve_duplicate_columns=False,
 ) -> pd.DataFrame:
     """Build every configured notation/ionic feature with one shared contract."""
     params = dict(params or {})
+    preserve_duplicate_columns = bool(
+        params.get("preserve_duplicate_columns", preserve_duplicate_columns)
+    )
     frames = []
     append_polymer_ensemble = bool(params.get("append_polymer_semantic_features", False))
     append_polymer_string = bool(params.get("append_polymer_string_features", False))
@@ -908,7 +912,8 @@ def extract_configured_semantic_features(
         return pd.DataFrame(index=range(len(smiles_like_list)))
 
     result = pd.concat(frames, axis=1)
-    result = result.loc[:, ~result.columns.duplicated()]
+    if not preserve_duplicate_columns:
+        result = result.loc[:, ~result.columns.duplicated()]
     if prefix:
         result = _add_prefix_to_columns(result, prefix)
     return result
@@ -919,18 +924,29 @@ def append_configured_semantic_features(
     valid_indices,
     smiles_like_list,
     params=None,
+    *,
+    preserve_duplicate_columns=False,
 ) -> tuple[pd.DataFrame, list[int]]:
     """Append configured semantic features while preserving extractor row alignment."""
+    params = dict(params or {})
+    preserve_duplicate_columns = bool(
+        params.get("preserve_duplicate_columns", preserve_duplicate_columns)
+    )
     base = features_df.copy() if isinstance(features_df, pd.DataFrame) else pd.DataFrame()
     indices = [int(i) for i in (valid_indices or [])]
-    semantic_full = extract_configured_semantic_features(smiles_like_list, params)
+    semantic_full = extract_configured_semantic_features(
+        smiles_like_list,
+        params,
+        preserve_duplicate_columns=preserve_duplicate_columns,
+    )
     if semantic_full.empty and len(semantic_full.columns) == 0:
         return base, indices
 
     if not base.empty and indices:
         semantic_subset = semantic_full.iloc[indices].reset_index(drop=True)
         base = pd.concat([base.reset_index(drop=True), semantic_subset], axis=1)
-        base = base.loc[:, ~base.columns.duplicated()]
+        if not preserve_duplicate_columns:
+            base = base.loc[:, ~base.columns.duplicated()]
         return base, indices
 
     return semantic_full.reset_index(drop=True), list(range(len(semantic_full)))

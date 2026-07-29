@@ -23,6 +23,8 @@ import pickle
 import re
 import subprocess
 import time
+import copy
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -1066,6 +1068,21 @@ from core.visualizer import Visualizer
 from core.plot_utils import fig_to_png_bytes, fig_to_html
 from core.training_curves import plot_history
 from core.training_runs import TrainingRunManager
+from core.virtual_screening import POST_FEATURE_COMPUTED_DEFINITIONS
+from core.post_feature_mapping import (
+    apply_mapping,
+    build_post_feature_catalog,
+    catalog_fingerprint,
+    create_mapping_draft,
+    mapping_snapshot,
+    mapping_snapshot_restore_policy,
+    validate_mapping,
+    validate_mapping_for_prediction,
+)
+from core.navigation import (
+    NAVIGATION_PAGES,
+    resolve_navigation_page,
+)
 from core.applicability_domain import ApplicabilityDomainAnalyzer, TanimotoADAnalyzer
 from core.ui_config import (
     MANUAL_TUNING_PARAMS,
@@ -1945,7 +1962,7 @@ if __name__ == "__main__":
 # --- 全局常量 ---
 USER_DATA_DB = "datasets/user_data.csv"
 SESSION_SNAPSHOT_DIR = os.path.join(CACHE_DIR, "session_snapshots")
-SESSION_SNAPSHOT_VERSION = 1
+SESSION_SNAPSHOT_VERSION = 2
 
 _SNAPSHOT_DF_KEYS = [
     "data",
@@ -1963,6 +1980,8 @@ _SNAPSHOT_META_KEYS = [
     "molecular_feature_names",
     "source_feature_names",
     "molecular_feature_config",
+    "molecular_feature_workflow",
+    "molecular_feature_trace",
     "feature_classification",
     "best_params",
     "optimized_model_name",
@@ -1972,6 +1991,12 @@ _SNAPSHOT_META_KEYS = [
     "last_training_run_id",
     "last_export_model_path",
     "last_export_feature_process_path",
+    "post_feature_mapping_default",
+    "post_feature_mapping_draft",
+    "post_feature_mapping_confirmation",
+    "post_feature_mapping_model_fingerprint",
+    "post_feature_mapping_catalog_fingerprint",
+    "post_feature_mapping_snapshot",
 ]
 
 # --- 自定义 CSS 样式 ---
@@ -2086,6 +2111,16 @@ def _restore_session_snapshot(tag: str = "latest", override: bool = False) -> tu
     meta = _load_snapshot_meta(tag)
     if not meta:
         return False, "no_snapshot"
+    snapshot_sid = meta.get("sid")
+    current_sid = _get_or_create_session_id()
+    if (
+        mapping_snapshot_restore_policy(
+            meta,
+            current_session_id=current_sid,
+        )
+        == "session_mismatch"
+    ):
+        return False, "session_mismatch"
 
     _, df_paths = _snapshot_paths(tag)
     for key in _SNAPSHOT_DF_KEYS:
@@ -2108,9 +2143,432 @@ def _restore_session_snapshot(tag: str = "latest", override: bool = False) -> tu
             continue
         st.session_state[key] = meta.get(key)
 
+    try:
+        snapshot_version = int(meta.get("version") or 1)
+    except (TypeError, ValueError):
+        snapshot_version = 1
+    if snapshot_version < 2 or "molecular_feature_workflow" not in meta or "molecular_feature_trace" not in meta:
+        _clear_molecular_feature_session_metadata()
+    if mapping_snapshot_restore_policy(
+        meta,
+        current_session_id=current_sid,
+    ) == "clear":
+        _clear_post_feature_mapping_session_metadata()
+
     st.session_state["_snapshot_loaded"] = True
     st.session_state["_snapshot_loaded_at"] = meta.get("saved_at")
     return True, "ok"
+
+
+def _clear_molecular_feature_session_metadata():
+    st.session_state["molecular_feature_workflow"] = None
+    st.session_state["molecular_feature_trace"] = []
+    _clear_post_feature_mapping_session_metadata()
+
+
+def _clear_post_feature_mapping_session_metadata():
+    st.session_state["post_feature_mapping_default"] = None
+    st.session_state["post_feature_mapping_draft"] = None
+    st.session_state["post_feature_mapping_confirmation"] = False
+    st.session_state["post_feature_mapping_model_fingerprint"] = None
+    st.session_state["post_feature_mapping_catalog_fingerprint"] = None
+    st.session_state["post_feature_mapping_snapshot"] = None
+
+
+def _post_feature_mapping_model_fingerprint(model_feature_cols):
+    payload = [str(column) for column in (model_feature_cols or [])]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _post_feature_mapping_catalog_fingerprint(catalog):
+    return catalog_fingerprint(catalog)
+
+
+def _restore_post_feature_mapping_metadata(payload, model_feature_cols=None):
+    extra = payload.get("extra") if isinstance(payload, dict) else None
+    extra = extra if isinstance(extra, dict) else {}
+    default = (
+        extra.get("post_feature_mapping_default")
+        if "post_feature_mapping_default" in extra
+        else payload.get("post_feature_mapping_default")
+        if isinstance(payload, dict)
+        else None
+    )
+    _clear_post_feature_mapping_session_metadata()
+    if not isinstance(default, dict):
+        return
+
+    default = copy.deepcopy(default)
+    model_fingerprint = _post_feature_mapping_model_fingerprint(
+        model_feature_cols or default.get("model_feature_cols") or []
+    )
+    stored_model_fingerprint = default.get("model_fingerprint") or model_fingerprint
+    stored_catalog_fingerprint = default.get("catalog_fingerprint")
+    st.session_state["post_feature_mapping_default"] = default
+    st.session_state["post_feature_mapping_draft"] = copy.deepcopy(default)
+    st.session_state["post_feature_mapping_confirmation"] = False
+    st.session_state["post_feature_mapping_model_fingerprint"] = stored_model_fingerprint
+    st.session_state["post_feature_mapping_catalog_fingerprint"] = stored_catalog_fingerprint
+
+
+def _invalidate_post_feature_mapping_if_changed(model_feature_cols, catalog_fp):
+    draft = st.session_state.get("post_feature_mapping_draft")
+    if not isinstance(draft, dict):
+        return False
+
+    current_model_fp = _post_feature_mapping_model_fingerprint(model_feature_cols)
+    previous_model_fp = st.session_state.get(
+        "post_feature_mapping_model_fingerprint"
+    ) or draft.get("model_fingerprint")
+    if previous_model_fp is None and draft.get("model_feature_cols") is not None:
+        previous_model_fp = _post_feature_mapping_model_fingerprint(
+            draft.get("model_feature_cols")
+        )
+    previous_catalog_fp = st.session_state.get(
+        "post_feature_mapping_catalog_fingerprint"
+    ) or draft.get("catalog_fingerprint")
+    changed = (
+        previous_model_fp is not None and previous_model_fp != current_model_fp
+    ) or (
+        previous_catalog_fp is not None and previous_catalog_fp != catalog_fp
+    )
+    st.session_state["post_feature_mapping_model_fingerprint"] = current_model_fp
+    st.session_state["post_feature_mapping_catalog_fingerprint"] = catalog_fp
+    if not changed:
+        return False
+
+    draft["invalid"] = True
+    st.session_state["post_feature_mapping_confirmation"] = False
+    return True
+
+
+def _post_feature_mapping_snapshot_for_screening():
+    draft = st.session_state.get("post_feature_mapping_draft")
+    if (
+        not isinstance(draft, dict)
+        or not st.session_state.get("post_feature_mapping_confirmation", False)
+        or draft.get("invalid")
+    ):
+        return None
+    return mapping_snapshot(draft)
+
+
+def _prepare_post_feature_mapping_for_prediction(
+    *,
+    model_feature_cols,
+    molecular_feature_cols,
+    candidate_df,
+    computed_definitions,
+    missing_input_tolerant,
+    panel_key,
+):
+    """Shared ordinary/formulation prediction gate; never creates a post-prediction snapshot."""
+    if not model_feature_cols:
+        empty_catalog = build_post_feature_catalog(
+            candidate_df,
+            computed_definitions=computed_definitions,
+            excluded_columns={
+                "resin_smiles",
+                "hardener_smiles",
+                "combo_smiles",
+                "candidate_origin",
+                "formulation_id",
+            },
+        )
+        return None, {
+            "ok": True,
+            "status": "not_required",
+            "errors": [],
+            "warnings": [],
+            "mapped_feature_cols": [],
+            "mapping_hash": None,
+            "catalog_fingerprint": catalog_fingerprint(empty_catalog),
+        }, empty_catalog
+    catalog = build_post_feature_catalog(
+        candidate_df,
+        computed_definitions=computed_definitions,
+        excluded_columns={
+            "resin_smiles",
+            "hardener_smiles",
+            "combo_smiles",
+            "candidate_origin",
+            "formulation_id",
+        },
+    )
+    confirmed_mapping, report = _render_post_feature_mapping_panel(
+        model_feature_cols=list(model_feature_cols),
+        molecular_feature_cols=list(molecular_feature_cols or []),
+        candidate_df=candidate_df,
+        workflow_fingerprint=(st.session_state.get("molecular_feature_workflow", {}) or {}).get("workflow_hash"),
+        model_fingerprint=_post_feature_mapping_model_fingerprint(model_feature_cols),
+        missing_input_tolerant=bool(missing_input_tolerant),
+        panel_key=panel_key,
+    )
+    if confirmed_mapping is None or not report.get("ok"):
+        return None, report, catalog
+    return confirmed_mapping, report, catalog
+
+
+def _render_post_feature_mapping_panel(
+    *,
+    model_feature_cols: list[str],
+    molecular_feature_cols: list[str],
+    candidate_df: pd.DataFrame,
+    workflow_fingerprint: str | None,
+    model_fingerprint: str,
+    missing_input_tolerant: bool,
+    panel_key: str,
+) -> tuple[dict | None, dict]:
+    """渲染共享中文人工映射面板，未确认时返回 (None, report)。"""
+    excluded_columns = {
+        "resin_smiles", "hardener_smiles", "combo_smiles", "candidate_origin",
+        "formulation_id", "_molecule_key",
+    }
+    catalog = build_post_feature_catalog(
+        candidate_df,
+        computed_definitions=POST_FEATURE_COMPUTED_DEFINITIONS,
+        excluded_columns=excluded_columns,
+    )
+    catalog_fp = catalog_fingerprint(catalog)
+    model_cols = [str(column) for column in (model_feature_cols or []) if str(column).strip()]
+    if not model_cols:
+        return None, {
+            "ok": True, "status": "not_required", "errors": [], "warnings": [],
+            "mapped_feature_cols": [], "mapping_hash": None,
+            "catalog_fingerprint": catalog_fp,
+        }
+
+    prefix = f"post_feature_mapping_{panel_key}"
+    draft_key = f"{prefix}_draft"
+    default_key = f"{prefix}_default"
+    confirmed_key = f"{prefix}_confirmed"
+    previous = st.session_state.get(draft_key)
+    stale_draft = isinstance(previous, dict) and (
+        previous.get("model_fingerprint") != model_fingerprint
+        or previous.get("catalog_fingerprint") != catalog_fp
+    )
+    if not isinstance(previous, dict):
+        previous = create_mapping_draft(
+            model_cols,
+            molecular_feature_cols=molecular_feature_cols,
+            catalog=catalog,
+            model_fingerprint=model_fingerprint,
+            workflow_fingerprint=workflow_fingerprint,
+        )
+        st.session_state[draft_key] = previous
+        st.session_state[confirmed_key] = False
+    draft = copy.deepcopy(previous)
+    draft["model_feature_cols"] = model_cols
+    draft["model_fingerprint"] = model_fingerprint
+    draft["workflow_fingerprint"] = workflow_fingerprint
+    draft["catalog_fingerprint"] = catalog_fp
+
+    st.markdown("### 后处理特征人工映射")
+    st.caption(
+        f"模型指纹：{model_fingerprint[:12]}… | 工作流指纹：{workflow_fingerprint or '无'} | "
+        f"目录指纹：{catalog_fp[:12]}…"
+    )
+    load_clicked = st.button("加载已保存映射草稿", key=f"{prefix}_load")
+    reset_clicked = st.button("重置为空白映射", key=f"{prefix}_reset")
+    if load_clicked:
+        saved = st.session_state.get("post_feature_mapping_default")
+        if not isinstance(saved, dict):
+            saved = st.session_state.get(default_key)
+        if isinstance(saved, dict):
+            draft = copy.deepcopy(saved)
+            draft["confirmed"] = False
+            draft["status"] = "draft"
+            for rule in draft.get("rules", {}).values():
+                rule["confirmed"] = False
+            st.session_state[draft_key] = draft
+            st.session_state[confirmed_key] = False
+            for feature in model_cols:
+                for suffix in ("source_type", "source_column", "constant", "unit", "definition"):
+                    st.session_state.pop(f"{prefix}_{feature}_{suffix}", None)
+            st.warning("已加载为草稿，必须点击“确认本次映射”后才可预测。")
+        else:
+            st.info("当前没有已保存的模型默认映射。")
+    if reset_clicked:
+        draft = create_mapping_draft(
+            model_cols,
+            molecular_feature_cols=molecular_feature_cols,
+            catalog=catalog,
+            model_fingerprint=model_fingerprint,
+            workflow_fingerprint=workflow_fingerprint,
+        )
+        st.session_state[draft_key] = draft
+        st.session_state[confirmed_key] = False
+        for feature in model_cols:
+            for suffix in ("source_type", "source_column", "constant", "unit", "definition"):
+                st.session_state.pop(f"{prefix}_{feature}_{suffix}", None)
+        st.rerun()
+    if stale_draft:
+        st.warning("模型特征或候选目录已变化，旧映射仅保留为草稿，必须重新确认。")
+
+    catalog_rows = catalog.set_index("column").to_dict("index") if not catalog.empty else {}
+    source_labels = {"pending": "待选择", "computed": "计算列", "candidate": "原始候选列", "constant": "常数值", "unused": "不使用"}
+    updated_rules = {}
+    header = st.columns(9)
+    for column, label in zip(header, ["模型特征", "特征类别", "来源类型", "来源列", "常数值", "单位", "计算定义", "状态", ""]):
+        label and column.markdown(f"**{label}**")
+    for feature in model_cols:
+        rule = (draft.get("rules") or {}).get(feature) or {}
+        row = st.columns(9)
+        row[0].write(feature)
+        selected_col = rule.get("source_column")
+        category = catalog_rows.get(selected_col, {}).get("category", "未分类") if selected_col else "未分类"
+        row[1].write(category)
+        type_key = f"{prefix}_{feature}_source_type"
+        source_type = row[2].selectbox(
+            "来源类型", list(source_labels), format_func=source_labels.get,
+            index=list(source_labels).index(rule.get("source_type")) if rule.get("source_type") in source_labels else 0,
+            key=type_key, label_visibility="collapsed",
+        )
+        options = [""] + [str(value) for value in catalog.loc[catalog["source_type"].eq(source_type), "column"].tolist()] if not catalog.empty else [""]
+        source_index = options.index(selected_col) if selected_col in options else 0
+        source_column = row[3].selectbox("来源列", options, index=source_index, key=f"{prefix}_{feature}_source_column", label_visibility="collapsed", disabled=source_type not in {"computed", "candidate"})
+        constant_value = row[4].number_input("常数值", value=float(rule.get("constant_value") or 0.0), key=f"{prefix}_{feature}_constant", label_visibility="collapsed", disabled=source_type != "constant")
+        unit = row[5].text_input("单位", value=str(rule.get("unit") or ""), key=f"{prefix}_{feature}_unit", label_visibility="collapsed")
+        definition = row[6].text_input("计算定义", value=str(rule.get("definition") or ""), key=f"{prefix}_{feature}_definition", label_visibility="collapsed")
+        row[7].write("已确认" if rule.get("confirmed") and draft.get("confirmed") else source_labels.get(source_type, "待选择"))
+        updated_rules[feature] = {
+            "source_type": source_type, "source_column": source_column or None,
+            "constant_value": constant_value if source_type == "constant" else None,
+            "unit": unit or None, "definition": definition or None,
+            "confirmed": False,
+        }
+
+    def _rule_edit_signature(rule):
+        rule = rule if isinstance(rule, dict) else {}
+        return (
+            rule.get("source_type"),
+            rule.get("source_column"),
+            rule.get("constant_value"),
+            rule.get("unit"),
+            rule.get("definition"),
+        )
+
+    previous_rules = previous.get("rules") if isinstance(previous, dict) else {}
+    mapping_edited = any(
+        _rule_edit_signature((previous_rules or {}).get(feature))
+        != _rule_edit_signature(updated_rules.get(feature))
+        for feature in model_cols
+    )
+    preserved_confirmation = bool(
+        st.session_state.get(confirmed_key, False)
+        and previous.get("confirmed", False)
+        and not stale_draft
+        and not mapping_edited
+    )
+    for rule in updated_rules.values():
+        rule["confirmed"] = preserved_confirmation
+    draft["rules"] = updated_rules
+    draft["confirmed"] = preserved_confirmation
+    draft["status"] = "confirmed" if preserved_confirmation else "draft"
+    st.session_state[draft_key] = draft
+    confirm_clicked = st.button("确认本次映射", type="primary", key=f"{prefix}_confirm")
+    save_clicked = st.button("另存为模型默认映射", key=f"{prefix}_save")
+    if confirm_clicked:
+        for rule in draft["rules"].values():
+            rule["confirmed"] = True
+        draft["confirmed"] = True
+        draft["status"] = "confirmed"
+        report = validate_mapping(draft, model_feature_cols=model_cols, candidate_df=candidate_df, catalog=catalog, missing_input_tolerant=missing_input_tolerant)
+        st.session_state[draft_key] = draft if report.get("ok") else {**draft, "confirmed": False, "status": "draft"}
+        st.session_state[confirmed_key] = bool(report.get("ok"))
+    if save_clicked:
+        if st.session_state.get(confirmed_key) and isinstance(st.session_state.get(draft_key), dict):
+            st.session_state["post_feature_mapping_default"] = mapping_snapshot(st.session_state[draft_key])
+            st.session_state[default_key] = copy.deepcopy(st.session_state["post_feature_mapping_default"])
+            st.success("已另存为模型默认映射。")
+        else:
+            st.warning("请先确认有效映射，再另存为模型默认映射。")
+    active = st.session_state.get(draft_key, draft)
+    report = validate_mapping(active, model_feature_cols=model_cols, candidate_df=candidate_df, catalog=catalog, missing_input_tolerant=missing_input_tolerant)
+    if not st.session_state.get(confirmed_key, False):
+        report["ok"] = False
+        report["errors"] = list(report.get("errors") or []) + ["本次后处理特征映射尚未确认"]
+    for warning in report.get("warnings") or []:
+        st.warning(f"⚠️ {warning}")
+    for error in report.get("errors") or []:
+        st.error(f"❌ {error}")
+    st.caption(f"映射哈希：{report.get('mapping_hash') or '无'}")
+    if report.get("ok"):
+        st.session_state["post_feature_mapping_draft"] = copy.deepcopy(active)
+        st.session_state["post_feature_mapping_confirmation"] = True
+        st.session_state["post_feature_mapping_model_fingerprint"] = model_fingerprint
+        st.session_state["post_feature_mapping_catalog_fingerprint"] = report.get("catalog_fingerprint")
+    return (active if report.get("ok") else None), report
+
+
+def _restore_versioned_molecular_feature_metadata(payload):
+    if not isinstance(payload, dict):
+        _clear_molecular_feature_session_metadata()
+        return
+    extra = payload.get("extra")
+    extra = extra if isinstance(extra, dict) else {}
+    workflow = (
+        extra.get("molecular_feature_workflow")
+        if "molecular_feature_workflow" in extra
+        else payload.get("molecular_feature_workflow")
+        if "molecular_feature_workflow" in payload
+        else None
+    )
+    trace = (
+        extra.get("molecular_feature_trace")
+        if "molecular_feature_trace" in extra
+        else payload.get("molecular_feature_trace")
+        if "molecular_feature_trace" in payload
+        else None
+    )
+    st.session_state["molecular_feature_workflow"] = workflow
+    st.session_state["molecular_feature_trace"] = trace if trace is not None else []
+
+
+def _restore_molecular_feature_metadata(payload, model_feature_cols=None):
+    from core.virtual_screening import (
+        resolve_molecular_feature_config,
+        resolve_molecular_feature_workflow,
+    )
+
+    _clear_molecular_feature_session_metadata()
+    _restore_versioned_molecular_feature_metadata(payload)
+    _restore_post_feature_mapping_metadata(
+        payload,
+        model_feature_cols=model_feature_cols,
+    )
+    workflow = resolve_molecular_feature_workflow(
+        payload,
+        model_feature_cols=model_feature_cols,
+    )
+    if workflow is not None:
+        workflow_payload = workflow.to_dict()
+        st.session_state["molecular_feature_workflow"] = workflow_payload
+        config = workflow.to_legacy_config()
+    else:
+        config = resolve_molecular_feature_config(payload)
+    st.session_state["molecular_feature_config"] = config
+    return workflow, config
+
+
+def _current_molecular_feature_artifact_extra():
+    return {
+        "molecular_feature_workflow": st.session_state.get(
+            "molecular_feature_workflow"
+        ),
+        "molecular_feature_config": st.session_state.get(
+            "molecular_feature_config"
+        ),
+        "molecular_feature_trace": st.session_state.get(
+            "molecular_feature_trace",
+            [],
+        ),
+        "post_feature_mapping_default": st.session_state.get(
+            "post_feature_mapping_default"
+        ),
+    }
 
 
 def _is_recent_snapshot(meta: dict, max_hours: int = 72) -> bool:
@@ -2181,11 +2639,20 @@ def init_session_state():
         'compute_device': 'auto',
         # --- [新增] 分子特征提取流程配置（用于导出/复现） ---
         'molecular_feature_config': None,
+        'molecular_feature_workflow': None,
+        'molecular_feature_trace': [],
+        'post_feature_mapping_default': None,
+        'post_feature_mapping_draft': None,
+        'post_feature_mapping_confirmation': False,
+        'post_feature_mapping_model_fingerprint': None,
+        'post_feature_mapping_catalog_fingerprint': None,
+        'post_feature_mapping_snapshot': None,
         # --- [新增] 最近一次自动导出信息 ---
         'last_export_model_path': None,
         'last_export_feature_process_path': None,
         'last_export_model_bytes': None,
         'last_export_feature_process_bytes': None,
+        'last_export_status': None,
 
         # --- [新增] Active Learning ---
         'al_pool_data': None,
@@ -2235,6 +2702,9 @@ def _load_new_base_dataset(df: pd.DataFrame):
     st.session_state.molecular_features = None
     st.session_state.molecular_feature_names = []
     st.session_state.molecular_feature_config = None
+    st.session_state.molecular_feature_workflow = None
+    st.session_state.molecular_feature_trace = []
+    _clear_post_feature_mapping_session_metadata()
     _register_source_feature_names(df, overwrite=True)
 
 def _df_cache_key(df: pd.DataFrame) -> int:
@@ -2450,68 +2920,44 @@ def render_sidebar():
         st.title(f"🔬 {APP_NAME}")
         st.caption(f"版本 {VERSION}")
 
-        # 分组折叠导航
-        page = None
-        
-        # 数据准备（默认展开）
-        with st.expander("📊 数据准备", expanded=True):
-            data_page = st.radio(
-                "数据准备",
-                ["🏠 首页", "📤 数据上传", "🔍 数据探索", "🧹 数据清洗", "✨ 数据增强"],
-                label_visibility="collapsed",
-                key="nav_data",
-            )
-            if data_page != st.session_state.get("_last_data_page", ""):
-                page = data_page
-                st.session_state["_last_data_page"] = data_page
-        
-        # 特征工程（默认折叠）
-        with st.expander("🧬 特征工程", expanded=False):
-            feature_page = st.radio(
-                "特征工程",
-                ["🧬 分子特征", "🖼️ 图像转SMILES", "🎯 特征选择"],
-                label_visibility="collapsed",
-                key="nav_feature",
-            )
-            if feature_page != st.session_state.get("_last_feature_page", ""):
-                page = feature_page
-                st.session_state["_last_feature_page"] = feature_page
-        
-        # 建模分析（默认展开）
-        with st.expander("🤖 建模分析", expanded=True):
-            model_page = st.radio(
-                "建模分析",
-                ["🤖 模型训练", "📈 训练记录", "📊 模型解释", "⚙️ 超参优化", "🧠 主动学习"],
-                label_visibility="collapsed",
-                key="nav_model",
-            )
-            if model_page != st.session_state.get("_last_model_page", ""):
-                page = model_page
-                st.session_state["_last_model_page"] = model_page
-        
-        # 应用预测（默认折叠）
-        with st.expander("🔮 应用预测", expanded=False):
-            app_page = st.radio(
-                "应用预测",
-                ["🔮 预测应用", "🔧 模型补齐数据", "🧪 虚拟分子筛选"],
-                label_visibility="collapsed",
-                key="nav_app",
-            )
-            if app_page != st.session_state.get("_last_app_page", ""):
-                page = app_page
-                st.session_state["_last_app_page"] = app_page
-        
-        # 状态条记录（单独显示）
-        if st.checkbox("📋 状态条记录", key="nav_status_toggle"):
-            page = "📋 状态条记录"
-        
-        # 确定最终页面
-        if page is None:
-            page = st.session_state.get("_last_active_page", "🏠 首页")
-        else:
-            st.session_state["_last_active_page"] = page
+        # 旧版四组 radio 会同时保存四个选中值，并在同一次 rerun 中互相覆盖。
+        # 统一为一个页面选择源，避免侧边栏出现多个互相冲突的导航状态。
+        for legacy_key in (
+            "nav_data",
+            "nav_feature",
+            "nav_model",
+            "nav_app",
+            "nav_status_toggle",
+            "_last_data_page",
+            "_last_feature_page",
+            "_last_model_page",
+            "_last_app_page",
+        ):
+            st.session_state.pop(legacy_key, None)
 
-        st.markdown("---")
+        current_page = resolve_navigation_page(
+            st.session_state.get("_last_active_page")
+        )
+        pending_page = st.session_state.pop("_nav_to", None)
+        if pending_page:
+            current_page = resolve_navigation_page(
+                current_page=current_page,
+                pending_page=pending_page,
+            )
+
+        selected_page = st.session_state.get("nav_page")
+        if pending_page or selected_page not in NAVIGATION_PAGES:
+            st.session_state["nav_page"] = current_page
+
+        st.markdown("### 页面导航")
+        page = st.selectbox(
+            "页面导航",
+            NAVIGATION_PAGES,
+            key="nav_page",
+            label_visibility="collapsed",
+        )
+        page = resolve_navigation_page(page)
+        st.session_state["_last_active_page"] = page
 
         st.markdown("---")
         st.markdown("### 📊 数据状态")
@@ -7668,6 +8114,171 @@ def page_molecular_features():
             key="confirm_molecular_feature_source_role_conflict",
         )
 
+    def _workflow_method_params(batch=False):
+        params = {
+            "skip_ionic_compounds": bool(skip_ionic_compounds),
+            "ionic_filter_behavior": (
+                "clear_source_cells"
+                if batch
+                else "exclude_rows_preserve_source_rows"
+            ),
+        }
+        if "分子指纹" in extraction_method:
+            params.update({
+                "fp_type": str(fp_type),
+                "fp_bits": int(fp_bits),
+                "fp_radius": int(fp_radius),
+                "fp_use_chirality": bool(fp_use_chirality),
+                "fp_use_features": bool(fp_use_features),
+            })
+            if not batch:
+                params["drop_all_zero_bits"] = bool(drop_all_zero_bits)
+        elif "RDKit 并行版" in extraction_method:
+            params.update({
+                "n_jobs": int(n_jobs),
+                "batch_size": int(batch_size),
+                "fast_mode": bool(fast_mode),
+            })
+        elif "Mordred" in extraction_method:
+            params.update({
+                "mordred_batch_size": int(mordred_batch_size),
+                "mordred_ignore_3d": bool(mordred_ignore_3d),
+                "mordred_n_jobs": int(mordred_n_jobs),
+            })
+        elif "3D构象" in extraction_method:
+            params.update({
+                "rdkit3d_coulomb_top_k": int(rdkit3d_coulomb_top_k),
+                "rdkit3d_n_jobs": rdkit3d_n_jobs,
+            })
+            if not batch:
+                params.update({
+                    "keep_all_rows_3d": bool(keep_all_rows_3d),
+                })
+        elif "TDA拓扑" in extraction_method:
+            params.update({
+                "tda_maxdim": int(tda_maxdim),
+                "tda_use_pim": bool(tda_use_pim),
+                "tda_pim_pixels": int(tda_pim_pixels),
+                "tda_pim_spread": float(tda_pim_spread),
+            })
+            if not batch:
+                params.update({
+                    "tda_add_hs": bool(tda_add_hs),
+                    "tda_max_points": (
+                        None
+                        if str(tda_max_points) == "不限制"
+                        else int(tda_max_points)
+                    ),
+                    "tda_do_optimize": bool(tda_do_optimize),
+                })
+        elif "Transformer Embedding" in extraction_method:
+            params.update({
+                "lm_model_name": str(lm_model_name),
+                "lm_pooling": str(lm_pooling),
+                "lm_max_length": int(lm_max_length),
+                "lm_batch_size": int(lm_batch_size),
+                "lm_trust_remote_code": bool(lm_trust_remote_code),
+            })
+        elif "图神经网络" in extraction_method:
+            params.update({
+                "gnn_model_type": str(gnn_model_type),
+                "gnn_batch_size": int(gnn_batch_size),
+                "gnn_chunk_size": int(gnn_chunk_size),
+                "gnn_add_hs": bool(gnn_add_hs),
+                "gnn_pooling": str(gnn_pooling),
+                "gnn_seed": int(gnn_seed),
+                "gnn_num_workers": int(gnn_num_workers),
+                "gnn_cache_graphs": bool(gnn_cache_graphs),
+                "gnn_cache_size": int(gnn_cache_size),
+                "gnn_weights_path": str(gnn_weights_path).strip(),
+                "gnn_hidden_dim": gnn_hidden_dim,
+                "gnn_num_layers": gnn_num_layers,
+                "gnn_dropout": gnn_dropout,
+                "gnn_gat_heads": gnn_gat_heads,
+                "gnn_num_timesteps": gnn_num_timesteps,
+                "gnn_output_dim": gnn_output_dim,
+                "gnn_use_dual_gpu": bool(gnn_use_dual_gpu),
+                "gnn_bigsmiles_mode": str(gnn_bigsmiles_mode),
+                "gnn_bigsmiles_num_samples": int(gnn_bigsmiles_num_samples),
+                "gnn_bigsmiles_min_repeat_units": int(
+                    gnn_bigsmiles_min_repeat_units
+                ),
+                "gnn_bigsmiles_max_repeat_units": int(
+                    gnn_bigsmiles_max_repeat_units
+                ),
+            })
+        elif "ML力场" in extraction_method:
+            params.update({
+                "ani_batch_size": int(ani_batch_size),
+                "ani_cpu_workers": int(ani_cpu_workers),
+            })
+        elif "快速力场" in extraction_method:
+            params.update({
+                "ff_mode": str(ff_mode),
+                "ff_max_iters": int(ff_max_iters),
+                "ff_minimize": bool(ff_minimize),
+                "ff_per_mol_timeout_s": int(ff_per_mol_timeout_s),
+                "ff_max_heavy_atoms": int(ff_max_heavy_atoms),
+                "ff_max_fragments": int(ff_max_fragments),
+                "ff_keep_largest_fragment": bool(ff_keep_largest_fragment),
+                "ff_skip_opt_above_atoms": int(ff_skip_opt_above_atoms),
+                "ff_n_jobs": int(ff_n_jobs),
+            })
+        elif "xTB" in extraction_method:
+            params.update({
+                "xtb_path": str(xtb_path).strip() or "xtb",
+                "xtb_method": str(xtb_method),
+                "xtb_run_mode": str(xtb_run_mode),
+                "xtb_charge": int(xtb_charge),
+                "xtb_uhf": int(xtb_uhf),
+                "xtb_timeout_s": int(xtb_timeout_s),
+                "xtb_max_iters": int(xtb_max_iters),
+                "xtb_total_timeout_s": int(xtb_total_timeout_s),
+                "xtb_max_heavy_atoms": int(xtb_max_heavy_atoms),
+                "xtb_max_fragments": int(xtb_max_fragments),
+                "xtb_keep_largest_fragment": bool(xtb_keep_largest_fragment),
+                "xtb_cache_size": int(xtb_cache_size),
+                "xtb_n_jobs": int(xtb_n_jobs),
+                "xtb_random_state": 42,
+            })
+        elif "FGD" in extraction_method:
+            params.update({
+                "fgd_multi_label": bool(fgd_multi_label),
+                "fgd_keep_largest_frag": bool(fgd_keep_largest_frag),
+                "fgd_count_features": bool(fgd_count_features),
+                "fgd_cache_size": int(fgd_cache_size),
+            })
+        elif "环氧树脂" in extraction_method:
+            params.update({
+                "phr_col": phr_col,
+                "stoich_mode": stoich_mode,
+                "enable_reaction_simulation": bool(enable_reaction_simulation),
+                "multicomp_reaction_method": multicomp_reaction_method,
+            })
+        return params
+
+    def _workflow_semantic_params(polymer_string_features=False):
+        return {
+            "append_polymer_string_features": bool(polymer_string_features),
+            "append_polymer_semantic_features": bool(
+                append_polymer_semantic_features
+            ),
+            "append_ionic_semantic_features": bool(
+                append_ionic_semantic_features
+            ),
+            "bigsmiles_semantic_num_samples": int(
+                bigsmiles_semantic_num_samples
+            ),
+            "bigsmiles_semantic_min_repeat_units": int(
+                bigsmiles_semantic_min_repeat_units
+            ),
+            "bigsmiles_semantic_max_repeat_units": int(
+                bigsmiles_semantic_max_repeat_units
+            ),
+            "bigsmiles_semantic_random_state": 17,
+            "preserve_duplicate_columns": True,
+        }
+
     st.markdown("---")
 
     # [修改] 按钮区域：增加清除按钮
@@ -7678,6 +8289,9 @@ def page_molecular_features():
 
     with col_btn2:
         if st.button("🗑️ 清除已提取特征"):
+            st.session_state.molecular_feature_workflow = None
+            st.session_state.molecular_feature_config = None
+            st.session_state.molecular_feature_trace = []
             # 检查是否有记录的特征列名
             if st.session_state.get('molecular_feature_names'):
                 current_df = st.session_state.processed_data
@@ -7720,10 +8334,22 @@ def page_molecular_features():
 
         # --- [新增] 批量模式处理 ---
         if batch_mode and batch_smiles_cols:
+            from core.molecular_feature_workflow import (
+                build_workflow_from_training_state,
+                find_duplicate_feature_names,
+                merge_feature_name_lists_in_order,
+                validate_feature_frame_contract,
+            )
+
             st.info(f"🔄 批量处理模式：将依次处理 {len(batch_smiles_cols)} 个SMILES列")
             
             all_batch_features = []
             all_batch_feature_names = []
+            workflow_steps = []
+            workflow_trace = []
+            batch_duplicate_feature_names = []
+            batch_duplicate_error = False
+            batch_failed = False
             batch_progress = st.progress(0)
             batch_status = st.empty()
             
@@ -7754,6 +8380,32 @@ def page_molecular_features():
                 # [修复] 最终确保 col_prefix 不是 None 或空字符串
                 if not col_prefix:
                     col_prefix = f"col{batch_idx}"
+
+                workflow_step = {
+                    "step_id": f"batch_{batch_idx + 1}",
+                    "order": batch_idx,
+                    "role": _infer_selected_component_role([current_smiles_col]),
+                    "source_columns": [current_smiles_col],
+                    "method": extraction_method,
+                    "prefix": col_prefix,
+                    "params": _workflow_method_params(batch=True),
+                    "semantic_params": _workflow_semantic_params(),
+                    "feature_names": [],
+                    "valid_row_behavior": {
+                        "source_row_count": len(df),
+                        "source_row_indices": list(range(len(df))),
+                        "source_valid_indices": [],
+                        "ionic_excluded_indices": [],
+                        "keep_all_rows": True,
+                        "invalid_row_policy": "nan_fill",
+                    },
+                }
+                workflow_steps.append(workflow_step)
+                trace_started = time.perf_counter()
+                trace_warnings = []
+                trace_valid_indices = []
+                trace_features = []
+                batch_step_succeeded = False
                 
                 # 执行单列提取（以下代码将被复用）
                 _dev_pref = st.session_state.get('compute_device', 'auto')
@@ -7767,9 +8419,19 @@ def page_molecular_features():
                 resin_smiles_series, resin_ncomp = _combine_components(df, resin_component_cols)
                 smiles_list = resin_smiles_series.tolist()
                 smiles_list_input = smiles_list
+                source_valid_indices = [
+                    index for index, value in enumerate(smiles_list)
+                    if value is not None
+                    and not (isinstance(value, float) and np.isnan(value))
+                    and str(value).strip()
+                ]
                 auto_polymer_features_batch = _looks_polymer_rich(smiles_list_input)
+                workflow_step["semantic_params"] = _workflow_semantic_params(
+                    auto_polymer_features_batch
+                )
 
                 # [新增] 离子化合物过滤（批量模式）- 只清空包含离子的格子
+                ionic_excluded_indices = []
                 if skip_ionic_compounds:
                     def contains_ionic_fragment_batch(smiles_str):
                         """检测 SMILES 是否包含离子片段"""
@@ -7785,9 +8447,10 @@ def page_molecular_features():
                     # 检测并清空包含离子的格子
                     ionic_count = 0
                     cleaned_smiles_list = []
-                    for s in smiles_list:
+                    for row_index, s in enumerate(smiles_list):
                         if contains_ionic_fragment_batch(s):
                             cleaned_smiles_list.append(None)  # 清空该格子
+                            ionic_excluded_indices.append(row_index)
                             ionic_count += 1
                         else:
                             cleaned_smiles_list.append(s)
@@ -7799,6 +8462,14 @@ def page_molecular_features():
                         # 更新 resin_ncomp
                         resin_ncomp = pd.Series([0 if s is None else resin_ncomp.iloc[i] for i, s in enumerate(smiles_list)])
                         st.info(f"✓ 共 {len(df)} 行数据，其中 {ionic_count} 个格子被清空")
+                workflow_step["valid_row_behavior"].update({
+                    "source_valid_indices": list(source_valid_indices),
+                    "ionic_excluded_indices": list(ionic_excluded_indices),
+                    "source_row_mapping": [
+                        {"source_row_index": index, "input_position": index}
+                        for index in range(len(df))
+                    ],
+                })
 
                 # 为批量模式禁用固化剂（每列独立处理）
                 hardener_list = None
@@ -7808,9 +8479,16 @@ def page_molecular_features():
                     # 获取有效索引
                     valid_indices = [i for i, s in enumerate(smiles_list_input) 
                                     if s is not None and not (isinstance(s, float) and np.isnan(s)) and str(s).strip()]
+                    workflow_step["valid_row_behavior"].update({
+                        "source_valid_indices": list(source_valid_indices),
+                        "valid_indices": list(valid_indices),
+                        "n_valid_samples": len(valid_indices),
+                    })
                     
                     if not valid_indices:
                         st.warning(f"⚠️ 列 `{current_smiles_col}` 没有有效的SMILES，跳过")
+                        trace_warnings.append("no_valid_smiles")
+                        batch_failed = True
                         continue
                     
                     # 提取特征
@@ -7883,6 +8561,7 @@ def page_molecular_features():
                         from core.molecular_features import SmilesTransformerEmbeddingExtractor
                         if not str(lm_model_name).strip():
                             st.error("❌ 请填写 HuggingFace Model ID 或本地路径（Transformer Embedding）")
+                            batch_failed = True
                             continue
                         lm_extractor = SmilesTransformerEmbeddingExtractor(
                             model_name=lm_model_name,
@@ -7901,6 +8580,7 @@ def page_molecular_features():
                         # 图神经网络特征
                         if not GNN_AVAILABLE:
                             st.error("❌ 未检测到 torch_geometric，无法使用图神经网络特征。")
+                            batch_failed = True
                             continue
 
                         # [新增] 双 GPU 并行支持
@@ -7926,6 +8606,10 @@ def page_molecular_features():
                                 "chunk_size": int(gnn_chunk_size),
                                 "num_workers": int(gnn_num_workers),
                                 "model_state_path": gnn_weights_path.strip() or None,
+                                "bigsmiles_mode": workflow_step["params"]["gnn_bigsmiles_mode"],
+                                "bigsmiles_num_samples": workflow_step["params"]["gnn_bigsmiles_num_samples"],
+                                "bigsmiles_min_repeat_units": workflow_step["params"]["gnn_bigsmiles_min_repeat_units"],
+                                "bigsmiles_max_repeat_units": workflow_step["params"]["gnn_bigsmiles_max_repeat_units"],
                             }
 
                             gnn_features, sub_valid_idx = extract_gnn_features_dual_gpu(valid_smiles, gnn_cfg)
@@ -7950,10 +8634,15 @@ def page_molecular_features():
                                 "num_workers": int(gnn_num_workers),
                                 "chunk_size": int(gnn_chunk_size),
                                 "model_state_path": gnn_weights_path.strip() or None,
+                                "bigsmiles_mode": workflow_step["params"]["gnn_bigsmiles_mode"],
+                                "bigsmiles_num_samples": workflow_step["params"]["gnn_bigsmiles_num_samples"],
+                                "bigsmiles_min_repeat_units": workflow_step["params"]["gnn_bigsmiles_min_repeat_units"],
+                                "bigsmiles_max_repeat_units": workflow_step["params"]["gnn_bigsmiles_max_repeat_units"],
                             }
                             graph_extractor = _get_gnn_featurizer(gnn_cfg)
                             if graph_extractor is None:
                                 st.error("❌ GNN 特征提取器初始化失败，请检查依赖和参数。")
+                                batch_failed = True
                                 continue
 
                             # [自动恢复] 使用 try-except 包装 featurize 调用
@@ -8051,6 +8740,7 @@ def page_molecular_features():
                         )
                         if not getattr(xtb_extractor, "AVAILABLE", False):
                             st.error("❌ 未检测到 xtb 可执行文件。")
+                            batch_failed = True
                             continue
                         feat_df_xtb, sub_valid_idx = xtb_extractor.featurize(valid_smiles, n_jobs=xtb_n_jobs)
                         if len(feat_df_xtb) > 0:
@@ -8071,6 +8761,7 @@ def page_molecular_features():
                             extracted_valid_indices = [valid_indices[i] for i in sub_valid_idx]
                     else:
                         st.warning(f"⚠️ 批量模式暂不支持 `{extraction_method}` 方法，跳过列 `{current_smiles_col}`")
+                        batch_failed = True
                         continue
 
                     from core.molecular_features import extract_configured_semantic_features
@@ -8083,6 +8774,7 @@ def page_molecular_features():
                         "bigsmiles_semantic_min_repeat_units": int(bigsmiles_semantic_min_repeat_units),
                         "bigsmiles_semantic_max_repeat_units": int(bigsmiles_semantic_max_repeat_units),
                         "bigsmiles_semantic_random_state": 17,
+                        "preserve_duplicate_columns": True,
                     }
                     semantic_full_df = extract_configured_semantic_features(
                         smiles_list_input,
@@ -8090,13 +8782,28 @@ def page_molecular_features():
                         prefix=col_prefix,
                     )
                     if not semantic_full_df.empty:
+                        semantic_duplicate_names = find_duplicate_feature_names(
+                            semantic_full_df.columns.tolist()
+                        )
+                        if semantic_duplicate_names:
+                            raise ValueError(
+                                "duplicate emitted feature names before batch merge: "
+                                + ", ".join(semantic_duplicate_names)
+                            )
                         if features_df is not None and len(features_df) > 0:
                             semantic_subset = semantic_full_df.iloc[extracted_valid_indices].reset_index(drop=True)
+                            duplicate_names = find_duplicate_feature_names(
+                                list(features_df.columns) + list(semantic_subset.columns)
+                            )
+                            if duplicate_names:
+                                raise ValueError(
+                                    "duplicate emitted feature names before batch merge: "
+                                    + ", ".join(duplicate_names)
+                                )
                             features_df = pd.concat(
                                 [features_df.reset_index(drop=True), semantic_subset],
                                 axis=1,
                             )
-                            features_df = features_df.loc[:, ~features_df.columns.duplicated()]
                         else:
                             features_df = semantic_full_df.iloc[valid_indices].reset_index(drop=True)
                             extracted_valid_indices = valid_indices.copy()
@@ -8104,6 +8811,29 @@ def page_molecular_features():
                     if features_df is not None and len(features_df) > 0:
                         # 重置索引并对齐
                         features_df = features_df.reset_index(drop=True)
+                        contract_errors = validate_feature_frame_contract(
+                            features_df,
+                            extracted_valid_indices,
+                            len(df),
+                        )
+                        if contract_errors:
+                            raise ValueError(
+                                "feature contract violation: "
+                                + "; ".join(contract_errors)
+                            )
+                        trace_features = features_df.columns.tolist()
+                        duplicate_names = find_duplicate_feature_names(trace_features)
+                        duplicate_names.extend(
+                            name
+                            for name in trace_features
+                            if name in all_batch_feature_names
+                            and name not in duplicate_names
+                        )
+                        if duplicate_names:
+                            raise ValueError(
+                                "duplicate emitted feature names before batch merge: "
+                                + ", ".join(duplicate_names)
+                            )
                         
                         # 创建完整的特征DataFrame（包含所有行，无效行用NaN填充）
                         full_features = pd.DataFrame(index=range(len(df)), columns=features_df.columns)
@@ -8112,32 +8842,100 @@ def page_molecular_features():
                                 full_features.iloc[orig_idx] = features_df.iloc[new_idx]
                         
                         all_batch_features.append(full_features)
-                        all_batch_feature_names.extend(features_df.columns.tolist())
+                        trace_valid_indices = list(extracted_valid_indices)
+                        trace_features = features_df.columns.tolist()
+                        workflow_step["feature_names"] = list(trace_features)
+                        workflow_step["semantic_params"] = _workflow_semantic_params(
+                            auto_polymer_features_batch
+                        )
+                        workflow_step["valid_row_behavior"].update({
+                            "source_valid_indices": list(valid_indices),
+                            "valid_indices": trace_valid_indices,
+                            "n_valid_samples": len(trace_valid_indices),
+                        })
+                        all_batch_feature_names = merge_feature_name_lists_in_order(
+                            all_batch_feature_names,
+                            trace_features,
+                        )
+                        batch_step_succeeded = True
                         st.success(f"✅ 列 `{current_smiles_col}` 提取了 {len(features_df.columns)} 个特征")
+                    else:
+                        raise ValueError(
+                            "feature contract violation: no features extracted"
+                        )
                     
                 except Exception as e:
                     import traceback
+                    batch_failed = True
+                    trace_warnings.append(str(e))
+                    if "duplicate emitted feature names" in str(e):
+                        batch_duplicate_error = True
+                        batch_duplicate_feature_names.extend(
+                            name.strip()
+                            for name in str(e).split(":", 1)[-1].split(",")
+                            if name.strip()
+                            and name.strip() not in batch_duplicate_feature_names
+                        )
                     st.error(f"❌ 处理列 `{current_smiles_col}` 时出错: {str(e)}")
                     st.code(traceback.format_exc())
-                    continue
+                finally:
+                    workflow_trace.append({
+                        "step_id": workflow_step["step_id"],
+                        "mode": "training_batch",
+                        "input_count": len(df),
+                        "valid_count": len(trace_valid_indices),
+                        "output_columns": list(trace_features),
+                        "elapsed_time": time.perf_counter() - trace_started,
+                        "warnings": trace_warnings,
+                        "status": "success" if batch_step_succeeded else "failed",
+                    })
             
             batch_progress.progress(1.0)
             batch_status.markdown("**✅ 批量处理完成！**")
             
             # 合并所有批量提取的特征
-            if all_batch_features:
+            emitted_feature_names = [
+                name
+                for feature_frame in all_batch_features
+                for name in feature_frame.columns.tolist()
+            ]
+            batch_duplicate_feature_names.extend(
+                name
+                for name in find_duplicate_feature_names(emitted_feature_names)
+                if name not in batch_duplicate_feature_names
+            )
+            source_feature_conflicts = [
+                name
+                for name in find_duplicate_feature_names(
+                    list(df.columns) + emitted_feature_names
+                )
+                if name not in batch_duplicate_feature_names
+            ]
+            batch_duplicate_feature_names.extend(source_feature_conflicts)
+            batch_success = (
+                bool(all_batch_features)
+                and len(all_batch_features) == len(batch_smiles_cols)
+                and not batch_failed
+                and not batch_duplicate_error
+                and not batch_duplicate_feature_names
+            )
+            if batch_success:
                 combined_features = pd.concat(all_batch_features, axis=1)
                 
                 # 合并到原始数据
                 merged_df = pd.concat([df.reset_index(drop=True), combined_features.reset_index(drop=True)], axis=1)
-                merged_df = merged_df.loc[:, ~merged_df.columns.duplicated()]
                 
                 st.session_state.processed_data = merged_df
                 
                 # ✅ 累积保存分子特征名（而不是覆盖）
-                existing_mol_names = set(st.session_state.get('molecular_feature_names', []))
-                new_mol_names = set(all_batch_feature_names)
-                combined_mol_names = list(existing_mol_names | new_mol_names)
+                existing_mol_names = st.session_state.get(
+                    'molecular_feature_names', []
+                )
+                new_mol_names = list(all_batch_feature_names)
+                combined_mol_names = merge_feature_name_lists_in_order(
+                    existing_mol_names,
+                    new_mol_names,
+                )
                 st.session_state.molecular_feature_names = combined_mol_names
                 
                 # ✅ 清除特征分类缓存，下次进入特征选择页面时会重新分类
@@ -8145,12 +8943,19 @@ def page_molecular_features():
                     del st.session_state['feature_classification']
                 
                 # ✅ 关键修复：自动将新提取的特征添加到feature_cols中
-                existing_feature_cols = set(st.session_state.get('feature_cols', []))
-                updated_feature_cols = list(existing_feature_cols | new_mol_names)
+                existing_feature_cols = st.session_state.get('feature_cols', [])
+                updated_feature_cols = merge_feature_name_lists_in_order(
+                    existing_feature_cols,
+                    new_mol_names,
+                )
                 st.session_state.feature_cols = updated_feature_cols
                 if 'multiselect_features' in st.session_state:
-                    existing_multiselect = set(st.session_state.multiselect_features)
-                    st.session_state.multiselect_features = list(existing_multiselect | new_mol_names)
+                    st.session_state.multiselect_features = (
+                        merge_feature_name_lists_in_order(
+                            st.session_state.multiselect_features,
+                            new_mol_names,
+                        )
+                    )
                 
                 st.success(f"🎉 批量提取完成！共从 {len(batch_smiles_cols)} 列提取了 {len(all_batch_feature_names)} 个特征（累计 {len(combined_mol_names)} 个分子特征）")
                 
@@ -8158,11 +8963,74 @@ def page_molecular_features():
                 st.markdown("### 📋 提取的特征预览")
                 st.dataframe(combined_features.head(), width="stretch")
             else:
-                st.error("❌ 批量处理未能提取任何特征")
+                if batch_duplicate_feature_names:
+                    st.error(
+                        "❌ 批量处理发现重复的输出特征名，已取消合并："
+                        + ", ".join(batch_duplicate_feature_names)
+                    )
+                elif batch_failed:
+                    st.error(
+                        "❌ 批量处理未满足全部特征契约，已取消本次提取；"
+                        "已保留此前有效的数据和分子特征流程。"
+                    )
+                else:
+                    st.error("❌ 批量处理未能提取任何特征")
+                workflow_trace.append({
+                    "step_id": "batch_run",
+                    "mode": "training_batch",
+                    "status": "failed",
+                    "failed": True,
+                    "input_count": len(df),
+                    "valid_count": 0,
+                    "output_columns": [],
+                    "elapsed_time": 0.0,
+                    "warnings": [
+                        "atomic batch extraction was not committed"
+                    ],
+                    "error": (
+                        "duplicate emitted feature names"
+                        if batch_duplicate_feature_names
+                        else "one or more batch steps failed or returned no features"
+                    ),
+                })
+                st.session_state["molecular_feature_trace"] = workflow_trace
+
+            if batch_success:
+                workflow = build_workflow_from_training_state(
+                    {
+                        "mode": "multi_batch",
+                        "selected_source_columns": list(batch_smiles_cols),
+                        "source_columns": list(batch_smiles_cols),
+                        "workflow_steps": workflow_steps,
+                        "merge_order": [
+                            step["step_id"] for step in workflow_steps
+                        ],
+                        "input_contract": {
+                            "selected_source_columns": list(batch_smiles_cols),
+                            "source_row_count": len(df),
+                            "source_row_indices": list(range(len(df))),
+                            "source_row_mapping": [
+                                {"source_row_index": index, "input_position": index}
+                                for index in range(len(df))
+                            ],
+                            "row_policy": "keep_all_rows",
+                            "resin_component_cols": list(batch_smiles_cols),
+                            "skip_ionic_compounds": bool(skip_ionic_compounds),
+                            "ionic_filter_behavior": "clear_source_cells",
+                        },
+                    },
+                    all_batch_feature_names,
+                )
+                st.session_state["molecular_feature_workflow"] = workflow.to_dict()
+                st.session_state["molecular_feature_config"] = (
+                    workflow.to_legacy_config()
+                )
+                st.session_state["molecular_feature_trace"] = workflow_trace
             
             return  # 批量模式处理完成后返回
         
         # --- 单列模式（原有逻辑） ---
+        single_workflow_trace_started = time.perf_counter()
         # --- [新增] Torch 设备选择（与侧边栏同步） ---
         _dev_pref = st.session_state.get('compute_device', 'auto')
         if _dev_pref == 'cuda' and torch.cuda.is_available():
@@ -8204,8 +9072,31 @@ def page_molecular_features():
                 'bigsmiles_semantic_min_repeat_units': int(bigsmiles_semantic_min_repeat_units),
                 'bigsmiles_semantic_max_repeat_units': int(bigsmiles_semantic_max_repeat_units),
                 'bigsmiles_semantic_random_state': 17,
+                'preserve_duplicate_columns': True,
+                'skip_ionic_compounds': bool(skip_ionic_compounds),
+                'ionic_filter_behavior': 'exclude_rows_preserve_source_rows',
             }
         )
+        def _record_single_workflow_failure(message, valid_count=0):
+            previous_workflow = st.session_state.get("molecular_feature_workflow")
+            previous_config = st.session_state.get("molecular_feature_config")
+            if previous_workflow is None and previous_config is None:
+                st.session_state["molecular_feature_workflow"] = None
+                st.session_state["molecular_feature_config"] = None
+            st.session_state["molecular_feature_trace"] = [{
+                "step_id": "single_1",
+                "mode": "training_single",
+                "status": "error",
+                "input_count": len(df),
+                "valid_count": int(valid_count),
+                "output_columns": [],
+                "elapsed_time": time.perf_counter() - single_workflow_trace_started,
+                "warnings": [str(message)],
+                "error": str(message),
+                "preserved_previous_workflow": (
+                    previous_workflow is not None or previous_config is not None
+                ),
+            }]
         oplog(f"Start molecular feature extraction: {extraction_method} (device={torch_device})")
 
         # -----------------------------
@@ -8215,6 +9106,13 @@ def page_molecular_features():
         # -----------------------------
         resin_smiles_series, resin_ncomp = _combine_components(df, resin_component_cols)
         smiles_list = resin_smiles_series.tolist()
+        source_row_indices = list(range(len(df)))
+        source_valid_indices = [
+            index for index, value in enumerate(smiles_list)
+            if value is not None
+            and not (isinstance(value, float) and np.isnan(value))
+            and str(value).strip()
+        ]
 
         # [新增] 离子化合物过滤 - 标记但不清空，在特征提取时跳过
         ionic_indices = set()  # 记录包含离子的索引
@@ -8435,6 +9333,7 @@ def page_molecular_features():
                 extractor = PersistentHomologyFeatureExtractor(config)
                 if not getattr(extractor, "AVAILABLE", False):
                     st.error("❌ 未检测到 ripser/persim，请先安装：pip install ripser persim")
+                    _record_single_workflow_failure("TDA extractor unavailable")
                     return
 
                 features_df, valid_indices = extractor.smiles_to_tda_features(smiles_list_input, add_hs=bool(tda_add_hs))
@@ -8443,6 +9342,7 @@ def page_molecular_features():
                 from core.molecular_features import SmilesTransformerEmbeddingExtractor
                 if not str(lm_model_name).strip():
                     st.error("❌ 请填写 HuggingFace Model ID 或本地路径（Transformer Embedding）")
+                    _record_single_workflow_failure("Transformer model is empty")
                     st.stop()
                 oplog(f"Running Transformer embedding: model={lm_model_name}, pooling={lm_pooling}, max_length={lm_max_length}, batch={lm_batch_size}")
                 oplog(f"SMILES sources (resin_component_cols): {resin_component_cols}")
@@ -8466,6 +9366,7 @@ def page_molecular_features():
                 )
                 if not getattr(extractor, "AVAILABLE", False):
                     st.error("❌ 未检测到 transformers，请先安装：pip install transformers")
+                    _record_single_workflow_failure("Transformer extractor unavailable")
                     st.stop()
                 features_df, valid_indices = extractor.smiles_to_embeddings(smiles_list_input, batch_size=lm_batch_size)
 
@@ -8473,6 +9374,7 @@ def page_molecular_features():
                 status_text.text("正在提取图神经网络特征...")
                 if not GNN_AVAILABLE:
                     st.error("❌ 未检测到 torch_geometric，无法使用图神经网络特征。")
+                    _record_single_workflow_failure("GNN extractor unavailable")
                     return
                 try:
                     mf_cfg['params'].update({
@@ -8560,6 +9462,7 @@ def page_molecular_features():
                     graph_extractor = _get_gnn_featurizer(gnn_cfg)
                     if graph_extractor is None:
                         st.error("❌ GNN 特征提取器初始化失败，请检查依赖和参数。")
+                        _record_single_workflow_failure("GNN featurizer initialization failed")
                         return
 
                     # [自动恢复] 使用 try-except 包装 featurize 调用
@@ -8595,6 +9498,7 @@ def page_molecular_features():
                         with st.expander("查看详细错误信息"):
                             st.code(traceback.format_exc())
 
+                        _record_single_workflow_failure(error_msg)
                         return
 
                     gnn_features = gnn_features if gnn_features is not None else np.array([])
@@ -8631,6 +9535,7 @@ def page_molecular_features():
                         msg += "\n\n" + "\n".join(detail)
                     st.error(msg)
                     st.caption("常见原因：1) 未安装 torchani；2) torch/torchani 版本不兼容；3) 无网络导致模型权重无法下载；4) SMILES 含 '*' 等占位符或含金属元素（ANI2x 仅支持 H,C,N,O,F,S,Cl）。")
+                    _record_single_workflow_failure(msg)
                     return
 
                 oplog(f"ANI params: batch_size={ani_batch_size}, cpu_workers(3D)={ani_cpu_workers}")
@@ -8705,6 +9610,7 @@ def page_molecular_features():
                 )
                 if not getattr(extractor, "AVAILABLE", False):
                     st.error("❌ 未检测到 xtb 可执行文件。")
+                    _record_single_workflow_failure("xTB executable unavailable")
                     return
                 features_df, valid_indices = extractor.featurize(smiles_list_input, n_jobs=xtb_n_jobs)
             elif "FGD" in extraction_method:
@@ -8741,6 +9647,7 @@ def page_molecular_features():
 
                 if hardener_col is None:
                     st.error("请选择固化剂列！")
+                    _record_single_workflow_failure("hardener column is required")
                     return
 
                 phr_list = None
@@ -8856,6 +9763,7 @@ def page_molecular_features():
                         pass
 
             from core.molecular_features import append_configured_semantic_features
+            from core.molecular_feature_workflow import find_duplicate_feature_names
 
             features_df, valid_indices = append_configured_semantic_features(
                 features_df,
@@ -8863,6 +9771,16 @@ def page_molecular_features():
                 smiles_list_input,
                 mf_cfg.get("params") or {},
             )
+            emitted_duplicates = find_duplicate_feature_names(
+                features_df.columns.tolist()
+                if isinstance(features_df, pd.DataFrame)
+                else []
+            )
+            if emitted_duplicates:
+                raise ValueError(
+                    "duplicate emitted feature names before single-column merge: "
+                    + ", ".join(emitted_duplicates)
+                )
 
             # [调试] 显示提取结果信息
             print(f"[DEBUG] features_df type: {type(features_df)}")
@@ -8875,7 +9793,6 @@ def page_molecular_features():
             # --- 合并结果逻辑 ---
             if len(features_df) > 0:
                 st.success("✅ 进入合并结果逻辑")
-                st.session_state.molecular_features = features_df
 
                 # 多组分情况：特征已经有 crosslink_ 前缀，不需要再添加列名前缀
                 if is_multicomponent:
@@ -8920,6 +9837,14 @@ def page_molecular_features():
                 # - 否则：仅保留成功提取特征的样本行（原逻辑）
                 # -----------------------------
                 features_df = features_df.reset_index(drop=True)
+                emitted_duplicates = find_duplicate_feature_names(
+                    features_df.columns.tolist()
+                )
+                if emitted_duplicates:
+                    raise ValueError(
+                        "duplicate emitted feature names before single-column merge: "
+                        + ", ".join(emitted_duplicates)
+                    )
 
                 if 'keep_all_rows_3d' in locals() and keep_all_rows_3d:
                     base_df = df.reset_index(drop=True)
@@ -8964,47 +9889,177 @@ def page_molecular_features():
                     if hardener_ncomp is not None:
                         merged_df[f"{smiles_col}_hardener_n_components"] = hardener_ncomp.iloc[valid_indices].reset_index(drop=True)
 
-                merged_df = merged_df.loc[:, ~merged_df.columns.duplicated()]
+                merged_duplicates = find_duplicate_feature_names(
+                    merged_df.columns.tolist()
+                )
+                if merged_duplicates:
+                    raise ValueError(
+                        "duplicate columns after single-column merge: "
+                        + ", ".join(merged_duplicates)
+                    )
+                st.session_state.molecular_features = features_df
                 st.session_state.processed_data = merged_df
                 
                 # ✅ 累积保存分子特征名（而不是覆盖）
-                existing_mol_names = set(st.session_state.get('molecular_feature_names', []))
-                new_mol_names = set(features_df.columns.tolist())
-                combined_mol_names = list(existing_mol_names | new_mol_names)
+                from core.molecular_feature_workflow import (
+                    build_workflow_from_training_state,
+                    merge_feature_name_lists_in_order,
+                )
+
+                existing_mol_names = st.session_state.get(
+                    'molecular_feature_names', []
+                )
+                new_mol_names = features_df.columns.tolist()
+                combined_mol_names = merge_feature_name_lists_in_order(
+                    existing_mol_names,
+                    new_mol_names,
+                )
                 st.session_state.molecular_feature_names = combined_mol_names
 
                 # [调试] 显示保存的分子特征名
                 st.info(f"📝 已保存 {len(new_mol_names)} 个新分子特征名到 molecular_feature_names")
                 if len(new_mol_names) <= 10:
-                    st.write(f"新特征名: {list(new_mol_names)}")
+                    st.write(f"新特征名: {new_mol_names}")
                 else:
-                    st.write(f"新特征名（前10个）: {list(new_mol_names)[:10]}")
+                    st.write(f"新特征名（前10个）: {new_mol_names[:10]}")
                 
                 # ✅ 清除特征分类缓存，下次进入特征选择页面时会重新分类
                 if 'feature_classification' in st.session_state:
                     del st.session_state['feature_classification']
                 
                 # ✅ 关键修复：自动将新提取的特征添加到feature_cols中
-                existing_feature_cols = set(st.session_state.get('feature_cols', []))
-                updated_feature_cols = list(existing_feature_cols | new_mol_names)
+                existing_feature_cols = st.session_state.get('feature_cols', [])
+                updated_feature_cols = merge_feature_name_lists_in_order(
+                    existing_feature_cols,
+                    new_mol_names,
+                )
                 st.session_state.feature_cols = updated_feature_cols
                 if 'multiselect_features' in st.session_state:
-                    existing_multiselect = set(st.session_state.multiselect_features)
-                    st.session_state.multiselect_features = list(existing_multiselect | new_mol_names)
+                    st.session_state.multiselect_features = (
+                        merge_feature_name_lists_in_order(
+                            st.session_state.multiselect_features,
+                            new_mol_names,
+                        )
+                    )
                 
                 # 保存分子特征提取流程（用于训练完成后自动导出 & 加载模型时提示所需特征）
                 try:
                     mf_cfg.update({
-                        'prefix': prefix,
+                        'prefix': "crosslink" if is_multicomponent else prefix,
                         'n_features': int(features_df.shape[1]),
                         'feature_names': features_df.columns.tolist(),
-                        'n_valid_samples': int(len(valid_indices)) if 'valid_indices' in locals() else None,
+                        'n_valid_samples': int(len(valid_indices)),
                     })
                     if 'keep_all_rows_3d' in locals():
                         mf_cfg['keep_all_rows_3d'] = bool(keep_all_rows_3d)
-                    st.session_state['molecular_feature_config'] = mf_cfg
-                except Exception:
-                    pass
+
+                    workflow_source_columns = (
+                        list(resin_component_cols or [])
+                    )
+                    workflow_source_columns = (
+                        merge_feature_name_lists_in_order(
+                            workflow_source_columns,
+                            hardener_component_cols or [],
+                        )
+                    )
+                    workflow_params = dict(mf_cfg.get('params') or {})
+                    workflow_params.update(_workflow_method_params(batch=False))
+                    workflow_semantic_params = _workflow_semantic_params(
+                        auto_polymer_string_features
+                    )
+                    workflow_step = {
+                        "step_id": "single_1",
+                        "order": 0,
+                        "role": primary_source_role,
+                        "source_columns": workflow_source_columns,
+                        "method": extraction_method,
+                        "prefix": mf_cfg["prefix"],
+                        "params": workflow_params,
+                        "semantic_params": workflow_semantic_params,
+                        "feature_names": features_df.columns.tolist(),
+                        "valid_row_behavior": {
+                            "source_row_count": len(df),
+                            "source_row_indices": source_row_indices,
+                            "source_valid_indices": list(source_valid_indices),
+                            "ionic_excluded_indices": sorted(ionic_indices),
+                            "source_row_mapping": [
+                                {"source_row_index": index, "input_position": index}
+                                for index in source_row_indices
+                            ],
+                            "valid_indices": [int(index) for index in valid_indices],
+                            "n_valid_samples": int(len(valid_indices)),
+                            "keep_all_rows": bool(keep_all_rows_3d),
+                            "invalid_row_policy": (
+                                "nan_fill"
+                                if keep_all_rows_3d
+                                else "drop_invalid_rows"
+                            ),
+                        },
+                    }
+                    workflow = build_workflow_from_training_state(
+                        {
+                            "mode": "single_batch",
+                            "selected_source_columns": workflow_source_columns,
+                            "source_columns": workflow_source_columns,
+                            "resin_component_cols": list(
+                                resin_component_cols or []
+                            ),
+                            "hardener_col": hardener_col,
+                            "hardener_component_cols": list(
+                                hardener_component_cols or []
+                            ),
+                            "hardener_fusion_mode": hardener_fusion_mode,
+                            "resin_mix_mode": resin_mix_mode,
+                            "primary_component_role": primary_source_role,
+                            "input_contract": {
+                                "selected_source_columns": workflow_source_columns,
+                                "source_row_count": len(df),
+                                "source_row_indices": source_row_indices,
+                                "source_row_mapping": [
+                                    {"source_row_index": index, "input_position": index}
+                                    for index in source_row_indices
+                                ],
+                                "resin_component_cols": list(
+                                    resin_component_cols or []
+                                ),
+                                "hardener_col": hardener_col,
+                                "hardener_component_cols": list(
+                                    hardener_component_cols or []
+                                ),
+                                "hardener_fusion_mode": hardener_fusion_mode,
+                                "resin_mix_mode": resin_mix_mode,
+                                "primary_component_role": primary_source_role,
+                                "skip_ionic_compounds": bool(skip_ionic_compounds),
+                                "ionic_filter_behavior": (
+                                    "exclude_rows_preserve_source_rows"
+                                ),
+                                "legacy_fields": mf_cfg,
+                            },
+                            "workflow_steps": [workflow_step],
+                            "merge_order": ["single_1"],
+                        },
+                        features_df.columns.tolist(),
+                    )
+                    st.session_state["molecular_feature_workflow"] = (
+                        workflow.to_dict()
+                    )
+                    st.session_state["molecular_feature_config"] = (
+                        workflow.to_legacy_config()
+                    )
+                    st.session_state["molecular_feature_trace"] = [{
+                        "step_id": "single_1",
+                        "mode": "training_single",
+                        "input_count": len(df),
+                        "valid_count": len(valid_indices),
+                        "output_columns": features_df.columns.tolist(),
+                        "elapsed_time": (
+                            time.perf_counter() - single_workflow_trace_started
+                        ),
+                        "warnings": [],
+                        "status": "success",
+                    }]
+                except Exception as workflow_error:
+                    st.warning(f"⚠️ 分子特征流程记录失败：{workflow_error}")
                 st.success(f"✅ 成功提取 {len(features_df)} 个样本的 {features_df.shape[1]} 个分子特征")
 
                 log_fe_step(
@@ -9044,7 +10099,10 @@ def page_molecular_features():
                     col_sel1, col_sel2 = st.columns(2)
                     with col_sel1:
                         # 按特征名前缀过滤
-                        prefixes = list(set([f.split('_')[0] for f in all_mol_features if '_' in f]))
+                        prefixes = merge_feature_name_lists_in_order(
+                            [],
+                            [f.split('_')[0] for f in all_mol_features if '_' in f],
+                        )
                         selected_prefixes = st.multiselect(
                             "按前缀筛选（可选）",
                             options=prefixes,
@@ -9092,6 +10150,10 @@ def page_molecular_features():
                             st.warning("⚠️ 请至少选择一个分子特征")
             else:
                 st.error("❌ 未能提取任何特征：当前选择的 SMILES 列可能全部为空/无效，或 3D 构象生成全部失败。")
+                _record_single_workflow_failure(
+                    "no features extracted",
+                    valid_count=len(valid_indices) if valid_indices else 0,
+                )
                 # 额外诊断：快速检查前 200 条是否能被 RDKit 解析（不做 3D）
                 try:
                     ok, checked, bad = _quick_rdkit_parse_stats(smiles_list_input, max_check=200)
@@ -9110,6 +10172,361 @@ def page_molecular_features():
             import traceback
             st.error(f"❌ 提取失败: {str(e)}")
             st.code(traceback.format_exc())
+            _record_single_workflow_failure(str(e))
+
+
+# ============================================================
+# 页面：分子特征工程复现
+# ============================================================
+def page_molecular_feature_reproduction():
+    """Review, validate, preview, and lock the saved molecular feature workflow."""
+    st.title("🧬 分子特征工程复现")
+    st.caption("按训练时保存的步骤、源列、角色、参数和合并顺序复现分子特征；不会用零值或通用指纹替代缺失特征。")
+
+    from copy import deepcopy
+    from core.molecular_feature_workflow import (
+        MolecularFeatureWorkflow,
+        append_workflow_step,
+        build_workflow_diff,
+        can_lock_workflow,
+        execute_molecular_feature_workflow,
+        normalize_workflow_config,
+        validate_workflow_config,
+    )
+    from core.virtual_screening import resolve_molecular_feature_workflow
+
+    artifact = st.session_state.get("imported_model_artifact") or {}
+    workflow_payload = st.session_state.get("molecular_feature_workflow")
+    if not isinstance(workflow_payload, dict):
+        resolved = resolve_molecular_feature_workflow(
+            artifact,
+            model_feature_cols=st.session_state.get("feature_cols") or [],
+        ) if artifact else None
+        workflow_payload = resolved.to_dict() if resolved is not None else None
+
+    with st.expander("📥 导入或替换 feature_process.json", expanded=workflow_payload is None):
+        workflow_file = st.file_uploader(
+            "上传训练时导出的特征流程",
+            type=["json"],
+            key="molecular_feature_reproduction_upload",
+        )
+        if workflow_file is not None:
+            try:
+                payload = json.loads(workflow_file.getvalue().decode("utf-8"))
+                resolved = resolve_molecular_feature_workflow(
+                    payload,
+                    model_feature_cols=st.session_state.get("feature_cols") or [],
+                )
+                if resolved is None:
+                    raise ValueError("文件中没有可识别的 molecular_feature_workflow 或 molecular_feature_config")
+                workflow_payload = resolved.to_dict()
+                st.session_state["molecular_feature_workflow"] = workflow_payload
+                st.session_state["molecular_feature_config"] = resolved.to_legacy_config()
+                st.session_state["screening_workflow_locked"] = False
+                st.success(f"已加载 workflow：{workflow_payload.get('workflow_hash', '')[:16]}…")
+            except Exception as exc:
+                st.error(f"流程文件解析失败：{exc}")
+
+    if not isinstance(workflow_payload, dict):
+        st.warning("当前会话没有保存的分子特征 workflow。请先在【🧬 分子特征】完成提取，或上传 feature_process.json。")
+        st.info("推荐顺序：导入与模型配套的模型文件 → 导入流程 → 在本页校验并锁定 → 再进入虚拟筛选。")
+        return
+
+    try:
+        workflow = MolecularFeatureWorkflow.from_dict(workflow_payload)
+    except Exception as exc:
+        st.error(f"workflow 无法规范化：{exc}")
+        return
+
+    current_model = get_current_model()
+    model_feature_cols = [
+        str(column)
+        for column in (st.session_state.get("feature_cols") or [])
+        if str(column).strip()
+    ]
+    molecular_model_cols = [
+        column for column in model_feature_cols
+        if column in set(workflow.final_feature_names)
+    ]
+    runtime_fingerprint = None
+    try:
+        import hashlib
+
+        fingerprint_payload = {
+            "model_name": st.session_state.get("model_name"),
+            "model_type": type(current_model).__module__ + "." + type(current_model).__name__
+            if current_model is not None else None,
+            "target_col": st.session_state.get("target_col"),
+            "feature_cols": model_feature_cols,
+        }
+        runtime_fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+    except Exception:
+        runtime_fingerprint = None
+
+    status_cols = st.columns(4)
+    status_cols[0].metric("流程模式", "多批次" if workflow.mode == "multi_batch" else "单批次")
+    status_cols[1].metric("步骤数", len(workflow.steps))
+    status_cols[2].metric("最终特征", len(workflow.final_feature_names))
+    status_cols[3].metric(
+        "筛选状态",
+        "已锁定" if st.session_state.get("screening_workflow_locked") else "未锁定",
+    )
+    st.code(f"workflow hash: {workflow.workflow_hash}", language="text")
+    if workflow.model_fingerprint:
+        st.caption(f"训练时模型指纹：{workflow.model_fingerprint}")
+    if runtime_fingerprint:
+        st.caption(f"当前会话模型指纹：{runtime_fingerprint}")
+    if workflow.legacy:
+        st.warning("当前流程来自旧版配置，已自动适配为单步 workflow；若要完全复现多批次顺序，请重新导出训练流程。")
+
+    data_frame = st.session_state.get("processed_data")
+    if not isinstance(data_frame, pd.DataFrame):
+        data_frame = st.session_state.get("data")
+    available_columns = list(data_frame.columns) if isinstance(data_frame, pd.DataFrame) else []
+
+    validation_payload = workflow.to_dict()
+    if workflow.model_fingerprint and runtime_fingerprint:
+        validation_payload["expected_model_fingerprint"] = workflow.model_fingerprint
+    validation_report = validate_workflow_config(
+        validation_payload,
+        model_feature_cols=molecular_model_cols or None,
+        available_columns=available_columns or None,
+    )
+    if validation_report.get("ok"):
+        st.success("当前 workflow 通过结构校验。")
+    else:
+        st.warning("当前 workflow 仍有阻塞项，请在下方修正后再锁定。")
+        for key in ("missing_steps", "missing_columns", "missing_features", "order_mismatch"):
+            values = validation_report.get(key)
+            if values:
+                st.write(f"- {key}: {values}")
+
+    st.markdown("### 1) 训练流程清单")
+    step_rows = []
+    for order, step in enumerate(workflow.steps, start=1):
+        step_rows.append(
+            {
+                "顺序": order,
+                "步骤ID": step.get("step_id"),
+                "角色": step.get("role"),
+                "方法": step.get("method"),
+                "源列": " | ".join(map(str, step.get("source_columns") or [])),
+                "前缀": step.get("prefix") or "",
+                "输出特征数": len(step.get("feature_names") or []),
+            }
+        )
+    st.dataframe(pd.DataFrame(step_rows), width="stretch", hide_index=True)
+
+    add_step_col, add_step_hint_col = st.columns([1, 3])
+    with add_step_col:
+        if st.button(
+            "➕ 添加训练流程步骤",
+            key="mfr_add_workflow_step",
+            help="在现有训练流程末尾追加一个可编辑步骤，不会覆盖已有步骤。",
+        ):
+            try:
+                appended_payload = append_workflow_step(workflow.to_dict())
+                st.session_state["molecular_feature_workflow"] = appended_payload
+                st.session_state["molecular_feature_workflow_draft"] = None
+                st.session_state["screening_workflow_locked"] = False
+                st.session_state["molecular_feature_reproduction_edit_mode"] = "高级编辑"
+                st.success(
+                    f"已追加步骤 `{appended_payload['steps'][-1]['step_id']}`；"
+                    "请在下方填写角色、源列、方法和参数。"
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"追加流程步骤失败：{exc}")
+    with add_step_hint_col:
+        st.caption("新增步骤会追加到末尾并自动进入高级编辑；原有步骤、合并顺序和特征顺序保持不变。")
+
+    edit_mode = st.radio(
+        "编辑模式",
+        ["只读查看", "高级编辑"],
+        horizontal=True,
+        key="molecular_feature_reproduction_edit_mode",
+    )
+    edited_payload = deepcopy(workflow.to_dict())
+    if edit_mode == "高级编辑":
+        st.markdown("### 2) 高级流程编辑")
+        st.caption("编辑后必须重新校验并锁定；参数采用 JSON 保存，以保留 xTB、BigSMILES、语义特征等完整设置。")
+        step_ids = [str(step.get("step_id")) for step in edited_payload.get("steps", [])]
+        for step_index, step in enumerate(edited_payload.get("steps", [])):
+            step_id = str(step.get("step_id") or f"step_{step_index + 1}")
+            with st.expander(f"{step_index + 1}. {step_id}", expanded=step_index == 0):
+                role_options = ["resin", "hardener", "neutral"]
+                role_value = str(step.get("role") or "neutral")
+                role_index = role_options.index(role_value) if role_value in role_options else 2
+                step["role"] = st.selectbox(
+                    "角色",
+                    role_options,
+                    index=role_index,
+                    key=f"mfr_role_{step_index}",
+                )
+                source_options = list(dict.fromkeys(
+                    available_columns
+                    + list(step.get("source_columns") or [])
+                    + ["resin_smiles", "hardener_smiles"]
+                ))
+                step["source_columns"] = st.multiselect(
+                    "源列（保持训练时顺序）",
+                    source_options,
+                    default=[column for column in step.get("source_columns") or [] if column in source_options],
+                    key=f"mfr_source_{step_index}",
+                )
+                step["method"] = st.text_input(
+                    "特征方法",
+                    value=str(step.get("method") or ""),
+                    key=f"mfr_method_{step_index}",
+                )
+                step["prefix"] = st.text_input(
+                    "输出前缀",
+                    value=str(step.get("prefix") or ""),
+                    key=f"mfr_prefix_{step_index}",
+                )
+                params_text = st.text_area(
+                    "参数 JSON",
+                    value=json.dumps(step.get("params") or {}, ensure_ascii=False, indent=2, default=str),
+                    height=140,
+                    key=f"mfr_params_{step_index}",
+                )
+                semantic_text = st.text_area(
+                    "语义参数 JSON",
+                    value=json.dumps(step.get("semantic_params") or {}, ensure_ascii=False, indent=2, default=str),
+                    height=120,
+                    key=f"mfr_semantic_{step_index}",
+                )
+                feature_text = st.text_area(
+                    "该步骤输出特征名（每行一个）",
+                    value="\n".join(map(str, step.get("feature_names") or [])),
+                    height=120,
+                    key=f"mfr_features_{step_index}",
+                )
+                try:
+                    step["params"] = json.loads(params_text or "{}")
+                    if not isinstance(step["params"], dict):
+                        raise ValueError("参数 JSON 必须是对象")
+                except Exception as exc:
+                    st.error(f"参数 JSON 无效：{exc}")
+                try:
+                    step["semantic_params"] = json.loads(semantic_text or "{}")
+                    if not isinstance(step["semantic_params"], dict):
+                        raise ValueError("语义参数 JSON 必须是对象")
+                except Exception as exc:
+                    st.error(f"语义参数 JSON 无效：{exc}")
+                step["feature_names"] = [
+                    line.strip() for line in feature_text.splitlines() if line.strip()
+                ]
+
+        merge_order_text = st.text_input(
+            "合并顺序（step_id 用逗号分隔）",
+            value=", ".join(map(str, edited_payload.get("merge_order") or step_ids)),
+            key="mfr_merge_order",
+        )
+        edited_payload["merge_order"] = [
+            value.strip() for value in merge_order_text.replace("，", ",").split(",") if value.strip()
+        ]
+        final_feature_text = st.text_area(
+            "最终特征顺序（每行一个；必须与模型实际分子特征列一致）",
+            value="\n".join(map(str, edited_payload.get("final_feature_names") or [])),
+            height=160,
+            key="mfr_final_features",
+        )
+        edited_payload["final_feature_names"] = [
+            line.strip() for line in final_feature_text.splitlines() if line.strip()
+        ]
+        if st.button("应用编辑到当前会话", key="mfr_apply_edit"):
+            try:
+                normalized = normalize_workflow_config(edited_payload)
+                st.session_state["molecular_feature_workflow_draft"] = normalized
+                st.session_state["screening_workflow_locked"] = False
+                st.success("编辑草稿已保存；请点击“重新校验草稿”确认。")
+            except Exception as exc:
+                st.error(f"保存编辑失败：{exc}")
+
+    draft_payload = st.session_state.get("molecular_feature_workflow_draft")
+    if isinstance(draft_payload, dict):
+        try:
+            draft_workflow = MolecularFeatureWorkflow.from_dict(draft_payload)
+            draft_report = validate_workflow_config(
+                draft_workflow.to_dict(),
+                model_feature_cols=molecular_model_cols or None,
+                available_columns=available_columns or None,
+            )
+            st.markdown("### 3) 草稿校验与差异")
+            st.write({
+                "草稿 workflow hash": draft_workflow.workflow_hash,
+                "校验通过": bool(draft_report.get("ok")),
+                "缺失源列": draft_report.get("missing_columns") or [],
+                "缺失特征": draft_report.get("missing_features") or [],
+            })
+            diff = build_workflow_diff(workflow.to_dict(), draft_workflow.to_dict())
+            st.json(diff)
+            if st.button("采用草稿作为当前流程", key="mfr_accept_draft"):
+                st.session_state["molecular_feature_workflow"] = draft_workflow.to_dict()
+                st.session_state["molecular_feature_config"] = draft_workflow.to_legacy_config()
+                workflow_payload = draft_workflow.to_dict()
+                workflow = draft_workflow
+                validation_report = draft_report
+                st.session_state["screening_workflow_locked"] = False
+                st.success("草稿已成为当前 workflow。")
+        except Exception as exc:
+            st.error(f"草稿无法校验：{exc}")
+
+    st.markdown("### 4) 预览执行与锁定")
+    preview_cols = []
+    for step in workflow.steps:
+        preview_cols.extend(step.get("source_columns") or [])
+    preview_cols = list(dict.fromkeys(column for column in preview_cols if column in available_columns))
+    if isinstance(data_frame, pd.DataFrame) and preview_cols:
+        preview_count = st.slider("预览行数", 1, min(20, len(data_frame)), min(3, len(data_frame)), key="mfr_preview_count")
+        if st.button("执行少量样本预览", key="mfr_preview_run"):
+            preview_data = data_frame[preview_cols].head(int(preview_count)).copy()
+            preview_status = st.empty()
+            preview_status.info("正在按 workflow 执行预览…")
+            try:
+                preview_result = execute_molecular_feature_workflow(
+                    preview_data,
+                    workflow,
+                    device=None,
+                    mode="preview",
+                    progress_callback=lambda trace: preview_status.info(
+                        f"已完成 {trace.get('step_id')}：{trace.get('valid_count', 0)} / {trace.get('input_count', 0)} 行"
+                    ),
+                )
+                st.session_state["molecular_feature_preview"] = preview_result.features
+                st.success(
+                    f"预览完成：{len(preview_result.features)} 行 × {len(preview_result.features.columns)} 列；"
+                    f"workflow hash={preview_result.workflow_hash[:16]}…"
+                )
+                if preview_result.warnings:
+                    st.warning("；".join(preview_result.warnings))
+                st.dataframe(preview_result.features.head(10), width="stretch")
+                st.dataframe(pd.DataFrame(preview_result.step_trace), width="stretch", hide_index=True)
+            except Exception as exc:
+                preview_status.error(f"预览失败：{exc}")
+    else:
+        st.info("当前没有足够的原始数据源列，暂不执行预览；导入数据后可在此验证行对齐。")
+
+    lock_disabled = not can_lock_workflow(validation_report)
+    if lock_disabled:
+        st.info("校验通过且源列/特征顺序完整后，才能锁定 workflow。")
+    if st.button("🔒 锁定并用于虚拟筛选", type="primary", disabled=lock_disabled, key="mfr_lock_workflow"):
+        st.session_state["molecular_feature_workflow"] = workflow.to_dict()
+        st.session_state["molecular_feature_config"] = workflow.to_legacy_config()
+        st.session_state["screening_workflow_locked"] = True
+        st.session_state["screening_workflow_hash"] = workflow.workflow_hash
+        st.success("已锁定。虚拟筛选将严格执行该 workflow，不再回退到 MACCS/Morgan 或零值填充。")
+
+    st.download_button(
+        "⬇️ 下载当前 workflow JSON",
+        data=json.dumps(workflow.to_dict(), ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+        file_name="molecular_feature_workflow.json",
+        mime="application/json",
+        key="mfr_download_workflow",
+    )
 
 
 # ============================================================
@@ -9624,6 +11041,7 @@ def _render_binary_classification_results(
             imputer=res.get("imputer"),
             feature_cols=effective_feature_cols,
             target_col=target_col,
+            extra=_current_molecular_feature_artifact_extra(),
         )
         st.session_state.last_training_run_id = summary.run_id
         st.caption(f"已保存训练记录：{summary.run_id}")
@@ -10760,6 +12178,7 @@ def page_model_training():
                     st.session_state.feature_mask = res.get('feature_mask')  # [修复] 保存特征掩码
                     st.session_state.train_result = res
                     st.session_state.cv_result = cv_res
+                    st.session_state.imported_model_artifact = None
 
                     st.session_state.X_train = res['X_train']
                     st.session_state.X_test = res['X_test']
@@ -11123,13 +12542,26 @@ def page_model_training():
                             imputer=res.get('imputer'),
                             feature_cols=effective_feature_cols,
                             target_col=target_col,
+                            extra=_current_molecular_feature_artifact_extra(),
                         )
                         st.session_state.last_training_run_id = summary.run_id
                         st.caption(f"🗂️ 已保存训练记录: {summary.run_id}（可在【📈 训练记录】查看）")
 
                         # --- [新增] 训练完成后自动导出模型文件 + 分子特征提取流程 ---
+                        st.session_state.last_export_model_path = None
+                        st.session_state.last_export_feature_process_path = None
+                        st.session_state.last_export_model_bytes = None
+                        st.session_state.last_export_feature_process_bytes = None
+                        st.session_state.last_export_status = {
+                            "ok": False,
+                            "state": "in_progress",
+                            "run_id": summary.run_id if summary else None,
+                        }
                         try:
-                            from core.model_io import create_model_artifact_bytes
+                            from core.model_io import (
+                                create_model_artifact_bytes,
+                                workflow_to_artifact_extra,
+                            )
                             import datetime
 
                             # 组装 extra 信息：用于加载模型时提示需要哪些特征/分子特征流程
@@ -11140,7 +12572,15 @@ def page_model_training():
                                 'training_run_id': summary.run_id if summary else None,
                                 'compute_device_pref': st.session_state.get('compute_device', 'auto'),
                                 'molecular_feature_config': st.session_state.get('molecular_feature_config'),
+                                'molecular_feature_workflow': st.session_state.get('molecular_feature_workflow'),
+                                'molecular_feature_trace': st.session_state.get('molecular_feature_trace', []),
+                                'post_feature_mapping_default': st.session_state.get('post_feature_mapping_default'),
                             }
+                            _extra.update(
+                                workflow_to_artifact_extra(
+                                    st.session_state.get('molecular_feature_workflow')
+                                )
+                            )
                             # 如果有 FE tracker，也一并导出
                             _tracker = st.session_state.get('fe_tracker', None)
                             if _tracker is not None:
@@ -11193,7 +12633,15 @@ def page_model_training():
                                 'target_col': target_col,
                                 'required_features': effective_feature_cols,
                                 'molecular_feature_config': st.session_state.get('molecular_feature_config'),
+                                'molecular_feature_workflow': st.session_state.get('molecular_feature_workflow'),
+                                'molecular_feature_trace': st.session_state.get('molecular_feature_trace', []),
+                                'post_feature_mapping_default': st.session_state.get('post_feature_mapping_default'),
                             }
+                            process_payload.update(
+                                workflow_to_artifact_extra(
+                                    st.session_state.get('molecular_feature_workflow')
+                                )
+                            )
                             process_bytes = json.dumps(process_payload, ensure_ascii=False, indent=2).encode('utf-8')
                             export_proc_path = os.path.join(run_dir, 'feature_process.json')
                             with open(export_proc_path, 'wb') as f:
@@ -11206,6 +12654,13 @@ def page_model_training():
                             st.session_state._trained_model_artifact = model_bytes
                             st.session_state._trained_process_artifact = process_bytes
                             st.session_state._trained_model_name = os.path.basename(export_model_path)
+                            st.session_state.last_export_status = {
+                                "ok": True,
+                                "state": "completed",
+                                "run_id": summary.run_id if summary else None,
+                                "model_path": export_model_path,
+                                "feature_process_path": export_proc_path,
+                            }
 
                             with st.expander("📦 自动导出（训练完成后已生成文件）", expanded=False):
                                 st.caption(f"已保存至: {export_model_path}")
@@ -11226,8 +12681,16 @@ def page_model_training():
                                         mime='application/json',
                                         key="download_process_trained"
                                     )
-                        except Exception:
-                            pass
+                        except Exception as export_exc:
+                            export_message = f"自动导出失败：{export_exc}"
+                            st.session_state.last_export_status = {
+                                "ok": False,
+                                "state": "failed",
+                                "run_id": summary.run_id if summary else None,
+                                "error": str(export_exc),
+                            }
+                            st.error(export_message)
+                            print(f"Warning: {export_message}")
 
                     except Exception:
                         pass
@@ -11440,7 +12903,10 @@ def page_model_training():
                                 )
                     else:
                         try:
-                            from core.model_io import create_model_artifact_bytes
+                            from core.model_io import (
+                                create_model_artifact_bytes,
+                                workflow_to_artifact_extra,
+                            )
                             metrics = {}
                             tr = st.session_state.get("train_result") or {}
                             for k in ["r2", "rmse", "mae", "train_time", "split_strategy", "n_bins"]:
@@ -11456,7 +12922,15 @@ def page_model_training():
                                 "app_version": str(VERSION),
                                 "effective_feature_cols": effective_feature_cols,
                                 "molecular_feature_config": st.session_state.get("molecular_feature_config"),
+                                "molecular_feature_workflow": st.session_state.get("molecular_feature_workflow"),
+                                "molecular_feature_trace": st.session_state.get("molecular_feature_trace", []),
+                                "post_feature_mapping_default": st.session_state.get("post_feature_mapping_default"),
                             }
+                            extra_export.update(
+                                workflow_to_artifact_extra(
+                                    st.session_state.get("molecular_feature_workflow")
+                                )
+                            )
                             _processed_ref = st.session_state.get("processed_data")
                             if _processed_ref is None:
                                 _processed_ref = st.session_state.get("data")
@@ -11491,6 +12965,12 @@ def page_model_training():
                                 key="download_model_fallback"
                             )
                         except Exception as e:
+                            st.session_state.last_export_status = {
+                                "ok": False,
+                                "state": "failed",
+                                "error": str(e),
+                                "source": "manual_fallback",
+                            }
                             st.error(f"模型导出失败：{e}")
                         st.info("提示：若使用深度学习模型（TF/自定义网络），joblib 序列化可能失败。可改用【导出训练脚本】在目标环境复现训练。")
 
@@ -13310,6 +14790,8 @@ def page_prediction():
                 if st.session_state.get("_last_import_hash") == file_hash and get_current_model() is not None:
                     st.info("模型已加载（检测到相同文件），已跳过重复导入。")
                 else:
+                    _clear_molecular_feature_session_metadata()
+                    st.session_state["molecular_feature_config"] = None
                     with st.spinner("正在加载模型…（首次可能较慢）"):
                         from core.model_io import load_model_artifact_bytes
                         artifact = load_model_artifact_bytes(data_bytes)
@@ -13343,6 +14825,10 @@ def page_prediction():
                     st.session_state.imputer = artifact.get("imputer", None)
                     st.session_state.X_train_raw = artifact.get("X_train_raw")
                     st.session_state.X_test_raw = artifact.get("X_test_raw")
+                    _restore_molecular_feature_metadata(
+                        artifact,
+                        model_feature_cols=artifact.get("feature_cols"),
+                    )
                     if is_xgboost and model_obj:
                         st.session_state.model = model_obj
                         st.session_state.xgb_model_id = None
@@ -14314,6 +15800,8 @@ def page_virtual_screening():
                 if st.session_state.get("_last_import_hash") == file_hash and get_current_model() is not None:
                     st.info("模型已加载（检测到相同文件），已跳过重复导入。")
                 else:
+                    _clear_molecular_feature_session_metadata()
+                    st.session_state["molecular_feature_config"] = None
                     with st.spinner("正在加载模型…（首次可能较慢）"):
                         from core.model_io import load_model_artifact_bytes
                         artifact = load_model_artifact_bytes(data_bytes)
@@ -14342,6 +15830,10 @@ def page_virtual_screening():
 
                     st.session_state.scaler = artifact.get("scaler", None)
                     st.session_state.imputer = artifact.get("imputer", None)
+                    _restore_molecular_feature_metadata(
+                        artifact,
+                        model_feature_cols=artifact.get("feature_cols"),
+                    )
                     if is_xgboost and model_obj:
                         st.session_state.model = model_obj
                         st.session_state.xgb_model_id = None
@@ -14372,21 +15864,51 @@ def page_virtual_screening():
         return
 
     # --- 载入分子特征流程 ---
-    mf_cfg = st.session_state.get("molecular_feature_config")
-    if mf_cfg is None:
-        try:
-            artifact = st.session_state.get("imported_model_artifact") or {}
-            extra = artifact.get("extra") or {}
-            mf_cfg = extra.get("molecular_feature_config") or extra.get("feature_process")
-        except Exception:
-            mf_cfg = None
+    artifact = st.session_state.get("imported_model_artifact") or {}
+    screening_workflow = None
+    artifact_mf_cfg = None
+    if artifact:
+        screening_workflow, artifact_mf_cfg = _restore_molecular_feature_metadata(
+            artifact,
+            model_feature_cols=feature_cols,
+        )
+    else:
+        from core.virtual_screening import resolve_molecular_feature_workflow
+
+        screening_workflow = resolve_molecular_feature_workflow(
+            {
+                "molecular_feature_workflow": st.session_state.get(
+                    "molecular_feature_workflow"
+                ),
+                "molecular_feature_config": st.session_state.get(
+                    "molecular_feature_config"
+                ),
+            },
+            model_feature_cols=feature_cols,
+        )
+    if artifact:
+        mf_cfg = artifact_mf_cfg
+    else:
+        mf_cfg = st.session_state.get("molecular_feature_config")
 
     if mf_cfg is None:
         st.info("未检测到分子特征流程配置，可上传 feature_process.json 继续。")
         cfg_file = st.file_uploader("上传分子特征流程（feature_process.json）", type=["json"], key="vs_cfg")
         if cfg_file is not None:
             try:
-                mf_cfg = json.load(cfg_file)
+                _clear_molecular_feature_session_metadata()
+                st.session_state["molecular_feature_config"] = None
+                cfg_payload = json.load(cfg_file)
+                screening_workflow, mf_cfg = _restore_molecular_feature_metadata(
+                    cfg_payload,
+                    model_feature_cols=feature_cols,
+                )
+                if mf_cfg is None:
+                    raise ValueError(
+                        "文件中未找到有效的 molecular_feature_workflow "
+                        "或 molecular_feature_config.method"
+                    )
+                st.session_state.molecular_feature_config = mf_cfg
                 st.success("✅ 已加载分子特征流程配置")
             except Exception as e:
                 st.error(f"解析配置失败: {e}")
@@ -14396,8 +15918,15 @@ def page_virtual_screening():
         st.warning("⚠️ 缺少分子特征流程配置，无法从 SMILES 自动生成模型特征。")
         return
 
+    from core.molecular_feature_workflow import (
+        MolecularFeatureWorkflow,
+        execute_molecular_feature_workflow,
+        materialize_workflow_source_columns,
+        validate_workflow_config,
+    )
     from core.virtual_screening import (
         RDKIT_AVAILABLE as VS_RDKIT_AVAILABLE,
+        POST_FEATURE_COMPUTED_DEFINITIONS,
         add_candidate_equivalent_metrics,
         add_formulation_feasibility_scores,
         add_synthesizability_scores,
@@ -14424,10 +15953,55 @@ def page_virtual_screening():
         predict_with_model,
         rank_screening_candidates,
         resolve_component_smiles_cols,
+        resolve_molecular_feature_workflow,
+        resolve_workflow_source_columns_by_role,
         select_diverse_top_candidates,
         summarize_model_screening_profile,
         summarize_smiles_stats,
+        validate_molecular_feature_contract,
     )
+
+    if screening_workflow is None:
+        screening_workflow = resolve_molecular_feature_workflow(
+            {
+                "molecular_feature_workflow": st.session_state.get(
+                    "molecular_feature_workflow"
+                ),
+                "molecular_feature_config": mf_cfg,
+            },
+            model_feature_cols=feature_cols,
+        )
+    if screening_workflow is not None and not isinstance(
+        screening_workflow, MolecularFeatureWorkflow
+    ):
+        screening_workflow = MolecularFeatureWorkflow.from_dict(
+            screening_workflow
+        )
+    if screening_workflow is not None:
+        workflow_diagnostics = validate_workflow_config(
+            screening_workflow.to_dict(),
+            model_feature_cols=None,
+        )
+        if not workflow_diagnostics.get("ok", False):
+            details = []
+            if workflow_diagnostics.get("missing_steps"):
+                details.append(
+                    "缺少步骤: "
+                    + ", ".join(map(str, workflow_diagnostics["missing_steps"]))
+                )
+            if workflow_diagnostics.get("missing_columns"):
+                details.append(
+                    "缺少源列: "
+                    + ", ".join(map(str, workflow_diagnostics["missing_columns"][:8]))
+                )
+            if details:
+                st.error("❌ 分子特征 workflow 无法执行：" + "；".join(details))
+                return
+        if screening_workflow.legacy and screening_workflow.missing_items:
+            st.warning(
+                "当前模型使用旧版单步分子特征配置，已自动适配为 workflow；"
+                "若要完全复现多组分顺序，请在“分子特征复现”页锁定新版流程。"
+            )
 
     # 工业级过滤模块（二阶段智能过滤）
     from core.industrial_filter import (
@@ -14440,8 +16014,52 @@ def page_virtual_screening():
     )
     from core.structure_filter import pipeline_structure_filter
 
+    try:
+        feature_contract = validate_molecular_feature_contract(
+            feature_cols,
+            mf_cfg,
+        )
+    except ValueError as contract_error:
+        st.error(f"❌ 当前模型与分子特征流程不匹配：{contract_error}")
+        st.warning(
+            "筛选已停止。此前在特征流程不一致时产生的结果只能视为无效占位预测，"
+            "请导入与模型一起导出的 feature_process.json 后重新运行。"
+        )
+        return
+    contract_overlap = feature_contract.get("overlap") or []
+    if contract_overlap:
+        st.caption(
+            f"特征契约已锁定：模型与当前流程共同使用 {len(contract_overlap)} 个分子特征列，"
+            f"示例：{', '.join(contract_overlap[:5])}"
+        )
+
+    workflow_feature_names = []
+    if screening_workflow is not None:
+        workflow_feature_names = [
+            str(name)
+            for name in (screening_workflow.final_feature_names or [])
+            if str(name).strip()
+        ]
+    configured_molecular_feature_cols = list(workflow_feature_names)
+    if not configured_molecular_feature_cols:
+        configured_molecular_feature_cols = [
+            str(name)
+            for name in (mf_cfg.get("feature_names") or [])
+            if str(name).strip()
+        ]
+    post_feature_model_cols = [
+        str(column)
+        for column in feature_cols
+        if str(column) not in set(configured_molecular_feature_cols)
+    ]
+
+    workflow_resin_source_cols, workflow_hardener_source_cols = (
+        resolve_workflow_source_columns_by_role(screening_workflow, mf_cfg)
+    )
+
     hardener_required = bool(
-        mf_cfg.get("hardener_col")
+        workflow_hardener_source_cols
+        or mf_cfg.get("hardener_col")
         or mf_cfg.get("hardener_component_cols")
         or any(
             re.search(
@@ -14949,6 +16567,18 @@ def page_virtual_screening():
             "hardener",
             available_columns=available_design_columns,
         )
+        if workflow_resin_source_cols:
+            auto_resin_cols_global = [
+                column
+                for column in workflow_resin_source_cols
+                if not available_design_columns or column in available_design_columns
+            ]
+        if workflow_hardener_source_cols:
+            auto_hard_cols_global = [
+                column
+                for column in workflow_hardener_source_cols
+                if not available_design_columns or column in available_design_columns
+            ]
         resin_channel_available = bool(auto_resin_cols_global)
         hardener_channel_available = bool(auto_hard_cols_global or hardener_required)
         hardener_formula_enabled_default = hardener_channel_available
@@ -15738,6 +17368,18 @@ def page_virtual_screening():
         screening_mf_cfg["params"] = dict(mf_cfg.get("params") or {})
         if screening_uses_xtb:
             screening_mf_cfg["params"]["xtb_n_jobs"] = int(screening_xtb_n_jobs)
+            if screening_workflow is not None:
+                workflow_payload = screening_workflow.to_dict()
+                for workflow_step in workflow_payload.get("steps") or []:
+                    step_method = str(workflow_step.get("method") or "")
+                    if "xTB" not in step_method:
+                        continue
+                    step_params = dict(workflow_step.get("params") or {})
+                    step_params["xtb_n_jobs"] = int(screening_xtb_n_jobs)
+                    workflow_step["params"] = step_params
+                screening_workflow = MolecularFeatureWorkflow.from_dict(
+                    workflow_payload
+                )
 
         formula_molecule_first = st.checkbox(
             "超大空间时先做分子预筛",
@@ -15770,6 +17412,44 @@ def page_virtual_screening():
                 if observed_max is not None and float(observed_max) > float(train_high):
                     range_text += f" | 实测最大值: {float(observed_max):.4f}"
                 st.caption(range_text)
+
+        def _execute_screening_features(candidate_frame, *, mode="screening"):
+            if not isinstance(candidate_frame, pd.DataFrame):
+                return pd.DataFrame(), "候选配方不是 DataFrame"
+            if screening_workflow is None:
+                return pd.DataFrame(), "未解析到分子特征 workflow"
+            workflow_input = materialize_workflow_source_columns(
+                candidate_frame,
+                resin_columns=workflow_resin_source_cols,
+                hardener_columns=workflow_hardener_source_cols,
+            )
+
+            def _workflow_progress(trace):
+                step_id = trace.get("step_id", "step")
+                valid_count = trace.get("valid_count", 0)
+                output_count = len(trace.get("output_columns") or [])
+                if mode == "formula" and formula_status is not None:
+                    formula_status.info(
+                        f"分子特征步骤 {step_id} 完成：有效行 {valid_count:,}，"
+                        f"输出特征 {output_count:,}"
+                    )
+
+            try:
+                execution = execute_molecular_feature_workflow(
+                    workflow_input,
+                    screening_workflow,
+                    device=torch_device,
+                    mode=mode,
+                    progress_callback=_workflow_progress,
+                )
+            except Exception as exc:
+                return pd.DataFrame(), str(exc)
+            st.session_state["molecular_feature_trace"] = execution.step_trace
+            if execution.warnings:
+                st.session_state["molecular_feature_trace_warnings"] = list(
+                    execution.warnings
+                )
+            return execution.features, None
 
         st.markdown("### 5) 联合评分")
         formula_synth_min = st.slider(
@@ -16077,6 +17757,22 @@ def page_virtual_screening():
                 resin_col="resin_smiles",
                 hardener_col="hardener_smiles" if hardener_formula_enabled else None,
             )
+            formula_mapping, formula_mapping_report, _ = (
+                _prepare_post_feature_mapping_for_prediction(
+                    model_feature_cols=post_feature_model_cols,
+                    molecular_feature_cols=configured_molecular_feature_cols,
+                    candidate_df=pool_df,
+                    computed_definitions=POST_FEATURE_COMPUTED_DEFINITIONS,
+                    missing_input_tolerant=False,
+                    panel_key="formulation",
+                )
+            )
+            if not formula_mapping_report["ok"]:
+                st.error(
+                    "❌ 配方级预测已阻断：后处理特征映射未通过预测前校验。"
+                    + "；".join(formula_mapping_report.get("errors") or [])
+                )
+                return
             pool_df["_molecule_key"] = _make_formula_molecule_key(pool_df)
 
             base_row = None
@@ -16169,7 +17865,7 @@ def page_virtual_screening():
                     f"保留实测锚点 {int(expensive_limit_metadata.get('anchors_kept', 0)):,} 个。"
                 )
             saved_mol_feature_cols = [
-                c for c in (mf_cfg.get("feature_names") or [])
+                c for c in workflow_feature_names
                 if c in feature_cols
             ]
             reusable_feature_mask = pd.Series(False, index=unique_mol_df.index)
@@ -16197,18 +17893,28 @@ def page_virtual_screening():
                 feature_cache_key = _build_formula_feature_cache_key(
                     extract_mol_df["resin_smiles"].tolist(),
                     extract_hardener_inputs,
-                    screening_mf_cfg,
+                    {
+                        "workflow": screening_workflow.to_dict()
+                        if screening_workflow is not None
+                        else None,
+                        "legacy_config": screening_mf_cfg,
+                    },
                     torch_device,
                 )
                 cached_feature_df = formula_feature_cache.get(feature_cache_key)
-                if isinstance(cached_feature_df, pd.DataFrame) and len(cached_feature_df) == len(extract_mol_df):
+                if (
+                    isinstance(cached_feature_df, pd.DataFrame)
+                    and len(cached_feature_df) == len(extract_mol_df)
+                    and all(
+                        column in cached_feature_df.columns
+                        for column in workflow_feature_names
+                    )
+                ):
                     extracted_mol_features = cached_feature_df.copy()
                 else:
-                    extracted_mol_features, err = extract_features_from_config(
-                        resin_smiles=extract_mol_df["resin_smiles"].tolist(),
-                        hardener_smiles=extract_hardener_inputs,
-                        mf_cfg=screening_mf_cfg,
-                        device=torch_device,
+                    extracted_mol_features, err = _execute_screening_features(
+                        extract_mol_df,
+                        mode="formula",
                     )
                     if err:
                         st.error(f"❌ 分子特征提取失败: {err}")
@@ -16225,6 +17931,19 @@ def page_virtual_screening():
             combined_feature_cols = list(dict.fromkeys(
                 saved_mol_feature_cols + list(extracted_mol_features.columns)
             ))
+            try:
+                validate_molecular_feature_contract(
+                    feature_cols,
+                    screening_mf_cfg,
+                    extracted_feature_cols=combined_feature_cols,
+                )
+            except ValueError as contract_error:
+                st.error(f"❌ 实际提取结果与模型特征不匹配：{contract_error}")
+                st.warning(
+                    "筛选已停止，避免使用基线值或插补值伪造分子特征。"
+                    "请检查模型导出的特征流程、前缀及树脂/固化剂输入列。"
+                )
+                return
             unique_mol_features = pd.DataFrame(
                 np.nan,
                 index=unique_mol_df.index,
@@ -16292,9 +18011,29 @@ def page_virtual_screening():
                     mol_features=unique_mol_features,
                     base_row=base_row,
                     fill_missing_fp=True,
+                    strict=screening_workflow is not None,
+                    strict_feature_cols=saved_mol_feature_cols
+                    if screening_workflow is not None
+                    else None,
                 )
                 unique_X_prefilter = _downcast_screening_numeric(unique_X_prefilter)
-                unique_X_prefilter = apply_feature_overrides(unique_X_prefilter, unique_mol_df)
+                if formula_mapping is not None:
+                    mapped_unique_post = apply_mapping(
+                        unique_X_prefilter[post_feature_model_cols],
+                        unique_mol_df,
+                        formula_mapping,
+                        model_feature_cols=post_feature_model_cols,
+                    )
+                    unique_X_prefilter.loc[:, post_feature_model_cols] = mapped_unique_post
+                unique_X_prefilter = apply_feature_overrides(
+                    unique_X_prefilter,
+                    unique_mol_df,
+                    allowed_override_cols=[
+                        column
+                        for column in feature_cols
+                        if column not in set(post_feature_model_cols)
+                    ],
+                )
                 try:
                     pre_preds = predict_with_model(
                         model,
@@ -16351,14 +18090,38 @@ def page_virtual_screening():
                 mol_features=mol_features,
                 base_row=base_row,
                 fill_missing_fp=True,
+                strict=screening_workflow is not None,
+                strict_feature_cols=saved_mol_feature_cols
+                if screening_workflow is not None
+                else None,
             )
             X = _downcast_screening_numeric(X)
-            X = apply_feature_overrides(X, pool_df)
+            if formula_mapping is not None:
+                mapped_post = apply_mapping(
+                    X[post_feature_model_cols],
+                    pool_df,
+                    formula_mapping,
+                    model_feature_cols=post_feature_model_cols,
+                )
+                X.loc[:, post_feature_model_cols] = mapped_post
+            X = apply_feature_overrides(
+                X,
+                pool_df,
+                allowed_override_cols=[
+                    column
+                    for column in feature_cols
+                    if column not in set(post_feature_model_cols)
+                ],
+            )
             observed_row_mask = pool_df.get(
                 "candidate_origin",
                 pd.Series("", index=pool_df.index),
             ).astype(str).eq("train_observed_pair")
-            observed_feature_cols = [c for c in feature_cols if c in pool_df.columns]
+            observed_feature_cols = [
+                c
+                for c in feature_cols
+                if c in pool_df.columns and c not in set(post_feature_model_cols)
+            ]
             if observed_row_mask.any() and observed_feature_cols:
                 X.loc[observed_row_mask, observed_feature_cols] = (
                     pool_df.loc[observed_row_mask, observed_feature_cols]
@@ -16367,6 +18130,9 @@ def page_virtual_screening():
                 )
 
             try:
+                st.session_state["post_feature_mapping_snapshot"] = (
+                    _post_feature_mapping_snapshot_for_screening()
+                )
                 formula_progress.progress(78)
                 formula_status.info("正在进行模型预测与不确定度评估...")
                 preds, pred_std, uncertainty_source = predict_with_uncertainty_info(
@@ -17439,6 +19205,22 @@ def page_virtual_screening():
             resin_col="resin_smiles",
             hardener_col="hardener_smiles" if "hardener_smiles" in pool_df.columns else None,
         )
+        ordinary_mapping, ordinary_mapping_report, _ = (
+            _prepare_post_feature_mapping_for_prediction(
+                model_feature_cols=post_feature_model_cols,
+                molecular_feature_cols=configured_molecular_feature_cols,
+                candidate_df=pool_df,
+                computed_definitions=POST_FEATURE_COMPUTED_DEFINITIONS,
+                missing_input_tolerant=False,
+                panel_key="ordinary",
+            )
+        )
+        if not ordinary_mapping_report["ok"]:
+            st.error(
+                "❌ 普通筛选预测已阻断：后处理特征映射未通过预测前校验。"
+                + "；".join(ordinary_mapping_report.get("errors") or [])
+            )
+            return
 
         # 设备选择（用于 Transformer/ANI）
         torch_device = None
@@ -17457,12 +19239,33 @@ def page_virtual_screening():
         hardener_inputs = None
         if hardener_col and "hardener_smiles" in pool_df.columns:
             hardener_inputs = pool_df["hardener_smiles"].tolist()
-        mol_features, err = extract_features_from_config(
-            resin_smiles=pool_df["resin_smiles"].tolist(),
-            hardener_smiles=hardener_inputs,
-            mf_cfg=mf_cfg,
-            device=torch_device,
-        )
+        if screening_workflow is not None:
+            workflow_input = materialize_workflow_source_columns(
+                pool_df,
+                resin_columns=workflow_resin_source_cols,
+                hardener_columns=workflow_hardener_source_cols,
+            )
+            try:
+                workflow_result = execute_molecular_feature_workflow(
+                    workflow_input,
+                    screening_workflow,
+                    device=torch_device,
+                    mode="screening",
+                )
+                mol_features = workflow_result.features
+                st.session_state["molecular_feature_trace"] = (
+                    workflow_result.step_trace
+                )
+                err = None
+            except Exception as exc:
+                mol_features, err = pd.DataFrame(), str(exc)
+        else:
+            mol_features, err = extract_features_from_config(
+                resin_smiles=pool_df["resin_smiles"].tolist(),
+                hardener_smiles=hardener_inputs,
+                mf_cfg=mf_cfg,
+                device=torch_device,
+            )
         if err:
             st.error(f"❌ 分子特征提取失败: {err}")
             return
@@ -17510,10 +19313,35 @@ def page_virtual_screening():
             mol_features=mol_features,
             base_row=base_row,
             fill_missing_fp=True,
+            strict=screening_workflow is not None,
+            strict_feature_cols=[
+                column for column in workflow_feature_names if column in feature_cols
+            ]
+            if screening_workflow is not None
+            else None,
         )
-        X = apply_feature_overrides(X, pool_df)
+        if ordinary_mapping is not None:
+            mapped_post = apply_mapping(
+                X[post_feature_model_cols],
+                pool_df,
+                ordinary_mapping,
+                model_feature_cols=post_feature_model_cols,
+            )
+            X.loc[:, post_feature_model_cols] = mapped_post
+        X = apply_feature_overrides(
+            X,
+            pool_df,
+            allowed_override_cols=[
+                column
+                for column in feature_cols
+                if column not in set(post_feature_model_cols)
+            ],
+        )
 
         try:
+            st.session_state["post_feature_mapping_snapshot"] = (
+                _post_feature_mapping_snapshot_for_screening()
+            )
             preds = predict_with_model(model, X, pipeline=pipeline, imputer=imputer, scaler=scaler)
         except Exception as e:
             st.error(f"❌ 预测失败: {e}")
@@ -18162,6 +19990,7 @@ def page_hyperparameter_optimization():
                         st.session_state.train_result = result
                         st.session_state.cv_result = None
                         st.session_state.best_params = best_params
+                        st.session_state.imported_model_artifact = None
 
                         print(f"[DEBUG] ✓ Data saved successfully")
                     except Exception as save_e:
@@ -19202,6 +21031,8 @@ elif page == "✨ 数据增强":
     page_data_enhancement()
 elif page == "🧬 分子特征":
     page_molecular_features()
+elif page == "🧬 分子特征复现":
+    page_molecular_feature_reproduction()
 
 elif page == "🖼️ 图像转SMILES":
     page_image_to_smiles()

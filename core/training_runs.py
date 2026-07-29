@@ -76,6 +76,7 @@ class TrainingRunManager:
         imputer: Any = None,
         feature_cols: Optional[List[str]] = None,
         target_col: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> TrainingRunSummary:
         run_id, run_dir = self.create_run_dir(model_name)
 
@@ -152,6 +153,7 @@ class TrainingRunManager:
                         "f1": meta.get("f1"),
                         "roc_auc": meta.get("roc_auc"),
                     },
+                    extra=extra,
                 )
 
                 with open(os.path.join(run_dir, "model.pkl"), "wb") as f:

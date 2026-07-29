@@ -8,6 +8,7 @@ import os
 import itertools
 import inspect
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -25,6 +26,10 @@ except Exception:  # pragma: no cover - optional dependency
     RDKIT_AVAILABLE = False
 
 from .smiles_utils import normalize_chemical_string, parse_chemical_string
+from .molecular_feature_workflow import (
+    MolecularFeatureWorkflow,
+    materialize_workflow_source_columns,
+)
 
 
 DEFAULT_EPOXY_RULES = {
@@ -66,6 +71,34 @@ DEFAULT_EPOXY_RULES = {
 # (membership in two rings), so it misses ordinary oxirane rings entirely.
 EPOXIDE_SMARTS = "[O;r3]1[C;r3][C;r3]1"
 
+POST_FEATURE_COMPUTED_DEFINITIONS = {
+    "computed_resin_molecular_weight": {"category": "分子量", "unit": "g/mol", "definition": "RDKit MolWt(resin)"},
+    "computed_hardener_molecular_weight": {"category": "分子量", "unit": "g/mol", "definition": "RDKit MolWt(hardener)"},
+    "computed_resin_eew": {"category": "EEW", "unit": "g/eq", "definition": "resin molecular weight / epoxy functionality"},
+    "computed_hardener_ahew": {"category": "AHEW", "unit": "g/eq", "definition": "hardener molecular weight / active equivalent functionality"},
+    "computed_resin_functionality": {"category": "官能度", "unit": "eq/mol", "definition": "count of epoxy SMARTS matches"},
+    "computed_hardener_functionality": {"category": "官能度", "unit": "eq/mol", "definition": "count of supported active-hydrogen sites"},
+    "computed_theoretical_phr": {"category": "PHR", "unit": "phr", "definition": "100 * AHEW / EEW"},
+    "computed_actual_phr": {"category": "PHR", "unit": "phr", "definition": "manual/original ratio when valid, otherwise theoretical PHR"},
+    "computed_stoich_ratio": {"category": "配比", "unit": "ratio", "definition": "actual PHR / theoretical PHR"},
+    "computed_stoich_delta": {"category": "配比", "unit": "phr", "definition": "actual PHR - theoretical PHR"},
+    "computed_resin_eq_100": {"category": "配比", "unit": "eq", "definition": "100 / EEW"},
+    "computed_hardener_eq": {"category": "配比", "unit": "eq", "definition": "actual PHR / AHEW"},
+    "computed_equiv_ratio_h_to_r": {"category": "配比", "unit": "ratio", "definition": "hardener equivalents / resin equivalents"},
+    "computed_equiv_ratio_r_to_h": {"category": "配比", "unit": "ratio", "definition": "resin equivalents / hardener equivalents"},
+}
+
+POST_FEATURE_DISPLAY_ALIASES = {
+    "EEW", "AHEW", "Resin_Functionality", "Hardener_Functionality",
+    "Theoretical_PHR", "Actual_PHR", "Stoich_Ratio", "Stoich_Delta",
+    "Resin_Eq_100", "Hardener_Eq", "Equiv_Ratio_H_to_R",
+    "Equiv_Ratio_R_to_H", "PHR", "eew", "ahew", "resin_functionality",
+    "hardener_functionality", "theoretical_phr", "actual_phr", "stoich_ratio",
+    "stoichiometric_ratio", "stoichiometric_ratio_r", "stoichiometry_r",
+    "r_value", "resin_eq_100", "hardener_eq", "equiv_ratio_h_to_r",
+    "equiv_ratio_r_to_h",
+}
+
 
 @dataclass
 class CandidatePool:
@@ -103,6 +136,12 @@ def _dedupe_keep_order(items: Iterable[str]) -> List[str]:
     return out
 
 
+def _as_column_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    return [str(item) for item in (value or []) if str(item).strip()]
+
+
 def _smiles_lookup_key(value: Any) -> str:
     if value is None:
         return ""
@@ -118,13 +157,217 @@ def _is_fingerprint_bit_column(name: Any) -> bool:
     return bool(re.search(r"(?:^|_)(?:Resin|Hardener)_(?:MACCS|Morgan)_\d+$", text, flags=re.I))
 
 
+def resolve_molecular_feature_config(payload: Any) -> Optional[Dict[str, Any]]:
+    """Extract the actual molecular-feature config from an artifact or JSON payload."""
+    if not isinstance(payload, dict):
+        return None
+
+    if str(payload.get("method") or "").strip():
+        return payload
+
+    candidates: List[Any] = []
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        candidates.extend(
+            [
+                extra.get("molecular_feature_config"),
+                extra.get("feature_process"),
+            ]
+        )
+    candidates.extend(
+        [
+            payload.get("molecular_feature_config"),
+            payload.get("feature_process"),
+        ]
+    )
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        nested = candidate.get("molecular_feature_config")
+        if isinstance(nested, dict) and str(nested.get("method") or "").strip():
+            return nested
+        if str(candidate.get("method") or "").strip():
+            return candidate
+    return None
+
+
+def legacy_config_to_workflow(
+    payload: Any,
+    model_feature_cols: Optional[Sequence[Any]] = None,
+) -> MolecularFeatureWorkflow:
+    """Adapt a legacy single-step config without claiming batch completeness."""
+    config = dict(payload) if isinstance(payload, dict) else {}
+    feature_names = [
+        str(name)
+        for name in (config.get("feature_names") or model_feature_cols or [])
+        if str(name).strip()
+    ]
+    source_columns = []
+    for key in ("smiles_col", "resin_component_cols", "hardener_component_cols"):
+        value = config.get(key)
+        values = [value] if isinstance(value, str) else list(value or [])
+        for column in values:
+            if column and str(column) not in source_columns:
+                source_columns.append(str(column))
+
+    step = {
+        "step_id": "legacy_molecular_features",
+        "order": 0,
+        "role": config.get("primary_component_role") or "neutral",
+        "source_columns": source_columns
+        + [
+            str(config["hardener_col"])
+            for _ in [0]
+            if config.get("hardener_col")
+            and str(config["hardener_col"]) not in source_columns
+        ],
+        "method": config.get("method"),
+        "prefix": config.get("prefix") or "",
+        "params": dict(config.get("params") or {}),
+        "semantic_params": dict(config.get("semantic_params") or {}),
+        "feature_names": feature_names,
+        "valid_row_behavior": dict(config.get("valid_row_behavior") or {}),
+    }
+    missing_items = [
+        field_name
+        for field_name in ("batch_mode", "batch_smiles_cols", "workflow_steps")
+        if field_name not in config
+    ]
+    workflow_payload = {
+        "schema_version": 2,
+        "model_fingerprint": config.get("model_fingerprint"),
+        "mode": "single_batch",
+        "input_contract": {
+            "legacy_fields": config,
+            "resin_component_cols": (
+                [config["resin_component_cols"]]
+                if isinstance(config.get("resin_component_cols"), str)
+                else list(config.get("resin_component_cols") or [])
+            ),
+            "hardener_component_cols": (
+                [config["hardener_component_cols"]]
+                if isinstance(config.get("hardener_component_cols"), str)
+                else list(config.get("hardener_component_cols") or [])
+            ),
+            "hardener_col": config.get("hardener_col"),
+        },
+        "steps": [step],
+        "merge_order": [step["step_id"]],
+        "final_feature_names": feature_names,
+        "feature_source_map": {
+            name: step["step_id"] for name in feature_names
+        },
+        "derived_feature_steps": [],
+        "random_seeds": {},
+        "legacy": True,
+        "missing_items": missing_items,
+    }
+    return MolecularFeatureWorkflow.from_dict(workflow_payload)
+
+
+def resolve_molecular_feature_workflow(
+    payload: Any,
+    model_feature_cols: Optional[Sequence[Any]] = None,
+) -> Optional[MolecularFeatureWorkflow]:
+    """Resolve versioned workflow first, then adapt legacy config payloads."""
+    if not isinstance(payload, dict):
+        return None
+
+    extra = payload.get("extra")
+    extra = extra if isinstance(extra, dict) else {}
+    workflow_candidates = [
+        extra.get("molecular_feature_workflow"),
+        payload.get("molecular_feature_workflow"),
+    ]
+    for candidate in workflow_candidates:
+        if isinstance(candidate, MolecularFeatureWorkflow):
+            return candidate
+        if isinstance(candidate, dict):
+            return MolecularFeatureWorkflow.from_dict(candidate)
+
+    legacy_candidates = [
+        extra.get("molecular_feature_config"),
+        payload.get("molecular_feature_config"),
+        extra.get("feature_process"),
+        payload.get("feature_process"),
+    ]
+    for candidate in legacy_candidates:
+        if isinstance(candidate, dict):
+            nested = candidate.get("molecular_feature_config")
+            if isinstance(nested, dict):
+                candidate = nested
+            if str(candidate.get("method") or "").strip() or candidate.get("feature_names"):
+                return legacy_config_to_workflow(
+                    candidate,
+                    model_feature_cols=model_feature_cols or payload.get("feature_cols"),
+                )
+    return None
+
+
+def validate_molecular_feature_contract(
+    model_feature_cols: Sequence[Any],
+    mf_cfg: Optional[Dict[str, Any]],
+    extracted_feature_cols: Optional[Sequence[Any]] = None,
+) -> Dict[str, Any]:
+    """Validate that the saved molecular-feature workflow feeds the model columns."""
+    model_cols = [str(col).strip() for col in (model_feature_cols or []) if str(col).strip()]
+    config_cols = [
+        str(col).strip()
+        for col in ((mf_cfg or {}).get("feature_names") or [])
+        if str(col).strip()
+    ]
+    if not model_cols or not config_cols:
+        return {
+            "ok": True,
+            "model_feature_cols": model_cols,
+            "configured_feature_cols": config_cols,
+            "overlap": [],
+        }
+
+    config_by_key = {_normalize_feature_key(col): col for col in config_cols}
+    overlap = [col for col in model_cols if _normalize_feature_key(col) in config_by_key]
+    if not overlap:
+        method = str((mf_cfg or {}).get("method") or "未声明")
+        model_preview = ", ".join(model_cols[:8])
+        config_preview = ", ".join(config_cols[:8])
+        raise ValueError(
+            "特征契约不一致：模型需要的特征列与当前分子特征流程完全没有交集。"
+            f"模型列示例=[{model_preview}]；当前流程={method}，"
+            f"生成列示例=[{config_preview}]。"
+            "不能用基线值、插补值或零值替代另一种分子特征；请重新导入与模型配套的 feature_process.json。"
+        )
+
+    if extracted_feature_cols is not None:
+        extracted_cols = {
+            _normalize_feature_key(col)
+            for col in (extracted_feature_cols or [])
+            if str(col).strip()
+        }
+        missing = [col for col in overlap if _normalize_feature_key(col) not in extracted_cols]
+        if missing:
+            preview = ", ".join(missing[:8])
+            raise ValueError(
+                "特征契约不一致：分子特征流程声明了模型需要的列，但实际提取结果缺少 "
+                f"{len(missing)} 列 [{preview}]。"
+                "请检查特征方法、参数、前缀以及双组分输入列。"
+            )
+
+    return {
+        "ok": True,
+        "model_feature_cols": model_cols,
+        "configured_feature_cols": config_cols,
+        "overlap": overlap,
+    }
+
+
 def infer_primary_component_role(mf_cfg: Optional[Dict]) -> str:
     """Infer the chemistry role represented by the saved primary SMILES inputs."""
     cfg = mf_cfg or {}
     explicit_role = str(cfg.get("primary_component_role") or "").strip().lower()
     if explicit_role in {"resin", "hardener", "neutral"}:
         return explicit_role
-    names = list(cfg.get("resin_component_cols") or [])
+    names = _as_column_list(cfg.get("resin_component_cols"))
     if cfg.get("smiles_col"):
         names.append(cfg.get("smiles_col"))
     text = " ".join(str(name).lower() for name in names if name)
@@ -205,11 +448,19 @@ def resolve_component_smiles_cols(
         return (str(name).lower() if not match else str(name)[: match.start()].lower(), int(match.group(1)) if match else -1)
 
     if target_role == "resin":
-        configured = list(cfg.get("resin_component_cols") or [])
+        configured = _as_column_list(cfg.get("resin_component_cols"))
         selector = cfg.get("smiles_col")
     else:
-        configured = list(cfg.get("hardener_component_cols") or [])
+        configured = _as_column_list(cfg.get("hardener_component_cols"))
         selector = cfg.get("hardener_col")
+        if not configured:
+            configured = [
+                name
+                for name in _as_column_list(cfg.get("resin_component_cols"))
+                if _role_score(name, "hardener") > 0
+            ]
+            if not selector and _role_score(cfg.get("smiles_col"), "hardener") > 0:
+                selector = cfg.get("smiles_col")
 
     configured = _dedupe(configured)
     if selector:
@@ -247,6 +498,93 @@ def resolve_component_smiles_cols(
             and re.search(r"(smiles|bigsmiles|smile)", str(name), flags=re.I)
         ]
     return sorted(matches, key=_natural_key)
+
+
+def resolve_workflow_source_columns_by_role(
+    workflow: Any,
+    config: Optional[Dict[str, Any]],
+) -> Tuple[List[str], List[str]]:
+    """Resolve declared workflow source columns into resin and hardener roles.
+
+    Older artifacts used ``resin_component_cols`` as the primary model input
+    field even when those columns were curing-agent columns.  Classification
+    therefore uses both the saved step role and column-name evidence, instead
+    of trusting the legacy field name blindly.
+    """
+    resin_columns: List[str] = []
+    hardener_columns: List[str] = []
+    resin_tokens = ("resin", "epoxy", "树脂", "基体")
+    hardener_tokens = (
+        "hardener",
+        "curing",
+        "curer",
+        "curative",
+        "固化剂",
+        "交联剂",
+    )
+
+    def add_unique(target: List[str], values: Any) -> None:
+        for value in _as_column_list(values):
+            if value not in target:
+                target.append(value)
+
+    def role_score(column: Any) -> Tuple[int, int]:
+        text = str(column or "").lower()
+        return (
+            sum(text.count(token) for token in resin_tokens),
+            sum(text.count(token) for token in hardener_tokens),
+        )
+
+    def add_classified(values: Any, default_role: str) -> None:
+        for column in _as_column_list(values):
+            resin_score, hardener_score = role_score(column)
+            if hardener_score > resin_score and hardener_score > 0:
+                add_unique(hardener_columns, [column])
+            elif resin_score > hardener_score and resin_score > 0:
+                add_unique(resin_columns, [column])
+            elif default_role == "hardener":
+                add_unique(hardener_columns, [column])
+            else:
+                add_unique(resin_columns, [column])
+
+    if isinstance(workflow, Mapping):
+        workflow_steps = workflow.get("steps") or []
+        workflow_contract = workflow.get("input_contract") or {}
+    else:
+        workflow_steps = getattr(workflow, "steps", []) or []
+        workflow_contract = getattr(workflow, "input_contract", {}) or {}
+
+    for step in workflow_steps:
+        if not isinstance(step, Mapping):
+            continue
+        role = str(step.get("role") or "").lower()
+        default_role = (
+            "hardener"
+            if ("hardener" in role or "curing" in role)
+            else "resin"
+            if ("resin" in role or "epoxy" in role)
+            else "resin"
+        )
+        add_classified(step.get("source_columns"), default_role)
+
+    contract = dict(workflow_contract) if isinstance(workflow_contract, Mapping) else {}
+    add_classified(contract.get("resin_component_cols"), "resin")
+    add_classified(contract.get("hardener_component_cols"), "hardener")
+    add_classified(contract.get("hardener_col"), "hardener")
+
+    cfg = config or {}
+    add_classified(cfg.get("resin_component_cols"), "resin")
+    add_classified(cfg.get("hardener_component_cols"), "hardener")
+    add_classified(cfg.get("hardener_col"), "hardener")
+
+    if not resin_columns:
+        add_classified(
+            cfg.get("smiles_col"),
+            "hardener"
+            if str(cfg.get("primary_component_role") or "").lower() == "hardener"
+            else "resin",
+        )
+    return resin_columns, hardener_columns
 
 
 def _pick_matching_column(columns: Sequence[str], aliases: Sequence[str]) -> Optional[str]:
@@ -1428,6 +1766,9 @@ def extract_features_from_config(
             valid_indices,
             smiles_list_input,
             params,
+            preserve_duplicate_columns=bool(
+                params.get("preserve_duplicate_columns", False)
+            ),
         )
     except Exception as e:  # pragma: no cover - best effort
         return pd.DataFrame(), f"semantic feature extraction failed: {e}"
@@ -1465,9 +1806,16 @@ def build_feature_matrix(
     mol_features: pd.DataFrame,
     base_row: Optional[pd.Series] = None,
     fill_missing_fp: bool = True,
+    strict: bool = False,
+    strict_feature_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
+    required_cols = [str(column) for column in (feature_cols or [])]
+    strict_required_cols = [
+        str(column)
+        for column in (strict_feature_cols if strict_feature_cols is not None else required_cols)
+    ]
     n = len(mol_features) if mol_features is not None else 0
-    X = pd.DataFrame(np.nan, index=range(n), columns=feature_cols, dtype=float)
+    X = pd.DataFrame(np.nan, index=range(n), columns=required_cols, dtype=float)
     if base_row is not None:
         for c in base_row.index:
             if c in X.columns:
@@ -1476,10 +1824,43 @@ def build_feature_matrix(
         for c in mol_features.columns:
             if c in X.columns:
                 X[c] = mol_features[c].values
-    if fill_missing_fp:
+    if fill_missing_fp and not strict:
         fp_cols = [c for c in X.columns if ("maccs" in c.lower()) or ("morgan" in c.lower())]
         if fp_cols:
             X[fp_cols] = X[fp_cols].fillna(0)
+    if strict:
+        missing_columns = [
+            column
+            for column in strict_required_cols
+            if mol_features is None or column not in mol_features.columns
+        ]
+        if strict_feature_cols is None and base_row is not None:
+            missing_columns = [
+                column
+                for column in missing_columns
+                if column not in base_row.index
+            ]
+        if missing_columns:
+            preview = ", ".join(missing_columns[:12])
+            suffix = " ..." if len(missing_columns) > 12 else ""
+            raise ValueError(
+                f"strict feature matrix is missing {len(missing_columns)} required columns "
+                f"[{preview}{suffix}]"
+            )
+        invalid_value_columns = []
+        for column in strict_required_cols:
+            if mol_features is None or column not in mol_features.columns:
+                continue
+            values = pd.to_numeric(mol_features[column], errors="coerce")
+            if values.isna().any():
+                invalid_value_columns.append(column)
+        if invalid_value_columns:
+            preview = ", ".join(invalid_value_columns[:12])
+            suffix = " ..." if len(invalid_value_columns) > 12 else ""
+            raise ValueError(
+                f"strict feature matrix contains missing or non-numeric values in "
+                f"{len(invalid_value_columns)} extracted columns [{preview}{suffix}]"
+            )
     for col in X.columns:
         X[col] = pd.to_numeric(X[col], errors="coerce")
     return X.replace([np.inf, -np.inf], np.nan).astype(float)
@@ -1682,6 +2063,20 @@ def add_candidate_equivalent_metrics(
     )
 
     metric_columns = {
+        "computed_resin_molecular_weight": resin_mw_arr,
+        "computed_hardener_molecular_weight": hardener_mw_arr,
+        "computed_resin_eew": eew_arr,
+        "computed_hardener_ahew": ahew_arr,
+        "computed_resin_functionality": resin_func_arr,
+        "computed_hardener_functionality": hardener_func_arr,
+        "computed_theoretical_phr": theo_phr_arr,
+        "computed_actual_phr": actual_phr_arr,
+        "computed_stoich_ratio": stoich_ratio_arr,
+        "computed_stoich_delta": stoich_delta_arr,
+        "computed_resin_eq_100": resin_eq_arr,
+        "computed_hardener_eq": hardener_eq_arr,
+        "computed_equiv_ratio_h_to_r": equiv_h_to_r_arr,
+        "computed_equiv_ratio_r_to_h": equiv_r_to_h_arr,
         "EEW": eew_arr,
         "AHEW": ahew_arr,
         "Resin_Functionality": resin_func_arr,
@@ -2667,6 +3062,7 @@ def enumerate_formulation_candidates(
 
     resin_df = resin_df.dropna(subset=["smiles"]) if "smiles" in resin_df.columns else pd.DataFrame()
     hard_df = hard_df.dropna(subset=["smiles"]) if "smiles" in hard_df.columns else pd.DataFrame()
+    total_pairs = 0
 
     if resin_df.empty:
         return FormulaDesignSpace(candidate_df=pd.DataFrame(), metadata={"total_pairs": total_pairs, "grid_size": 0, "total_possible": 0, "paused": True})
@@ -2700,7 +3096,6 @@ def enumerate_formulation_candidates(
     hard_meta = hard_df.drop_duplicates("smiles").set_index("smiles") if use_hardener else None
     grid_keys, grid_values, grid_size = _compute_grid_spec(feature_grid)
     limit = max(1, int(max_formulations))
-    total_pairs = 0
     accumulated_count = 0
 
     all_batches = []
@@ -2778,6 +3173,7 @@ def apply_feature_overrides(
     candidate_df: pd.DataFrame,
     *,
     skip_cols: Optional[Sequence[str]] = None,
+    allowed_override_cols: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     if X is None or X.empty or candidate_df is None or candidate_df.empty:
         return X
@@ -2794,6 +3190,11 @@ def apply_feature_overrides(
         "hardener_availability_score",
         "availability_score",
     }
+    skip.update(POST_FEATURE_DISPLAY_ALIASES)
+    skip.update(POST_FEATURE_COMPUTED_DEFINITIONS)
+    if allowed_override_cols is not None:
+        allowed = {str(column) for column in allowed_override_cols}
+        skip.difference_update(allowed)
     if skip_cols:
         skip.update(str(c) for c in skip_cols if c is not None)
 

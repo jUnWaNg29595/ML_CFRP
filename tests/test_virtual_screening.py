@@ -2,6 +2,9 @@ import unittest
 
 import numpy as np
 import pandas as pd
+import pytest
+import core.virtual_screening as virtual_screening
+from core.training_runs import TrainingRunManager
 
 from core.molecular_features import (
     OptimizedRDKitFeatureExtractor,
@@ -26,8 +29,298 @@ from core.virtual_screening import (
     limit_unique_candidates_for_expensive_features,
     predict_with_model,
     resolve_component_smiles_cols,
+    resolve_molecular_feature_config,
+    resolve_molecular_feature_workflow,
+    resolve_workflow_source_columns_by_role,
+    legacy_config_to_workflow,
+    materialize_workflow_source_columns,
 )
+
+
+def test_exact_replay_rejects_missing_required_feature_without_fingerprint_fill():
+    with pytest.raises(ValueError, match="missing"):
+        build_feature_matrix(
+            ["resin_1_x", "hardener_1_x"],
+            pd.DataFrame({"resin_1_x": [1.0]}),
+            strict=True,
+        )
 from core.smiles_utils import parse_chemical_string
+
+
+def test_artifact_round_trip_preserves_workflow_hash_and_feature_order():
+    artifact = {
+        "feature_cols": ["resin_1_x", "hardener_1_x"],
+        "extra": {
+            "molecular_feature_workflow": {
+                "schema_version": 2,
+                "merge_order": ["resin_1", "hardener_1"],
+                "final_feature_names": ["resin_1_x", "hardener_1_x"],
+            }
+        },
+    }
+    workflow = resolve_molecular_feature_workflow(artifact)
+    assert workflow is not None
+    assert workflow.final_feature_names == ["resin_1_x", "hardener_1_x"]
+
+
+def test_workflow_only_payload_can_be_projected_to_legacy_extractor_config():
+    workflow = resolve_molecular_feature_workflow(
+        {
+            "molecular_feature_workflow": {
+                "schema_version": 2,
+                "mode": "single_batch",
+                "steps": [
+                    {
+                        "step_id": "single",
+                        "source_columns": ["resin_smiles"],
+                        "method": "xTB",
+                        "feature_names": ["resin_gap"],
+                    }
+                ],
+                "merge_order": ["single"],
+                "final_feature_names": ["resin_gap"],
+            }
+        }
+    )
+
+    assert workflow is not None
+    legacy = workflow.to_legacy_config()
+    assert legacy["method"] == "xTB"
+    assert legacy["smiles_col"] == "resin_smiles"
+    assert legacy["feature_names"] == ["resin_gap"]
+
+
+def test_legacy_single_config_is_marked_partial_when_batch_fields_are_absent():
+    workflow = legacy_config_to_workflow(
+        {"method": "xTB", "feature_names": ["resin_xtb_gap"]},
+        model_feature_cols=["resin_xtb_gap"],
+    )
+    assert workflow.legacy is True
+    assert workflow.missing_items
+
+
+def test_legacy_string_component_columns_remain_single_columns_and_keep_hardener_source():
+    workflow = legacy_config_to_workflow(
+        {
+            "method": "xTB",
+            "smiles_col": "resin_smiles",
+            "resin_component_cols": "resin_smiles",
+            "hardener_col": "hardener_smiles",
+            "hardener_component_cols": "hardener_smiles",
+            "feature_names": ["resin_gap"],
+        }
+    )
+
+    assert workflow.input_contract["resin_component_cols"] == ["resin_smiles"]
+    assert workflow.input_contract["hardener_component_cols"] == ["hardener_smiles"]
+    assert workflow.input_contract["hardener_col"] == "hardener_smiles"
+    assert workflow.steps[0]["source_columns"] == [
+        "resin_smiles",
+        "hardener_smiles",
+    ]
+
+
+def test_training_run_model_artifact_receives_molecular_feature_metadata(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_create_model_artifact_bytes(**kwargs):
+        captured.update(kwargs)
+        return b"artifact"
+
+    monkeypatch.setattr(
+        "core.model_io.create_model_artifact_bytes",
+        fake_create_model_artifact_bytes,
+    )
+
+    extra = {
+        "molecular_feature_workflow": {"schema_version": 2},
+        "molecular_feature_config": {"method": "xTB"},
+        "molecular_feature_trace": [{"step_id": "single"}],
+    }
+    manager = TrainingRunManager(base_dir=str(tmp_path))
+    summary = manager.save_run(
+        model_name="demo",
+        metadata={"r2": 0.5},
+        model=object(),
+        feature_cols=["resin_gap"],
+        target_col="target",
+        extra=extra,
+    )
+
+    assert captured["extra"] == extra
+    assert (tmp_path / summary.run_id / "model.pkl").read_bytes() == b"artifact"
+
+
+def test_app_metadata_restore_prefers_extra_and_clears_missing_fields():
+    import app
+
+    workflow_from_extra = {
+        "schema_version": 2,
+        "mode": "single_batch",
+        "steps": [
+            {
+                "step_id": "extra_step",
+                "source_columns": ["resin_smiles"],
+                "method": "xTB",
+                "feature_names": ["extra_gap"],
+            }
+        ],
+        "merge_order": ["extra_step"],
+        "final_feature_names": ["extra_gap"],
+    }
+    workflow_from_top_level = {
+        **workflow_from_extra,
+        "steps": [{**workflow_from_extra["steps"][0], "step_id": "top_step"}],
+        "merge_order": ["top_step"],
+        "final_feature_names": ["top_gap"],
+    }
+
+    app._restore_versioned_molecular_feature_metadata(
+        {
+            "molecular_feature_workflow": workflow_from_top_level,
+            "molecular_feature_trace": [{"step_id": "top"}],
+            "extra": {
+                "molecular_feature_workflow": workflow_from_extra,
+                "molecular_feature_trace": [{"step_id": "extra"}],
+            },
+        }
+    )
+    assert app.st.session_state["molecular_feature_workflow"] == workflow_from_extra
+    assert app.st.session_state["molecular_feature_trace"] == [{"step_id": "extra"}]
+
+    app._restore_versioned_molecular_feature_metadata(
+        {"extra": {"molecular_feature_config": {"method": "xTB"}}}
+    )
+    assert app.st.session_state["molecular_feature_workflow"] is None
+    assert app.st.session_state["molecular_feature_trace"] == []
+
+
+def test_app_workflow_only_restore_projects_legacy_config_into_session():
+    import app
+
+    workflow_payload = {
+        "schema_version": 2,
+        "mode": "single_batch",
+        "steps": [
+            {
+                "step_id": "single",
+                "source_columns": ["resin_smiles"],
+                "method": "xTB",
+                "prefix": "resin",
+                "feature_names": ["resin_gap"],
+            }
+        ],
+        "merge_order": ["single"],
+        "final_feature_names": ["resin_gap"],
+    }
+
+    workflow, config = app._restore_molecular_feature_metadata(
+        {"molecular_feature_workflow": workflow_payload},
+        model_feature_cols=["resin_gap"],
+    )
+
+    assert workflow is not None
+    assert config["method"] == "xTB"
+    assert config["smiles_col"] == "resin_smiles"
+    assert config["feature_names"] == ["resin_gap"]
+    assert app.st.session_state["molecular_feature_workflow"]["workflow_hash"]
+    assert app.st.session_state["molecular_feature_config"] == config
+
+
+def test_artifact_extra_contains_post_feature_mapping_default(monkeypatch):
+    import app
+
+    app.st.session_state["post_feature_mapping_default"] = {
+        "schema_version": 1,
+        "model_feature_cols": ["temperature"],
+        "rules": {
+            "temperature": {
+                "source_type": "candidate",
+                "source_column": "temperature",
+                "confirmed": True,
+            }
+        },
+        "mapping_hash": "mapping-hash",
+    }
+    extra = app._current_molecular_feature_artifact_extra()
+    assert extra["post_feature_mapping_default"]["mapping_hash"] == "mapping-hash"
+
+
+def test_restore_model_metadata_loads_mapping_as_unconfirmed_draft():
+    import app
+
+    app._restore_molecular_feature_metadata(
+        {
+            "extra": {
+                "post_feature_mapping_default": {
+                    "schema_version": 1,
+                    "model_feature_cols": ["EEW"],
+                    "rules": {
+                        "EEW": {
+                            "source_type": "computed",
+                            "source_column": "computed_resin_eew",
+                            "confirmed": True,
+                        }
+                    },
+                }
+            }
+        },
+        model_feature_cols=["EEW"],
+    )
+    assert app.st.session_state["post_feature_mapping_draft"]["rules"]["EEW"]["source_type"] == "computed"
+    assert app.st.session_state["post_feature_mapping_confirmation"] is False
+
+
+def test_post_feature_mapping_invalidation_keeps_molecular_metadata():
+    import app
+
+    app.st.session_state["molecular_feature_workflow"] = {"workflow": "keep"}
+    app.st.session_state["molecular_feature_trace"] = [{"step": "keep"}]
+    app.st.session_state["post_feature_mapping_draft"] = {
+        "model_feature_cols": ["temperature"],
+        "catalog_fingerprint": "catalog-a",
+    }
+    app.st.session_state["post_feature_mapping_model_fingerprint"] = "model-a"
+    app.st.session_state["post_feature_mapping_catalog_fingerprint"] = "catalog-a"
+    app.st.session_state["post_feature_mapping_confirmation"] = True
+
+    app._invalidate_post_feature_mapping_if_changed(
+        ["pressure"],
+        "catalog-b",
+    )
+
+    assert app.st.session_state["molecular_feature_workflow"] == {"workflow": "keep"}
+    assert app.st.session_state["molecular_feature_trace"] == [{"step": "keep"}]
+    assert app.st.session_state["post_feature_mapping_draft"]["invalid"] is True
+    assert app.st.session_state["post_feature_mapping_confirmation"] is False
+
+
+def test_app_v1_snapshot_restore_clears_new_workflow_metadata(monkeypatch):
+    import app
+
+    app.st.session_state["molecular_feature_workflow"] = {"stale": True}
+    app.st.session_state["molecular_feature_trace"] = [{"stale": True}]
+    monkeypatch.setattr(
+        app,
+        "_load_snapshot_meta",
+        lambda tag="latest": {
+            "version": 1,
+            "saved_at": "2026-07-29T00:00:00",
+            "df_keys": [],
+        },
+    )
+    monkeypatch.setattr(
+        app,
+        "_snapshot_paths",
+        lambda tag="latest": ("unused.json", {}),
+    )
+
+    restored, reason = app._restore_session_snapshot(override=True)
+
+    assert restored is True
+    assert reason == "ok"
+    assert app.st.session_state["molecular_feature_workflow"] is None
+    assert app.st.session_state["molecular_feature_trace"] == []
 
 
 class VirtualScreeningRuleTests(unittest.TestCase):
@@ -66,6 +359,60 @@ class VirtualScreeningRuleTests(unittest.TestCase):
 
 
 class VirtualScreeningFeatureContractTests(unittest.TestCase):
+    def test_incompatible_molecular_feature_config_is_rejected(self):
+        validator = getattr(virtual_screening, "validate_molecular_feature_contract", None)
+        self.assertIsNotNone(validator)
+        with self.assertRaisesRegex(ValueError, "特征契约不一致"):
+            validator(
+                ["xtb_gap", "xtb_homo"],
+                {
+                    "method": "分子指纹",
+                    "feature_names": ["Resin_MACCS_1", "Resin_MACCS_2"],
+                },
+                extracted_feature_cols=["Resin_MACCS_1", "Resin_MACCS_2"],
+            )
+
+    def test_matching_molecular_feature_config_is_accepted(self):
+        result = virtual_screening.validate_molecular_feature_contract(
+            ["temperature", "xtb_gap", "xtb_homo"],
+            {
+                "method": "xTB",
+                "feature_names": ["xtb_gap", "xtb_homo", "xtb_lumo"],
+            },
+            extracted_feature_cols=["xtb_gap", "xtb_homo", "xtb_lumo"],
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["overlap"], ["xtb_gap", "xtb_homo"])
+
+    def test_imported_artifact_config_overrides_stale_session_method(self):
+        config = resolve_molecular_feature_config(
+            {
+                "extra": {
+                    "molecular_feature_config": {
+                        "method": "xTB",
+                        "params": {"xtb_method": "gfn2"},
+                    }
+                }
+            }
+        )
+
+        self.assertIsNotNone(config)
+        self.assertEqual(config["method"], "xTB")
+
+    def test_feature_process_wrapper_is_unwrapped(self):
+        config = resolve_molecular_feature_config(
+            {
+                "molecular_feature_config": {
+                    "method": "xTB",
+                    "feature_names": ["xtb_gap"],
+                }
+            }
+        )
+
+        self.assertEqual(config["method"], "xTB")
+        self.assertEqual(config["feature_names"], ["xtb_gap"])
+
     def test_bigsmiles_is_converted_before_rdkit_screening(self):
         molecule = parse_chemical_string("{[<]CCO[>]}")
         self.assertIsNotNone(molecule)
@@ -304,6 +651,88 @@ class VirtualScreeningRoleTests(unittest.TestCase):
             resolve_component_smiles_cols(cfg, "hardener"),
             ["curing_agent_smiles_1"],
         )
+
+    def test_legacy_resin_field_with_curing_columns_is_split_by_chemical_role(self):
+        resin_columns, hardener_columns = resolve_workflow_source_columns_by_role(
+            None,
+            {
+                "smiles_col": "resin_smiles",
+                "resin_component_cols": [
+                    "curing_agent_smiles_1",
+                    "curing_agent_smiles_2",
+                ],
+            },
+        )
+
+        self.assertEqual(resin_columns, ["resin_smiles"])
+        self.assertEqual(
+            hardener_columns,
+            ["curing_agent_smiles_1", "curing_agent_smiles_2"],
+        )
+
+    def test_workflow_source_roles_merge_explicit_steps_without_cross_contamination(self):
+        resin_columns, hardener_columns = resolve_workflow_source_columns_by_role(
+            {
+                "steps": [
+                    {
+                        "role": "resin",
+                        "source_columns": ["resin_smiles_1"],
+                    },
+                    {
+                        "role": "hardener",
+                        "source_columns": ["curing_agent_smiles_1"],
+                    },
+                ],
+                "input_contract": {
+                    "resin_component_cols": [
+                        "resin_smiles_1",
+                        "curing_agent_smiles_1",
+                    ],
+                },
+            },
+            {},
+        )
+
+        self.assertEqual(resin_columns, ["resin_smiles_1"])
+        self.assertEqual(hardener_columns, ["curing_agent_smiles_1"])
+
+    def test_materialize_uses_top_level_component_parser_for_bigsmiles(self):
+        candidates = pd.DataFrame(
+            {
+                "resin_smiles": ["CC.O", "{[<]CCO[>]}.CC"],
+                "hardener_smiles": ["NCCN.CN", "{[<]CCO[>]}"],
+            }
+        )
+
+        materialized = materialize_workflow_source_columns(
+            candidates,
+            resin_columns=["resin_smiles_1", "resin_smiles_2"],
+            hardener_columns=[
+                "curing_agent_smiles_1",
+                "curing_agent_smiles_2",
+            ],
+        )
+
+        self.assertEqual(
+            materialized["resin_smiles_1"].tolist(),
+            ["CC", "{[<]CCO[>]}"],
+        )
+        self.assertEqual(materialized["resin_smiles_2"].tolist(), ["O", "CC"])
+        self.assertEqual(
+            materialized["curing_agent_smiles_1"].tolist(),
+            ["NCCN", "{[<]CCO[>]}"],
+        )
+        self.assertEqual(
+            materialized["curing_agent_smiles_2"].tolist(),
+            ["CN", None],
+        )
+
+        existing = candidates.assign(resin_smiles_1=["existing", None])
+        preserved = materialize_workflow_source_columns(
+            existing,
+            resin_columns=["resin_smiles_1", "resin_smiles_2"],
+        )
+        self.assertEqual(preserved["resin_smiles_1"].tolist(), ["existing", None])
 
 
 class VirtualScreeningSamplingTests(unittest.TestCase):
