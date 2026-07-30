@@ -83,6 +83,12 @@ try:
 except Exception:
     MissingValueHandler = None
 
+try:
+    from .process_pls import PROCESS_PLS_SCHEMA_VERSION, ProcessPLSTransformer
+except Exception:
+    PROCESS_PLS_SCHEMA_VERSION = 1
+    ProcessPLSTransformer = None
+
 
 # [新增] Epoxy PINN (Physics-Informed) 模型
 try:
@@ -750,6 +756,44 @@ def _sanitize_feature_frame(df_in: pd.DataFrame, model_name_in: str) -> pd.DataF
         if bool(too_large.any().any()):
             df_out[num_cols] = df_out[num_cols].where(~too_large, np.nan)
     return df_out
+
+
+def _validate_process_pls_config(config, feature_columns) -> None:
+    if not isinstance(config, dict):
+        raise ValueError("已启用工艺 PLS，但没有有效的工艺 PLS 配置")
+    if config.get("schema_version") != PROCESS_PLS_SCHEMA_VERSION:
+        raise ValueError("工艺 PLS 工作流版本不匹配，请回到特征选择页面重新锁定")
+    process_feature_cols = list(config.get("process_feature_cols") or [])
+    if not process_feature_cols:
+        raise ValueError("已启用工艺 PLS，但工作流没有工艺特征列")
+    if not set(process_feature_cols).issubset(set(feature_columns or [])):
+        raise ValueError("工艺 PLS 所需原始列不完整，请检查特征选择和数据列映射")
+
+
+def _config_to_process_pls_kwargs(config) -> dict:
+    return {
+        "process_feature_cols": list(config.get("process_feature_cols") or []),
+        "max_components": int(config.get("max_components", 8) or 8),
+        "vip_top_k": int(config.get("vip_top_k", 8) or 8),
+        "missing_threshold": float(config.get("missing_threshold", 0.85) or 0.85),
+        "random_state": int(config.get("random_state", 42) or 42),
+        "cv_splits": int(config.get("cv_splits", 5) or 5),
+    }
+
+
+def _make_process_pls_step(process_pls_config, enabled, feature_columns=None):
+    if not enabled:
+        return None
+    if ProcessPLSTransformer is None:
+        raise ValueError("工艺 PLS 模块不可用，请检查 core/process_pls.py")
+    if feature_columns is not None:
+        _validate_process_pls_config(process_pls_config, feature_columns)
+    elif not isinstance(process_pls_config, dict):
+        raise ValueError("已启用工艺 PLS，但没有有效的工艺 PLS 配置")
+    return (
+        "process_pls",
+        ProcessPLSTransformer(**_config_to_process_pls_kwargs(process_pls_config)),
+    )
 
 
 def _filter_fit_kwargs_by_signature(model, fit_kwargs: dict) -> dict:
@@ -2764,6 +2808,8 @@ class EnhancedModelTrainer:
         target_balance_enabled=True,
         balance_n_bins=10,
         balance_max_weight=3.0,
+        process_pls_config=None,
+        use_process_pls=False,
         **params,
     ):
         if isinstance(X, pd.DataFrame):
@@ -2820,8 +2866,27 @@ class EnhancedModelTrainer:
         else:
             fit_idx = np.arange(len(y_train), dtype=int)
             early_idx = np.asarray([], dtype=int)
-        X_fit_raw = X_train_raw.iloc[fit_idx].reset_index(drop=True)
-        X_early_valid_raw = X_train_raw.iloc[early_idx].reset_index(drop=True)
+
+        if use_process_pls and model_name in RAW_FRAME_MODELS_WITH_SMILES:
+            raise ValueError("工艺 PLS 暂不支持含 SMILES 的原始帧融合模型，请先关闭工艺 PLS")
+
+        process_pls_step = _make_process_pls_step(
+            process_pls_config,
+            use_process_pls,
+            X_df.columns.tolist(),
+        )
+        pipeline_steps = []
+        X_train_model_frame = X_train_raw
+        X_test_model_frame = X_test_raw
+        if process_pls_step is not None:
+            process_pls = process_pls_step[1]
+            process_pls.fit(X_train_raw, y_train)
+            X_train_model_frame = process_pls.transform(X_train_raw)
+            X_test_model_frame = process_pls.transform(X_test_raw)
+            pipeline_steps.append(process_pls_step)
+
+        X_fit_raw = X_train_model_frame.iloc[fit_idx].reset_index(drop=True)
+        X_early_valid_raw = X_train_model_frame.iloc[early_idx].reset_index(drop=True)
         y_fit = y_train[fit_idx]
         y_early_valid = y_train[early_idx]
         balance_info = _build_target_balance_info(
@@ -2857,7 +2922,7 @@ class EnhancedModelTrainer:
         model.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
         train_time = time.time() - start_time
 
-        pipeline = Pipeline(steps=[("model", model)])
+        pipeline = Pipeline(steps=pipeline_steps + [("model", model)])
         y_pred_test = np.asarray(pipeline.predict(X_test_raw)).ravel()
         y_pred_train = np.asarray(pipeline.predict(X_train_raw)).ravel()
 
@@ -2875,12 +2940,12 @@ class EnhancedModelTrainer:
 
         r2_val, rmse_val, mae_val = _safe_metrics(y_test, y_pred_test)
 
-        X_train_view = X_train_raw
-        X_test_view = X_test_raw
+        X_train_view = X_train_model_frame
+        X_test_view = X_test_model_frame
         if hasattr(model, "_transform"):
             try:
-                X_train_arr, _ = model._transform(X_train_raw)
-                X_test_arr, _ = model._transform(X_test_raw)
+                X_train_arr, _ = model._transform(X_train_model_frame)
+                X_test_arr, _ = model._transform(X_test_model_frame)
                 columns = getattr(getattr(model, "_prep_", None), "feature_names", None)
                 if not columns:
                     columns = [f"feat_{i}" for i in range(X_train_arr.shape[1])]
@@ -2891,10 +2956,10 @@ class EnhancedModelTrainer:
                 X_test_view = X_test_raw
         elif hasattr(model, "_prepare_features_and_mask"):
             try:
-                X_train_arr, _ = model._prepare_features_and_mask(X_train_raw, fit=False)
-                X_test_arr, _ = model._prepare_features_and_mask(X_test_raw, fit=False)
-                if isinstance(X_train_raw, pd.DataFrame):
-                    columns = list(X_train_raw.columns)
+                X_train_arr, _ = model._prepare_features_and_mask(X_train_model_frame, fit=False)
+                X_test_arr, _ = model._prepare_features_and_mask(X_test_model_frame, fit=False)
+                if isinstance(X_train_model_frame, pd.DataFrame):
+                    columns = list(X_train_model_frame.columns)
                 else:
                     columns = [f"feat_{i}" for i in range(X_train_arr.shape[1])]
                 X_train_view = pd.DataFrame(X_train_arr, columns=columns)
@@ -2904,8 +2969,8 @@ class EnhancedModelTrainer:
                 X_test_view = X_test_raw
         elif hasattr(model, "transform_tabular"):
             try:
-                X_train_arr = model.transform_tabular(X_train_raw)
-                X_test_arr = model.transform_tabular(X_test_raw)
+                X_train_arr = model.transform_tabular(X_train_model_frame)
+                X_test_arr = model.transform_tabular(X_test_model_frame)
                 columns = list(getattr(model, "numeric_feature_names_", None) or [f"feat_{i}" for i in range(X_train_arr.shape[1])])
                 X_train_view = pd.DataFrame(X_train_arr, columns=columns)
                 X_test_view = pd.DataFrame(X_test_arr, columns=columns)
@@ -2942,6 +3007,7 @@ class EnhancedModelTrainer:
             "X_test": X_test_view,
             "X_train_raw": X_train_raw,
             "X_test_raw": X_test_raw,
+            "feature_names": list(X_train_model_frame.columns),
             "y_train": y_train,
             "y_test": y_test,
             "y_pred": y_pred_test,
@@ -3388,6 +3454,8 @@ class EnhancedModelTrainer:
         target_balance_enabled=True,
         balance_n_bins=10,
         balance_max_weight=3.0,
+        process_pls_config=None,
+        use_process_pls=False,
         **params
     ):
         """训练单个模型（支持随机/分层/分组划分）"""
@@ -3435,6 +3503,8 @@ class EnhancedModelTrainer:
                 target_balance_enabled=target_balance_enabled,
                 balance_n_bins=balance_n_bins,
                 balance_max_weight=balance_max_weight,
+                process_pls_config=process_pls_config,
+                use_process_pls=use_process_pls,
                 **params,
             )
 
@@ -3531,6 +3601,12 @@ class EnhancedModelTrainer:
                 X_arr = X_arr.astype(float)
             except (ValueError, TypeError) as e:
                 raise ValueError(f"特征数据包含非数值类型，无法训练。请检查特征选择是否包含了文本列（如 SMILES）。错误: {e}")
+        raw_feature_names = list(X_df.columns)
+        process_pls_step = _make_process_pls_step(
+            process_pls_config,
+            use_process_pls,
+            raw_feature_names,
+        )
 
         # 缺失值策略只作用于目标列：无效目标样本已在上方从本次训练视图中排除，
         # 原始 X 数据不因输入特征缺失而丢行。不能原生接收 NaN 的模型在后续使用插补。
@@ -3541,8 +3617,12 @@ class EnhancedModelTrainer:
             split_strategy=split_strategy, n_bins=n_bins, groups=groups
         )
 
-        X_train_raw = X_arr[train_idx]
-        X_test_raw = X_arr[test_idx]
+        if process_pls_step is not None:
+            X_train_raw = X_df.iloc[train_idx].reset_index(drop=True)
+            X_test_raw = X_df.iloc[test_idx].reset_index(drop=True)
+        else:
+            X_train_raw = X_arr[train_idx]
+            X_test_raw = X_arr[test_idx]
         y_train = y_arr[train_idx]
         y_test = y_arr[test_idx]
 
@@ -3665,8 +3745,17 @@ class EnhancedModelTrainer:
 
         y_scaler = StandardScaler() if normalize_target else None
 
-        X_train_proc = X_train_raw
-        X_test_proc = X_test_raw
+        if process_pls_step is not None:
+            process_pls = process_pls_step[1]
+            process_pls.fit(X_train_raw, y_train)
+            X_train_pls = process_pls.transform(X_train_raw)
+            X_test_pls = process_pls.transform(X_test_raw)
+            feature_names = process_pls.get_feature_names_out().tolist()
+            X_train_proc = X_train_pls.to_numpy(dtype=float, copy=False)
+            X_test_proc = X_test_pls.to_numpy(dtype=float, copy=False)
+        else:
+            X_train_proc = X_train_raw
+            X_test_proc = X_test_raw
 
         # [修复] 初始化特征掩码，用于跟踪哪些特征被保留
         # 这个掩码将被保存，以便在预测时应用相同的特征选择
@@ -4160,6 +4249,8 @@ class EnhancedModelTrainer:
 
         # 6) 组装 Pipeline（不再重新 fit，用于后续 predict 保持一致）
         steps = []
+        if process_pls_step is not None:
+            steps.append(process_pls_step)
         if imputer is not None:
             steps.append(('imputer', imputer))
         # 添加 inf 清理步骤（即使训练时已清理，预测时也需要）
@@ -4300,6 +4391,7 @@ class EnhancedModelTrainer:
         print(f"[DEBUG] Creating return DataFrames (skip_raw={skip_raw})...")
 
         cols = feature_names if (feature_names is not None and len(feature_names) == X_train_proc.shape[1]) else [f"feat_{i}" for i in range(X_train_proc.shape[1])]
+        raw_cols = raw_feature_names if process_pls_step is not None else cols
         print(f"[DEBUG] Using {len(cols)} column names")
 
         try:
@@ -4314,9 +4406,15 @@ class EnhancedModelTrainer:
                 X_test_raw_df = None
                 print(f"[DEBUG] ✓ Skipped raw DataFrames")
             else:
-                X_train_raw_df = pd.DataFrame(X_train_raw, columns=cols, copy=False)
+                if isinstance(X_train_raw, pd.DataFrame):
+                    X_train_raw_df = X_train_raw.copy()
+                else:
+                    X_train_raw_df = pd.DataFrame(X_train_raw, columns=raw_cols, copy=False)
                 print(f"[DEBUG] ✓ X_train_raw_df created: {X_train_raw_df.shape}")
-                X_test_raw_df = pd.DataFrame(X_test_raw, columns=cols, copy=False)
+                if isinstance(X_test_raw, pd.DataFrame):
+                    X_test_raw_df = X_test_raw.copy()
+                else:
+                    X_test_raw_df = pd.DataFrame(X_test_raw, columns=raw_cols, copy=False)
                 print(f"[DEBUG] ✓ X_test_raw_df created: {X_test_raw_df.shape}")
 
             X_train_result = X_train_df
@@ -4389,6 +4487,7 @@ class EnhancedModelTrainer:
                 'scaler': None,
                 'imputer': None,
                 'feature_mask': feature_mask,  # [修复] 保存特征掩码
+                'feature_names': list(cols),
                 'X_train': None,  # 不返回大数据
                 'X_test': None,
                 'X_train_raw': None,
@@ -4430,6 +4529,7 @@ class EnhancedModelTrainer:
                 'scaler': scaler,
             'imputer': imputer,
             'feature_mask': feature_mask,  # [修复] 保存特征掩码
+            'feature_names': list(cols),
             'X_train': X_train_result,
             'X_test': X_test_result,
             'X_train_raw': X_train_raw_result,
@@ -4854,6 +4954,8 @@ class EnhancedModelTrainer:
         target_balance_enabled=True,
         balance_n_bins=10,
         balance_max_weight=3.0,
+        process_pls_config=None,
+        use_process_pls=False,
         **params,
     ):
         if isinstance(X, pd.DataFrame):
@@ -4879,6 +4981,13 @@ class EnhancedModelTrainer:
             if not smiles_col:
                 raise ValueError("未检测到 SMILES 列，请在训练参数中指定 smiles_col")
             model_params["smiles_col"] = smiles_col
+        if use_process_pls and model_name in RAW_FRAME_MODELS_WITH_SMILES:
+            raise ValueError("工艺 PLS 暂不支持含 SMILES 的原始帧融合模型，请先关闭工艺 PLS")
+        _make_process_pls_step(
+            process_pls_config,
+            use_process_pls,
+            X_df.columns.tolist(),
+        )
 
         cv_strategy = (cv_strategy or "repeated_kfold").lower()
         n_splits = int(max(2, n_splits))
@@ -4919,6 +5028,17 @@ class EnhancedModelTrainer:
             if _should_pass_target_name(model_name) and "target_name" not in fold_params and hasattr(y, "name"):
                 fold_params["target_name"] = getattr(y, "name", None)
             base_model = self._get_model(model_name, random_state=int(random_state + fold_i), **fold_params)
+            X_train_fold = X_df.iloc[tr_idx].reset_index(drop=True)
+            X_valid_fold = X_df.iloc[va_idx].reset_index(drop=True)
+            if use_process_pls:
+                process_pls = _make_process_pls_step(
+                    process_pls_config,
+                    True,
+                    X_df.columns.tolist(),
+                )[1]
+                process_pls.fit(X_train_fold, y_arr[tr_idx])
+                X_train_fold = process_pls.transform(X_train_fold)
+                X_valid_fold = process_pls.transform(X_valid_fold)
             fold_balance = _build_target_balance_info(
                 y_arr[tr_idx],
                 enabled=target_balance_enabled,
@@ -4928,7 +5048,7 @@ class EnhancedModelTrainer:
             )
             fit_data = _prepare_balanced_fit_data(
                 base_model,
-                X_df.iloc[tr_idx].reset_index(drop=True),
+                X_train_fold,
                 y_arr[tr_idx],
                 fold_balance,
                 random_state=int(random_state + fold_i),
@@ -4937,7 +5057,7 @@ class EnhancedModelTrainer:
             if fit_data["sample_weight"] is not None:
                 fit_kwargs["sample_weight"] = fit_data["sample_weight"]
             base_model.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
-            pred = np.asarray(base_model.predict(X_df.iloc[va_idx].reset_index(drop=True))).ravel()
+            pred = np.asarray(base_model.predict(X_valid_fold)).ravel()
             fold_target_balance.append(
                 {
                     key: value
@@ -5011,6 +5131,8 @@ class EnhancedModelTrainer:
         target_balance_enabled=True,
         balance_n_bins=10,
         balance_max_weight=3.0,
+        process_pls_config=None,
+        use_process_pls=False,
         **params
     ):
         """交叉验证（输出每折分数 + OOF 预测）
@@ -5067,6 +5189,8 @@ class EnhancedModelTrainer:
                 target_balance_enabled=target_balance_enabled,
                 balance_n_bins=balance_n_bins,
                 balance_max_weight=balance_max_weight,
+                process_pls_config=process_pls_config,
+                use_process_pls=use_process_pls,
                 **params,
             )
 
@@ -5161,6 +5285,13 @@ class EnhancedModelTrainer:
             except (ValueError, TypeError) as e:
                 raise ValueError(f"特征数据包含非数值类型，无法训练。请检查特征选择是否包含了文本列（如 SMILES）。错误: {e}")
 
+        process_pls_enabled = bool(use_process_pls)
+        _make_process_pls_step(
+            process_pls_config,
+            process_pls_enabled,
+            feature_names,
+        )
+
         # 只排除目标列缺失的样本；输入特征缺失行保留到各折，
         # 由折内插补器或模型自身的缺失值能力处理。
 
@@ -5226,7 +5357,7 @@ class EnhancedModelTrainer:
         use_multi_gpu = False
         available_gpus = []
 
-        if model_name == "XGBoost" and XGBOOST_AVAILABLE:
+        if model_name == "XGBoost" and XGBOOST_AVAILABLE and not process_pls_enabled:
             try:
                 import torch
                 if torch.cuda.is_available() and torch.cuda.device_count() > 1:
@@ -5332,6 +5463,20 @@ class EnhancedModelTrainer:
             # 串行训练（原有逻辑）
             for fold_i, (tr_idx, va_idx) in enumerate(split_iter):
                 base_model = self._get_model(model_name, **model_params)
+                if process_pls_enabled:
+                    X_train_fold = X_df.iloc[tr_idx].reset_index(drop=True)
+                    X_valid_fold = X_df.iloc[va_idx].reset_index(drop=True)
+                    process_pls = _make_process_pls_step(
+                        process_pls_config,
+                        True,
+                        feature_names,
+                    )[1]
+                    process_pls.fit(X_train_fold, y_arr[tr_idx])
+                    X_train_fold = process_pls.transform(X_train_fold)
+                    X_valid_fold = process_pls.transform(X_valid_fold)
+                else:
+                    X_train_fold = X_arr[tr_idx]
+                    X_valid_fold = X_arr[va_idx]
                 fold_balance = _build_target_balance_info(
                     y_arr[tr_idx],
                     enabled=target_balance_enabled,
@@ -5343,7 +5488,7 @@ class EnhancedModelTrainer:
                 if model_name == "XGBoost" and XGBOOST_AVAILABLE:
                     # XGBoost early stopping requires an eval_set in CV folds.
                     fit_kwargs = {
-                        "eval_set": [(X_arr[va_idx], y_arr[va_idx])],
+                        "eval_set": [(X_valid_fold, y_arr[va_idx])],
                         "eval_metric": xgb_fit_params.get("eval_metric") or "rmse",
                     }
                     verbose_eval = xgb_fit_params.get("verbose_eval") or 0
@@ -5354,7 +5499,7 @@ class EnhancedModelTrainer:
 
                     fit_data = _prepare_balanced_fit_data(
                         base_model,
-                        X_arr[tr_idx],
+                        X_train_fold,
                         y_arr[tr_idx],
                         fold_balance,
                         random_state=int(random_state + fold_i),
@@ -5362,7 +5507,7 @@ class EnhancedModelTrainer:
                     if fit_data["sample_weight"] is not None:
                         fit_kwargs["sample_weight"] = fit_data["sample_weight"]
                     _safe_xgb_fit(base_model, fit_data["X"], fit_data["y"], fit_kwargs)
-                    pred = base_model.predict(X_arr[va_idx])
+                    pred = base_model.predict(X_valid_fold)
                 else:
                     pipe = Pipeline(steps=[
                         ('imputer', SimpleImputer(strategy='median')),
@@ -5374,7 +5519,7 @@ class EnhancedModelTrainer:
 
                     fit_data = _prepare_balanced_fit_data(
                         base_model,
-                        X_arr[tr_idx],
+                        X_train_fold,
                         y_arr[tr_idx],
                         fold_balance,
                         random_state=int(random_state + fold_i),
@@ -5383,7 +5528,7 @@ class EnhancedModelTrainer:
                     if fit_data["sample_weight"] is not None:
                         fit_kwargs["model__sample_weight"] = fit_data["sample_weight"]
                     pipe.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
-                    pred = pipe.predict(X_arr[va_idx])
+                    pred = pipe.predict(X_valid_fold)
 
                 fold_target_balance.append(
                     {

@@ -100,3 +100,105 @@ def test_process_candidate_inference_excludes_molecular_and_text_columns():
         target_col="target",
     )
     assert result == ["cure_temperature", "cure_time"]
+
+
+def test_process_pls_training_pipeline_fits_only_training_rows():
+    from core.model_trainer import EnhancedModelTrainer
+
+    X = pd.DataFrame({
+        "temperature": [1.0, 2.0, 3.0, 4.0, 1000.0, 1001.0],
+        "time": [10.0, 11.0, 12.0, 13.0, 999.0, 1000.0],
+    })
+    y = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    config = {
+        "schema_version": 1,
+        "enabled": True,
+        "process_feature_cols": ["temperature", "time"],
+        "max_components": 1,
+        "vip_top_k": 1,
+        "missing_threshold": 0.85,
+        "cv_splits": 2,
+        "random_state": 42,
+        "selection_mode": "auto_combined_score",
+    }
+
+    trainer = EnhancedModelTrainer()
+    result = trainer.train_model(
+        X,
+        y,
+        model_name="线性回归",
+        test_size=1 / 3,
+        random_state=42,
+        process_pls_config=config,
+        use_process_pls=True,
+    )
+    fitted = result["pipeline"].named_steps["process_pls"]
+    expected_median = float(X.iloc[result["train_indices"]]["temperature"].median())
+    assert fitted.imputer_.statistics_[0] == expected_median
+    assert expected_median != float(X["temperature"].median())
+    assert result["feature_names"]
+
+
+def test_process_pls_is_not_applied_when_disabled():
+    from core.model_trainer import EnhancedModelTrainer
+
+    X = pd.DataFrame({
+        "temperature": [1.0, 2.0, 3.0, 4.0],
+        "time": [10.0, 11.0, 12.0, 13.0],
+    })
+    y = pd.Series([1.0, 2.0, 3.0, 4.0])
+    result = EnhancedModelTrainer().train_model(
+        X,
+        y,
+        model_name="线性回归",
+        use_process_pls=False,
+    )
+    assert "process_pls" not in result["pipeline"].named_steps
+
+
+def test_process_pls_cross_validation_fits_each_outer_training_fold(monkeypatch):
+    import core.model_trainer as model_trainer
+    from core.model_trainer import EnhancedModelTrainer
+    from core.process_pls import ProcessPLSTransformer
+
+    fit_row_counts = []
+
+    class RecordingProcessPLS(ProcessPLSTransformer):
+        def fit(self, X, y):
+            fit_row_counts.append(len(X))
+            return super().fit(X, y)
+
+    monkeypatch.setattr(model_trainer, "ProcessPLSTransformer", RecordingProcessPLS)
+
+    X = pd.DataFrame({
+        "temperature": [1.0, 2.0, 3.0, 4.0, 1000.0, 1001.0, 1002.0, 1003.0],
+        "time": [10.0, 11.0, 12.0, 13.0, 999.0, 1000.0, 1001.0, 1002.0],
+    })
+    y = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+    config = {
+        "schema_version": 1,
+        "enabled": True,
+        "process_feature_cols": ["temperature", "time"],
+        "max_components": 1,
+        "vip_top_k": 1,
+        "missing_threshold": 0.85,
+        "cv_splits": 2,
+        "random_state": 42,
+        "selection_mode": "auto_combined_score",
+    }
+
+    result = EnhancedModelTrainer().cross_validate_model(
+        X,
+        y,
+        model_name="线性回归",
+        cv_strategy="repeated_kfold",
+        n_splits=4,
+        n_repeats=1,
+        random_state=42,
+        process_pls_config=config,
+        use_process_pls=True,
+    )
+
+    assert result["fold_r2"]
+    assert fit_row_counts
+    assert all(row_count < len(X) for row_count in fit_row_counts)

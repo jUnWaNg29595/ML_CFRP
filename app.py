@@ -12497,6 +12497,15 @@ def page_model_training():
                     print(f"[DEBUG APP] About to call trainer.train_model...")
                     import sys
                     sys.stdout.flush()
+                    process_pls_workflow = st.session_state.get("process_pls_workflow")
+                    use_process_pls_for_training = bool(
+                        isinstance(process_pls_workflow, dict)
+                        and process_pls_workflow.get("enabled")
+                        and st.session_state.get(
+                            "process_pls_use_in_training",
+                            st.session_state.get("process_pls_enabled_default", False),
+                        )
+                    )
 
                     try:
                         res = trainer.train_model(
@@ -12511,6 +12520,8 @@ def page_model_training():
                             target_balance_enabled=bool(target_balance_enabled),
                             balance_n_bins=int(balance_n_bins),
                             balance_max_weight=float(balance_max_weight),
+                            process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
+                            use_process_pls=use_process_pls_for_training,
                             **params
                         )
                     finally:
@@ -12586,6 +12597,8 @@ def page_model_training():
                             target_balance_enabled=bool(target_balance_enabled),
                             balance_n_bins=int(balance_n_bins),
                             balance_max_weight=float(balance_max_weight),
+                            process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
+                            use_process_pls=use_process_pls_for_training,
                             **params
                         )
 
@@ -20806,16 +20819,27 @@ def page_hyperparameter_optimization():
                                 X_train, X_test, y_train, y_test = train_test_split(
                                     X, y, test_size=0.2, random_state=42
                                 )
+                                process_pls_workflow = st.session_state.get("process_pls_workflow")
+                                use_process_pls_for_training = bool(
+                                    isinstance(process_pls_workflow, dict)
+                                    and process_pls_workflow.get("enabled")
+                                    and st.session_state.get(
+                                        "process_pls_use_in_training",
+                                        st.session_state.get("process_pls_enabled_default", False),
+                                    )
+                                )
 
                                 # 训练模型
                                 result = trainer.train_model(
                                     X_train, y_train,
                                     model_name=model_name,
+                                    process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
+                                    use_process_pls=use_process_pls_for_training,
                                     **best_params
                                 )
 
                                 # 预测
-                                model_obj = result['model']
+                                model_obj = result.get('pipeline') or result['model']
                                 y_pred_train = model_obj.predict(X_train)
                                 y_pred_test = model_obj.predict(X_test)
 
@@ -20891,9 +20915,20 @@ def page_hyperparameter_optimization():
                 task_mgr.start_task(opt_task_id)
                 
                 try:
+                    process_pls_workflow = st.session_state.get("process_pls_workflow")
+                    use_process_pls_for_training = bool(
+                        isinstance(process_pls_workflow, dict)
+                        and process_pls_workflow.get("enabled")
+                        and st.session_state.get(
+                            "process_pls_use_in_training",
+                            st.session_state.get("process_pls_enabled_default", False),
+                        )
+                    )
                     result = trainer.train_model(
                         X, y,
                         model_name=model_name,
+                        process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
+                        use_process_pls=use_process_pls_for_training,
                         **best_params
                     )
 
