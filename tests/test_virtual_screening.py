@@ -22,6 +22,7 @@ from core.virtual_screening import (
     build_feature_matrix,
     enumerate_formulation_candidates,
     extract_features_from_config,
+    filter_formulation_candidates_by_component_limits,
     filter_candidates_by_epoxy_rules,
     generate_candidate_pool,
     generate_virtual_component_library,
@@ -763,6 +764,44 @@ class VirtualScreeningRoleTests(unittest.TestCase):
 
 
 class VirtualScreeningSamplingTests(unittest.TestCase):
+    def test_single_resin_mode_rejects_precomposed_resin_smiles(self):
+        resin = build_component_library(
+            ["C1CO1.CCO", "COCC1CO1"],
+            role="resin",
+            source="test",
+        )
+        hardener = build_component_library(
+            ["NCCN"],
+            role="hardener",
+            source="test",
+        )
+
+        design = enumerate_formulation_candidates(
+            resin,
+            hardener,
+            max_pairs=10,
+            max_formulations=10,
+            max_resin_components=1,
+        )
+
+        assert design.candidate_df["resin_smiles"].tolist() == ["COCC1CO1"]
+
+    def test_component_limit_filter_removes_multicomponent_observed_rows(self):
+        candidates = pd.DataFrame(
+            {
+                "resin_smiles": ["C1CO1.CCO", "COCC1CO1"],
+                "hardener_smiles": ["NCCN", "NCCCN"],
+            }
+        )
+
+        filtered = filter_formulation_candidates_by_component_limits(
+            candidates,
+            max_resin_components=1,
+            max_hardener_components=1,
+        )
+
+        assert filtered["resin_smiles"].tolist() == ["COCC1CO1"]
+
     def test_observed_feature_override_does_not_erase_generated_rows(self):
         feature_matrix = pd.DataFrame({"feature_a": [1.0, 2.0]})
         candidates = pd.DataFrame({"feature_a": [9.0, float("nan")]})

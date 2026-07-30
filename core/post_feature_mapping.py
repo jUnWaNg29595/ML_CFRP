@@ -83,6 +83,15 @@ def sanitize_feature_columns(
     return columns
 
 
+def feature_values_or_empty(values: Any) -> Any:
+    """Return an empty sequence only for missing feature metadata.
+
+    NumPy arrays cannot be used in boolean expressions when they contain more
+    than one item, so callers must not use ``values or []`` for feature lists.
+    """
+    return [] if values is None else values
+
+
 def _safe_text(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -290,6 +299,18 @@ def create_mapping_draft(
         "workflow_fingerprint": workflow_fingerprint,
         "catalog_fingerprint": catalog_fingerprint(catalog),
     }
+
+
+def commit_mapping_form_draft(
+    current_mapping: dict[str, Any],
+    edited_mapping: dict[str, Any],
+    *,
+    submitted: bool,
+) -> dict[str, Any]:
+    """Persist form edits only after an explicit form submission."""
+    if not submitted:
+        return copy.deepcopy(current_mapping)
+    return copy.deepcopy(edited_mapping)
 
 
 def validate_mapping(

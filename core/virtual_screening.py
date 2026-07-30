@@ -126,6 +126,44 @@ def _clean_smiles_list(items: Iterable) -> List[str]:
     return out
 
 
+def count_smiles_components(value: Any) -> int:
+    """Count disconnected molecular components represented by a SMILES value."""
+    if value is None:
+        return 0
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "<na>", "na"}:
+        return 0
+    return sum(1 for part in text.split(".") if part.strip())
+
+
+def filter_formulation_candidates_by_component_limits(
+    candidate_df: Optional[pd.DataFrame],
+    *,
+    max_resin_components: int = 1,
+    max_hardener_components: int = 1,
+    resin_col: str = "resin_smiles",
+    hardener_col: str = "hardener_smiles",
+) -> pd.DataFrame:
+    """Keep only formulation rows within the configured component limits."""
+    if candidate_df is None:
+        return pd.DataFrame()
+    if candidate_df.empty:
+        return candidate_df.copy()
+
+    out = candidate_df.copy()
+    keep_mask = pd.Series(True, index=out.index)
+    limits = (
+        (resin_col, max(1, int(max_resin_components))),
+        (hardener_col, max(1, int(max_hardener_components))),
+    )
+    for column, limit in limits:
+        if column not in out.columns:
+            continue
+        component_counts = out[column].map(count_smiles_components)
+        keep_mask &= component_counts.le(limit)
+    return out.loc[keep_mask].reset_index(drop=True)
+
+
 def _dedupe_keep_order(items: Iterable[str]) -> List[str]:
     seen = set()
     out = []
@@ -3126,11 +3164,27 @@ def _generate_multicomponent_pool(
     dedupe: bool = True,
 ) -> List[str]:
     """从SMILES列表中随机采样最多max_components个组分的组合（复配），避免枚举全部组合。"""
-    if max_components <= 1:
-        return smiles_list
     items = _dedupe_keep_order(_clean_smiles_list(smiles_list)) if dedupe else list(smiles_list)
+    items = [
+        item
+        for item in items
+        if count_smiles_components(item) <= max(1, int(max_components))
+    ]
+    if max_components <= 1:
+        return items
     if not items:
         return []
+    item_component_counts = {
+        item: count_smiles_components(item)
+        for item in items
+    }
+
+    def _valid_combination(combo: Sequence[str]) -> bool:
+        return sum(
+            item_component_counts.get(item, count_smiles_components(item))
+            for item in combo
+        ) <= int(max_components)
+
     rng = np.random.default_rng(int(random_state))
     n_items = len(items)
     results = list(items)
@@ -3151,7 +3205,8 @@ def _generate_multicomponent_pool(
         from itertools import combinations
         for n in range(2, min(max_components, n_items) + 1):
             for combo in combinations(items, n):
-                results.append(".".join(combo))
+                if _valid_combination(combo):
+                    results.append(".".join(combo))
     else:
         sampled = set()
         max_attempts = min(remaining * 5, 100_000)
@@ -3160,7 +3215,7 @@ def _generate_multicomponent_pool(
             n = rng.integers(2, min(max_components, n_items) + 1)
             choices = rng.choice(items, size=n, replace=False)
             combo = tuple(sorted(choices))
-            if combo not in sampled:
+            if _valid_combination(combo) and combo not in sampled:
                 sampled.add(combo)
                 results.append(".".join(combo))
             attempts += 1
@@ -3201,17 +3256,15 @@ def enumerate_formulation_candidates(
     use_hardener = not hard_df.empty
 
     # 多组分扩展
-    resin_smiles_list = resin_df["smiles"].tolist()
-    if max_resin_components > 1:
-        resin_smiles_list = _generate_multicomponent_pool(
-            resin_smiles_list,
-            max_components=int(max_resin_components),
-            max_samples=int(max_pairs),
-            random_state=int(random_state),
-            dedupe=bool(comp_diversity),
-        )
+    resin_smiles_list = _generate_multicomponent_pool(
+        resin_df["smiles"].tolist(),
+        max_components=int(max_resin_components),
+        max_samples=int(max_pairs),
+        random_state=int(random_state),
+        dedupe=bool(comp_diversity),
+    )
     hardener_smiles_list = hard_df["smiles"].tolist() if use_hardener else None
-    if use_hardener and max_hardener_components > 1 and hardener_smiles_list:
+    if use_hardener and hardener_smiles_list:
         hardener_smiles_list = _generate_multicomponent_pool(
             hardener_smiles_list,
             max_components=int(max_hardener_components),

@@ -3,7 +3,7 @@
 
 二阶段策略：
   阶段1 = 类别感知宽松过滤（保留20-30%）
-  阶段2 = 训练数据相似度评分排序（保留Top N）
+  阶段2 = 训练数据相似度评分排序（可选保留Top N）
 
 类别自动识别：胺/酸酐/酚/硫醇/咪唑 五类 + 未知
 """
@@ -624,20 +624,20 @@ def pipeline_industrial_filter(
     smiles_list: List[str],
     known_set: Set[str],
     stage1_max_mp: float = 130.0,
-    stage2_top_n: int = 2000,
+    stage2_top_n: Optional[int] = None,
     workers: int = 128,
     label: str = "分子",
 ) -> Tuple[List[str], Dict[str, int], pd.DataFrame]:
     """二阶段工业级过滤Pipeline。
 
     阶段1: 类别感知宽松过滤（保留20-30%）
-    阶段2: 训练数据相似度评分排序（保留Top N）
+    阶段2: 训练数据相似度评分排序；仅在显式传入 `stage2_top_n` 时截断
 
     Args:
         smiles_list: 待过滤的SMILES列表
         known_set: 已知固化剂SMILES集合（从训练数据提取）
         stage1_max_mp: 最大熔点阈值
-        stage2_top_n: 阶段2保留的Top N数量
+        stage2_top_n: 阶段2保留的Top N数量；`None` 或非正数表示不截断
         workers: 并行线程数
         label: 标签（仅用于日志）
 
@@ -664,7 +664,10 @@ def pipeline_industrial_filter(
         if not score_df.empty:
             score_df = score_df.sort_values("avg_similarity", ascending=False)
             score_df["rank"] = range(1, len(score_df) + 1)
-            top_n = min(stage2_top_n, len(score_df))
+            if stage2_top_n is None or int(stage2_top_n) <= 0:
+                top_n = len(score_df)
+            else:
+                top_n = min(int(stage2_top_n), len(score_df))
             top_smiles = set(score_df.head(top_n)["smiles"].tolist())
             final_passed = [s for s in stage1_passed if s in top_smiles]
             stats["stage2_kept"] = len(final_passed)

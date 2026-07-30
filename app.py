@@ -1056,11 +1056,17 @@ from core.data_explorer import EnhancedDataExplorer
 from core.model_trainer import EnhancedModelTrainer, AutoGluonWrapper, GRAPH_MODEL_NAMES, CLASSIFICATION_MODEL_NAMES  # 确保引入 Wrapper
 # 延迟导入 model_interpreter 以避免 SHAP 兼容性问题
 try:
-    from core.model_interpreter import ModelInterpreter, EnhancedModelInterpreter, compute_xgboost_native_shap
+    from core.model_interpreter import (
+        ModelInterpreter,
+        EnhancedModelInterpreter,
+        compute_xgboost_native_shap,
+        resolve_feature_names_for_matrix,
+    )
 except Exception as _shap_err:
     ModelInterpreter = None
     EnhancedModelInterpreter = None
     compute_xgboost_native_shap = None
+    resolve_feature_names_for_matrix = None
     import warnings
     warnings.warn(f'SHAP 模块导入失败，模型解释功能将受限: {_shap_err}')
 from core.molecular_features import AdvancedMolecularFeatureExtractor, RDKitFeatureExtractor
@@ -1076,7 +1082,9 @@ from core.post_feature_mapping import (
     build_post_feature_catalog,
     build_manual_mapping_choices,
     catalog_fingerprint,
+    commit_mapping_form_draft,
     create_mapping_draft,
+    feature_values_or_empty,
     mapping_snapshot,
     mapping_snapshot_restore_policy,
     normalize_mapping,
@@ -1236,7 +1244,7 @@ def _extract_pipeline_feature_mask(pipeline):
 
 
 def _apply_feature_mask_to_feature_cols(feature_cols, feature_mask):
-    cols = _deduplicate_feature_list(feature_cols or [])
+    cols = _deduplicate_feature_list(feature_values_or_empty(feature_cols))
     if not cols or feature_mask is None:
         return cols
 
@@ -1251,6 +1259,50 @@ def _apply_feature_mask_to_feature_cols(feature_cols, feature_mask):
     return [col for col, keep in zip(cols, mask) if bool(keep)]
 
 
+def _coerce_feature_mask(feature_mask):
+    if feature_mask is None:
+        return None
+    try:
+        return np.asarray(feature_mask, dtype=bool).ravel()
+    except Exception:
+        return None
+
+
+def _resolve_feature_mask(train_result=None, imported_artifact=None, pipeline=None):
+    train_result = train_result if isinstance(train_result, dict) else {}
+    artifact = imported_artifact if isinstance(imported_artifact, dict) else {}
+    artifact_extra = artifact.get("extra")
+    artifact_extra = artifact_extra if isinstance(artifact_extra, dict) else {}
+    candidates = (
+        train_result.get("feature_mask"),
+        artifact.get("feature_mask"),
+        artifact_extra.get("feature_mask"),
+        _extract_pipeline_feature_mask(pipeline),
+        _extract_pipeline_feature_mask(artifact.get("pipeline")),
+    )
+    for candidate in candidates:
+        normalized = _coerce_feature_mask(candidate)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _extract_artifact_final_feature_names(artifact_extra):
+    if not isinstance(artifact_extra, dict):
+        return []
+    workflow = artifact_extra.get("molecular_feature_workflow")
+    candidates = (
+        artifact_extra.get("effective_feature_cols"),
+        artifact_extra.get("final_feature_names"),
+        workflow.get("final_feature_names") if isinstance(workflow, dict) else None,
+    )
+    for candidate in candidates:
+        columns = _deduplicate_feature_list_normalized(feature_values_or_empty(candidate))
+        if columns:
+            return columns
+    return []
+
+
 def _resolve_effective_feature_cols(
     train_result=None,
     selected_feature_cols=None,
@@ -1259,8 +1311,18 @@ def _resolve_effective_feature_cols(
     imported_artifact=None,
 ):
     expected_n = _get_expected_model_feature_count(model=model, pipeline=pipeline)
-    selected_cols = _deduplicate_feature_list_normalized(selected_feature_cols or [])
+    selected_cols = _deduplicate_feature_list_normalized(
+        feature_values_or_empty(selected_feature_cols)
+    )
     artifact = imported_artifact if isinstance(imported_artifact, dict) else {}
+    artifact_extra = artifact.get("extra") or {}
+    if not isinstance(artifact_extra, dict):
+        artifact_extra = {}
+    feature_mask = _resolve_feature_mask(
+        train_result=train_result,
+        imported_artifact=artifact,
+        pipeline=pipeline,
+    )
 
     candidates = []
 
@@ -1270,26 +1332,45 @@ def _resolve_effective_feature_cols(
             if isinstance(frame, pd.DataFrame):
                 cols = _deduplicate_feature_list(list(frame.columns))
                 if cols:
+                    masked_cols = _apply_feature_mask_to_feature_cols(cols, feature_mask)
+                    if masked_cols:
+                        candidates.append((f"train_result.{key}+feature_mask", masked_cols))
                     candidates.append((f"train_result.{key}", cols))
 
-    artifact_extra = artifact.get("extra") or {}
-    artifact_effective_cols = _deduplicate_feature_list_normalized(artifact_extra.get("effective_feature_cols") or [])
+    artifact_effective_cols = _deduplicate_feature_list_normalized(
+        feature_values_or_empty(artifact_extra.get("effective_feature_cols"))
+    )
     if artifact_effective_cols:
+        masked_effective_cols = _apply_feature_mask_to_feature_cols(
+            artifact_effective_cols,
+            feature_mask,
+        )
+        if masked_effective_cols:
+            candidates.append(
+                ("artifact.extra.effective_feature_cols+feature_mask", masked_effective_cols)
+            )
         candidates.append(("artifact.extra.effective_feature_cols", artifact_effective_cols))
 
-    artifact_feature_cols = _deduplicate_feature_list_normalized(artifact.get("feature_cols") or [])
-    artifact_feature_mask = artifact.get("feature_mask")
-    if artifact_feature_mask is None:
-        artifact_feature_mask = _extract_pipeline_feature_mask(artifact.get("pipeline"))
-    artifact_masked_cols = _apply_feature_mask_to_feature_cols(artifact_feature_cols, artifact_feature_mask)
-    if artifact_masked_cols:
-        source = "artifact.feature_cols+mask" if artifact_feature_mask is not None else "artifact.feature_cols"
-        candidates.append((source, artifact_masked_cols))
+    artifact_workflow_cols = _extract_artifact_final_feature_names(artifact_extra)
+    if artifact_workflow_cols:
+        candidates.append(("artifact.extra.workflow.final_feature_names", artifact_workflow_cols))
 
-    pipeline_feature_mask = _extract_pipeline_feature_mask(pipeline)
-    session_masked_cols = _apply_feature_mask_to_feature_cols(selected_cols, pipeline_feature_mask)
+    artifact_feature_cols = _deduplicate_feature_list_normalized(
+        feature_values_or_empty(artifact.get("feature_cols"))
+    )
+    artifact_masked_cols = _apply_feature_mask_to_feature_cols(
+        artifact_feature_cols,
+        feature_mask,
+    )
+    if artifact_masked_cols:
+        source = "artifact.feature_cols+feature_mask" if feature_mask is not None else "artifact.feature_cols"
+        candidates.append((source, artifact_masked_cols))
+    if artifact_feature_cols:
+        candidates.append(("artifact.feature_cols", artifact_feature_cols))
+
+    session_masked_cols = _apply_feature_mask_to_feature_cols(selected_cols, feature_mask)
     if session_masked_cols:
-        source = "session.feature_cols+pipeline_mask" if pipeline_feature_mask is not None else "session.feature_cols"
+        source = "session.feature_cols+feature_mask" if feature_mask is not None else "session.feature_cols"
         candidates.append((source, session_masked_cols))
 
     model_feature_names = None
@@ -1306,12 +1387,14 @@ def _resolve_effective_feature_cols(
     if model_feature_names is None and model is not None and hasattr(model, "get_booster"):
         try:
             booster_feature_names = model.get_booster().feature_names
-            if booster_feature_names:
+            if booster_feature_names is not None:
                 model_feature_names = booster_feature_names
         except Exception:
             pass
 
-    model_feature_cols = _deduplicate_feature_list_normalized(model_feature_names or [])
+    model_feature_cols = _deduplicate_feature_list_normalized(
+        feature_values_or_empty(model_feature_names)
+    )
     if model_feature_cols:
         candidates.append(("model.feature_names_in_", model_feature_cols))
 
@@ -1527,7 +1610,12 @@ def _resolve_prediction_feature_cols(model=None, pipeline=None, session_feature_
     candidates = []
     artifact = imported_artifact or {}
     if isinstance(artifact, dict):
-        candidates.append(("artifact.feature_cols", _clean(artifact.get("feature_cols") or [])))
+        candidates.append(
+            (
+                "artifact.feature_cols",
+                _clean(feature_values_or_empty(artifact.get("feature_cols"))),
+            )
+        )
 
     model_feature_names = None
     for obj in (pipeline, model):
@@ -1543,13 +1631,13 @@ def _resolve_prediction_feature_cols(model=None, pipeline=None, session_feature_
     if model_feature_names is None and model is not None and hasattr(model, "get_booster"):
         try:
             booster_feature_names = model.get_booster().feature_names
-            if booster_feature_names:
+            if booster_feature_names is not None:
                 model_feature_names = booster_feature_names
         except Exception:
             pass
 
-    candidates.append(("model.feature_names_in_", _clean(model_feature_names or [])))
-    candidates.append(("session.feature_cols", _clean(session_feature_cols or [])))
+    candidates.append(("model.feature_names_in_", _clean(feature_values_or_empty(model_feature_names))))
+    candidates.append(("session.feature_cols", _clean(feature_values_or_empty(session_feature_cols))))
 
     chosen_source = None
     chosen_cols = []
@@ -1568,7 +1656,7 @@ def _resolve_prediction_feature_cols(model=None, pipeline=None, session_feature_
                 break
 
     note = None
-    session_cols = _clean(session_feature_cols or [])
+    session_cols = _clean(feature_values_or_empty(session_feature_cols))
     if expected_n is not None:
         if len(chosen_cols) != expected_n:
             note = f"模型要求 {expected_n} 个特征，但当前可解析到的特征列表是 {len(chosen_cols)} 个。"
@@ -2406,107 +2494,88 @@ def _render_post_feature_mapping_panel(
         if (previous_rules or {}).get(feature, {}).get("source_type")
         not in {None, "pending", "keep"}
     ]
-    manual_features = mapping_panel.multiselect(
-        "选择需要手动改变的模型特征（可不选）",
-        options=model_cols,
-        default=previous_manual_features,
-        key=f"{prefix}_manual_features",
-        help="未选中的特征将保留当前候选配方已有值，不会自动匹配同名列。",
-    )
-    manual_feature_set = set(manual_features)
-    if not manual_features:
-        mapping_panel.info("当前未选择需要改变的特征；点击“确认映射并继续”即可保留现有值。")
+    with mapping_panel.form(key=f"{prefix}_form", clear_on_submit=False):
+        manual_features = st.multiselect(
+            "选择需要手动改变的模型特征（可不选）",
+            options=model_cols,
+            default=previous_manual_features,
+            key=f"{prefix}_manual_features",
+            help="未选中的特征将保留当前候选配方已有值，不会自动匹配同名列。",
+        )
+        manual_feature_set = set(manual_features)
+        if not manual_features:
+            st.info("当前未选择需要改变的特征；点击“确认映射并继续”即可保留现有值。")
 
-    updated_rules = {}
-    for feature in model_cols:
-        rule = (draft.get("rules") or {}).get(feature) or {}
-        if feature not in manual_feature_set:
+        updated_rules = {}
+        for feature in model_cols:
+            rule = (draft.get("rules") or {}).get(feature) or {}
+            if feature not in manual_feature_set:
+                updated_rules[feature] = {
+                    "source_type": "keep",
+                    "source_column": None,
+                    "constant_value": None,
+                    "unit": None,
+                    "definition": None,
+                    "confirmed": False,
+                }
+                continue
+            selected_index = 0
+            for choice_index, choice in enumerate(choices):
+                if (
+                    choice["source_type"] == rule.get("source_type")
+                    and choice["source_column"] == rule.get("source_column")
+                ):
+                    selected_index = choice_index
+                    break
+            row = st.columns([1.1, 2.9])
+            row[0].markdown(f"**{feature}**")
+            selected_label = row[1].selectbox(
+                "来源",
+                choice_labels,
+                index=selected_index,
+                key=f"{prefix}_{feature}_source_choice",
+                label_visibility="collapsed",
+            )
+            selected_choice = choices[choice_labels.index(selected_label)]
+            constant_value = None
+            if selected_choice["source_type"] == "constant":
+                constant_default = 0.0
+                try:
+                    candidate_constant = float(rule.get("constant_value"))
+                    if np.isfinite(candidate_constant):
+                        constant_default = candidate_constant
+                except (TypeError, ValueError):
+                    pass
+                constant_value = row[1].number_input(
+                    "常数值",
+                    value=constant_default,
+                    key=f"{prefix}_{feature}_constant",
+                    label_visibility="visible",
+                )
             updated_rules[feature] = {
-                "source_type": "keep",
-                "source_column": None,
-                "constant_value": None,
-                "unit": None,
-                "definition": None,
+                "source_type": selected_choice["source_type"],
+                "source_column": selected_choice["source_column"],
+                "constant_value": constant_value,
+                "unit": rule.get("unit"),
+                "definition": rule.get("definition"),
                 "confirmed": False,
             }
-            continue
-        selected_index = 0
-        for choice_index, choice in enumerate(choices):
-            if (
-                choice["source_type"] == rule.get("source_type")
-                and choice["source_column"] == rule.get("source_column")
-            ):
-                selected_index = choice_index
-                break
-        row = mapping_panel.columns([1.1, 2.9])
-        row[0].markdown(f"**{feature}**")
-        selected_label = row[1].selectbox(
-            "来源",
-            choice_labels,
-            index=selected_index,
-            key=f"{prefix}_{feature}_source_choice",
-            label_visibility="collapsed",
-        )
-        selected_choice = choices[choice_labels.index(selected_label)]
-        constant_value = None
-        if selected_choice["source_type"] == "constant":
-            constant_default = 0.0
-            try:
-                candidate_constant = float(rule.get("constant_value"))
-                if np.isfinite(candidate_constant):
-                    constant_default = candidate_constant
-            except (TypeError, ValueError):
-                pass
-            constant_value = row[1].number_input(
-                "常数值",
-                value=constant_default,
-                key=f"{prefix}_{feature}_constant",
-                label_visibility="visible",
-            )
-        updated_rules[feature] = {
-            "source_type": selected_choice["source_type"],
-            "source_column": selected_choice["source_column"],
-            "constant_value": constant_value,
-            "unit": rule.get("unit"),
-            "definition": rule.get("definition"),
-            "confirmed": False,
-        }
 
-    def _rule_edit_signature(rule):
-        rule = rule if isinstance(rule, dict) else {}
-        return (
-            rule.get("source_type"),
-            rule.get("source_column"),
-            rule.get("constant_value"),
-            rule.get("unit"),
-            rule.get("definition"),
+        action_col, clear_col = st.columns([1, 1])
+        confirm_clicked = action_col.form_submit_button(
+            "确认映射并继续",
+            type="primary",
+            width="stretch",
+        )
+        clear_clicked = clear_col.form_submit_button(
+            "清空选择",
+            width="stretch",
         )
 
-    previous_rules = previous.get("rules") if isinstance(previous, dict) else {}
-    mapping_edited = any(
-        _rule_edit_signature((previous_rules or {}).get(feature))
-        != _rule_edit_signature(updated_rules.get(feature))
-        for feature in model_cols
-    )
-    preserved_confirmation = bool(
-        st.session_state.get(confirmed_key, False)
-        and previous.get("confirmed", False)
-        and not stale_draft
-        and not mapping_edited
-    )
-    for rule in updated_rules.values():
-        rule["confirmed"] = preserved_confirmation
-    draft["rules"] = updated_rules
-    draft["confirmed"] = preserved_confirmation
-    draft["status"] = "confirmed" if preserved_confirmation else "draft"
-    st.session_state[draft_key] = draft
-    action_col, clear_col = mapping_panel.columns([1, 1])
-    confirm_clicked = action_col.button(
-        "确认映射并继续",
-        type="primary",
-        key=f"{prefix}_confirm",
-    )
-    clear_clicked = clear_col.button("清空选择", key=f"{prefix}_clear")
+    edited_draft = copy.deepcopy(draft)
+    edited_draft["rules"] = updated_rules
+    edited_draft["confirmed"] = False
+    edited_draft["status"] = "draft"
     if clear_clicked:
         blank = create_mapping_draft(
             model_cols,
@@ -2522,6 +2591,11 @@ def _render_post_feature_mapping_panel(
             st.session_state.pop(f"{prefix}_{feature}_constant", None)
         st.rerun()
     if confirm_clicked:
+        draft = commit_mapping_form_draft(
+            previous,
+            edited_draft,
+            submitted=True,
+        )
         for rule in draft["rules"].values():
             rule["confirmed"] = True
         draft["confirmed"] = True
@@ -2535,7 +2609,7 @@ def _render_post_feature_mapping_panel(
         )
         st.session_state[draft_key] = draft if report.get("ok") else {**draft, "confirmed": False, "status": "draft"}
         st.session_state[confirmed_key] = bool(report.get("ok"))
-    active = st.session_state.get(draft_key, draft)
+    active = st.session_state.get(draft_key, previous)
     report = validate_mapping(
         active,
         model_feature_cols=model_cols,
@@ -2620,6 +2694,9 @@ def _restore_molecular_feature_metadata(payload, model_feature_cols=None):
 
 
 def _current_molecular_feature_artifact_extra():
+    feature_mask = _coerce_feature_mask(st.session_state.get("feature_mask"))
+    if feature_mask is not None:
+        feature_mask = feature_mask.tolist()
     return {
         "molecular_feature_workflow": st.session_state.get(
             "molecular_feature_workflow"
@@ -2634,6 +2711,7 @@ def _current_molecular_feature_artifact_extra():
         "post_feature_mapping_default": st.session_state.get(
             "post_feature_mapping_default"
         ),
+        "feature_mask": feature_mask,
     }
 
 
@@ -12962,6 +13040,15 @@ def page_model_training():
                                 'molecular_feature_workflow': st.session_state.get('molecular_feature_workflow'),
                                 'molecular_feature_trace': st.session_state.get('molecular_feature_trace', []),
                                 'post_feature_mapping_default': st.session_state.get('post_feature_mapping_default'),
+                                'feature_mask': (
+                                    _coerce_feature_mask(
+                                        st.session_state.get('feature_mask')
+                                    ).tolist()
+                                    if _coerce_feature_mask(
+                                        st.session_state.get('feature_mask')
+                                    ) is not None
+                                    else None
+                                ),
                             }
                             _extra.update(
                                 workflow_to_artifact_extra(
@@ -13023,6 +13110,15 @@ def page_model_training():
                                 'molecular_feature_workflow': st.session_state.get('molecular_feature_workflow'),
                                 'molecular_feature_trace': st.session_state.get('molecular_feature_trace', []),
                                 'post_feature_mapping_default': st.session_state.get('post_feature_mapping_default'),
+                                'feature_mask': (
+                                    _coerce_feature_mask(
+                                        st.session_state.get('feature_mask')
+                                    ).tolist()
+                                    if _coerce_feature_mask(
+                                        st.session_state.get('feature_mask')
+                                    ) is not None
+                                    else None
+                                ),
                             }
                             process_payload.update(
                                 workflow_to_artifact_extra(
@@ -13312,6 +13408,15 @@ def page_model_training():
                                 "molecular_feature_workflow": st.session_state.get("molecular_feature_workflow"),
                                 "molecular_feature_trace": st.session_state.get("molecular_feature_trace", []),
                                 "post_feature_mapping_default": st.session_state.get("post_feature_mapping_default"),
+                                "feature_mask": (
+                                    _coerce_feature_mask(
+                                        st.session_state.get("feature_mask")
+                                    ).tolist()
+                                    if _coerce_feature_mask(
+                                        st.session_state.get("feature_mask")
+                                    ) is not None
+                                    else None
+                                ),
                             }
                             extra_export.update(
                                 workflow_to_artifact_extra(
@@ -13618,12 +13723,35 @@ def page_model_interpretation():
         st.warning("当前训练/测试数据格式异常，无法进入模型解释。")
         return
 
-    # 修复：如果 feature_names 为空，从 X_train 获取列名
-    if not feature_names:
-        if isinstance(X_train, pd.DataFrame):
-            feature_names = X_train.columns.tolist()
-        else:
-            feature_names = [f"Feature_{i}" for i in range(X_train.shape[1])]
+    imported_artifact = st.session_state.get("imported_model_artifact") or {}
+    artifact_extra = imported_artifact.get("extra") or {}
+    train_result = st.session_state.get("train_result") or {}
+    feature_mask = train_result.get("feature_mask")
+    if feature_mask is None:
+        feature_mask = st.session_state.get("feature_mask")
+    if feature_mask is None:
+        feature_mask = imported_artifact.get("feature_mask")
+    if feature_mask is None:
+        feature_mask = artifact_extra.get("feature_mask")
+    artifact_feature_names = (
+        artifact_extra.get("effective_feature_cols")
+        or imported_artifact.get("feature_cols")
+        or []
+    )
+    effective_feature_names, _, _ = _resolve_effective_feature_cols(
+        train_result=train_result,
+        selected_feature_cols=feature_names,
+        model=model,
+        pipeline=st.session_state.get("pipeline"),
+        imported_artifact=imported_artifact,
+    )
+    feature_names = resolve_feature_names_for_matrix(
+        X_train,
+        feature_names=effective_feature_names or artifact_feature_names or feature_names,
+        model=model,
+        pipeline=st.session_state.get("pipeline"),
+        feature_mask=feature_mask,
+    )
 
     # [调试] 打印特征名信息
     print(f"\n[DEBUG] ========== SHAP Feature Names Debug ==========")
@@ -15186,9 +15314,14 @@ def page_prediction():
                     # 写入 session_state（用于后续页面复用）
                     st.session_state.model_name = artifact.get("model_name") or "ImportedModel"
                     st.session_state.target_col = artifact.get("target_col") or st.session_state.get("target_col", "")
+                    imported_model = artifact.get("model", None) or artifact.get("pipeline", None)
+                    st.session_state.feature_mask = _resolve_feature_mask(
+                        imported_artifact=artifact,
+                        pipeline=artifact.get("pipeline", None),
+                    )
                     imported_feature_cols = _resolve_effective_feature_cols(
                         selected_feature_cols=artifact.get("feature_cols") or st.session_state.get("feature_cols", []),
-                        model=artifact.get("model", None) or artifact.get("pipeline", None),
+                        model=imported_model,
                         pipeline=artifact.get("pipeline", None),
                         imported_artifact=artifact,
                     )[0]
@@ -15200,7 +15333,7 @@ def page_prediction():
                     st.session_state.pipeline = artifact.get("pipeline", None)
 
                     # 关键修复：XGBoost模型使用cache_resource
-                    model_obj = artifact.get("model", None) or artifact.get("pipeline", None)
+                    model_obj = imported_model
                     model_name = artifact.get("model_name") or "ImportedModel"
                     is_xgboost = model_name == "XGBoost" or (model_obj and str(type(model_obj).__name__).lower().startswith('xgb'))
 
@@ -16302,9 +16435,14 @@ def page_virtual_screening():
 
                     st.session_state.model_name = artifact.get("model_name") or "ImportedModel"
                     st.session_state.target_col = artifact.get("target_col") or st.session_state.get("target_col", "")
+                    imported_model = artifact.get("model", None) or artifact.get("pipeline", None)
+                    st.session_state.feature_mask = _resolve_feature_mask(
+                        imported_artifact=artifact,
+                        pipeline=artifact.get("pipeline", None),
+                    )
                     imported_feature_cols = _resolve_effective_feature_cols(
                         selected_feature_cols=artifact.get("feature_cols") or st.session_state.get("feature_cols", []),
-                        model=artifact.get("model", None) or artifact.get("pipeline", None),
+                        model=imported_model,
                         pipeline=artifact.get("pipeline", None),
                         imported_artifact=artifact,
                     )[0]
@@ -16316,7 +16454,7 @@ def page_virtual_screening():
                     st.session_state.pipeline = artifact.get("pipeline", None)
 
                     # 关键修复：XGBoost模型使用cache_resource
-                    model_obj = artifact.get("model", None) or artifact.get("pipeline", None)
+                    model_obj = imported_model
                     model_name = artifact.get("model_name") or "ImportedModel"
                     is_xgboost = model_name == "XGBoost" or (model_obj and str(type(model_obj).__name__).lower().startswith('xgb'))
 
@@ -16451,6 +16589,7 @@ def page_virtual_screening():
         estimate_proxy_uncertainty,
         extract_effect_tags,
         extract_features_from_config,
+        filter_formulation_candidates_by_component_limits,
         filter_candidates_by_size,
         filter_candidates_by_epoxy_rules,
         generate_candidate_pool,
@@ -18352,6 +18491,20 @@ def page_virtual_screening():
                         design_space.metadata["observed_anchor_count"] = observed_anchor_count
                         design_space.metadata["sampled"] = int(len(pool_df))
                         st.caption(f"已强制加入 {observed_anchor_count} 个原始实测树脂/固化剂配方，避免高性能训练样本在随机组合中丢失。")
+            pool_before_component_limits = int(len(pool_df))
+            pool_df = filter_formulation_candidates_by_component_limits(
+                pool_df,
+                max_resin_components=int(max_resin_components),
+                max_hardener_components=int(max_hardener_components),
+            )
+            component_limit_removed = pool_before_component_limits - int(len(pool_df))
+            if component_limit_removed > 0:
+                design_space.metadata["component_limit_removed"] = int(component_limit_removed)
+                st.info(
+                    f"已按组分上限移除 {component_limit_removed:,} 条超限配方；"
+                    f"当前树脂最多 {int(max_resin_components)} 个组分，"
+                    f"固化剂最多 {int(max_hardener_components)} 个组分。"
+                )
             if pool_df.empty:
                 st.warning("⚠️ 未生成任何虚拟配方，请检查候选库和组合设置。")
                 return
@@ -21510,12 +21663,21 @@ def page_training_records():
                         # 加载模型到session_state
                         st.session_state.model_name = model_artifact.get("model_name") or meta.get("model_name", "")
                         st.session_state.target_col = model_artifact.get("target_col") or meta.get("target_col", "")
-                        st.session_state.feature_cols = model_artifact.get("feature_cols") or []
                         st.session_state.pipeline = model_artifact.get("pipeline", None)
 
                         # 关键修复：XGBoost模型使用cache_resource
                         model_obj = model_artifact.get("model", None) or model_artifact.get("pipeline", None)
                         model_name = model_artifact.get("model_name") or meta.get("model_name", "")
+                        st.session_state.feature_mask = _resolve_feature_mask(
+                            imported_artifact=model_artifact,
+                            pipeline=model_artifact.get("pipeline", None),
+                        )
+                        st.session_state.feature_cols = _resolve_effective_feature_cols(
+                            selected_feature_cols=model_artifact.get("feature_cols") or [],
+                            model=model_obj,
+                            pipeline=model_artifact.get("pipeline", None),
+                            imported_artifact=model_artifact,
+                        )[0] or sanitize_feature_columns(model_artifact.get("feature_cols"))
                         is_xgboost = model_name == "XGBoost" or (model_obj and str(type(model_obj).__name__).lower().startswith('xgb'))
 
                         if is_xgboost and model_obj:
@@ -21527,6 +21689,7 @@ def page_training_records():
 
                         st.session_state.scaler = model_artifact.get("scaler", None)
                         st.session_state.imputer = model_artifact.get("imputer", None)
+                        st.session_state.imported_model_artifact = model_artifact
                         if is_xgboost and model_obj:
                             st.session_state.model = model_obj
                             st.session_state.xgb_model_id = None

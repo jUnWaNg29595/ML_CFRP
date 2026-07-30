@@ -12,12 +12,14 @@ from core.post_feature_mapping import (
     build_post_feature_catalog,
     build_manual_mapping_choices,
     catalog_fingerprint,
+    commit_mapping_form_draft,
     create_mapping_draft,
     mapping_fingerprint,
     mapping_snapshot,
     mapping_snapshot_restore_policy,
     normalize_mapping,
     sanitize_feature_columns,
+    feature_values_or_empty,
     validate_mapping,
 )
 
@@ -55,6 +57,12 @@ def test_feature_column_sanitization_rejects_compact_streamlit_repr_text():
     )
 
     assert sanitize_feature_columns(["temperature", polluted_text]) == ["temperature"]
+
+
+def test_feature_values_or_empty_does_not_evaluate_numpy_array_truth_value():
+    values = np.array(["resin_xtb_gap", "curing_agent_xtb_gap"])
+
+    assert feature_values_or_empty(values) is values
 
 
 def test_mapping_normalization_removes_polluted_feature_and_rule_keys():
@@ -166,6 +174,48 @@ def test_default_mapping_is_only_a_draft():
     )
     assert draft["status"] == "draft"
     assert draft["confirmed"] is False
+
+
+def test_mapping_form_edits_are_persisted_only_after_explicit_submit():
+    current = {
+        "status": "draft",
+        "confirmed": False,
+        "rules": {
+            "EEW": {
+                "source_type": "pending",
+                "source_column": None,
+                "confirmed": False,
+            }
+        },
+    }
+    edited = {
+        **current,
+        "status": "confirmed",
+        "confirmed": True,
+        "rules": {
+            "EEW": {
+                "source_type": "computed",
+                "source_column": "computed_resin_eew",
+                "confirmed": True,
+            }
+        },
+    }
+
+    not_submitted = commit_mapping_form_draft(
+        current,
+        edited,
+        submitted=False,
+    )
+    assert not_submitted == current
+    assert current["rules"]["EEW"]["source_type"] == "pending"
+
+    submitted = commit_mapping_form_draft(
+        current,
+        edited,
+        submitted=True,
+    )
+    assert submitted == edited
+    assert submitted is not edited
 
 
 def test_mapping_draft_is_blank_even_when_catalog_contains_all_model_names():
