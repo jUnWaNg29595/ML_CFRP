@@ -239,3 +239,41 @@ def test_process_pls_artifact_round_trip_preserves_workflow_metadata():
     ]
     assert restored["extra"]["process_pls_schema_version"] == 1
     assert restored["extra"]["process_pls_workflow_hash"] == "abc123"
+
+
+def test_legacy_artifact_without_process_pls_is_unchanged():
+    from core.model_io import create_model_artifact, dumps_artifact, loads_artifact
+
+    artifact = create_model_artifact(
+        model_name="legacy",
+        target_col="target",
+        feature_cols=["temperature"],
+        model=object(),
+        extra={"molecular_feature_workflow": {"schema_version": 1}},
+    )
+    restored = loads_artifact(dumps_artifact(artifact))
+
+    assert "process_pls_workflow" not in restored["extra"]
+    assert restored["extra"]["molecular_feature_workflow"] == {"schema_version": 1}
+
+
+def test_process_pls_output_order_is_stable_after_joblib_round_trip(tmp_path):
+    import joblib
+
+    X = pd.DataFrame({
+        "temperature": [1.0, 2.0, 3.0, 4.0],
+        "time": [10.0, 11.0, 12.0, 13.0],
+        "other": [5.0, 6.0, 7.0, 8.0],
+    })
+    y = np.array([1.0, 2.0, 3.0, 4.0])
+    transformer = ProcessPLSTransformer(
+        process_feature_cols=["temperature", "time"],
+        max_components=1,
+    ).fit(X, y)
+    path = tmp_path / "process_pls.joblib"
+
+    joblib.dump(transformer, path)
+    restored = joblib.load(path)
+
+    assert restored.get_feature_names_out().tolist() == transformer.get_feature_names_out().tolist()
+    pd.testing.assert_frame_equal(restored.transform(X), transformer.transform(X))
