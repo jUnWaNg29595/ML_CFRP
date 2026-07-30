@@ -26,6 +26,7 @@ import time
 import copy
 import hashlib
 import functools
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -1073,6 +1074,7 @@ from core.virtual_screening import POST_FEATURE_COMPUTED_DEFINITIONS
 from core.post_feature_mapping import (
     apply_mapping,
     build_post_feature_catalog,
+    build_manual_mapping_choices,
     catalog_fingerprint,
     create_mapping_draft,
     mapping_snapshot,
@@ -2326,7 +2328,7 @@ def _render_post_feature_mapping_panel(
     missing_input_tolerant: bool,
     panel_key: str,
 ) -> tuple[dict | None, dict]:
-    """渲染共享中文人工映射面板，未确认时返回 (None, report)。"""
+    """渲染简洁的筛选前人工映射区，未确认时返回 (None, report)。"""
     excluded_columns = {
         "resin_smiles", "hardener_smiles", "combo_smiles", "candidate_origin",
         "formulation_id", "_molecule_key",
@@ -2343,9 +2345,7 @@ def _render_post_feature_mapping_panel(
     )
     if rejected_types:
         st.warning(
-            "检测到无效的模型特征列，已忽略后再继续："
-            + "、".join(rejected_types)
-            + "。请检查模型导出文件或会话快照中的特征列记录。"
+            "模型特征列表中检测到无效记录，已忽略后继续。"
         )
     if not model_cols:
         return None, {
@@ -2356,14 +2356,13 @@ def _render_post_feature_mapping_panel(
 
     prefix = f"post_feature_mapping_{panel_key}"
     draft_key = f"{prefix}_draft"
-    default_key = f"{prefix}_default"
     confirmed_key = f"{prefix}_confirmed"
     previous = st.session_state.get(draft_key)
     stale_draft = isinstance(previous, dict) and (
         previous.get("model_fingerprint") != model_fingerprint
         or previous.get("catalog_fingerprint") != catalog_fp
     )
-    if not isinstance(previous, dict):
+    if not isinstance(previous, dict) or stale_draft:
         previous = create_mapping_draft(
             model_cols,
             molecular_feature_cols=molecular_feature_cols,
@@ -2373,84 +2372,103 @@ def _render_post_feature_mapping_panel(
         )
         st.session_state[draft_key] = previous
         st.session_state[confirmed_key] = False
+        st.session_state.pop(f"{prefix}_manual_features", None)
+        for feature in model_cols:
+            st.session_state.pop(f"{prefix}_{feature}_source_choice", None)
+            st.session_state.pop(f"{prefix}_{feature}_constant", None)
     draft = copy.deepcopy(previous)
     draft["model_feature_cols"] = model_cols
     draft["model_fingerprint"] = model_fingerprint
     draft["workflow_fingerprint"] = workflow_fingerprint
     draft["catalog_fingerprint"] = catalog_fp
 
-    st.markdown("### 后处理特征人工映射")
-    st.caption(
-        f"模型指纹：{model_fingerprint[:12]}… | 工作流指纹：{workflow_fingerprint or '无'} | "
-        f"目录指纹：{catalog_fp[:12]}…"
+    choices = build_manual_mapping_choices(
+        catalog,
+        include_constant=True,
+        include_unused=bool(missing_input_tolerant),
     )
-    load_clicked = st.button("加载已保存映射草稿", key=f"{prefix}_load")
-    reset_clicked = st.button("重置为空白映射", key=f"{prefix}_reset")
-    if load_clicked:
-        saved = st.session_state.get("post_feature_mapping_default")
-        if not isinstance(saved, dict):
-            saved = st.session_state.get(default_key)
-        if isinstance(saved, dict):
-            draft = copy.deepcopy(saved)
-            draft["confirmed"] = False
-            draft["status"] = "draft"
-            for rule in draft.get("rules", {}).values():
-                rule["confirmed"] = False
-            st.session_state[draft_key] = draft
-            st.session_state[confirmed_key] = False
-            for feature in model_cols:
-                for suffix in ("source_type", "source_column", "constant", "unit", "definition"):
-                    st.session_state.pop(f"{prefix}_{feature}_{suffix}", None)
-            st.warning("已加载为草稿，必须点击“确认本次映射”后才可预测。")
-        else:
-            st.info("当前没有已保存的模型默认映射。")
-    if reset_clicked:
-        draft = create_mapping_draft(
-            model_cols,
-            molecular_feature_cols=molecular_feature_cols,
-            catalog=catalog,
-            model_fingerprint=model_fingerprint,
-            workflow_fingerprint=workflow_fingerprint,
-        )
-        st.session_state[draft_key] = draft
-        st.session_state[confirmed_key] = False
-        for feature in model_cols:
-            for suffix in ("source_type", "source_column", "constant", "unit", "definition"):
-                st.session_state.pop(f"{prefix}_{feature}_{suffix}", None)
-        st.rerun()
-    if stale_draft:
-        st.warning("模型特征或候选目录已变化，旧映射仅保留为草稿，必须重新确认。")
+    choice_labels = [choice["label"] for choice in choices]
 
-    catalog_rows = catalog.set_index("column").to_dict("index") if not catalog.empty else {}
-    source_labels = {"pending": "待选择", "computed": "计算列", "candidate": "原始候选列", "constant": "常数值", "unused": "不使用"}
+    mapping_panel = st.expander("筛选前确认：模型特征来源", expanded=True)
+    mapping_panel.caption(
+        f"模型共有 {len(model_cols)} 个特征；默认保留候选配方已有值，"
+        "只对需要改变的特征手动设置来源。系统不会按同名列自动匹配。"
+    )
+    if catalog.empty:
+        mapping_panel.warning(
+            "当前候选池没有可供映射的数值列，请先检查配方特征或改用常数值。"
+        )
+
+    previous_rules = previous.get("rules") if isinstance(previous, dict) else {}
+    previous_manual_features = [
+        feature
+        for feature in model_cols
+        if (previous_rules or {}).get(feature, {}).get("source_type")
+        not in {None, "pending", "keep"}
+    ]
+    manual_features = mapping_panel.multiselect(
+        "选择需要手动改变的模型特征（可不选）",
+        options=model_cols,
+        default=previous_manual_features,
+        key=f"{prefix}_manual_features",
+        help="未选中的特征将保留当前候选配方已有值，不会自动匹配同名列。",
+    )
+    manual_feature_set = set(manual_features)
+    if not manual_features:
+        mapping_panel.info("当前未选择需要改变的特征；点击“确认映射并继续”即可保留现有值。")
+
     updated_rules = {}
-    header = st.columns(9)
-    for column, label in zip(header, ["模型特征", "特征类别", "来源类型", "来源列", "常数值", "单位", "计算定义", "状态", ""]):
-        label and column.markdown(f"**{label}**")
     for feature in model_cols:
         rule = (draft.get("rules") or {}).get(feature) or {}
-        row = st.columns(9)
-        row[0].write(feature)
-        selected_col = rule.get("source_column")
-        category = catalog_rows.get(selected_col, {}).get("category", "未分类") if selected_col else "未分类"
-        row[1].write(category)
-        type_key = f"{prefix}_{feature}_source_type"
-        source_type = row[2].selectbox(
-            "来源类型", list(source_labels), format_func=source_labels.get,
-            index=list(source_labels).index(rule.get("source_type")) if rule.get("source_type") in source_labels else 0,
-            key=type_key, label_visibility="collapsed",
+        if feature not in manual_feature_set:
+            updated_rules[feature] = {
+                "source_type": "keep",
+                "source_column": None,
+                "constant_value": None,
+                "unit": None,
+                "definition": None,
+                "confirmed": False,
+            }
+            continue
+        selected_index = 0
+        for choice_index, choice in enumerate(choices):
+            if (
+                choice["source_type"] == rule.get("source_type")
+                and choice["source_column"] == rule.get("source_column")
+            ):
+                selected_index = choice_index
+                break
+        row = mapping_panel.columns([1.1, 2.9])
+        row[0].markdown(f"**{feature}**")
+        selected_label = row[1].selectbox(
+            "来源",
+            choice_labels,
+            index=selected_index,
+            key=f"{prefix}_{feature}_source_choice",
+            label_visibility="collapsed",
         )
-        options = [""] + [str(value) for value in catalog.loc[catalog["source_type"].eq(source_type), "column"].tolist()] if not catalog.empty else [""]
-        source_index = options.index(selected_col) if selected_col in options else 0
-        source_column = row[3].selectbox("来源列", options, index=source_index, key=f"{prefix}_{feature}_source_column", label_visibility="collapsed", disabled=source_type not in {"computed", "candidate"})
-        constant_value = row[4].number_input("常数值", value=float(rule.get("constant_value") or 0.0), key=f"{prefix}_{feature}_constant", label_visibility="collapsed", disabled=source_type != "constant")
-        unit = row[5].text_input("单位", value=str(rule.get("unit") or ""), key=f"{prefix}_{feature}_unit", label_visibility="collapsed")
-        definition = row[6].text_input("计算定义", value=str(rule.get("definition") or ""), key=f"{prefix}_{feature}_definition", label_visibility="collapsed")
-        row[7].write("已确认" if rule.get("confirmed") and draft.get("confirmed") else source_labels.get(source_type, "待选择"))
+        selected_choice = choices[choice_labels.index(selected_label)]
+        constant_value = None
+        if selected_choice["source_type"] == "constant":
+            constant_default = 0.0
+            try:
+                candidate_constant = float(rule.get("constant_value"))
+                if np.isfinite(candidate_constant):
+                    constant_default = candidate_constant
+            except (TypeError, ValueError):
+                pass
+            constant_value = row[1].number_input(
+                "常数值",
+                value=constant_default,
+                key=f"{prefix}_{feature}_constant",
+                label_visibility="visible",
+            )
         updated_rules[feature] = {
-            "source_type": source_type, "source_column": source_column or None,
-            "constant_value": constant_value if source_type == "constant" else None,
-            "unit": unit or None, "definition": definition or None,
+            "source_type": selected_choice["source_type"],
+            "source_column": selected_choice["source_column"],
+            "constant_value": constant_value,
+            "unit": rule.get("unit"),
+            "definition": rule.get("definition"),
             "confirmed": False,
         }
 
@@ -2482,33 +2500,66 @@ def _render_post_feature_mapping_panel(
     draft["confirmed"] = preserved_confirmation
     draft["status"] = "confirmed" if preserved_confirmation else "draft"
     st.session_state[draft_key] = draft
-    confirm_clicked = st.button("确认本次映射", type="primary", key=f"{prefix}_confirm")
-    save_clicked = st.button("另存为模型默认映射", key=f"{prefix}_save")
+    action_col, clear_col = mapping_panel.columns([1, 1])
+    confirm_clicked = action_col.button(
+        "确认映射并继续",
+        type="primary",
+        key=f"{prefix}_confirm",
+    )
+    clear_clicked = clear_col.button("清空选择", key=f"{prefix}_clear")
+    if clear_clicked:
+        blank = create_mapping_draft(
+            model_cols,
+            molecular_feature_cols=[],
+            catalog=catalog,
+            model_fingerprint=model_fingerprint,
+            workflow_fingerprint=workflow_fingerprint,
+        )
+        st.session_state[draft_key] = blank
+        st.session_state[confirmed_key] = False
+        for feature in model_cols:
+            st.session_state.pop(f"{prefix}_{feature}_source_choice", None)
+            st.session_state.pop(f"{prefix}_{feature}_constant", None)
+        st.rerun()
     if confirm_clicked:
         for rule in draft["rules"].values():
             rule["confirmed"] = True
         draft["confirmed"] = True
         draft["status"] = "confirmed"
-        report = validate_mapping(draft, model_feature_cols=model_cols, candidate_df=candidate_df, catalog=catalog, missing_input_tolerant=missing_input_tolerant)
+        report = validate_mapping(
+            draft,
+            model_feature_cols=model_cols,
+            candidate_df=candidate_df,
+            catalog=catalog,
+            missing_input_tolerant=missing_input_tolerant,
+        )
         st.session_state[draft_key] = draft if report.get("ok") else {**draft, "confirmed": False, "status": "draft"}
         st.session_state[confirmed_key] = bool(report.get("ok"))
-    if save_clicked:
-        if st.session_state.get(confirmed_key) and isinstance(st.session_state.get(draft_key), dict):
-            st.session_state["post_feature_mapping_default"] = mapping_snapshot(st.session_state[draft_key])
-            st.session_state[default_key] = copy.deepcopy(st.session_state["post_feature_mapping_default"])
-            st.success("已另存为模型默认映射。")
-        else:
-            st.warning("请先确认有效映射，再另存为模型默认映射。")
     active = st.session_state.get(draft_key, draft)
-    report = validate_mapping(active, model_feature_cols=model_cols, candidate_df=candidate_df, catalog=catalog, missing_input_tolerant=missing_input_tolerant)
+    report = validate_mapping(
+        active,
+        model_feature_cols=model_cols,
+        candidate_df=candidate_df,
+        catalog=catalog,
+        missing_input_tolerant=missing_input_tolerant,
+    )
     if not st.session_state.get(confirmed_key, False):
         report["ok"] = False
-        report["errors"] = list(report.get("errors") or []) + ["本次后处理特征映射尚未确认"]
-    for warning in report.get("warnings") or []:
-        st.warning(f"⚠️ {warning}")
-    for error in report.get("errors") or []:
-        st.error(f"❌ {error}")
-    st.caption(f"映射哈希：{report.get('mapping_hash') or '无'}")
+        report["errors"] = list(report.get("errors") or [])
+    if report.get("ok"):
+        mapping_panel.success(f"已确认 {len(model_cols)} 个特征来源，可以继续筛选。")
+    elif confirm_clicked:
+        mapping_panel.error("映射未通过检查：请为每个特征选择有效的数值来源列。")
+    else:
+        pending_features = [
+            feature
+            for feature, rule in updated_rules.items()
+            if rule.get("source_type") == "pending"
+        ]
+        if pending_features:
+            preview = "、".join(pending_features[:6])
+            suffix = "…" if len(pending_features) > 6 else ""
+            mapping_panel.caption(f"待选择：{preview}{suffix}")
     if report.get("ok"):
         st.session_state["post_feature_mapping_draft"] = copy.deepcopy(active)
         st.session_state["post_feature_mapping_confirmation"] = True
@@ -9067,11 +9118,15 @@ def page_molecular_features():
                                 + ", ".join(duplicate_names)
                             )
                         
-                        # 创建完整的特征DataFrame（包含所有行，无效行用NaN填充）
-                        full_features = pd.DataFrame(index=range(len(df)), columns=features_df.columns)
-                        for new_idx, orig_idx in enumerate(extracted_valid_indices):
-                            if new_idx < len(features_df):
-                                full_features.iloc[orig_idx] = features_df.iloc[new_idx]
+                        # 按源数据行号向量化回填，避免逐行 iloc 写入
+                        from core.molecular_feature_workflow import (
+                            align_extracted_features_to_rows,
+                        )
+                        full_features = align_extracted_features_to_rows(
+                            features_df,
+                            extracted_valid_indices,
+                            len(df),
+                        )
                         
                         all_batch_features.append(full_features)
                         trace_valid_indices = list(extracted_valid_indices)
@@ -10079,11 +10134,16 @@ def page_molecular_features():
 
                     features_df = features_df.add_prefix(prefix)
 
-                # -----------------------------
-                # 合并策略：
-                # - keep_all_rows_3d=True：保留原始所有行；仅对 valid_indices 填充特征，其余为 NaN（推荐，适合大量空值场景）
-                # - 否则：仅保留成功提取特征的样本行（原逻辑）
-                # -----------------------------
+                    st.info(
+                        f"⏳ 正在将 {len(features_df.columns)} 个特征写回 "
+                        f"{len(df)} 行数据并保存流程..."
+                    )
+
+                    # -----------------------------
+                    # 合并策略：
+                    # - keep_all_rows_3d=True：保留原始所有行；仅对 valid_indices 填充特征，其余为 NaN（推荐，适合大量空值场景）
+                    # - 否则：仅保留成功提取特征的样本行（原逻辑）
+                    # -----------------------------
                 features_df = features_df.reset_index(drop=True)
                 emitted_duplicates = find_duplicate_feature_names(
                     features_df.columns.tolist()
@@ -16396,6 +16456,7 @@ def page_virtual_screening():
         generate_candidate_pool,
         generate_virtual_component_library,
         generate_feature_guided_candidates,
+        get_valid_feature_row_mask,
         infer_primary_component_role,
         limit_unique_candidates_for_expensive_features,
         merge_component_libraries,
@@ -17977,22 +18038,106 @@ def page_virtual_screening():
             w_novel = weight_values["novelty"]
             w_feat = weight_values["feature_guidance"]
 
-        if st.button(
+        formula_preflight_mapping = None
+        formula_preflight_report = {"ok": False, "errors": []}
+        pending_formula_pool = st.session_state.get("vs_formula_pending_pool")
+        pending_formula_ready = False
+        if isinstance(pending_formula_pool, pd.DataFrame) and not pending_formula_pool.empty:
+            st.caption(
+                f"检测到待确认的配方候选池（{len(pending_formula_pool):,} 条）。"
+                "请在下方确认模型特征来源。"
+            )
+            formula_preflight_mapping, formula_preflight_report, _ = (
+                _prepare_post_feature_mapping_for_prediction(
+                    model_feature_cols=post_feature_model_cols,
+                    molecular_feature_cols=configured_molecular_feature_cols,
+                    candidate_df=pending_formula_pool,
+                    computed_definitions=POST_FEATURE_COMPUTED_DEFINITIONS,
+                    missing_input_tolerant=False,
+                    panel_key="formulation",
+                )
+            )
+            pending_formula_ready = bool(formula_preflight_report.get("ok"))
+            st.session_state["vs_formula_mapping_ready"] = pending_formula_ready
+            if st.button(
+                "放弃待确认候选池",
+                key="vs_formula_discard_pending",
+                help="清除当前候选池并重新生成，不会删除训练数据或模型。",
+            ):
+                st.session_state.pop("vs_formula_pending_pool", None)
+                st.session_state.pop("vs_formula_pending_design_metadata", None)
+                st.session_state.pop("vs_formula_pending_chem_rule_funnel", None)
+                st.session_state["vs_formula_mapping_ready"] = False
+                st.rerun()
+
+        formula_run_clicked = st.button(
             "🚀 开始配方级高通量筛选",
             type="primary",
             key="vs_formula_run",
             on_click=_mark_virtual_screening_run_requested,
-        ):
+            disabled=(
+                isinstance(pending_formula_pool, pd.DataFrame)
+                and not pending_formula_ready
+            ),
+            help=(
+                "请先确认模型特征来源"
+                if isinstance(pending_formula_pool, pd.DataFrame)
+                and not pending_formula_ready
+                else None
+            ),
+        )
+        if formula_run_clicked:
             formula_run_t0 = time.time()
             formula_status = st.empty()
             formula_progress = st.progress(1)
             _vs_start_time = time.time()
             _vs_pause_flag = [False]
+            formula_resume = (
+                isinstance(pending_formula_pool, pd.DataFrame)
+                and not pending_formula_pool.empty
+                and pending_formula_ready
+            )
             formula_status.info("正在初始化配方级高通量筛选...")
             resin_libraries = []
             hardener_libraries = []
+            if formula_resume:
+                pending_resin_smiles = (
+                    pending_formula_pool.get("resin_smiles", pd.Series(dtype=str))
+                    .dropna()
+                    .astype(str)
+                    .loc[lambda values: values.str.strip().ne("")]
+                    .tolist()
+                )
+                if pending_resin_smiles:
+                    resin_libraries.append(
+                        build_component_library(
+                            pending_resin_smiles,
+                            role="resin",
+                            source="pending_pool",
+                            max_items=len(pending_resin_smiles),
+                            random_state=int(formula_random_state),
+                        )
+                    )
+                if hardener_formula_enabled:
+                    pending_hardener_smiles = (
+                        pending_formula_pool.get("hardener_smiles", pd.Series(dtype=str))
+                        .dropna()
+                        .astype(str)
+                        .loc[lambda values: values.str.strip().ne("")]
+                        .tolist()
+                    )
+                    if pending_hardener_smiles:
+                        hardener_libraries.append(
+                            build_component_library(
+                                pending_hardener_smiles,
+                                role="hardener",
+                                source="pending_pool",
+                                max_items=len(pending_hardener_smiles),
+                                random_state=int(formula_random_state),
+                            )
+                        )
 
-            if use_dataset_source and isinstance(df_ref_design, pd.DataFrame):
+            if not formula_resume and use_dataset_source and isinstance(df_ref_design, pd.DataFrame):
                 dataset_resin_pool = _collect_smiles_pool(df_ref_design, dataset_resin_cols, max_samples=int(dataset_pool_limit)) if dataset_resin_cols else []
                 if dataset_resin_pool:
                     resin_libraries.append(
@@ -18017,7 +18162,7 @@ def page_virtual_screening():
                             )
                         )
 
-            if use_upload_source and isinstance(upload_df, pd.DataFrame) and upload_resin_col:
+            if not formula_resume and use_upload_source and isinstance(upload_df, pd.DataFrame) and upload_resin_col:
                 upload_resin_pool = _collect_smiles_pool(upload_df, [upload_resin_col], max_samples=int(upload_pool_limit))
                 if upload_resin_pool:
                     resin_libraries.append(
@@ -18042,7 +18187,7 @@ def page_virtual_screening():
                             )
                         )
 
-            if use_pubchem_source and pubchem_resin_pool:
+            if not formula_resume and use_pubchem_source and pubchem_resin_pool:
                 resin_libraries.append(
                     build_component_library(
                         pubchem_resin_pool,
@@ -18051,7 +18196,7 @@ def page_virtual_screening():
                         random_state=int(formula_random_state),
                     )
                 )
-            if use_pubchem_source and hardener_formula_enabled and pubchem_hard_pool:
+            if not formula_resume and use_pubchem_source and hardener_formula_enabled and pubchem_hard_pool:
                 hardener_libraries.append(
                     build_component_library(
                         pubchem_hard_pool,
@@ -18064,7 +18209,7 @@ def page_virtual_screening():
             base_resin_library = merge_component_libraries(*resin_libraries)
             base_hardener_library = merge_component_libraries(*hardener_libraries) if hardener_formula_enabled else pd.DataFrame()
 
-            if use_guided_source:
+            if not formula_resume and use_guided_source:
                 guided_resin_library = generate_virtual_component_library(
                     role="resin",
                     n_samples=int(guided_n_generate),
@@ -18149,24 +18294,38 @@ def page_virtual_screening():
                     f"本批 {int(batch_count):,} 条，累计 {int(total_count):,} 条..."
                 )
                 return not _vs_pause_flag[0]
-            design_space = enumerate_formulation_candidates(
-                resin_library,
-                hardener_library if hardener_formula_enabled else None,
-                pair_mode=pair_mode_map_formula.get(pair_mode_label, "cartesian"),
-                max_pairs=int(max_pairs_formula),
-                random_state=int(formula_random_state),
-                feature_grid=formula_feature_grid,
-                max_formulations=int(max_formulations),
-                batch_size=int(batch_process_size),
-                hardener_required=bool(hardener_formula_enabled),
-                max_resin_components=int(max_resin_components),
-                max_hardener_components=int(max_hardener_components),
-                comp_diversity=bool(comp_diversity),
-                batch_callback=_batch_callback,
-            )
+            if formula_resume:
+                design_space = SimpleNamespace(
+                    candidate_df=pending_formula_pool.copy(),
+                    metadata=dict(
+                        st.session_state.get("vs_formula_pending_design_metadata")
+                        or {}
+                    ),
+                )
+            else:
+                design_space = enumerate_formulation_candidates(
+                    resin_library,
+                    hardener_library if hardener_formula_enabled else None,
+                    pair_mode=pair_mode_map_formula.get(pair_mode_label, "cartesian"),
+                    max_pairs=int(max_pairs_formula),
+                    random_state=int(formula_random_state),
+                    feature_grid=formula_feature_grid,
+                    max_formulations=int(max_formulations),
+                    batch_size=int(batch_process_size),
+                    hardener_required=bool(hardener_formula_enabled),
+                    max_resin_components=int(max_resin_components),
+                    max_hardener_components=int(max_hardener_components),
+                    comp_diversity=bool(comp_diversity),
+                    batch_callback=_batch_callback,
+                )
             pool_df = design_space.candidate_df
             observed_anchor_count = 0
-            if use_dataset_source and isinstance(df_ref_design, pd.DataFrame) and dataset_resin_cols:
+            if (
+                not formula_resume
+                and use_dataset_source
+                and isinstance(df_ref_design, pd.DataFrame)
+                and dataset_resin_cols
+            ):
                 observed_formula_df = _collect_observed_formula_rows(
                     df_ref_design,
                     dataset_resin_cols,
@@ -18214,8 +18373,15 @@ def page_virtual_screening():
                 "applied": False,
                 "stage": formula_chem_rule_mode,
             }
+            if formula_resume:
+                chem_rule_funnel.update(
+                    dict(
+                        st.session_state.get("vs_formula_pending_chem_rule_funnel")
+                        or {}
+                    )
+                )
 
-            if apply_formula_chem_rules_pre:
+            if apply_formula_chem_rules_pre and not formula_resume:
                 formula_progress.progress(34)
                 formula_status.info("正在执行树脂/固化剂角色化学规则筛选...")
                 _pool_before_chem = int(len(pool_df))
@@ -18277,20 +18443,54 @@ def page_virtual_screening():
                 resin_col="resin_smiles",
                 hardener_col="hardener_smiles" if hardener_formula_enabled else None,
             )
-            formula_mapping, formula_mapping_report, _ = (
-                _prepare_post_feature_mapping_for_prediction(
-                    model_feature_cols=post_feature_model_cols,
-                    molecular_feature_cols=configured_molecular_feature_cols,
-                    candidate_df=pool_df,
+            if formula_preflight_mapping is not None:
+                actual_catalog = build_post_feature_catalog(
+                    pool_df,
                     computed_definitions=POST_FEATURE_COMPUTED_DEFINITIONS,
-                    missing_input_tolerant=False,
-                    panel_key="formulation",
+                    excluded_columns={
+                        "resin_smiles",
+                        "hardener_smiles",
+                        "combo_smiles",
+                        "candidate_origin",
+                        "formulation_id",
+                        "_molecule_key",
+                    },
                 )
-            )
+                formula_mapping = formula_preflight_mapping
+                formula_mapping_report = validate_mapping(
+                    formula_mapping,
+                    model_feature_cols=post_feature_model_cols,
+                    candidate_df=pool_df,
+                    catalog=actual_catalog,
+                    missing_input_tolerant=False,
+                )
+            else:
+                formula_mapping, formula_mapping_report, _ = (
+                    _prepare_post_feature_mapping_for_prediction(
+                        model_feature_cols=post_feature_model_cols,
+                        molecular_feature_cols=configured_molecular_feature_cols,
+                        candidate_df=pool_df,
+                        computed_definitions=POST_FEATURE_COMPUTED_DEFINITIONS,
+                        missing_input_tolerant=False,
+                        panel_key="formulation",
+                    )
+                )
             if not formula_mapping_report["ok"]:
+                st.session_state["vs_formula_pending_pool"] = pool_df.copy()
+                st.session_state["vs_formula_pending_design_metadata"] = dict(
+                    getattr(design_space, "metadata", {}) or {}
+                )
+                st.session_state["vs_formula_pending_chem_rule_funnel"] = dict(
+                    chem_rule_funnel
+                )
+                st.session_state["vs_formula_mapping_ready"] = False
                 st.error(
                     "❌ 配方级预测已阻断：后处理特征映射未通过预测前校验。"
                     + "；".join(formula_mapping_report.get("errors") or [])
+                )
+                st.info(
+                    "候选池已暂存。请在本页完成映射确认后，再点击“开始配方级高通量筛选”；"
+                    "确认前不会提取分子特征或调用模型预测。"
                 )
                 return
             pool_df["_molecule_key"] = _make_formula_molecule_key(pool_df)
@@ -18478,6 +18678,40 @@ def page_virtual_screening():
                     extracted_mol_features.reset_index(drop=True).to_numpy()
                 )
             unique_mol_features = _downcast_screening_numeric(unique_mol_features)
+            if screening_workflow is not None and saved_mol_feature_cols:
+                valid_unique_mask = get_valid_feature_row_mask(
+                    unique_mol_features,
+                    saved_mol_feature_cols,
+                ).reset_index(drop=True)
+                invalid_unique_count = int((~valid_unique_mask).sum())
+                if invalid_unique_count:
+                    unique_mol_df = unique_mol_df.reset_index(drop=True)
+                    unique_mol_features = unique_mol_features.reset_index(drop=True)
+                    valid_keys = set(
+                        unique_mol_df.loc[valid_unique_mask, "_molecule_key"].tolist()
+                    )
+                    pool_df = pool_df[
+                        pool_df["_molecule_key"].isin(valid_keys)
+                    ].reset_index(drop=True)
+                    unique_mol_df = unique_mol_df.loc[
+                        valid_unique_mask
+                    ].reset_index(drop=True)
+                    unique_mol_features = unique_mol_features.loc[
+                        valid_unique_mask
+                    ].reset_index(drop=True)
+                    design_space.metadata["invalid_feature_unique_count"] = (
+                        invalid_unique_count
+                    )
+                    formula_status.warning(
+                        f"已剔除 {invalid_unique_count:,} 个分子特征提取失败的唯一候选，"
+                        f"剩余 {len(unique_mol_df):,} 个唯一分子 / {len(pool_df):,} 个配方。"
+                    )
+                    if pool_df.empty:
+                        st.error(
+                            "❌ 所有候选的分子特征都未能按训练 workflow 生成，"
+                            "请检查 SMILES/BigSMILES 格式或分子特征流程配置。"
+                        )
+                        return
             unique_feature_table = pd.concat(
                 [
                     unique_mol_df[["_molecule_key"]].reset_index(drop=True),
@@ -19294,6 +19528,10 @@ def page_virtual_screening():
                 if isinstance(value, pd.DataFrame)
             }
             st.session_state["vs_formula_result_updated_at"] = time.time()
+            st.session_state.pop("vs_formula_pending_pool", None)
+            st.session_state.pop("vs_formula_pending_design_metadata", None)
+            st.session_state.pop("vs_formula_pending_chem_rule_funnel", None)
+            st.session_state["vs_formula_mapping_ready"] = False
 
             return
 
@@ -19836,17 +20074,40 @@ def page_virtual_screening():
             if target_row is not None:
                 base_row = target_row
 
+        strict_feature_cols = [
+            column for column in workflow_feature_names if column in feature_cols
+        ] if screening_workflow is not None else []
+        if strict_feature_cols:
+            valid_candidate_mask = get_valid_feature_row_mask(
+                mol_features,
+                strict_feature_cols,
+            ).reset_index(drop=True)
+            invalid_candidate_count = int((~valid_candidate_mask).sum())
+            if invalid_candidate_count:
+                pool_df = pool_df.reset_index(drop=True)
+                mol_features = mol_features.reset_index(drop=True)
+                pool_df = pool_df.loc[valid_candidate_mask].reset_index(drop=True)
+                mol_features = mol_features.loc[
+                    valid_candidate_mask
+                ].reset_index(drop=True)
+                st.warning(
+                    f"已剔除 {invalid_candidate_count:,} 个分子特征提取失败的候选，"
+                    f"剩余 {len(pool_df):,} 条。"
+                )
+                if pool_df.empty:
+                    st.error(
+                        "❌ 所有候选的分子特征都未能按训练 workflow 生成，"
+                        "请检查 SMILES/BigSMILES 格式或分子特征流程配置。"
+                    )
+                    return
+
         X = build_feature_matrix(
             feature_cols=feature_cols,
             mol_features=mol_features,
             base_row=base_row,
             fill_missing_fp=True,
             strict=screening_workflow is not None,
-            strict_feature_cols=[
-                column for column in workflow_feature_names if column in feature_cols
-            ]
-            if screening_workflow is not None
-            else None,
+            strict_feature_cols=strict_feature_cols or None,
         )
         if ordinary_mapping is not None:
             mapped_post = apply_mapping(

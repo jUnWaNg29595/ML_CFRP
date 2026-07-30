@@ -25,6 +25,7 @@ from core.virtual_screening import (
     filter_candidates_by_epoxy_rules,
     generate_candidate_pool,
     generate_virtual_component_library,
+    get_valid_feature_row_mask,
     infer_primary_component_role,
     limit_unique_candidates_for_expensive_features,
     predict_with_model,
@@ -47,6 +48,29 @@ def test_exact_replay_rejects_missing_required_feature_without_fingerprint_fill(
             pd.DataFrame({"resin_1_x": [1.0]}),
             strict=True,
         )
+
+
+def test_feature_row_mask_excludes_nan_inf_and_missing_required_features():
+    features = pd.DataFrame(
+        {
+            "resin_a": [1.0, np.nan, 3.0],
+            "resin_b": [2.0, 4.0, np.inf],
+        }
+    )
+
+    mask = get_valid_feature_row_mask(
+        features,
+        ["resin_a", "resin_b"],
+    )
+
+    assert mask.tolist() == [True, False, False]
+    missing_mask = get_valid_feature_row_mask(
+        features,
+        ["resin_a", "missing_feature"],
+    )
+    assert missing_mask.tolist() == [False, False, False]
+
+
 from core.smiles_utils import parse_chemical_string
 
 

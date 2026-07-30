@@ -1861,6 +1861,28 @@ def build_feature_matrix(
     return X.replace([np.inf, -np.inf], np.nan).astype(float)
 
 
+def get_valid_feature_row_mask(
+    mol_features: Optional[pd.DataFrame],
+    required_cols: Optional[Sequence[str]],
+) -> pd.Series:
+    """Return rows whose required extracted features are numeric and finite."""
+    if mol_features is None:
+        return pd.Series(dtype=bool)
+
+    mask = pd.Series(True, index=mol_features.index, dtype=bool)
+    required = [str(column) for column in (required_cols or []) if str(column)]
+    for column in required:
+        if column not in mol_features.columns:
+            return pd.Series(False, index=mol_features.index, dtype=bool)
+        try:
+            values = pd.to_numeric(mol_features[column], errors="coerce")
+            finite = np.isfinite(np.asarray(values, dtype=float))
+        except (TypeError, ValueError):
+            finite = np.zeros(len(mol_features), dtype=bool)
+        mask &= pd.Series(finite, index=mol_features.index, dtype=bool)
+    return mask
+
+
 def add_candidate_equivalent_metrics(
     df: pd.DataFrame,
     *,

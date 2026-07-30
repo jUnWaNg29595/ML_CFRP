@@ -35,10 +35,57 @@ _WORKFLOW_FIELDS = (
 
 def _deduplicate(values: list[Any]) -> list[Any]:
     result = []
+    hashable_seen = set()
+    serialized_seen = set()
+    fallback_values = []
     for value in values:
-        if value not in result:
-            result.append(value)
+        try:
+            if value in hashable_seen:
+                continue
+            hashable_seen.add(value)
+        except TypeError:
+            try:
+                marker = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=repr,
+                )
+            except (TypeError, ValueError):
+                if any(value == previous for previous in fallback_values):
+                    continue
+                fallback_values.append(value)
+            else:
+                if marker in serialized_seen:
+                    continue
+                serialized_seen.add(marker)
+        result.append(value)
     return result
+
+
+def align_extracted_features_to_rows(
+    features_df: pd.DataFrame,
+    valid_indices: Sequence[int] | None,
+    total_rows: int,
+) -> pd.DataFrame:
+    """Place extracted rows back into the source-row coordinate system."""
+    features = features_df.reset_index(drop=True)
+    row_count = max(0, int(total_rows))
+    indices = [
+        int(index)
+        for index in (valid_indices or [])
+        if 0 <= int(index) < row_count
+    ]
+    n_rows = min(len(indices), len(features))
+    if n_rows == 0:
+        return features.iloc[:0].reindex(range(row_count))
+
+    aligned = features.iloc[:n_rows].copy()
+    aligned.index = indices[:n_rows]
+    if aligned.index.has_duplicates:
+        aligned = aligned[~aligned.index.duplicated(keep="last")]
+    return aligned.reindex(range(row_count))
 
 
 def merge_extracted_features(
@@ -71,16 +118,11 @@ def merge_extracted_features(
         return pd.concat([base, features], axis=1, copy=False)
 
     n_rows = min(len(indices), len(features))
-    full_features = pd.DataFrame(
-        np.nan,
-        index=range(len(base)),
-        columns=features.columns,
-        dtype=float,
+    full_features = align_extracted_features_to_rows(
+        features,
+        indices[:n_rows],
+        len(base),
     )
-    if n_rows:
-        full_features.iloc[indices[:n_rows], :] = features.iloc[
-            :n_rows
-        ].to_numpy(copy=False)
     return pd.concat([base, full_features], axis=1, copy=False)
 
 
@@ -1267,18 +1309,19 @@ def _restore_step_rows(
     valid_indices: Sequence[int],
     row_index: pd.Index,
 ) -> pd.DataFrame:
-    restored = pd.DataFrame(index=row_index, columns=features.columns)
-    if len(features) == 0:
-        return restored
     valid = [int(index) for index in valid_indices]
     if len(valid) != len(features):
         raise ValueError(
             "feature extractor returned a row count inconsistent with valid indices"
         )
-    for feature_position, original_position in enumerate(valid):
-        if original_position < 0 or original_position >= len(restored):
-            raise ValueError("feature extractor returned an out-of-range row index")
-        restored.iloc[original_position, :] = features.iloc[feature_position].to_numpy()
+    if any(original_position < 0 or original_position >= len(row_index) for original_position in valid):
+        raise ValueError("feature extractor returned an out-of-range row index")
+    restored = align_extracted_features_to_rows(
+        features,
+        valid,
+        len(row_index),
+    )
+    restored.index = row_index
     return restored
 
 

@@ -12,7 +12,7 @@ import pandas as pd
 
 
 POST_FEATURE_MAPPING_SCHEMA_VERSION = 1
-SOURCE_TYPES = ("pending", "computed", "candidate", "constant", "unused")
+SOURCE_TYPES = ("pending", "computed", "candidate", "constant", "unused", "keep")
 _UNSAFE_FEATURE_TEXT_MARKERS = (
     "DeltaGenerator",
     "LockedCursor",
@@ -20,6 +20,13 @@ _UNSAFE_FEATURE_TEXT_MARKERS = (
     "ScriptRunContext",
     "page_virtual_screening()",
     "<function ",
+)
+_UNSAFE_FEATURE_COMPACT_MARKERS = (
+    "deltagenerator",
+    "lockedcursor",
+    "runningcursor",
+    "scriptruncontext",
+    "page_virtual_screening",
 )
 MAPPING_SESSION_KEYS = frozenset(
     {
@@ -59,7 +66,11 @@ def sanitize_feature_columns(
                 rejected_types.append(type_name)
             continue
         column = value.strip()
-        if any(marker in column for marker in _UNSAFE_FEATURE_TEXT_MARKERS):
+        compact_column = "".join(column.split()).lower()
+        if (
+            any(marker in column for marker in _UNSAFE_FEATURE_TEXT_MARKERS)
+            or any(marker in compact_column for marker in _UNSAFE_FEATURE_COMPACT_MARKERS)
+        ):
             if "Streamlit内部对象文本" not in rejected_types:
                 rejected_types.append("Streamlit内部对象文本")
             continue
@@ -195,6 +206,59 @@ def build_post_feature_catalog(
     )
 
 
+def build_manual_mapping_choices(
+    catalog: pd.DataFrame,
+    *,
+    include_constant: bool = True,
+    include_unused: bool = True,
+) -> list[dict[str, Any]]:
+    """Build compact, explicit choices for the pre-screen mapping panel."""
+    choices: list[dict[str, Any]] = [
+        {
+            "label": "请选择来源",
+            "source_type": "pending",
+            "source_column": None,
+        }
+    ]
+    if isinstance(catalog, pd.DataFrame):
+        for row in catalog.to_dict(orient="records"):
+            column = _safe_text(row.get("column"))
+            source_type = _safe_text(row.get("source_type"))
+            if not column or source_type not in {"computed", "candidate"}:
+                continue
+            if source_type == "computed":
+                category = _safe_text(row.get("category"))
+                label = f"计算列：{column}"
+                if category and category != "未分类":
+                    label += f"（{category}）"
+            else:
+                label = f"原始列：{column}"
+            choices.append(
+                {
+                    "label": label,
+                    "source_type": source_type,
+                    "source_column": column,
+                }
+            )
+    if include_constant:
+        choices.append(
+            {
+                "label": "常数值（手动输入）",
+                "source_type": "constant",
+                "source_column": None,
+            }
+        )
+    if include_unused:
+        choices.append(
+            {
+                "label": "不使用（仅在模型允许缺失时）",
+                "source_type": "unused",
+                "source_column": None,
+            }
+        )
+    return choices
+
+
 def create_mapping_draft(
     model_feature_cols: list[str],
     *,
@@ -284,6 +348,8 @@ def validate_mapping(
                 errors.append(f"{feature}: unused is not allowed for this model input")
             else:
                 warnings.append(f"{feature}: explicitly unused; downstream preprocessing must allow missing input")
+        elif source_type == "keep":
+            warnings.append(f"{feature}: keep existing candidate feature value")
     mapping_hash = mapping_fingerprint(normalized)
     catalog_hash = catalog_fingerprint(catalog)
     stored_catalog_hash = mapping.get("catalog_fingerprint")
@@ -335,6 +401,8 @@ def apply_mapping(
             result[feature] = constant
         elif source_type == "unused":
             result[feature] = np.nan
+        elif source_type == "keep":
+            pass
     return result.reindex(columns=_feature_cols(model_feature_cols))
 
 

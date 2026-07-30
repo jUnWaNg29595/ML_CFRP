@@ -1,4 +1,5 @@
 import copy
+import time
 
 import pandas as pd
 import pytest
@@ -722,6 +723,46 @@ def test_append_training_workflow_preserves_previous_extraction_steps():
         "resin_2_maccs_1",
     ]
     assert appended.steps[-1]["source_columns"] == ["resin_smiles_2"]
+
+
+def test_workflow_normalization_scales_with_large_row_metadata():
+    rows = 4000
+    row_mapping = [
+        {"source_row_index": index, "input_position": index}
+        for index in range(rows)
+    ]
+    payload = {
+        "schema_version": 2,
+        "mode": "single_batch",
+        "input_contract": {
+            "source_row_count": rows,
+            "source_row_indices": list(range(rows)),
+            "source_row_mapping": row_mapping,
+        },
+        "steps": [
+            {
+                "step_id": "single_1",
+                "order": 0,
+                "source_columns": ["resin_smiles"],
+                "method": "MACCS",
+                "feature_names": ["resin_0"],
+                "valid_row_behavior": {
+                    "source_row_count": rows,
+                    "source_row_indices": list(range(rows)),
+                    "source_row_mapping": row_mapping,
+                    "valid_indices": list(range(rows)),
+                },
+            }
+        ],
+        "merge_order": ["single_1"],
+        "final_feature_names": ["resin_0"],
+    }
+
+    started = time.perf_counter()
+    normalized = normalize_workflow_config(payload)
+
+    assert normalized["input_contract"]["source_row_indices"] == list(range(rows))
+    assert time.perf_counter() - started < 1.0
 
 
 def test_append_training_workflow_generates_unique_ids_for_repeated_single_steps():

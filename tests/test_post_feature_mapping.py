@@ -10,6 +10,7 @@ from core.post_feature_mapping import (
     POST_FEATURE_MAPPING_SCHEMA_VERSION,
     apply_mapping,
     build_post_feature_catalog,
+    build_manual_mapping_choices,
     catalog_fingerprint,
     create_mapping_draft,
     mapping_fingerprint,
@@ -42,6 +43,15 @@ def test_feature_column_sanitization_rejects_persisted_streamlit_repr_text():
     polluted_text = (
         "page_virtual_screening() DeltaGenerator "
         "DeltaGenerator(_provided_cursor=LockedCursor(...))"
+    )
+
+    assert sanitize_feature_columns(["temperature", polluted_text]) == ["temperature"]
+
+
+def test_feature_column_sanitization_rejects_compact_streamlit_repr_text():
+    polluted_text = (
+        "page_virtual_screeningDeltaGeneratorDeltaGenerator("
+        "_provided_cursor=LockedCursor(_transient_elements=SparseList(...))"
     )
 
     assert sanitize_feature_columns(["temperature", polluted_text]) == ["temperature"]
@@ -108,6 +118,40 @@ def test_empty_draft_does_not_match_same_named_column():
     assert draft["confirmed"] is False
     assert draft["rules"]["EEW"]["source_type"] == "pending"
     assert draft["rules"]["EEW"]["source_column"] is None
+
+
+def test_manual_mapping_choices_are_compact_and_explicit():
+    catalog = build_post_feature_catalog(
+        pd.DataFrame(
+            {
+                "computed_resin_eew": [180.0],
+                "raw_temperature": [80.0],
+            }
+        ),
+        computed_definitions={
+            "computed_resin_eew": {
+                "category": "EEW",
+                "unit": "g/eq",
+                "definition": "resin molecular weight / epoxy functionality",
+            }
+        },
+    )
+
+    choices = build_manual_mapping_choices(catalog)
+
+    assert choices[0] == {
+        "label": "请选择来源",
+        "source_type": "pending",
+        "source_column": None,
+    }
+    assert choices[1]["label"] == "计算列：computed_resin_eew（EEW）"
+    assert choices[1]["source_type"] == "computed"
+    assert choices[1]["source_column"] == "computed_resin_eew"
+    assert choices[2]["label"] == "原始列：raw_temperature"
+    assert choices[2]["source_type"] == "candidate"
+    assert choices[2]["source_column"] == "raw_temperature"
+    assert all("dtype" not in choice["label"] for choice in choices)
+    assert all("指纹" not in choice["label"] for choice in choices)
 
 
 def test_default_mapping_is_only_a_draft():
@@ -261,6 +305,40 @@ def test_missing_input_tolerance_only_allows_explicit_unused_columns():
     )
     assert strict["ok"] is False
     assert tolerant["ok"] is True
+
+
+def test_keep_mapping_preserves_existing_candidate_feature_value():
+    candidate_df = pd.DataFrame(index=[0, 1])
+    catalog = build_post_feature_catalog(candidate_df, computed_definitions={})
+    mapping = {
+        "schema_version": 1,
+        "model_feature_cols": ["temperature"],
+        "rules": {
+            "temperature": {
+                "source_type": "keep",
+                "source_column": None,
+                "confirmed": True,
+            }
+        },
+        "confirmed": True,
+    }
+
+    report = validate_mapping(
+        mapping,
+        model_feature_cols=["temperature"],
+        candidate_df=candidate_df,
+        catalog=catalog,
+        missing_input_tolerant=False,
+    )
+    result = apply_mapping(
+        pd.DataFrame({"temperature": [80.0, 90.0]}),
+        candidate_df,
+        mapping,
+        model_feature_cols=["temperature"],
+    )
+
+    assert report["ok"] is True
+    assert result["temperature"].tolist() == [80.0, 90.0]
 
 
 def test_mapping_and_catalog_fingerprints_are_stable_but_catalog_changes_invalidate():
