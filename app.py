@@ -2259,6 +2259,26 @@ def _clear_molecular_feature_session_metadata():
     _clear_post_feature_mapping_session_metadata()
 
 
+def _clear_process_pls_session_metadata():
+    st.session_state["process_pls_workflow"] = None
+    st.session_state["process_pls_preview_report"] = None
+    st.session_state["process_pls_enabled_default"] = False
+    st.session_state["process_pls_use_in_training"] = False
+
+
+def _restore_process_pls_metadata(payload):
+    from core.model_io import restore_process_pls_metadata
+
+    workflow = restore_process_pls_metadata(payload)
+    if workflow is None:
+        _clear_process_pls_session_metadata()
+        return None
+    st.session_state["process_pls_workflow"] = workflow
+    st.session_state["process_pls_enabled_default"] = bool(workflow.get("enabled"))
+    st.session_state["process_pls_use_in_training"] = False
+    return workflow
+
+
 def _clear_post_feature_mapping_session_metadata():
     st.session_state["post_feature_mapping_default"] = None
     st.session_state["post_feature_mapping_draft"] = None
@@ -2700,7 +2720,7 @@ def _current_molecular_feature_artifact_extra():
     feature_mask = _coerce_feature_mask(st.session_state.get("feature_mask"))
     if feature_mask is not None:
         feature_mask = feature_mask.tolist()
-    return {
+    extra = {
         "molecular_feature_workflow": st.session_state.get(
             "molecular_feature_workflow"
         ),
@@ -2716,6 +2736,14 @@ def _current_molecular_feature_artifact_extra():
         ),
         "feature_mask": feature_mask,
     }
+    from core.model_io import process_pls_to_artifact_extra
+
+    extra.update(
+        process_pls_to_artifact_extra(
+            st.session_state.get("process_pls_workflow")
+        )
+    )
+    return extra
 
 
 def _is_recent_snapshot(meta: dict, max_hours: int = 72) -> bool:
@@ -10609,6 +10637,7 @@ def page_molecular_feature_reproduction():
                 workflow_payload = resolved.to_dict()
                 st.session_state["molecular_feature_workflow"] = workflow_payload
                 st.session_state["molecular_feature_config"] = resolved.to_legacy_config()
+                _restore_process_pls_metadata(payload)
                 st.session_state["screening_workflow_locked"] = False
                 st.success(f"已加载 workflow：{workflow_payload.get('workflow_hash', '')[:16]}…")
             except Exception as exc:
@@ -13065,6 +13094,7 @@ def page_model_training():
                         try:
                             from core.model_io import (
                                 create_model_artifact_bytes,
+                                process_pls_to_artifact_extra,
                                 workflow_to_artifact_extra,
                             )
                             import datetime
@@ -13093,6 +13123,11 @@ def page_model_training():
                             _extra.update(
                                 workflow_to_artifact_extra(
                                     st.session_state.get('molecular_feature_workflow')
+                                )
+                            )
+                            _extra.update(
+                                process_pls_to_artifact_extra(
+                                    st.session_state.get('process_pls_workflow')
                                 )
                             )
                             # 如果有 FE tracker，也一并导出
@@ -13163,6 +13198,11 @@ def page_model_training():
                             process_payload.update(
                                 workflow_to_artifact_extra(
                                     st.session_state.get('molecular_feature_workflow')
+                                )
+                            )
+                            process_payload.update(
+                                process_pls_to_artifact_extra(
+                                    st.session_state.get('process_pls_workflow')
                                 )
                             )
                             process_bytes = json.dumps(process_payload, ensure_ascii=False, indent=2).encode('utf-8')
@@ -13428,6 +13468,7 @@ def page_model_training():
                         try:
                             from core.model_io import (
                                 create_model_artifact_bytes,
+                                process_pls_to_artifact_extra,
                                 workflow_to_artifact_extra,
                             )
                             metrics = {}
@@ -13461,6 +13502,11 @@ def page_model_training():
                             extra_export.update(
                                 workflow_to_artifact_extra(
                                     st.session_state.get("molecular_feature_workflow")
+                                )
+                            )
+                            extra_export.update(
+                                process_pls_to_artifact_extra(
+                                    st.session_state.get("process_pls_workflow")
                                 )
                             )
                             _processed_ref = st.session_state.get("processed_data")
@@ -15394,6 +15440,7 @@ def page_prediction():
                         artifact,
                         model_feature_cols=artifact.get("feature_cols"),
                     )
+                    _restore_process_pls_metadata(artifact)
                     if is_xgboost and model_obj:
                         st.session_state.model = model_obj
                         st.session_state.xgb_model_id = None
@@ -16511,6 +16558,7 @@ def page_virtual_screening():
                         artifact,
                         model_feature_cols=artifact.get("feature_cols"),
                     )
+                    _restore_process_pls_metadata(artifact)
                     if is_xgboost and model_obj:
                         st.session_state.model = model_obj
                         st.session_state.xgb_model_id = None
@@ -16560,6 +16608,7 @@ def page_virtual_screening():
             artifact,
             model_feature_cols=feature_cols,
         )
+        _restore_process_pls_metadata(artifact)
     else:
         from core.virtual_screening import resolve_molecular_feature_workflow
 
@@ -16591,6 +16640,7 @@ def page_virtual_screening():
                     cfg_payload,
                     model_feature_cols=feature_cols,
                 )
+                _restore_process_pls_metadata(cfg_payload)
                 if mf_cfg is None:
                     raise ValueError(
                         "文件中未找到有效的 molecular_feature_workflow "

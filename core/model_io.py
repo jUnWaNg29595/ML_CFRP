@@ -16,6 +16,7 @@ import io
 import time
 
 from .molecular_feature_workflow import MolecularFeatureWorkflow
+from .process_pls import PROCESS_PLS_SCHEMA_VERSION
 
 try:
     import joblib  # sklearn dependency, but import defensively
@@ -40,6 +41,41 @@ def workflow_to_artifact_extra(workflow: Any) -> Dict[str, Any]:
         "workflow_hash": workflow.workflow_hash,
         "workflow_schema_version": workflow.schema_version,
     }
+
+
+def process_pls_to_artifact_extra(config: Any) -> Dict[str, Any]:
+    """Return compact, versioned process PLS metadata for an artifact."""
+    if not isinstance(config, dict):
+        return {}
+    workflow = dict(config)
+    return {
+        "process_pls_workflow": workflow,
+        "process_pls_schema_version": workflow.get("schema_version"),
+        "process_pls_workflow_hash": workflow.get("workflow_hash"),
+    }
+
+
+def restore_process_pls_metadata(payload: Any) -> Optional[Dict[str, Any]]:
+    """Extract and validate process PLS metadata from an artifact or config payload."""
+    if not isinstance(payload, dict):
+        return None
+    extra = payload.get("extra")
+    extra = extra if isinstance(extra, dict) else {}
+    workflow = (
+        extra.get("process_pls_workflow")
+        if "process_pls_workflow" in extra
+        else payload.get("process_pls_workflow")
+    )
+    if not isinstance(workflow, dict):
+        return None
+    try:
+        schema_version = int(workflow.get("schema_version", -1))
+    except (TypeError, ValueError):
+        schema_version = -1
+    if schema_version != PROCESS_PLS_SCHEMA_VERSION:
+        raise ValueError("导入模型的工艺 PLS workflow 版本不受支持")
+    return dict(workflow)
+
 
 def create_model_artifact(
     *,

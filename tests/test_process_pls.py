@@ -202,3 +202,40 @@ def test_process_pls_cross_validation_fits_each_outer_training_fold(monkeypatch)
     assert result["fold_r2"]
     assert fit_row_counts
     assert all(row_count < len(X) for row_count in fit_row_counts)
+
+
+def test_process_pls_artifact_round_trip_preserves_workflow_metadata():
+    from core.model_io import (
+        create_model_artifact,
+        dumps_artifact,
+        loads_artifact,
+        process_pls_to_artifact_extra,
+    )
+
+    config = {
+        "schema_version": 1,
+        "enabled": True,
+        "process_feature_cols": ["temperature", "time"],
+        "max_components": 8,
+        "vip_top_k": 8,
+        "missing_threshold": 0.85,
+        "cv_splits": 5,
+        "random_state": 42,
+        "selection_mode": "auto_combined_score",
+        "workflow_hash": "abc123",
+    }
+    artifact = create_model_artifact(
+        model_name="test",
+        target_col="target",
+        feature_cols=["process_pls_1"],
+        model=object(),
+        extra=process_pls_to_artifact_extra(config),
+    )
+    restored = loads_artifact(dumps_artifact(artifact))
+
+    assert restored["extra"]["process_pls_workflow"]["process_feature_cols"] == [
+        "temperature",
+        "time",
+    ]
+    assert restored["extra"]["process_pls_schema_version"] == 1
+    assert restored["extra"]["process_pls_workflow_hash"] == "abc123"
