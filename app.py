@@ -2087,6 +2087,9 @@ _SNAPSHOT_META_KEYS = [
     "post_feature_mapping_model_fingerprint",
     "post_feature_mapping_catalog_fingerprint",
     "post_feature_mapping_snapshot",
+    "process_pls_workflow",
+    "process_pls_preview_report",
+    "process_pls_enabled_default",
 ]
 
 # --- 自定义 CSS 样式 ---
@@ -2791,6 +2794,9 @@ def init_session_state():
         'post_feature_mapping_model_fingerprint': None,
         'post_feature_mapping_catalog_fingerprint': None,
         'post_feature_mapping_snapshot': None,
+        'process_pls_workflow': None,
+        'process_pls_preview_report': None,
+        'process_pls_enabled_default': False,
         # --- [新增] 最近一次自动导出信息 ---
         'last_export_model_path': None,
         'last_export_feature_process_path': None,

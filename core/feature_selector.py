@@ -24,11 +24,56 @@ from collections import Counter, defaultdict
 from joblib import Parallel, delayed
 import multiprocessing
 from .model_interpreter import compute_xgboost_native_shap
+from .process_pls import ProcessPLSTransformer, process_pls_config_to_dict
 
 warnings.filterwarnings('ignore')
 
 # 获取 CPU 核心数
 N_JOBS = max(1, multiprocessing.cpu_count() - 1)  # 保留一个核心给系统
+
+
+def infer_process_feature_candidates(
+    frame,
+    original_features,
+    molecular_features,
+    target_col,
+):
+    """Infer numeric process-feature candidates without mixing molecular inputs."""
+    if frame is None:
+        return []
+    molecular = set(molecular_features or [])
+    excluded = {str(target_col)} if target_col else set()
+    result = []
+    for column in list(original_features or []):
+        if column not in getattr(frame, "columns", []):
+            continue
+        column_name = str(column)
+        if column in molecular or column_name in excluded:
+            continue
+        if column_name.lower().endswith(("_smiles", "_bigsmiles")):
+            continue
+        if frame[column].dtype == "object":
+            continue
+        numeric = pd.to_numeric(frame[column], errors="coerce")
+        if numeric.notna().sum() == 0:
+            continue
+        result.append(column)
+    return result
+
+
+def build_process_pls_config(process_feature_cols, random_state=42):
+    """Build a serializable, unfitted process-PLS workflow config."""
+    return process_pls_config_to_dict({
+        "schema_version": 1,
+        "enabled": True,
+        "process_feature_cols": list(process_feature_cols or []),
+        "max_components": 8,
+        "vip_top_k": 8,
+        "missing_threshold": 0.85,
+        "cv_splits": 5,
+        "random_state": int(random_state),
+        "selection_mode": "auto_combined_score",
+    })
 
 
 # ==========================================
@@ -812,6 +857,7 @@ def render_feature_selector():
         "🌀 RFE递归消除",
         "🎯 FSFS去冗余",
         "🧩 PCA降维",
+        "⚗️ 工艺PLS",
         "⭐ 模型重要性",
         "🏷️ 前缀管理",
     ]
@@ -980,8 +1026,8 @@ def render_feature_selector():
         return molecular_features, original_features, classifier, recorded_mol_features
 
     # 只在需要特征分类的标签时才执行分类
-    # 标签 0 (手动选择) 和标签 1 (特征分类纠错) 需要分类结果
-    needs_classification = tab_choice in [tab_titles[0], tab_titles[1]]
+    # 标签 0 (手动选择)、1 (特征分类纠错) 和 7 (工艺PLS) 需要分类结果
+    needs_classification = tab_choice in [tab_titles[0], tab_titles[1], tab_titles[7]]
 
     if needs_classification:
         # 懒加载：只在需要时才执行特征分类
@@ -2642,8 +2688,149 @@ def render_feature_selector():
                     st.pyplot(fig_batch, use_container_width=True)
                     plt.close(fig_batch)
 
-    # --- Tab 8: 模型重要性 ---
+    # --- Tab 8: 工艺特征 PLS ---
     if tab_choice == tab_titles[7]:
+        molecular_features, original_features, classifier, recorded_mol_features = get_feature_classification()
+
+        st.markdown("#### ⚗️ 工艺特征 PLS")
+        st.caption("用于把稀疏工艺特征压缩为少量监督主成分；此处只做探索性预览，正式训练会重新在训练折内拟合以避免数据泄漏。")
+
+        process_candidates = infer_process_feature_candidates(
+            current_df,
+            original_features=original_features,
+            molecular_features=molecular_features,
+            target_col=target_col,
+        )
+
+        if not process_candidates:
+            st.warning("⚠️ 未检测到可用于 PLS 的工艺数值候选列。请先在“特征分类纠错”中把工艺列归为原始特征。")
+        else:
+            preview_rows = []
+            for column in process_candidates:
+                numeric = pd.to_numeric(current_df[column], errors="coerce")
+                preview_rows.append({
+                    "候选列": column,
+                    "缺失率": float(numeric.isna().mean()),
+                    "有效样本数": int(numeric.notna().sum()),
+                })
+            candidate_preview = pd.DataFrame(preview_rows)
+
+            selected_process_cols = st.multiselect(
+                "选择工艺候选列",
+                options=process_candidates,
+                default=[],
+                key="process_pls_selected_cols",
+                help="默认不自动全选，避免把无关原始特征误纳入 PLS。建议至少选择 2 个连续/数值工艺变量。",
+            )
+
+            st.markdown("##### 候选列预览")
+            display_preview = candidate_preview.copy()
+            display_preview["缺失率"] = display_preview["缺失率"].map(lambda value: f"{value:.1%}")
+            st.dataframe(display_preview, hide_index=True, height=260)
+
+            y_numeric = pd.to_numeric(current_df[target_col], errors="coerce") if target_col in current_df.columns else pd.Series(dtype=float)
+            y_mask = y_numeric.notna() & np.isfinite(y_numeric)
+            y_available = bool(y_mask.sum() >= 2)
+
+            col_diag, col_lock, col_clear = st.columns([1.2, 1.2, 1.0])
+            with col_diag:
+                if st.button("生成 PLS 诊断", key="btn_process_pls_preview"):
+                    if len(selected_process_cols) < 2:
+                        st.error("至少选择 2 个工艺数值特征")
+                    elif not y_available:
+                        st.error("当前数据没有可用于 PLS 诊断的数值目标列")
+                    else:
+                        try:
+                            fit_frame = current_df.loc[y_mask, selected_process_cols].copy()
+                            transformer = ProcessPLSTransformer(
+                                process_feature_cols=selected_process_cols,
+                                max_components=8,
+                                vip_top_k=8,
+                                missing_threshold=0.85,
+                                cv_splits=5,
+                                random_state=42,
+                            ).fit(fit_frame, y_numeric.loc[y_mask].to_numpy(dtype=float))
+
+                            cv_rows = transformer.cv_report_.get("candidates", [])
+                            cv_report = pd.DataFrame(cv_rows)
+                            if not cv_report.empty:
+                                cv_report = cv_report.rename(columns={
+                                    "n_components": "候选成分数",
+                                    "cv_r2_mean": "CV R²",
+                                    "cv_r2_std": "R²折间标准差",
+                                    "cv_rmse_mean": "CV RMSE",
+                                    "cv_rmse_std": "RMSE折间标准差",
+                                    "rmse_improvement": "RMSE改善",
+                                    "selection_score": "综合得分",
+                                })
+
+                            vip_report = pd.DataFrame({
+                                "特征": transformer.kept_process_feature_cols_,
+                                "VIP": transformer.vip_scores_,
+                            }).sort_values("VIP", ascending=False).head(8)
+
+                            st.session_state.process_pls_preview_report = {
+                                "selected_cols": list(selected_process_cols),
+                                "selected_n_components": int(transformer.n_components_),
+                                "cv_report": cv_report.to_dict("records"),
+                                "vip_top": vip_report.to_dict("records"),
+                                "workflow_hash_preview": transformer.workflow_hash_,
+                            }
+                            st.success("✅ PLS 诊断已生成（此预览不用于正式训练）")
+                        except Exception as exc:
+                            st.session_state.process_pls_preview_report = None
+                            st.error(f"PLS 诊断失败: {exc}")
+
+            preview_report = st.session_state.get("process_pls_preview_report")
+            with col_lock:
+                if st.button("锁定工艺 PLS 工作流", key="btn_process_pls_lock"):
+                    if len(selected_process_cols) < 2:
+                        st.error("至少选择 2 个工艺数值特征")
+                    elif not y_available:
+                        st.error("当前数据没有可用于 PLS 诊断的数值目标列")
+                    elif preview_report is None:
+                        st.error("请先生成 PLS 诊断")
+                    elif list(preview_report.get("selected_cols", [])) != list(selected_process_cols):
+                        st.error("当前选择与诊断结果不一致，请重新生成 PLS 诊断")
+                    else:
+                        st.session_state.process_pls_workflow = build_process_pls_config(
+                            selected_process_cols,
+                            random_state=42,
+                        )
+                        st.session_state.process_pls_enabled_default = False
+                        st.success("✅ 已锁定工艺 PLS 工作流；正式训练时默认关闭，需在训练页显式启用。")
+
+            with col_clear:
+                if st.button("清除锁定工作流", key="btn_process_pls_clear"):
+                    st.session_state.process_pls_workflow = None
+                    st.session_state.process_pls_preview_report = None
+                    st.session_state.process_pls_enabled_default = False
+                    st.success("已清除工艺 PLS 锁定配置")
+
+            preview_report = st.session_state.get("process_pls_preview_report")
+            if preview_report:
+                st.info("此预览不用于正式训练；正式训练会仅在训练数据内重新拟合 imputer、scaler 与 PLS。")
+                cv_display = pd.DataFrame(preview_report.get("cv_report", []))
+                if not cv_display.empty:
+                    st.markdown("##### PLS 诊断表")
+                    st.dataframe(cv_display, hide_index=True, height=260)
+                vip_display = pd.DataFrame(preview_report.get("vip_top", []))
+                if not vip_display.empty:
+                    st.markdown("##### VIP Top 结果")
+                    st.dataframe(vip_display, hide_index=True, height=240)
+
+            locked_workflow = st.session_state.get("process_pls_workflow")
+            if locked_workflow:
+                locked_cols = locked_workflow.get("process_feature_cols", [])
+                st.success(
+                    f"当前锁定：{len(locked_cols)} 个工艺列 | "
+                    f"max_components={locked_workflow.get('max_components')} | "
+                    f"vip_top_k={locked_workflow.get('vip_top_k')} | "
+                    f"hash={str(locked_workflow.get('workflow_hash', ''))[:12]}"
+                )
+
+    # --- Tab 9: 模型重要性 ---
+    if tab_choice == tab_titles[8]:
         st.markdown("#### ⭐ 模型重要性筛选")
 
         model = st.session_state.get('model')
@@ -2918,7 +3105,7 @@ def render_feature_selector():
                         st.info("👆 点击上方按钮开始计算SHAP重要性")
 
     # --- Tab 9: 前缀管理 ---
-    if tab_choice == tab_titles[8]:
+    if tab_choice == tab_titles[9]:
         from core.prefix_manager import render_prefix_manager
         render_prefix_manager()
 

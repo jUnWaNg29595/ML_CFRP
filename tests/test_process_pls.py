@@ -80,3 +80,23 @@ def test_process_pls_workflow_fingerprint_is_order_sensitive():
         "output_feature_names": ["process_pls_1"],
     })
     assert first != second
+
+
+def test_process_candidate_inference_excludes_molecular_and_text_columns():
+    from core.feature_selector import infer_process_feature_candidates
+
+    frame = pd.DataFrame({
+        "cure_temperature": [80.0, 90.0],
+        "cure_time": [30.0, 40.0],
+        "resin_smiles1": ["CCO", "CCC"],
+        "resin_Morgan_0": [0, 1],
+        "sample_id": ["A", "B"],
+        "target": [1.0, 2.0],
+    })
+    result = infer_process_feature_candidates(
+        frame,
+        original_features=["cure_temperature", "cure_time", "resin_smiles1", "resin_Morgan_0"],
+        molecular_features=["resin_smiles1", "resin_Morgan_0"],
+        target_col="target",
+    )
+    assert result == ["cure_temperature", "cure_time"]
