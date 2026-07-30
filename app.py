@@ -2797,6 +2797,7 @@ def init_session_state():
         'process_pls_workflow': None,
         'process_pls_preview_report': None,
         'process_pls_enabled_default': False,
+        'process_pls_use_in_training': False,
         # --- [新增] 最近一次自动导出信息 ---
         'last_export_model_path': None,
         'last_export_feature_process_path': None,
@@ -11626,6 +11627,26 @@ def page_model_training():
         scope_text = MODEL_SCOPE_GUIDE.get(model_name)
         if scope_text:
             st.caption(f"适用范围：{scope_text}")
+
+        process_pls_workflow = st.session_state.get("process_pls_workflow")
+        if (
+            not is_classification_task
+            and model_name not in GRAPH_MODEL_NAMES
+            and isinstance(process_pls_workflow, dict)
+            and process_pls_workflow.get("enabled")
+        ):
+            st.checkbox(
+                "使用已锁定工艺 PLS",
+                value=bool(st.session_state.get("process_pls_use_in_training", False)),
+                key="process_pls_use_in_training",
+                help="只转换锁定的工艺特征；分子特征 workflow 不变。正式拟合只使用训练折。",
+            )
+            st.caption(
+                f"工艺 PLS 已锁定：{len(process_pls_workflow.get('process_feature_cols', []))} 个原始列，"
+                f"workflow={str(process_pls_workflow.get('workflow_hash', ''))[:12]}…"
+            )
+        else:
+            st.caption("未锁定工艺 PLS；当前模型使用原始工艺特征流程。")
 
         # [新增] LazyPredict 快速模型对比
         st.markdown("---")

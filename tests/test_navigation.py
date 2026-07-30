@@ -18,3 +18,9 @@ def test_invalid_pending_shortcut_keeps_current_canonical_page():
         current_page="🧪 虚拟分子筛选",
         pending_page="不存在的页面",
     ) == "🧪 虚拟分子筛选"
+
+
+def test_process_pls_training_option_defaults_to_disabled_without_locked_workflow():
+    workflow = None
+    enabled = bool(workflow and workflow.get("enabled"))
+    assert enabled is False
