@@ -16601,6 +16601,60 @@ def page_virtual_screening():
 
     # --- 载入分子特征流程 ---
     artifact = st.session_state.get("imported_model_artifact") or {}
+    artifact_extra = artifact.get("extra") if isinstance(artifact, dict) else {}
+    artifact_extra = artifact_extra if isinstance(artifact_extra, dict) else {}
+    saved_process_pls_workflow = (
+        artifact_extra.get("process_pls_workflow")
+        or st.session_state.get("process_pls_workflow")
+    )
+    process_pls_step = None
+    if pipeline is not None:
+        try:
+            named_steps = getattr(pipeline, "named_steps", None)
+            if named_steps is not None:
+                process_pls_step = named_steps.get("process_pls")
+        except Exception:
+            process_pls_step = None
+        if process_pls_step is None:
+            try:
+                for step_name, step_obj in getattr(pipeline, "steps", []) or []:
+                    if step_name == "process_pls":
+                        process_pls_step = step_obj
+                        break
+            except Exception:
+                process_pls_step = None
+
+    if isinstance(saved_process_pls_workflow, dict) and saved_process_pls_workflow.get("enabled") and process_pls_step is None:
+        st.error(
+            "当前模型记录了工艺 PLS workflow，但模型文件里没有已拟合的 process_pls pipeline step。"
+            "请用“使用已锁定工艺 PLS”重新训练并导出模型后再筛选。"
+        )
+        return
+    if process_pls_step is not None:
+        process_pls_input_cols = sanitize_feature_columns(
+            getattr(process_pls_step, "input_feature_cols_", None)
+            or getattr(pipeline, "feature_names_in_", None)
+            or []
+        )
+        if not process_pls_input_cols:
+            st.error(
+                "当前模型包含工艺 PLS，但缺少训练时 raw 输入列记录；"
+                "请重新训练并导出模型后再筛选。"
+            )
+            return
+        if process_pls_input_cols != feature_cols:
+            feature_cols = process_pls_input_cols
+            st.session_state.feature_cols = feature_cols
+            st.session_state.multiselect_features = feature_cols.copy()
+            st.caption(
+                "已检测到工艺 PLS pipeline：筛选改用训练时保存的 raw 输入列，"
+                "不会在筛选阶段重新拟合 PLS。"
+            )
+        st.caption(
+            f"已复用模型内工艺 PLS："
+            f"{len(getattr(process_pls_step, 'process_feature_cols', []) or [])} 个原始工艺列"
+        )
+
     screening_workflow = None
     artifact_mf_cfg = None
     if artifact:

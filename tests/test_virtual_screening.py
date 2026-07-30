@@ -17,6 +17,7 @@ from core.molecular_features import (
 from core.virtual_screening import (
     DEFAULT_EPOXY_RULES,
     _calc_rule_features,
+    apply_saved_process_pls,
     apply_feature_overrides,
     build_component_library,
     build_feature_matrix,
@@ -49,6 +50,103 @@ def test_exact_replay_rejects_missing_required_feature_without_fingerprint_fill(
             pd.DataFrame({"resin_1_x": [1.0]}),
             strict=True,
         )
+
+
+def test_screening_reuses_saved_process_pls_without_refit():
+    from core.process_pls import ProcessPLSTransformer
+    from sklearn.linear_model import LinearRegression
+    from sklearn.pipeline import Pipeline
+
+    train = pd.DataFrame(
+        {
+            "temperature": [1.0, 2.0, 3.0, 4.0],
+            "time": [10.0, 11.0, 12.0, 13.0],
+            "other": [5.0, 6.0, 7.0, 8.0],
+        }
+    )
+    y = np.array([1.0, 2.0, 3.0, 4.0])
+    pipeline = Pipeline(
+        [
+            (
+                "process_pls",
+                ProcessPLSTransformer(
+                    process_feature_cols=["temperature", "time"],
+                    max_components=1,
+                    random_state=42,
+                ),
+            ),
+            ("model", LinearRegression()),
+        ]
+    )
+    pipeline.fit(train, y)
+    statistics_before = pipeline.named_steps["process_pls"].imputer_.statistics_.copy()
+
+    candidate = pd.DataFrame(
+        {"temperature": [1000.0], "time": [999.0], "other": [8.5]}
+    )
+    validated = apply_saved_process_pls(pipeline, candidate)
+    prediction = pipeline.predict(validated)
+
+    assert prediction.shape == (1,)
+    assert validated.columns.tolist() == ["temperature", "time", "other"]
+    np.testing.assert_array_equal(
+        pipeline.named_steps["process_pls"].imputer_.statistics_,
+        statistics_before,
+    )
+
+
+def test_screening_reports_missing_raw_process_columns():
+    from core.process_pls import ProcessPLSTransformer
+    from sklearn.linear_model import LinearRegression
+    from sklearn.pipeline import Pipeline
+
+    train = pd.DataFrame({"temperature": [1.0, 2.0, 3.0], "time": [4.0, 5.0, 6.0]})
+    pipeline = Pipeline(
+        [
+            (
+                "process_pls",
+                ProcessPLSTransformer(
+                    process_feature_cols=["temperature", "time"],
+                    max_components=1,
+                    random_state=42,
+                ),
+            ),
+            ("model", LinearRegression()),
+        ]
+    )
+    pipeline.fit(train, np.array([1.0, 2.0, 3.0]))
+
+    with pytest.raises(ValueError, match="高通量筛选缺少工艺 PLS 原始输入列"):
+        apply_saved_process_pls(pipeline, pd.DataFrame({"time": [1.0]}))
+
+
+def test_saved_process_pls_pipeline_exposes_raw_input_feature_names():
+    from core.process_pls import ProcessPLSTransformer
+    from sklearn.linear_model import LinearRegression
+    from sklearn.pipeline import Pipeline
+
+    train = pd.DataFrame(
+        {
+            "temperature": [1.0, 2.0, 3.0, 4.0],
+            "time": [10.0, 11.0, 12.0, 13.0],
+            "other": [5.0, 6.0, 7.0, 8.0],
+        }
+    )
+    pipeline = Pipeline(
+        [
+            (
+                "process_pls",
+                ProcessPLSTransformer(
+                    process_feature_cols=["temperature", "time"],
+                    max_components=1,
+                ),
+            ),
+            ("model", LinearRegression()),
+        ]
+    )
+    pipeline.fit(train, np.array([1.0, 2.0, 3.0, 4.0]))
+
+    assert pipeline.feature_names_in_.tolist() == ["temperature", "time", "other"]
 
 
 def test_feature_row_mask_excludes_nan_inf_and_missing_required_features():

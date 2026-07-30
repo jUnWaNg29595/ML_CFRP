@@ -237,6 +237,8 @@ class ProcessPLSTransformer(BaseEstimator, TransformerMixin):
     def fit(self, X, y):
         frame = _coerce_numeric_frame(X)
         self.input_feature_cols_ = frame.columns.tolist()
+        self.feature_names_in_ = np.asarray(self.input_feature_cols_, dtype=object)
+        self.n_features_in_ = len(self.input_feature_cols_)
         self.process_feature_cols_ = list(self.process_feature_cols or [])
         missing = [column for column in self.process_feature_cols_ if column not in frame.columns]
         if missing:

@@ -1899,6 +1899,59 @@ def build_feature_matrix(
     return X.replace([np.inf, -np.inf], np.nan).astype(float)
 
 
+def _get_saved_process_pls_step(pipeline):
+    if pipeline is None:
+        return None
+    named_steps = getattr(pipeline, "named_steps", None)
+    if isinstance(named_steps, Mapping) and "process_pls" in named_steps:
+        return named_steps.get("process_pls")
+    for step_name, step_obj in getattr(pipeline, "steps", []) or []:
+        if step_name == "process_pls":
+            return step_obj
+    return None
+
+
+def apply_saved_process_pls(pipeline, X_raw: pd.DataFrame) -> pd.DataFrame:
+    """Validate and order raw inputs for a fitted process-PLS pipeline.
+
+    The fitted Pipeline owns the actual transform. This helper deliberately does
+    not call ``fit`` or ``transform``; it only ensures high-throughput screening
+    passes the exact raw input columns that the saved ``process_pls`` step saw
+    during training.
+    """
+    if not isinstance(X_raw, pd.DataFrame):
+        X_raw = pd.DataFrame(X_raw)
+    else:
+        X_raw = X_raw.copy()
+
+    process_pls = _get_saved_process_pls_step(pipeline)
+    if process_pls is None:
+        return X_raw
+
+    required_cols = list(getattr(process_pls, "input_feature_cols_", []) or [])
+    if not required_cols:
+        configured_cols = list(getattr(process_pls, "process_feature_cols", []) or [])
+        if configured_cols:
+            raise ValueError(
+                "模型包含工艺 PLS 配置，但缺少已拟合的 process_pls pipeline step；"
+                "请重新训练并导出模型后再筛选。"
+            )
+        return X_raw
+
+    missing_cols = [column for column in required_cols if column not in X_raw.columns]
+    if missing_cols:
+        preview = ", ".join(map(str, missing_cols[:12]))
+        suffix = " ..." if len(missing_cols) > 12 else ""
+        raise ValueError(
+            f"高通量筛选缺少工艺 PLS 原始输入列: {preview}{suffix}"
+        )
+
+    ordered = X_raw.loc[:, required_cols].copy()
+    for column in ordered.columns:
+        ordered[column] = pd.to_numeric(ordered[column], errors="coerce")
+    return ordered.replace([np.inf, -np.inf], np.nan)
+
+
 def get_valid_feature_row_mask(
     mol_features: Optional[pd.DataFrame],
     required_cols: Optional[Sequence[str]],
@@ -2179,6 +2232,7 @@ def predict_with_model(
         X if isinstance(X, pd.DataFrame) else pd.DataFrame(X),
     )
     if pipeline is not None:
+        X = apply_saved_process_pls(pipeline, X)
         return pipeline.predict(X)
     X_arr = X.values
     if imputer is not None:
