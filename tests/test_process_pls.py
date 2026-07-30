@@ -1,0 +1,82 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+from core.process_pls import (
+    ProcessPLSTransformer,
+    compute_vip_scores,
+    fingerprint_process_pls_workflow,
+)
+
+
+def test_process_pls_outputs_components_vip_features_and_masks():
+    X = pd.DataFrame({
+        "cure_temp": [80.0, 90.0, np.nan, 110.0, 120.0, 130.0],
+        "cure_time": [30.0, 40.0, 50.0, np.nan, 70.0, 80.0],
+        "resin_MolWt": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0],
+    })
+    y = np.array([1.0, 1.5, 2.0, 2.5, 3.0, 3.5])
+
+    transformer = ProcessPLSTransformer(
+        process_feature_cols=["cure_temp", "cure_time"],
+        max_components=2,
+        vip_top_k=1,
+        random_state=42,
+    ).fit(X, y)
+    result = transformer.transform(X)
+
+    assert list(result.columns) == transformer.get_feature_names_out().tolist()
+    assert "process_pls_1" in result.columns
+    assert any(column.endswith("__missing") for column in result.columns)
+    assert "resin_MolWt" in result.columns
+    assert np.isfinite(result.to_numpy(dtype=float)).all()
+
+
+def test_process_pls_does_not_refit_on_transform():
+    train = pd.DataFrame({
+        "temperature": [1.0, 2.0, 3.0, np.nan],
+        "time": [10.0, 11.0, 12.0, 13.0],
+    })
+    test = pd.DataFrame({"temperature": [1000.0], "time": [999.0]})
+    y = np.array([1.0, 2.0, 3.0, 4.0])
+
+    transformer = ProcessPLSTransformer(
+        process_feature_cols=["temperature", "time"],
+        max_components=1,
+        random_state=42,
+    ).fit(train, y)
+    imputer_statistics = transformer.imputer_.statistics_.copy()
+    transformer.transform(test)
+
+    np.testing.assert_array_equal(transformer.imputer_.statistics_, imputer_statistics)
+
+
+def test_process_pls_rejects_missing_required_columns():
+    transformer = ProcessPLSTransformer(process_feature_cols=["temperature"])
+    with pytest.raises(ValueError, match="missing required process columns"):
+        transformer.fit(pd.DataFrame({"time": [1.0, 2.0]}), np.array([1.0, 2.0]))
+
+
+def test_vip_scores_are_finite_and_match_feature_count():
+    class FakePLS:
+        x_weights_ = np.array([[1.0], [2.0]])
+        x_scores_ = np.array([[1.0], [2.0], [3.0]])
+        y_loadings_ = np.array([[1.0]])
+
+    scores = compute_vip_scores(FakePLS())
+    assert scores.shape == (2,)
+    assert np.isfinite(scores).all()
+
+
+def test_process_pls_workflow_fingerprint_is_order_sensitive():
+    first = fingerprint_process_pls_workflow({
+        "schema_version": 1,
+        "process_feature_cols": ["temperature", "time"],
+        "output_feature_names": ["process_pls_1"],
+    })
+    second = fingerprint_process_pls_workflow({
+        "schema_version": 1,
+        "process_feature_cols": ["time", "temperature"],
+        "output_feature_names": ["process_pls_1"],
+    })
+    assert first != second
