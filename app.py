@@ -1,12 +1,12 @@
 ﻿# -*- coding: utf-8 -*-
 """
-碳纤维复合材料智能预测平台 v1.3.0
+碳纤维复合材料智能预测平台 v1.5.1
 更新内容：
-1. 修复SHAP图表显示和特征名缺失问题
-2. 优化所有图表布局，防止缩放变形
-3. 为所有图表增加数据导出(CSV)功能
-4. 增加双组分分子指纹拼接功能
-5. 增加训练脚本一键导出功能
+1. 支持多步骤分子特征提取 workflow 的导入与复现
+2. 支持双组分分子特征拼接及训练流程顺序保存
+3. 增强高通量筛选前特征映射和严格输入校验
+4. 优化分子特征提取与大规模候选筛选性能
+5. 修复导入分子特征流程中的 Torch 作用域错误
 """
 
 # ============================================
@@ -8851,16 +8851,16 @@ def page_molecular_features():
                 status_box.info("正在按导入流程提取分子特征...")
                 import_device = None
                 try:
-                    import torch
+                    import torch as _import_torch
 
                     dev_pref = str(st.session_state.get("compute_device", "auto"))
-                    if dev_pref.startswith("cuda") and torch.cuda.is_available():
-                        import_device = torch.device(dev_pref)
+                    if dev_pref.startswith("cuda") and _import_torch.cuda.is_available():
+                        import_device = _import_torch.device(dev_pref)
                     elif dev_pref == "cpu":
-                        import_device = torch.device("cpu")
+                        import_device = _import_torch.device("cpu")
                     else:
-                        import_device = torch.device(
-                            "cuda" if torch.cuda.is_available() else "cpu"
+                        import_device = _import_torch.device(
+                            "cuda" if _import_torch.cuda.is_available() else "cpu"
                         )
                 except Exception:
                     import_device = None

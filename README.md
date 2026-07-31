@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.30+-red.svg)](https://streamlit.io/)
-[![Version](https://img.shields.io/badge/Version-1.5.0-blueviolet.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-1.5.1-blueviolet.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 **基于机器学习的碳纤维复合材料性能预测与虚拟筛选系统**
@@ -33,9 +33,9 @@
 
 本平台是一个集成的机器学习系统，用于碳纤维增强聚合物（CFRP）的性能预测与材料筛选。系统结合了分子特征工程、深度学习模型、虚拟筛选和主动学习等先进技术。
 
-**当前版本：`1.5.0`（2026-07-30）**
+**当前版本：`1.5.1`（2026-07-31）**
 
-本版本重点增强了多步骤分子特征工作流复现、筛选前特征映射确认、大规模候选筛选稳定性，并新增工艺特征 PLS 工作流支持。
+本版本在多步骤分子特征工作流复现、筛选前特征映射确认、大规模候选筛选稳定性和工艺特征 PLS 工作流的基础上，修复了导入分子特征流程时 Torch 局部作用域导致的页面崩溃问题。
 
 **主要应用场景:**
 - 🎯 **性能预测**: 预测CFRP的拉伸强度、模量等关键性能指标
