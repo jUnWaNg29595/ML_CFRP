@@ -104,3 +104,45 @@ def test_disabled_semantic_features_do_not_copy_extracted_frame():
 
     assert returned is features
     assert valid_indices == [0, 1, 2]
+
+
+def test_xtb_extraction_calculates_duplicate_inputs_once(monkeypatch):
+    extractor = molecular_features.XTBFeatureExtractor(xtb_path='xtb')
+    monkeypatch.setattr(extractor, 'AVAILABLE', True)
+    calls = []
+
+    def fake_calc(raw):
+        calls.append(raw)
+        return {'xtb_gap': float(len(str(raw)))}
+
+    monkeypatch.setattr(extractor, '_calc_features', fake_calc)
+
+    features, valid_indices = extractor.featurize(
+        ['CCO', 'CCO', 'CCN', 'CCO'],
+        n_jobs=1,
+    )
+
+    assert calls == ['CCO', 'CCN']
+    assert valid_indices == [0, 1, 2, 3]
+    assert features['xtb_gap'].tolist() == [3.0, 3.0, 3.0, 3.0]
+
+
+def test_xtb_extraction_reuses_chemically_equivalent_inputs(monkeypatch):
+    extractor = molecular_features.XTBFeatureExtractor(xtb_path='xtb')
+    monkeypatch.setattr(extractor, 'AVAILABLE', True)
+    calls = []
+
+    def fake_calc(raw):
+        calls.append(raw)
+        return {'xtb_gap': 1.0}
+
+    monkeypatch.setattr(extractor, '_calc_features', fake_calc)
+
+    features, valid_indices = extractor.featurize(
+        ['C(C)O', 'CCO'],
+        n_jobs=1,
+    )
+
+    assert len(calls) == 1
+    assert valid_indices == [0, 1]
+    assert features['xtb_gap'].tolist() == [1.0, 1.0]

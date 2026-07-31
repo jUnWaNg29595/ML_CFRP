@@ -353,6 +353,67 @@ def test_app_workflow_only_restore_projects_legacy_config_into_session():
     assert app.st.session_state["molecular_feature_config"] == config
 
 
+def test_app_imported_molecular_workflow_replays_and_replaces_columns(monkeypatch):
+    import app
+
+    data = pd.DataFrame(
+        {
+            "resin_smiles": ["A", None, "C"],
+            "resin_value": ["stale", "stale", "stale"],
+            "target": [1.0, 2.0, 3.0],
+        }
+    )
+    workflow_payload = {
+        "molecular_feature_workflow": {
+            "schema_version": 2,
+            "mode": "single_batch",
+            "steps": [
+                {
+                    "step_id": "single",
+                    "source_columns": ["resin_smiles"],
+                    "method": "test",
+                    "prefix": "resin",
+                    "feature_names": ["resin_value"],
+                }
+            ],
+            "merge_order": ["single"],
+            "final_feature_names": ["resin_value"],
+        }
+    }
+
+    def fake_step(smiles, step, **_kwargs):
+        valid_indices = [
+            index for index, value in enumerate(smiles) if value is not None
+        ]
+        return (
+            pd.DataFrame(
+                {"value": [str(smiles[index]).lower() for index in valid_indices]},
+                index=valid_indices,
+            ),
+            valid_indices,
+            [],
+        )
+
+    monkeypatch.setattr(
+        "core.molecular_feature_workflow.execute_feature_step",
+        fake_step,
+    )
+
+    imported = app._run_imported_molecular_feature_workflow(
+        data,
+        workflow_payload,
+    )
+
+    assert imported["feature_names"] == ["resin_value"]
+    assert imported["features"].index.tolist() == [0, 1, 2]
+    assert imported["data"].columns.tolist().count("resin_value") == 1
+    assert imported["data"]["resin_value"].iloc[0] == "a"
+    assert pd.isna(imported["data"]["resin_value"].iloc[1])
+    assert imported["data"]["resin_value"].iloc[2] == "c"
+    assert imported["workflow"]["workflow_hash"]
+    assert imported["trace"][0]["mode"] == "training_import"
+
+
 def test_artifact_extra_contains_post_feature_mapping_default(monkeypatch):
     import app
 

@@ -25,7 +25,7 @@ from . import thread_config
 import pandas as pd
 import numpy as np
 import builtins
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing as mp
 from rdkit.Chem import MACCSkeys
 from tqdm import tqdm
@@ -37,8 +37,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from functools import partial  # 新增
+from functools import lru_cache, partial  # 新增
 
 
 def _safe_console_print(*args, **kwargs):
@@ -299,8 +300,9 @@ def _extract_polymer_unit_candidates(text) -> list[str]:
             expanded_parts.extend(sub_frags if sub_frags else [part])
 
         for frag in expanded_parts:
-            normalized = normalize_chemical_string(
+            normalized = _cached_normalize_chemical_string(
                 frag,
+                "auto",
                 canonicalize=True,
                 repair=True,
                 keep_largest_frag=False,
@@ -310,7 +312,7 @@ def _extract_polymer_unit_candidates(text) -> list[str]:
                 candidates.extend(normalized_frags if normalized_frags else [normalized])
                 continue
 
-            converted = convert_to_smiles(frag, fmt="auto")
+            converted = _cached_convert_to_smiles(frag, "auto")
             if converted:
                 converted = str(converted).strip()
                 if converted:
@@ -406,9 +408,9 @@ def _extract_bigsmiles_graph_sample_features(
 
     normalized_samples = []
     for item in sampled:
-        normalized = normalize_chemical_string(
+        normalized = _cached_normalize_chemical_string(
             item,
-            fmt="smiles",
+            "smiles",
             canonicalize=True,
             repair=True,
             keep_largest_frag=False,
@@ -429,7 +431,7 @@ def _extract_bigsmiles_graph_sample_features(
 
     for item in normalized_samples:
         try:
-            mol = parse_smiles_quiet(item)
+            mol = _cached_parse_smiles_quiet(item)
         except Exception:
             mol = None
         if mol is None:
@@ -517,12 +519,12 @@ def extract_polymer_string_features(smiles_like_list, prefix=None, include_bigsm
             rows.append(feat)
             continue
 
-        fmt = detect_chem_string_format(s)
+        fmt = _cached_detect_chem_string_format(s)
         blocks = _POLYMER_BLOCK_RE.findall(s)
         bond_desc = _POLYMER_BOND_DESC_RE.findall(s)
         candidates = _extract_polymer_unit_candidates(s)
         try:
-            fragment_est = split_smiles_cell(s)
+            fragment_est = list(_cached_split_smiles_cell_tuple(s))
         except Exception:
             fragment_est = []
 
@@ -562,11 +564,9 @@ def extract_polymer_string_features(smiles_like_list, prefix=None, include_bigsm
         if RDKIT_AVAILABLE and candidates:
             for cand in candidates:
                 try:
-                    mol = parse_chemical_string(
-                        cand,
-                        repair=True,
-                        keep_largest_frag=False,
-                    )
+                    mol = _cached_parse_smiles_quiet(cand)
+                    if mol is None:
+                        mol = _safe_fragment_mol_from_text(cand)
                     if mol is not None:
                         valid_mols.append(mol)
                 except Exception:
@@ -620,6 +620,107 @@ _COMMON_METAL_SYMBOLS = {
 }
 
 
+@lru_cache(maxsize=50000)
+def _cached_detect_chem_string_format(text: str) -> str:
+    return detect_chem_string_format(str(text or ""))
+
+
+@lru_cache(maxsize=50000)
+def _cached_convert_to_smiles(text: str, fmt: str = "auto") -> str | None:
+    return convert_to_smiles(str(text or ""), fmt=fmt)
+
+
+@lru_cache(maxsize=50000)
+def _cached_normalize_chemical_string(
+    text: str,
+    fmt: str,
+    canonicalize: bool,
+    repair: bool,
+    keep_largest_frag: bool,
+) -> str | None:
+    return normalize_chemical_string(
+        str(text or ""),
+        fmt=fmt,
+        canonicalize=bool(canonicalize),
+        repair=bool(repair),
+        keep_largest_frag=bool(keep_largest_frag),
+    )
+
+
+@lru_cache(maxsize=50000)
+def _cached_split_smiles_cell_tuple(text: str) -> tuple[str, ...]:
+    try:
+        return tuple(split_smiles_cell(str(text or "")) or ())
+    except Exception:
+        fallback = str(text or "").strip()
+        return (fallback,) if fallback else ()
+
+
+@lru_cache(maxsize=50000)
+def _cached_diagnose_chemical_string_raw(text: str) -> dict:
+    try:
+        return diagnose_chemical_string(str(text or ""))
+    except Exception:
+        return {}
+
+
+@lru_cache(maxsize=50000)
+def _cached_parse_smiles_quiet(text: str, sanitize: bool = True):
+    if not RDKIT_AVAILABLE:
+        return None
+    try:
+        return parse_smiles_quiet(str(text or ""), sanitize=bool(sanitize))
+    except Exception:
+        return None
+
+
+def _cached_diagnose_chemical_string(text: str) -> dict:
+    diag = dict(_cached_diagnose_chemical_string_raw(str(text or "")))
+    if isinstance(diag.get("details"), list):
+        diag["details"] = list(diag["details"])
+    return diag
+
+
+def _clear_semantic_feature_caches() -> None:
+    for cached_func in (
+        _cached_detect_chem_string_format,
+        _cached_convert_to_smiles,
+        _cached_normalize_chemical_string,
+        _cached_split_smiles_cell_tuple,
+        _cached_diagnose_chemical_string_raw,
+        _cached_parse_smiles_quiet,
+        _safe_fragment_mol_from_text,
+    ):
+        cache_clear = getattr(cached_func, "cache_clear", None)
+        if callable(cache_clear):
+            cache_clear()
+
+
+def _has_ionic_semantic_hint(text: str) -> bool:
+    s = str(text or "")
+    if not s:
+        return False
+    if any(pattern.search(s) for pattern, _replacement in _ION_ALIAS_PATTERNS):
+        return True
+    if re.search(r"\[[^\]]*[+-][^\]]*\]", s):
+        return True
+    for symbol in _COMMON_METAL_SYMBOLS:
+        if re.search(rf"(?<![A-Za-z]){re.escape(symbol)}(?![a-z])", s):
+            return True
+    return False
+
+
+def _cheap_fragment_count(text: str, *, polymer_like: bool = False) -> float:
+    s = str(text or "").strip()
+    if not s:
+        return 0.0
+    if polymer_like:
+        return float(max(1, s.count(".") + 1))
+    parts = re.split(r"\s*[;；|]\s*|\s+\+\s+|\.", s)
+    return float(max(1, len([part for part in parts if str(part).strip()])))
+
+
+@lru_cache(maxsize=50000)
 def _replace_common_ion_aliases(text: str) -> str:
     updated = str(text or "")
     for pattern, replacement in _ION_ALIAS_PATTERNS:
@@ -627,6 +728,7 @@ def _replace_common_ion_aliases(text: str) -> str:
     return updated
 
 
+@lru_cache(maxsize=50000)
 def _safe_fragment_mol_from_text(fragment: str):
     if not RDKIT_AVAILABLE:
         return None
@@ -704,18 +806,34 @@ def extract_ionic_semantic_features(smiles_like_list, prefix=None) -> pd.DataFra
         replaced = _replace_common_ion_aliases(s)
         feat["ionic_alias_replacement_used"] = 1.0 if replaced != s else 0.0
 
-        try:
-            diag = diagnose_chemical_string(s)
-        except Exception:
-            diag = {}
+        fmt = _cached_detect_chem_string_format(s)
+        ionic_hint = _has_ionic_semantic_hint(s)
+
+        if fmt == "bigsmiles" and not ionic_hint:
+            direct_mol = _cached_parse_smiles_quiet(s)
+            feat["ionic_direct_parse_ok"] = 1.0 if direct_mol is not None else 0.0
+            feat["ionic_proxy_parse_ok"] = 1.0
+            feat["ionic_normalized_ok"] = 1.0
+            feat["ionic_fragment_count"] = _cheap_fragment_count(s, polymer_like=True)
+            rows.append(feat)
+            continue
+
+        if not ionic_hint:
+            direct_mol = _cached_parse_smiles_quiet(s)
+            if direct_mol is not None:
+                feat["ionic_direct_parse_ok"] = 1.0
+                feat["ionic_proxy_parse_ok"] = 1.0
+                feat["ionic_normalized_ok"] = 1.0
+                feat["ionic_fragment_count"] = _cheap_fragment_count(s)
+                rows.append(feat)
+                continue
+
+        diag = _cached_diagnose_chemical_string(s)
         feat["ionic_proxy_parse_ok"] = 1.0 if diag.get("proxy_smiles_ok") else 0.0
         feat["ionic_direct_parse_ok"] = 1.0 if diag.get("rdkit_direct_ok") else 0.0
         feat["ionic_normalized_ok"] = 1.0 if diag.get("normalized_ok") else 0.0
 
-        try:
-            fragments = split_smiles_cell(replaced)
-        except Exception:
-            fragments = [replaced]
+        fragments = list(_cached_split_smiles_cell_tuple(replaced))
         fragments = [str(f).strip() for f in (fragments or []) if str(f).strip()]
         feat["ionic_fragment_count"] = float(len(fragments))
 
@@ -795,7 +913,7 @@ def extract_bigsmiles_ensemble_features(
             rows.append(feat)
             continue
         s = str(raw).strip()
-        if not s or detect_chem_string_format(s) != "bigsmiles" or not BIGSMILES_STOCHASTIC_AVAILABLE:
+        if not s or _cached_detect_chem_string_format(s) != "bigsmiles" or not BIGSMILES_STOCHASTIC_AVAILABLE:
             rows.append(feat)
             continue
 
@@ -825,16 +943,18 @@ def extract_bigsmiles_ensemble_features(
 
         valid_mols = []
         for item in sampled:
-            normalized = normalize_chemical_string(
+            normalized = _cached_normalize_chemical_string(
                 item,
-                fmt="smiles",
+                "smiles",
                 canonicalize=True,
                 repair=True,
                 keep_largest_frag=False,
             )
             if not normalized:
                 continue
-            mol = _safe_fragment_mol_from_text(normalized)
+            mol = _cached_parse_smiles_quiet(normalized)
+            if mol is None:
+                mol = _safe_fragment_mol_from_text(normalized)
             if mol is not None:
                 valid_mols.append(mol)
 
@@ -877,10 +997,33 @@ def extract_configured_semantic_features(
     preserve_duplicate_columns=False,
 ) -> pd.DataFrame:
     """Build every configured notation/ionic feature with one shared contract."""
+    smiles_values = [] if smiles_like_list is None else list(smiles_like_list)
     params = dict(params or {})
     preserve_duplicate_columns = bool(
         params.get("preserve_duplicate_columns", preserve_duplicate_columns)
     )
+
+    unique_values = []
+    value_positions = []
+    unique_position_by_key = {}
+    for raw in smiles_values:
+        if raw is None:
+            key = ("missing",)
+        else:
+            try:
+                if bool(pd.isna(raw)):
+                    key = ("missing",)
+                else:
+                    key = ("value", str(raw).strip())
+            except (TypeError, ValueError):
+                key = ("value", str(raw).strip())
+        position = unique_position_by_key.get(key)
+        if position is None:
+            position = len(unique_values)
+            unique_position_by_key[key] = position
+            unique_values.append(raw)
+        value_positions.append(position)
+
     frames = []
     append_polymer_ensemble = bool(params.get("append_polymer_semantic_features", False))
     append_polymer_string = bool(params.get("append_polymer_string_features", False))
@@ -889,11 +1032,11 @@ def extract_configured_semantic_features(
     # Training historically included string features whenever ensemble features
     # were enabled, even if the explicit string flag was absent.
     if append_polymer_string or append_polymer_ensemble:
-        frames.append(extract_polymer_string_features(smiles_like_list))
+        frames.append(extract_polymer_string_features(unique_values))
     if append_polymer_ensemble:
         frames.append(
             extract_bigsmiles_ensemble_features(
-                smiles_like_list,
+                unique_values,
                 n_samples=int(params.get("bigsmiles_semantic_num_samples", 8)),
                 min_repeat_units=int(params.get("bigsmiles_semantic_min_repeat_units", 1)),
                 max_repeat_units=int(params.get("bigsmiles_semantic_max_repeat_units", 4)),
@@ -901,17 +1044,18 @@ def extract_configured_semantic_features(
             )
         )
     if append_ionic:
-        frames.append(extract_ionic_semantic_features(smiles_like_list))
+        frames.append(extract_ionic_semantic_features(unique_values))
 
     frames = [
         frame.reset_index(drop=True)
         for frame in frames
-        if isinstance(frame, pd.DataFrame) and len(frame) == len(smiles_like_list)
+        if isinstance(frame, pd.DataFrame) and len(frame) == len(unique_values)
     ]
     if not frames:
-        return pd.DataFrame(index=range(len(smiles_like_list)))
+        return pd.DataFrame(index=range(len(smiles_values)))
 
     result = pd.concat(frames, axis=1)
+    result = result.iloc[value_positions].reset_index(drop=True)
     if not preserve_duplicate_columns:
         result = result.loc[:, ~result.columns.duplicated()]
     if prefix:
@@ -932,9 +1076,19 @@ def append_configured_semantic_features(
     preserve_duplicate_columns = bool(
         params.get("preserve_duplicate_columns", preserve_duplicate_columns)
     )
-    indices = [int(i) for i in (valid_indices or [])]
+    smiles_values = [] if smiles_like_list is None else list(smiles_like_list)
+    indices = [
+        int(i)
+        for i in (valid_indices or [])
+        if 0 <= int(i) < len(smiles_values)
+    ]
+    semantic_inputs = (
+        [smiles_values[index] for index in indices]
+        if indices
+        else smiles_values
+    )
     semantic_full = extract_configured_semantic_features(
-        smiles_like_list,
+        semantic_inputs,
         params,
         preserve_duplicate_columns=preserve_duplicate_columns,
     )
@@ -944,13 +1098,13 @@ def append_configured_semantic_features(
 
     if not base.empty and indices:
         base = base.copy()
-        semantic_subset = semantic_full.iloc[indices].reset_index(drop=True)
+        semantic_subset = semantic_full.reset_index(drop=True)
         base = pd.concat([base.reset_index(drop=True), semantic_subset], axis=1)
         if not preserve_duplicate_columns:
             base = base.loc[:, ~base.columns.duplicated()]
         return base, indices
 
-    return semantic_full.reset_index(drop=True), list(range(len(semantic_full)))
+    return semantic_full.reset_index(drop=True), indices or list(range(len(semantic_full)))
 
 
 # =============================================================================
@@ -3281,28 +3435,87 @@ class XTBFeatureExtractor:
             "xtb_success",
         ]
         self._cache = OrderedDict()
+        self._cache_lock = threading.RLock()
 
     def _cache_get(self, key: str | None):
         if not key or self.cache_size <= 0:
             return None
-        val = self._cache.get(key)
-        if val is not None:
-            try:
-                self._cache.move_to_end(key)
-            except Exception:
-                pass
+        with self._cache_lock:
+            val = self._cache.get(key)
+            if val is not None:
+                try:
+                    self._cache.move_to_end(key)
+                except Exception:
+                    pass
         return val
 
     def _cache_set(self, key: str | None, val):
         if not key or self.cache_size <= 0 or val is None:
             return
-        self._cache[key] = val
+        with self._cache_lock:
+            self._cache[key] = val
+            try:
+                self._cache.move_to_end(key)
+                if len(self._cache) > int(self.cache_size):
+                    self._cache.popitem(last=False)
+            except Exception:
+                pass
+
+    def _dedup_key(self, raw):
+        if raw is None:
+            return ("missing",)
         try:
-            self._cache.move_to_end(key)
-            if len(self._cache) > int(self.cache_size):
-                self._cache.popitem(last=False)
-        except Exception:
+            if bool(pd.isna(raw)):
+                return ("missing",)
+        except (TypeError, ValueError):
             pass
+
+        s = str(raw).strip()
+        if not s or s.lower() in {"nan", "none", "<na>", "na", "null"}:
+            return ("missing",)
+        if "*" in s:
+            try:
+                s = re.sub(r"\[\s*\*\s*\]", "C", s)
+            except Exception:
+                pass
+            s = s.replace("*", "C")
+
+        try:
+            converted = convert_to_smiles(s, fmt="auto") or s
+        except Exception:
+            converted = s
+        try:
+            fragments = split_smiles_cell(converted)
+        except Exception:
+            fragments = [converted]
+        fragments = [str(fragment).strip() for fragment in (fragments or []) if str(fragment).strip()]
+
+        canonical_fragments = []
+        for fragment in fragments:
+            canonical = canonicalize_smiles(fragment)
+            if canonical is None:
+                mol = parse_chemical_string(
+                    fragment,
+                    repair=True,
+                    keep_largest_frag=False,
+                )
+                if mol is not None:
+                    try:
+                        canonical = Chem.MolToSmiles(
+                            mol,
+                            canonical=True,
+                            isomericSmiles=True,
+                        )
+                    except Exception:
+                        canonical = None
+            if canonical is None:
+                canonical_fragments = []
+                break
+            canonical_fragments.append(canonical)
+
+        if canonical_fragments:
+            return ("canonical", ".".join(sorted(canonical_fragments)))
+        return ("value", s)
 
     def _embed_mol(self, mol):
         mol = Chem.AddHs(mol)
@@ -3582,7 +3795,7 @@ class XTBFeatureExtractor:
             "xtb_success": 1,
         }
 
-    def featurize(self, smiles_list, n_jobs=1):
+    def featurize(self, smiles_list, n_jobs=1, progress_callback=None):
         """提取 xTB 特征
 
         Args:
@@ -3595,8 +3808,34 @@ class XTBFeatureExtractor:
         if not self.AVAILABLE:
             return pd.DataFrame(), []
 
-        features_list = []
-        valid_indices = []
+        smiles_values = [] if smiles_list is None else list(smiles_list)
+        unique_smiles = []
+        unique_position_by_key = {}
+        row_to_unique_position = []
+        dedup_key_cache = {}
+        for raw in smiles_values:
+            if raw is None:
+                raw_marker = ("missing",)
+            else:
+                try:
+                    raw_marker = ("missing",) if bool(pd.isna(raw)) else ("raw", str(raw).strip())
+                except (TypeError, ValueError):
+                    raw_marker = ("raw", str(raw).strip())
+            key = dedup_key_cache.get(raw_marker)
+            if key is None:
+                key = self._dedup_key(raw)
+                dedup_key_cache[raw_marker] = key
+            unique_position = unique_position_by_key.get(key)
+            if unique_position is None:
+                unique_position = len(unique_smiles)
+                unique_position_by_key[key] = unique_position
+                unique_smiles.append(raw)
+            row_to_unique_position.append(unique_position)
+
+        if not unique_smiles:
+            return pd.DataFrame(), []
+
+        unique_features = {}
 
         # 确定并行进程数
         if n_jobs == -1:
@@ -3604,77 +3843,78 @@ class XTBFeatureExtractor:
         elif n_jobs <= 0:
             n_jobs = 1
 
-        # [修复] Windows 限制处理
-        original_n_jobs = n_jobs
-        use_pool = False
-        if os.name == 'nt':
-            if n_jobs > 61:
-                print(f"⚠️ Windows 环境：multiprocessing.Pool 最多支持 61 个进程，将 n_jobs 从 {n_jobs} 降为 61")
-                n_jobs = 61
-            use_pool = False
-        else:
-            # Linux 无限制，优先使用 ProcessPoolExecutor（更现代）
-            use_pool = False
+        n_jobs = max(1, min(int(n_jobs), len(unique_smiles)))
+
+        def _report(done_count):
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(
+                    float(done_count) / max(float(len(unique_smiles)), 1.0),
+                    (
+                        f"xTB：已完成 {done_count:,}/{len(unique_smiles):,} "
+                        f"个唯一分子（将回填 {len(smiles_values):,} 行）"
+                    ),
+                )
+            except Exception:
+                pass
 
         if n_jobs == 1:
             # 单进程模式
-            for idx, smi in enumerate(tqdm(smiles_list, desc="xTB")):
+            done_count = 0
+            for idx, smi in enumerate(
+                tqdm(
+                    unique_smiles,
+                    desc=f"xTB unique ({len(unique_smiles)}/{len(smiles_values)})",
+                )
+            ):
                 feats = self._calc_features(smi)
                 if feats is None:
+                    done_count += 1
+                    _report(done_count)
                     continue
-                features_list.append(feats)
-                valid_indices.append(idx)
+                unique_features[idx] = feats
+                done_count += 1
+                _report(done_count)
         else:
-            # 多进程模式
-            print(f"🚀 使用 {n_jobs} 个进程并行计算 xTB 特征...")
+            # 外部 xTB 本身是独立进程；线程池调度比 Python 进程池开销小，
+            # 也避免 Windows 进程池 61 workers 限制和重复 pickle 大对象。
+            print(
+                f"🚀 使用 {n_jobs} 个线程调度 xTB 外部进程："
+                f"{len(unique_smiles)} 个唯一输入，回填 {len(smiles_values)} 行"
+            )
 
-            if use_pool:
-                # 使用 multiprocessing.Pool（仅Linux，Windows限制61）
-                try:
-                    with mp.Pool(processes=n_jobs) as pool:
-                        results = []
-                        for idx, smi in enumerate(smiles_list):
-                            results.append((idx, pool.apply_async(self._calc_features, (smi,))))
+            with ThreadPoolExecutor(max_workers=n_jobs) as executor:
+                future_to_idx = {
+                    executor.submit(self._calc_features, smi): idx
+                    for idx, smi in enumerate(unique_smiles)
+                }
 
-                        # 收集结果
-                        for idx, async_result in tqdm(results, desc="xTB"):
-                            try:
-                                feats = async_result.get(timeout=self.timeout_s + 10)
-                                if feats is not None:
-                                    features_list.append((idx, feats))
-                            except Exception:
-                                pass  # 跳过失败的分子
-                except Exception as e:
-                    print(f"⚠️ multiprocessing.Pool 失败: {e}")
-                    print(f"   降级到 ProcessPoolExecutor (最多 61 进程)")
-                    n_jobs = min(n_jobs, 61)
-                    use_pool = False
+                done_count = 0
+                for future in tqdm(
+                    as_completed(future_to_idx),
+                    total=len(unique_smiles),
+                    desc=f"xTB unique ({len(unique_smiles)}/{len(smiles_values)})",
+                ):
+                    idx = future_to_idx[future]
+                    try:
+                        feats = future.result()
+                        if feats is not None:
+                            unique_features[idx] = feats
+                    except Exception:
+                        pass  # 跳过失败的分子
+                    finally:
+                        done_count += 1
+                        _report(done_count)
 
-            if not use_pool:
-                # 使用 ProcessPoolExecutor（标准方式）
-                from concurrent.futures import ProcessPoolExecutor, as_completed
-
-                with ProcessPoolExecutor(max_workers=n_jobs) as executor:
-                    # 提交所有任务
-                    future_to_idx = {
-                        executor.submit(self._calc_features, smi): idx
-                        for idx, smi in enumerate(smiles_list)
-                    }
-
-                    # 收集结果
-                    for future in tqdm(as_completed(future_to_idx), total=len(smiles_list), desc="xTB"):
-                        idx = future_to_idx[future]
-                        try:
-                            feats = future.result()
-                            if feats is not None:
-                                features_list.append((idx, feats))
-                        except Exception:
-                            pass  # 跳过失败的分子
-
-            # 按原始索引排序
-            features_list.sort(key=lambda x: x[0])
-            valid_indices = [idx for idx, _ in features_list]
-            features_list = [feats for _, feats in features_list]
+        features_list = []
+        valid_indices = []
+        for original_index, unique_position in enumerate(row_to_unique_position):
+            feats = unique_features.get(unique_position)
+            if feats is None:
+                continue
+            features_list.append(dict(feats))
+            valid_indices.append(original_index)
 
         if not features_list:
             return pd.DataFrame(), []

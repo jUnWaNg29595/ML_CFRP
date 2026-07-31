@@ -20,12 +20,163 @@ from core.molecular_feature_workflow import (
     normalize_workflow_config,
     prepare_step_inputs,
     get_feature_component_column_options,
+    merge_extracted_features,
     resolve_feature_component_columns,
     resolve_feature_component_role,
     validate_feature_frame_contract,
     validate_workflow_config,
 )
 from core.molecular_features import append_configured_semantic_features, extract_configured_semantic_features
+
+
+def test_ionic_semantic_features_reuses_duplicate_fragment_parse(monkeypatch):
+    class FakeAtom:
+        def __init__(self, symbol, charge):
+            self._symbol = symbol
+            self._charge = charge
+
+        def GetFormalCharge(self):
+            return self._charge
+
+        def GetSymbol(self):
+            return self._symbol
+
+    class FakeMol:
+        def __init__(self, atoms):
+            self._atoms = atoms
+
+        def GetAtoms(self):
+            return self._atoms
+
+    calls = []
+
+    def fake_parse(fragment, **_kwargs):
+        calls.append(fragment)
+        if fragment == "[Na+]":
+            return FakeMol([FakeAtom("Na", 1)])
+        if fragment == "[Cl-]":
+            return FakeMol([FakeAtom("Cl", -1)])
+        return FakeMol([])
+
+    monkeypatch.setattr(molecular_features, "RDKIT_AVAILABLE", True)
+    monkeypatch.setattr(
+        molecular_features,
+        "diagnose_chemical_string",
+        lambda _text: {
+            "proxy_smiles_ok": True,
+            "rdkit_direct_ok": True,
+            "normalized_ok": True,
+        },
+    )
+    monkeypatch.setattr(
+        molecular_features,
+        "split_smiles_cell",
+        lambda text: [part for part in str(text).split(".") if part],
+    )
+    monkeypatch.setattr(molecular_features, "parse_chemical_string", fake_parse)
+
+    cache_clear = getattr(molecular_features._safe_fragment_mol_from_text, "cache_clear", None)
+    if callable(cache_clear):
+        cache_clear()
+
+    result = molecular_features.extract_ionic_semantic_features(
+        ["[Na+].[Cl-]", "[Na+].[Cl-]"]
+    )
+
+    assert calls == ["[Na+]", "[Cl-]"]
+    assert result["ionic_has_cation"].tolist() == [1.0, 1.0]
+    assert result["ionic_has_anion"].tolist() == [1.0, 1.0]
+
+
+def test_ionic_semantic_features_fast_paths_nonionic_bigsmiles(monkeypatch):
+    monkeypatch.setattr(molecular_features, "RDKIT_AVAILABLE", True)
+    monkeypatch.setattr(
+        molecular_features,
+        "detect_chem_string_format",
+        lambda _text: "bigsmiles",
+    )
+    monkeypatch.setattr(molecular_features, "parse_smiles_quiet", lambda _text: None)
+    monkeypatch.setattr(
+        molecular_features,
+        "diagnose_chemical_string",
+        lambda _text: pytest.fail("non-ionic BigSMILES should not run full diagnosis"),
+    )
+    monkeypatch.setattr(
+        molecular_features,
+        "split_smiles_cell",
+        lambda _text: pytest.fail("non-ionic BigSMILES should not be converted for ionic features"),
+    )
+
+    result = molecular_features.extract_ionic_semantic_features(
+        ["{[>][<]CC(C)O}"]
+    )
+
+    assert result["ionic_missing"].tolist() == [0.0]
+    assert result["ionic_has_any_charge"].tolist() == [0.0]
+    assert result["ionic_proxy_parse_ok"].tolist() == [1.0]
+    assert result["ionic_normalized_ok"].tolist() == [1.0]
+    assert result["ionic_fragment_count"].tolist() == [1.0]
+
+
+def test_merge_extracted_features_preserves_contiguous_rows_without_reindexing():
+    base = pd.DataFrame({"source": range(4)})
+    features = pd.DataFrame({"feature": [10, 20, 30, 40]})
+
+    merged = merge_extracted_features(
+        base,
+        features,
+        [0, 1, 2, 3],
+        keep_all_rows=True,
+    )
+
+    assert merged.to_dict("list") == {
+        "source": [0, 1, 2, 3],
+        "feature": [10, 20, 30, 40],
+    }
+
+
+def test_merge_extracted_features_restores_sparse_rows():
+    base = pd.DataFrame({"source": range(4)})
+    features = pd.DataFrame({"feature": [10, 30]})
+
+    merged = merge_extracted_features(
+        base,
+        features,
+        [0, 2],
+        keep_all_rows=True,
+    )
+
+    assert merged["source"].tolist() == [0, 1, 2, 3]
+    assert merged["feature"].iloc[0] == 10
+    assert pd.isna(merged["feature"].iloc[1])
+    assert merged["feature"].iloc[2] == 30
+    assert pd.isna(merged["feature"].iloc[3])
+
+
+def test_append_configured_semantic_features_only_processes_valid_rows(monkeypatch):
+    calls = []
+
+    def fake_extract(smiles_like_list, params=None, **kwargs):
+        calls.append(list(smiles_like_list))
+        return pd.DataFrame({"semantic": [len(value) for value in smiles_like_list]})
+
+    monkeypatch.setattr(
+        molecular_features,
+        "extract_configured_semantic_features",
+        fake_extract,
+    )
+
+    base = pd.DataFrame({"xtb": [1, 2]})
+    result, valid_indices = append_configured_semantic_features(
+        base,
+        [1, 3],
+        ["invalid-row-0", "a", "invalid-row-2", "abcd"],
+        {"append_ionic_semantic_features": True},
+    )
+
+    assert calls == [["a", "abcd"]]
+    assert valid_indices == [1, 3]
+    assert result["semantic"].tolist() == [1, 4]
 
 
 def _workflow_payload():

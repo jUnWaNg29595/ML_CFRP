@@ -2716,6 +2716,97 @@ def _restore_molecular_feature_metadata(payload, model_feature_cols=None):
     return workflow, config
 
 
+def _resolve_imported_molecular_feature_workflow(payload, model_feature_cols=None):
+    from core.virtual_screening import resolve_molecular_feature_workflow
+
+    if not isinstance(payload, dict):
+        raise ValueError("导入的提取流程必须是 JSON 对象。")
+
+    candidates = [payload]
+    if isinstance(payload.get("workflow"), dict):
+        candidates.insert(0, {"molecular_feature_workflow": payload["workflow"]})
+    if isinstance(payload.get("molecular_feature_workflow"), dict):
+        candidates.insert(0, payload)
+    if payload.get("schema_version") and isinstance(payload.get("steps"), list):
+        candidates.insert(0, {"molecular_feature_workflow": payload})
+    if str(payload.get("method") or "").strip() or payload.get("feature_names"):
+        candidates.append({"molecular_feature_config": payload})
+
+    for candidate in candidates:
+        workflow = resolve_molecular_feature_workflow(
+            candidate,
+            model_feature_cols=model_feature_cols,
+        )
+        if workflow is not None:
+            return workflow
+    raise ValueError("未在导入文件中找到可执行的分子特征提取 workflow。")
+
+
+def _run_imported_molecular_feature_workflow(
+    data,
+    workflow_payload,
+    *,
+    device=None,
+    progress_callback=None,
+    model_feature_cols=None,
+):
+    """Replay an imported molecular-feature workflow on a dataframe."""
+    if not isinstance(data, pd.DataFrame):
+        raise TypeError("data must be a pandas DataFrame")
+
+    from core.molecular_feature_workflow import (
+        execute_molecular_feature_workflow,
+        find_duplicate_feature_names,
+    )
+
+    workflow = _resolve_imported_molecular_feature_workflow(
+        workflow_payload,
+        model_feature_cols=model_feature_cols,
+    )
+    source_df = data.reset_index(drop=True).copy()
+    execution = execute_molecular_feature_workflow(
+        source_df,
+        workflow,
+        device=device,
+        mode="training_import",
+        progress_callback=progress_callback,
+    )
+    features_df = execution.features.reset_index(drop=True)
+
+    duplicate_features = find_duplicate_feature_names(features_df.columns.tolist())
+    if duplicate_features:
+        raise ValueError(
+            "导入 workflow 生成了重复特征列："
+            + ", ".join(duplicate_features[:12])
+        )
+
+    replace_cols = [col for col in features_df.columns if col in source_df.columns]
+    if replace_cols:
+        source_df = source_df.drop(columns=replace_cols)
+    merged_df = pd.concat([source_df, features_df], axis=1)
+    duplicate_merged = find_duplicate_feature_names(merged_df.columns.tolist())
+    if duplicate_merged:
+        raise ValueError(
+            "导入 workflow 写回后存在重复列："
+            + ", ".join(duplicate_merged[:12])
+        )
+
+    workflow_dict = workflow.to_dict()
+    workflow_dict["workflow_hash"] = execution.workflow_hash or workflow_dict.get(
+        "workflow_hash"
+    )
+    return {
+        "data": merged_df,
+        "features": features_df,
+        "feature_names": features_df.columns.tolist(),
+        "workflow": workflow_dict,
+        "config": workflow.to_legacy_config(),
+        "trace": execution.step_trace,
+        "warnings": execution.warnings,
+        "valid_row_indices": execution.valid_row_indices,
+    }
+
+
 def _current_molecular_feature_artifact_extra():
     feature_mask = _coerce_feature_mask(st.session_state.get("feature_mask"))
     if feature_mask is not None:
@@ -8389,16 +8480,16 @@ def page_molecular_features():
                 step=1000,
             )
         with col_xtb_cache2:
-            # xTB 并行进程数：默认限制在 8，避免外部进程与 BLAS/OpenMP 线程争抢。
+            # xTB 本身是外部进程；用线程调度外部进程，允许更高并发但默认保持稳健。
             cpu_count = os.cpu_count() or 1
             if os.name == 'nt':
-                max_workers = min(cpu_count, 61)
-                default_jobs = min(cpu_count, 8)
-                help_text = f"检测到 {cpu_count} 个 CPU 核心。推荐 4-8 个进程；Windows 最多允许 61。"
+                max_workers = min(cpu_count, 128)
+                default_jobs = min(cpu_count, 16)
+                help_text = f"检测到 {cpu_count} 个 CPU 核心。xTB 使用线程调度外部进程；推荐 8-32，最高开放 128。"
             else:
-                max_workers = cpu_count
-                default_jobs = min(cpu_count, 8)
-                help_text = f"检测到 {cpu_count} 个 CPU 核心。推荐 4-8 个进程以平衡速度和内存。"
+                max_workers = min(cpu_count, 128)
+                default_jobs = min(cpu_count, 32)
+                help_text = f"检测到 {cpu_count} 个 CPU 核心。推荐 16-64 个并发；最高开放 128 以平衡速度和内存。"
 
             xtb_n_jobs = st.number_input(
                 "并行进程数",
@@ -8671,6 +8762,182 @@ def page_molecular_features():
         }
 
     st.markdown("---")
+
+    with st.expander("📥 导入提取流程并一键提取未处理数据", expanded=False):
+        st.caption(
+            "上传训练时导出的 `feature_process.json` 或包含 "
+            "`molecular_feature_workflow` 的模型元数据 JSON，系统会按保存的步骤顺序重新提取。"
+        )
+        import_file = st.file_uploader(
+            "选择提取流程 JSON",
+            type=["json"],
+            key="mf_import_workflow_json",
+            help="支持新版 workflow、模型 extra.molecular_feature_workflow，以及旧版 molecular_feature_config。",
+        )
+        source_mode = st.radio(
+            "提取数据源",
+            ["原始上传数据（未处理，推荐）", "当前处理后数据"],
+            index=0,
+            horizontal=True,
+            key="mf_import_workflow_source_mode",
+            help="原始上传数据适合一键复现训练前的分子特征提取；当前处理后数据适合在已清洗表上补特征。",
+        )
+        import_payload = None
+        import_workflow = None
+        import_source_df = (
+            st.session_state.data
+            if source_mode.startswith("原始") and st.session_state.get("data") is not None
+            else df
+        )
+        import_missing_cols = []
+
+        if import_file is not None:
+            try:
+                import_payload = json.loads(import_file.getvalue().decode("utf-8-sig"))
+                import_workflow = _resolve_imported_molecular_feature_workflow(
+                    import_payload,
+                )
+                workflow_source_cols = []
+                for step in import_workflow.steps:
+                    for col in step.get("source_columns") or []:
+                        if col not in workflow_source_cols:
+                            workflow_source_cols.append(col)
+                import_missing_cols = [
+                    col for col in workflow_source_cols if col not in import_source_df.columns
+                ]
+
+                c_imp1, c_imp2, c_imp3 = st.columns(3)
+                c_imp1.metric("流程步骤", len(import_workflow.steps))
+                c_imp2.metric("输出特征", len(import_workflow.final_feature_names))
+                c_imp3.metric("数据行数", len(import_source_df))
+                if workflow_source_cols:
+                    st.caption("来源列：" + ", ".join(map(str, workflow_source_cols[:12])))
+                if import_missing_cols:
+                    st.error(
+                        "当前数据缺少 workflow 所需来源列："
+                        + ", ".join(import_missing_cols[:12])
+                    )
+                elif import_workflow.legacy:
+                    st.warning("这是旧版 feature_process，能执行但流程信息可能不如新版完整。")
+                else:
+                    st.success("✅ 已识别可执行提取流程")
+            except Exception as exc:
+                import_payload = None
+                import_workflow = None
+                st.error(f"❌ 无法解析提取流程：{exc}")
+
+        run_imported_workflow = st.button(
+            "🚀 按导入流程一键提取",
+            type="primary",
+            disabled=import_payload is None or import_workflow is None or bool(import_missing_cols),
+            key="mf_run_imported_workflow",
+        )
+
+        if run_imported_workflow:
+            progress_bar = st.progress(0.0)
+            status_box = st.empty()
+            total_steps = max(1, len(import_workflow.steps))
+            completed_steps = []
+
+            def _import_progress(trace):
+                completed_steps.append(trace.get("step_id"))
+                progress_bar.progress(min(1.0, len(completed_steps) / total_steps))
+                status_box.info(
+                    f"正在执行流程步骤 {len(completed_steps)}/{total_steps}："
+                    f"{trace.get('step_id', 'unknown')}"
+                )
+
+            try:
+                status_box.info("正在按导入流程提取分子特征...")
+                import_device = None
+                try:
+                    import torch
+
+                    dev_pref = str(st.session_state.get("compute_device", "auto"))
+                    if dev_pref.startswith("cuda") and torch.cuda.is_available():
+                        import_device = torch.device(dev_pref)
+                    elif dev_pref == "cpu":
+                        import_device = torch.device("cpu")
+                    else:
+                        import_device = torch.device(
+                            "cuda" if torch.cuda.is_available() else "cpu"
+                        )
+                except Exception:
+                    import_device = None
+                imported = _run_imported_molecular_feature_workflow(
+                    import_source_df,
+                    import_payload,
+                    device=import_device,
+                    progress_callback=_import_progress,
+                )
+                from core.molecular_feature_workflow import merge_feature_name_lists_in_order
+
+                old_mol_names = list(st.session_state.get("molecular_feature_names") or [])
+                new_mol_names = imported["feature_names"]
+                replace_existing = source_mode.startswith("原始")
+                if replace_existing:
+                    combined_mol_names = new_mol_names
+                else:
+                    combined_mol_names = merge_feature_name_lists_in_order(
+                        old_mol_names,
+                        new_mol_names,
+                    )
+
+                st.session_state.molecular_features = imported["features"]
+                st.session_state.processed_data = imported["data"]
+                st.session_state.molecular_feature_names = combined_mol_names
+                st.session_state.molecular_feature_workflow = imported["workflow"]
+                st.session_state.molecular_feature_config = imported["config"]
+                st.session_state.molecular_feature_trace = imported["trace"]
+
+                existing_feature_cols = list(st.session_state.get("feature_cols") or [])
+                existing_multiselect = list(
+                    st.session_state.get("multiselect_features") or []
+                )
+                if replace_existing and old_mol_names:
+                    existing_feature_cols = [
+                        col for col in existing_feature_cols if col not in old_mol_names
+                    ]
+                    existing_multiselect = [
+                        col for col in existing_multiselect if col not in old_mol_names
+                    ]
+                st.session_state.feature_cols = merge_feature_name_lists_in_order(
+                    existing_feature_cols,
+                    new_mol_names,
+                )
+                st.session_state.multiselect_features = merge_feature_name_lists_in_order(
+                    existing_multiselect,
+                    new_mol_names,
+                )
+                if "feature_classification" in st.session_state:
+                    del st.session_state["feature_classification"]
+
+                try:
+                    log_fe_step(
+                        operation="导入分子特征流程",
+                        description=f"按导入 workflow 提取 {len(new_mol_names)} 个分子特征",
+                        params={
+                            "workflow_hash": imported["workflow"].get("workflow_hash"),
+                            "source_mode": source_mode,
+                            "steps": len(imported["trace"]),
+                        },
+                        input_df=import_source_df,
+                        output_df=imported["data"],
+                        message=f"已写回 {len(new_mol_names)} 个分子特征",
+                    )
+                except Exception:
+                    pass
+
+                progress_bar.progress(1.0)
+                status_box.success(
+                    f"✅ 导入流程提取完成：{len(imported['data'])} 行，"
+                    f"{len(new_mol_names)} 个分子特征已写回"
+                )
+                if imported["warnings"]:
+                    st.warning("；".join(imported["warnings"][:5]))
+            except Exception as exc:
+                progress_bar.empty()
+                status_box.error(f"❌ 导入流程提取失败：{exc}")
 
     # [修改] 按钮区域：增加清除按钮
     col_btn1, col_btn2 = st.columns([1, 4])
@@ -9590,6 +9857,8 @@ def page_molecular_features():
         try:
             progress_bar = st.progress(0)
             status_text = st.empty()
+            stage_timings = {}
+            extraction_stage_t0 = time.perf_counter()
 
             # 初始化 is_multicomponent 变量
             is_multicomponent = False
@@ -10028,7 +10297,18 @@ def page_molecular_features():
                     st.error("❌ 未检测到 xtb 可执行文件。")
                     _record_single_workflow_failure("xTB executable unavailable")
                     return
-                features_df, valid_indices = extractor.featurize(smiles_list_input, n_jobs=xtb_n_jobs)
+                def _xtb_progress(pct, msg):
+                    try:
+                        progress_bar.progress(max(1, min(90, int(float(pct) * 90))))
+                        status_text.text(str(msg))
+                    except Exception:
+                        pass
+
+                features_df, valid_indices = extractor.featurize(
+                    smiles_list_input,
+                    n_jobs=xtb_n_jobs,
+                    progress_callback=_xtb_progress,
+                )
             elif "FGD" in extraction_method:
                 from core.molecular_features import FGDFeatureExtractor
                 status_text.text("正在执行 FGD 结构分类与编码...")
@@ -10162,7 +10442,9 @@ def page_molecular_features():
                     )
                     features_df, valid_indices = extractor.extract_features(smiles_list, hardener_list, phr_list, stoich_mode)
 
-            progress_bar.progress(100)
+            stage_timings["特征提取"] = time.perf_counter() - extraction_stage_t0
+            progress_bar.progress(92)
+            status_text.text("特征提取完成，正在处理语义/BigSMILES 附加特征...")
 
             # [新增] 从 valid_indices 中排除离子索引
             if skip_ionic_compounds and ionic_indices:
@@ -10181,12 +10463,14 @@ def page_molecular_features():
             from core.molecular_features import append_configured_semantic_features
             from core.molecular_feature_workflow import find_duplicate_feature_names
 
+            semantic_stage_t0 = time.perf_counter()
             features_df, valid_indices = append_configured_semantic_features(
                 features_df,
                 valid_indices,
                 smiles_list_input,
                 mf_cfg.get("params") or {},
             )
+            stage_timings["语义特征"] = time.perf_counter() - semantic_stage_t0
             emitted_duplicates = find_duplicate_feature_names(
                 features_df.columns.tolist()
                 if isinstance(features_df, pd.DataFrame)
@@ -10198,17 +10482,16 @@ def page_molecular_features():
                     + ", ".join(emitted_duplicates)
                 )
 
-            # [调试] 显示提取结果信息
-            print(f"[DEBUG] features_df type: {type(features_df)}")
-            print(f"[DEBUG] features_df shape: {features_df.shape if hasattr(features_df, 'shape') else 'N/A'}")
-            print(f"[DEBUG] valid_indices length: {len(valid_indices) if valid_indices else 0}")
-            print(f"[DEBUG] features_df length check: {len(features_df)}")
-
-            st.info(f"🔍 调试信息: features_df 形状={features_df.shape if hasattr(features_df, 'shape') else 'N/A'}, 有效索引数={len(valid_indices) if valid_indices else 0}")
+            feature_shape = features_df.shape if hasattr(features_df, "shape") else ("N/A", "N/A")
+            st.caption(
+                f"特征提取结果：{feature_shape}；有效索引数 "
+                f"{len(valid_indices) if valid_indices else 0:,}"
+            )
 
             # --- 合并结果逻辑 ---
             if len(features_df) > 0:
-                st.success("✅ 进入合并结果逻辑")
+                merge_stage_t0 = time.perf_counter()
+                status_text.text("正在合并特征并保存流程...")
 
                 # 多组分情况：特征已经有 crosslink_ 前缀，不需要再添加列名前缀
                 if is_multicomponent:
@@ -10284,6 +10567,7 @@ def page_molecular_features():
                         locals().get("keep_all_rows_3d", False)
                     ),
                 )
+                stage_timings["合并写回"] = time.perf_counter() - merge_stage_t0
 
                 # 可选：追加组分数量特征
                 if resin_mix_mode and add_component_count_features:
@@ -10476,6 +10760,16 @@ def page_molecular_features():
                 except Exception as workflow_error:
                     st.warning(f"⚠️ 分子特征流程记录失败：{workflow_error}")
                 st.success(f"✅ 成功提取 {len(features_df)} 个样本的 {features_df.shape[1]} 个分子特征")
+                progress_bar.progress(100)
+                try:
+                    timing_text = " | ".join(
+                        f"{name} {elapsed:.2f}s"
+                        for name, elapsed in stage_timings.items()
+                    )
+                    if timing_text:
+                        st.caption(f"⏱️ 阶段耗时：{timing_text}")
+                except Exception:
+                    pass
 
                 log_fe_step(
                     operation="分子特征提取",

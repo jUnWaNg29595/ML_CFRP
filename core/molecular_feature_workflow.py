@@ -108,14 +108,13 @@ def merge_extracted_features(
         return pd.concat(
             [base.iloc[indices].reset_index(drop=True), features.iloc[: len(indices)]],
             axis=1,
-            copy=False,
         )
 
     if (
         len(base) == len(features) == len(indices)
         and indices == list(range(len(base)))
     ):
-        return pd.concat([base, features], axis=1, copy=False)
+        return pd.concat([base, features], axis=1)
 
     n_rows = min(len(indices), len(features))
     full_features = align_extracted_features_to_rows(
@@ -123,7 +122,7 @@ def merge_extracted_features(
         indices[:n_rows],
         len(base),
     )
-    return pd.concat([base, full_features], axis=1, copy=False)
+    return pd.concat([base, full_features], axis=1)
 
 
 _FEATURE_COMPONENT_ROLE_TOKENS = {
