@@ -460,20 +460,65 @@ class HyperparameterOptimizer:
 
         # 0. 记录目标列名（用于 Epoxy PINN auto mode）
         y_name = getattr(y, 'name', None)
-
-        # 1. 清理目标值并保留独立、分层的外层测试集。
-        evaluation_config = OptimizationEvaluationConfig(
-            test_size=float(val_size),
-            cv_folds=int(cv),
-            random_state=int(random_state),
-            max_samples=max_samples,
+        requested_cv_strategy = (
+            str(cv_strategy).lower() if cv_strategy is not None else None
         )
-        preflight = prepare_regression_optimization(X, y, evaluation_config)
-        preflight = select_stratified_training_budget(preflight, evaluation_config)
-        training_positions = np.asarray(preflight.outer_train_positions, dtype=int)
-        X = preflight.X.iloc[training_positions]
-        y = preflight.y.iloc[training_positions]
-        training_strata = preflight.strata[training_positions]
+        use_reliable_preflight = (
+            requested_cv_strategy is None
+            or requested_cv_strategy.startswith("strat")
+        )
+
+        if use_reliable_preflight:
+            # 1. 清理目标值并保留独立、分层的外层测试集。
+            evaluation_config = OptimizationEvaluationConfig(
+                test_size=float(val_size),
+                cv_folds=int(cv),
+                random_state=int(random_state),
+                max_samples=max_samples,
+            )
+            preflight = prepare_regression_optimization(X, y, evaluation_config)
+            preflight = select_stratified_training_budget(preflight, evaluation_config)
+            training_positions = np.asarray(preflight.outer_train_positions, dtype=int)
+            X = preflight.X.iloc[training_positions]
+            y = preflight.y.iloc[training_positions]
+            training_strata = preflight.strata[training_positions]
+        else:
+            # 显式 legacy kfold/holdout 保持旧行为：只清理目标值，不要求可靠分层预检。
+            max_samples = int(max_samples) if max_samples is not None else 0
+            if max_samples > 0:
+                n_total = len(X)
+                if n_total > max_samples:
+                    rng = np.random.default_rng(int(random_state))
+                    idx = rng.choice(n_total, size=max_samples, replace=False)
+                    if isinstance(X, (pd.DataFrame, pd.Series)):
+                        X = X.iloc[idx]
+                    else:
+                        X = np.asarray(X)[idx]
+                    if isinstance(y, (pd.DataFrame, pd.Series)):
+                        y = y.iloc[idx]
+                    else:
+                        y = np.asarray(y)[idx]
+
+            y_raw = y.iloc[:, 0] if isinstance(y, pd.DataFrame) else y
+            target_values = pd.to_numeric(pd.Series(y_raw), errors="coerce").replace(
+                [np.inf, -np.inf],
+                np.nan,
+            )
+            if len(X) != len(target_values):
+                raise ValueError("特征 X 与目标 y 的样本数必须一致")
+            valid_target_mask = np.isfinite(target_values.to_numpy(dtype=float))
+            if np.sum(~valid_target_mask) > 0:
+                print(
+                    f"⚠️ 警告: 检测到目标变量 y 中有 {np.sum(~valid_target_mask)} 个无效值，"
+                    "已在优化前自动移除对应样本。"
+                )
+                valid_positions = np.flatnonzero(valid_target_mask)
+                if isinstance(X, (pd.DataFrame, pd.Series)):
+                    X = X.iloc[valid_positions]
+                else:
+                    X = np.asarray(X)[valid_positions]
+            y = target_values.to_numpy(dtype=float)[valid_target_mask]
+            training_strata = None
 
         # 2. 保持现有训练器的数组接口。
         if isinstance(X, pd.DataFrame) and model_name != "Epoxy PINN (Physics-Informed)":
@@ -509,9 +554,6 @@ class HyperparameterOptimizer:
                         base_model
                     )
 
-                requested_cv_strategy = (
-                    str(cv_strategy).lower() if cv_strategy is not None else None
-                )
                 if requested_cv_strategy is not None and requested_cv_strategy.startswith("hold"):
                     X_train, X_val, y_train, y_val = train_test_split(
                         X, y, test_size=float(val_size), random_state=random_state

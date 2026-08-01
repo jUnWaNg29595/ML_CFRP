@@ -136,6 +136,53 @@ def test_explicit_kfold_uses_legacy_kfold_strategy(monkeypatch):
     assert calls == {"kfold": 1, "stratified": 0}
 
 
+def test_explicit_kfold_bypasses_reliable_preflight_when_strata_impossible(monkeypatch):
+    X = pd.DataFrame({"feature": np.arange(10, dtype=float)})
+    y = pd.Series(np.arange(10, dtype=float), name="tg")
+    optimizer = HyperparameterOptimizer()
+    optimizer.get_model_params = lambda trial, model_name, fast_mode=False: {}
+    optimizer.trainer._get_model = lambda model_name, **params: LinearRegression()
+
+    best_params, best_score, study = optimizer.optimize(
+        "线性回归",
+        X,
+        y,
+        n_trials=1,
+        cv=5,
+        cv_strategy="kfold",
+        n_jobs=1,
+        use_pruner=False,
+    )
+
+    assert best_params == {}
+    assert np.isfinite(best_score)
+    assert len(study.trials) == 1
+
+
+def test_explicit_holdout_bypasses_reliable_preflight_when_strata_impossible(monkeypatch):
+    X = pd.DataFrame({"feature": np.arange(10, dtype=float)})
+    y = pd.Series(np.arange(10, dtype=float), name="tg")
+    optimizer = HyperparameterOptimizer()
+    optimizer.get_model_params = lambda trial, model_name, fast_mode=False: {}
+    optimizer.trainer._get_model = lambda model_name, **params: LinearRegression()
+
+    best_params, best_score, study = optimizer.optimize(
+        "线性回归",
+        X,
+        y,
+        n_trials=1,
+        cv=5,
+        cv_strategy="holdout",
+        val_size=0.2,
+        n_jobs=1,
+        use_pruner=False,
+    )
+
+    assert best_params == {}
+    assert np.isfinite(best_score)
+    assert len(study.trials) == 1
+
+
 def test_duplicate_source_labels_support_preflight_and_training_budget():
     X = pd.DataFrame(
         {"feature": np.arange(80, dtype=float)},
