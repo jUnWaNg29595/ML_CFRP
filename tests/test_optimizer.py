@@ -157,3 +157,50 @@ def test_duplicate_source_labels_support_preflight_and_training_budget():
     assert set(preflight.outer_train_indices) == {"duplicate"}
     assert len(budgeted.outer_train_indices) == 32
     assert budgeted.outer_test_indices == preflight.outer_test_indices
+
+
+def test_optimizer_pipeline_keeps_pls_and_preprocessing_fold_local(monkeypatch):
+    import core.model_trainer as trainer_module
+    from core.model_trainer import EnhancedModelTrainer
+    from core.process_pls import ProcessPLSTransformer
+
+    fit_row_counts = []
+
+    class RecordingProcessPLS(ProcessPLSTransformer):
+        def fit(self, X, y):
+            fit_row_counts.append(len(X))
+            return super().fit(X, y)
+
+    monkeypatch.setattr(trainer_module, "ProcessPLSTransformer", RecordingProcessPLS)
+    X, y = _reliable_frame()
+    config = {
+        "schema_version": 1,
+        "enabled": True,
+        "process_feature_cols": ["process_temperature"],
+        "max_components": 1,
+        "vip_top_k": 1,
+        "missing_threshold": 0.85,
+        "cv_splits": 2,
+        "random_state": 42,
+        "selection_mode": "auto_combined_score",
+    }
+
+    pipeline = EnhancedModelTrainer(use_gpu=False).build_regression_cv_pipeline(
+        "线性回归",
+        X.columns.tolist(),
+        random_state=42,
+        process_pls_config=config,
+        use_process_pls=True,
+    )
+    pipeline.fit(X.iloc[:60], y.iloc[:60])
+    pipeline.predict(X.iloc[60:])
+
+    assert list(pipeline.named_steps) == [
+        "process_pls",
+        "inf_cleaner",
+        "imputer",
+        "nan_col_dropper",
+        "scaler",
+        "model",
+    ]
+    assert fit_row_counts == [60]

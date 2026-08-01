@@ -3440,6 +3440,44 @@ class EnhancedModelTrainer:
             "oof_log_loss": oof_metrics["log_loss"],
         }
 
+    def build_regression_cv_pipeline(
+        self,
+        model_name,
+        feature_columns,
+        *,
+        random_state=42,
+        process_pls_config=None,
+        use_process_pls=False,
+        **params,
+    ):
+        if str(model_name) in RAW_FRAME_MODEL_NAMES:
+            raise ValueError("当前模型不支持通用回归优化 pipeline，请在训练页使用专用训练流程")
+        if _is_classification_model(model_name):
+            raise ValueError("可信超参数优化当前仅支持回归模型")
+
+        columns = list(feature_columns or [])
+        process_pls_step = _make_process_pls_step(
+            process_pls_config,
+            bool(use_process_pls),
+            columns,
+        )
+        model = self._get_model(
+            model_name,
+            random_state=int(random_state),
+            **dict(params),
+        )
+        steps = []
+        if process_pls_step is not None:
+            steps.append(process_pls_step)
+        steps.extend([
+            ("inf_cleaner", InfCleaner()),
+            ("imputer", SimpleImputer(strategy="median")),
+            ("nan_col_dropper", AllNaNColumnDropper()),
+            ("scaler", StandardScaler()),
+            ("model", model),
+        ])
+        return Pipeline(steps=steps)
+
     def train_model(
         self,
         X,
