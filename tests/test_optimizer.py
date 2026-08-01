@@ -6,6 +6,7 @@ from core.optimizer import (
     OptimizationEvaluationConfig,
     build_adaptive_regression_strata,
     prepare_regression_optimization,
+    select_stratified_training_budget,
 )
 
 
@@ -64,3 +65,36 @@ def test_preflight_rejects_targets_that_cannot_support_stratified_cv():
             y,
             OptimizationEvaluationConfig(cv_folds=5, test_size=0.20),
         )
+
+
+def test_preflight_reduces_strata_until_outer_training_supports_cv():
+    X = pd.DataFrame({"feature": np.arange(20, dtype=float)})
+    y = pd.Series(np.repeat(np.arange(4, dtype=float), 5), name="tg")
+    config = OptimizationEvaluationConfig(
+        cv_folds=5,
+        test_size=0.20,
+        quantile_bins=4,
+        random_state=7,
+    )
+
+    preflight = prepare_regression_optimization(X, y, config)
+    training_positions = preflight.X.index.get_indexer(preflight.outer_train_indices)
+    training_counts = pd.Series(preflight.strata[training_positions]).value_counts()
+
+    assert preflight.quantile_bins < 4
+    assert training_counts.min() >= config.cv_folds
+
+
+def test_training_budget_rejects_strata_that_cannot_support_inner_cv():
+    X, y = _reliable_frame()
+    config = OptimizationEvaluationConfig(
+        cv_folds=4,
+        test_size=0.20,
+        quantile_bins=4,
+        max_samples=15,
+        random_state=7,
+    )
+    preflight = prepare_regression_optimization(X, y, config)
+
+    with pytest.raises(ValueError, match="训练样本预算无法保证每个连续目标分层至少保留 4 行"):
+        select_stratified_training_budget(preflight, config)

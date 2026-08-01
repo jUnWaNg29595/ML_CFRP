@@ -157,32 +157,42 @@ def prepare_regression_optimization(
         if config.quantile_bins is not None
         else min(10, max(2, len(y_valid) // (2 * int(config.cv_folds))))
     )
-    strata, actual_bins = build_adaptive_regression_strata(
-        y_valid,
-        cv_folds=config.cv_folds,
-        test_size=config.test_size,
-        requested_bins=candidate_bins,
-    )
-    splitter = StratifiedShuffleSplit(
-        n_splits=1,
-        test_size=config.test_size,
-        random_state=config.random_state,
-    )
-    outer_train_positions, outer_test_positions = next(splitter.split(X_valid, strata))
+    for requested_bins in range(int(candidate_bins), 1, -1):
+        strata, actual_bins = build_adaptive_regression_strata(
+            y_valid,
+            cv_folds=config.cv_folds,
+            test_size=config.test_size,
+            requested_bins=requested_bins,
+        )
+        splitter = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=config.test_size,
+            random_state=config.random_state,
+        )
+        outer_train_positions, outer_test_positions = next(splitter.split(X_valid, strata))
+        outer_training_counts = pd.Series(strata[outer_train_positions]).value_counts()
+        if outer_training_counts.min() < int(config.cv_folds):
+            continue
 
-    return OptimizationPreflight(
-        X=X_valid,
-        y=y_valid,
-        source_indices=source_indices,
-        strata=strata,
-        quantile_bins=actual_bins,
-        removed_target_rows=removed_target_rows,
-        outer_train_indices=X_valid.index.take(outer_train_positions).tolist(),
-        outer_test_indices=X_valid.index.take(outer_test_positions).tolist(),
-        validation_messages=[
-            f"已移除 {removed_target_rows} 行无效目标值。",
-            f"连续目标已使用 {actual_bins} 个自适应分层。",
-        ],
+        return OptimizationPreflight(
+            X=X_valid,
+            y=y_valid,
+            source_indices=source_indices,
+            strata=strata,
+            quantile_bins=actual_bins,
+            removed_target_rows=removed_target_rows,
+            outer_train_indices=X_valid.index.take(outer_train_positions).tolist(),
+            outer_test_indices=X_valid.index.take(outer_test_positions).tolist(),
+            validation_messages=[
+                f"已移除 {removed_target_rows} 行无效目标值。",
+                f"连续目标已使用 {actual_bins} 个自适应分层。",
+            ],
+        )
+
+    raise ValueError(
+        "无法构建满足独立测试集和 "
+        f"{int(config.cv_folds)} 折交叉验证的连续目标分层；有效样本={len(y_valid)}，"
+        "请减少折数、降低分箱或补充数据"
     )
 
 
@@ -197,6 +207,15 @@ def select_stratified_training_budget(
 
     train_positions = preflight.X.index.get_indexer(preflight.outer_train_indices)
     train_strata = preflight.strata[train_positions]
+    train_counts = pd.Series(train_strata).value_counts()
+    minimum_budget = int(config.cv_folds) * len(train_counts)
+    if max_samples < minimum_budget:
+        raise ValueError(
+            "训练样本预算无法保证每个连续目标分层至少保留 "
+            f"{int(config.cv_folds)} 行用于交叉验证；当前预算={max_samples}，"
+            f"至少需要={minimum_budget}，请增加 max_samples、减少折数或降低分箱"
+        )
+
     splitter = StratifiedShuffleSplit(
         n_splits=1,
         train_size=max_samples,
@@ -207,6 +226,13 @@ def select_stratified_training_budget(
     )
     selected_source_positions = train_positions[selected_positions]
     selected_indices = preflight.X.index.take(selected_source_positions).tolist()
+    selected_counts = pd.Series(train_strata[selected_positions]).value_counts()
+    if selected_counts.min() < int(config.cv_folds):
+        raise ValueError(
+            "训练样本预算无法保证每个连续目标分层至少保留 "
+            f"{int(config.cv_folds)} 行用于交叉验证；当前预算={max_samples}，"
+            f"请增加 max_samples、减少折数或降低分箱"
+        )
 
     return OptimizationPreflight(
         X=preflight.X,
