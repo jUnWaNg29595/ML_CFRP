@@ -1,8 +1,12 @@
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import KFold as RealKFold
+from sklearn.model_selection import StratifiedKFold as RealStratifiedKFold
 
 from core.optimizer import (
+    HyperparameterOptimizer,
     OptimizationEvaluationConfig,
     build_adaptive_regression_strata,
     prepare_regression_optimization,
@@ -98,3 +102,58 @@ def test_training_budget_rejects_strata_that_cannot_support_inner_cv():
 
     with pytest.raises(ValueError, match="训练样本预算无法保证每个连续目标分层至少保留 4 行"):
         select_stratified_training_budget(preflight, config)
+
+
+def test_explicit_kfold_uses_legacy_kfold_strategy(monkeypatch):
+    X, y = _reliable_frame()
+    optimizer = HyperparameterOptimizer()
+    optimizer.get_model_params = lambda trial, model_name, fast_mode=False: {}
+    optimizer.trainer._get_model = lambda model_name, **params: LinearRegression()
+    calls = {"kfold": 0, "stratified": 0}
+
+    def make_kfold(*args, **kwargs):
+        calls["kfold"] += 1
+        return RealKFold(*args, **kwargs)
+
+    def make_stratified(*args, **kwargs):
+        calls["stratified"] += 1
+        return RealStratifiedKFold(*args, **kwargs)
+
+    monkeypatch.setattr("core.optimizer.KFold", make_kfold)
+    monkeypatch.setattr("core.optimizer.StratifiedKFold", make_stratified)
+
+    optimizer.optimize(
+        "线性回归",
+        X,
+        y,
+        n_trials=1,
+        cv=4,
+        cv_strategy="kfold",
+        n_jobs=1,
+        use_pruner=False,
+    )
+
+    assert calls == {"kfold": 1, "stratified": 0}
+
+
+def test_duplicate_source_labels_support_preflight_and_training_budget():
+    X = pd.DataFrame(
+        {"feature": np.arange(80, dtype=float)},
+        index=pd.Index(["duplicate"] * 80, name="source_row"),
+    )
+    y = pd.Series(np.repeat(np.arange(10, dtype=float), 8), name="tg")
+    config = OptimizationEvaluationConfig(
+        cv_folds=4,
+        test_size=0.20,
+        quantile_bins=4,
+        max_samples=32,
+        random_state=7,
+    )
+
+    preflight = prepare_regression_optimization(X, y, config)
+    budgeted = select_stratified_training_budget(preflight, config)
+
+    assert len(preflight.source_indices) == 80
+    assert set(preflight.outer_train_indices) == {"duplicate"}
+    assert len(budgeted.outer_train_indices) == 32
+    assert budgeted.outer_test_indices == preflight.outer_test_indices

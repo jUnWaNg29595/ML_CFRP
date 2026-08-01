@@ -67,6 +67,8 @@ class OptimizationPreflight:
     outer_train_indices: list[Any]
     outer_test_indices: list[Any]
     validation_messages: list[str] = field(default_factory=list)
+    outer_train_positions: list[int] = field(default_factory=list, repr=False)
+    outer_test_positions: list[int] = field(default_factory=list, repr=False)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -187,6 +189,8 @@ def prepare_regression_optimization(
                 f"已移除 {removed_target_rows} 行无效目标值。",
                 f"连续目标已使用 {actual_bins} 个自适应分层。",
             ],
+            outer_train_positions=outer_train_positions.tolist(),
+            outer_test_positions=outer_test_positions.tolist(),
         )
 
     raise ValueError(
@@ -205,7 +209,7 @@ def select_stratified_training_budget(
     if max_samples <= 0 or max_samples >= len(preflight.outer_train_indices):
         return preflight
 
-    train_positions = preflight.X.index.get_indexer(preflight.outer_train_indices)
+    train_positions = np.asarray(preflight.outer_train_positions, dtype=int)
     train_strata = preflight.strata[train_positions]
     train_counts = pd.Series(train_strata).value_counts()
     minimum_budget = int(config.cv_folds) * len(train_counts)
@@ -247,6 +251,8 @@ def select_stratified_training_budget(
             *preflight.validation_messages,
             f"优化训练集已按分层预算缩减为 {len(selected_indices)} 行。",
         ],
+        outer_train_positions=selected_source_positions.tolist(),
+        outer_test_positions=list(preflight.outer_test_positions),
     )
 
 
@@ -431,7 +437,7 @@ class HyperparameterOptimizer:
         cv=5,
         random_state=42,
         progress_callback=None,
-        cv_strategy: str = "kfold",
+        cv_strategy: str | None = None,
         val_size: float = 0.2,
         max_samples: int | None = None,
         n_jobs: int = -1,
@@ -464,7 +470,7 @@ class HyperparameterOptimizer:
         )
         preflight = prepare_regression_optimization(X, y, evaluation_config)
         preflight = select_stratified_training_budget(preflight, evaluation_config)
-        training_positions = preflight.X.index.get_indexer(preflight.outer_train_indices)
+        training_positions = np.asarray(preflight.outer_train_positions, dtype=int)
         X = preflight.X.iloc[training_positions]
         y = preflight.y.iloc[training_positions]
         training_strata = preflight.strata[training_positions]
@@ -503,7 +509,10 @@ class HyperparameterOptimizer:
                         base_model
                     )
 
-                if str(cv_strategy).lower().startswith("hold"):
+                requested_cv_strategy = (
+                    str(cv_strategy).lower() if cv_strategy is not None else None
+                )
+                if requested_cv_strategy is not None and requested_cv_strategy.startswith("hold"):
                     X_train, X_val, y_train, y_val = train_test_split(
                         X, y, test_size=float(val_size), random_state=random_state
                     )
@@ -512,7 +521,7 @@ class HyperparameterOptimizer:
                     return r2_score(y_val, y_pred)
 
                 # 定义交叉验证策略
-                if str(cv_strategy).lower().startswith("strat") or evaluation_config.mode == "reliable":
+                if requested_cv_strategy is None or requested_cv_strategy.startswith("strat"):
                     cv_obj = StratifiedKFold(
                         n_splits=int(cv),
                         shuffle=True,
