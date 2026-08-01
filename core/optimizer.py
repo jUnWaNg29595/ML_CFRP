@@ -977,6 +977,15 @@ class HyperparameterOptimizer:
         started_at = time.monotonic()
 
         def build_legacy_pipeline(params):
+            if config.use_process_pls:
+                return self.trainer.build_regression_cv_pipeline(
+                    model_name,
+                    feature_columns,
+                    random_state=int(config.random_state),
+                    process_pls_config=config.process_pls_config,
+                    use_process_pls=True,
+                    **params,
+                )
             base_model = self.trainer._get_model(
                 model_name,
                 random_state=int(config.random_state),

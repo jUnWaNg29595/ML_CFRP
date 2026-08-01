@@ -1071,7 +1071,14 @@ except Exception as _shap_err:
     warnings.warn(f'SHAP 模块导入失败，模型解释功能将受限: {_shap_err}')
 from core.molecular_features import AdvancedMolecularFeatureExtractor, RDKitFeatureExtractor
 from core.feature_selector import SmartFeatureSelector, SmartSparseDataSelector, show_robust_feature_selection
-from core.optimizer import HyperparameterOptimizer, InverseDesigner, generate_tuning_suggestions
+from core.optimizer import (
+    HyperparameterOptimizer,
+    InverseDesigner,
+    OptimizationEvaluationConfig,
+    OptimizationProgress,
+    generate_tuning_suggestions,
+    prepare_regression_optimization,
+)
 from core.visualizer import Visualizer
 from core.plot_utils import fig_to_png_bytes, fig_to_html
 from core.training_curves import plot_history
@@ -2236,6 +2243,11 @@ def _restore_session_snapshot(tag: str = "latest", override: bool = False) -> tu
             continue
         st.session_state[key] = meta.get(key)
 
+    # 优化结果包含不可序列化的 Optuna study，只保留在当前运行会话中。
+    # 旧快照可能保存过字符串化对象，恢复时必须清空，不能让页面误当作结果对象使用。
+    st.session_state["optimization_result"] = None
+    st.session_state["best_score"] = None
+
     try:
         snapshot_version = int(meta.get("version") or 1)
     except (TypeError, ValueError):
@@ -2896,7 +2908,9 @@ def init_session_state():
         'y_train': None,
         'y_test': None,
         'optimization_history': [],
+        'optimization_result': None,
         'best_params': None,
+        'best_score': None,
         'molecular_feature_names': [],
         'source_feature_names': [],
         'optimized_model_name': None,  # 新增：记录优化的模型名
@@ -20943,8 +20957,9 @@ def page_virtual_screening():
             mime="text/csv",
         )
 
+
 def page_hyperparameter_optimization():
-    """超参数优化页面"""
+    """超参数优化页面：可靠基线默认使用外层独立测试集 + 内层固定交叉验证。"""
     st.title("⚙️ 超参数优化")
 
     if st.session_state.data is None:
@@ -20956,462 +20971,352 @@ def page_hyperparameter_optimization():
         return
 
     df = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
-    feature_cols = st.session_state.feature_cols
+    feature_cols = list(st.session_state.feature_cols)
     target_col = st.session_state.target_col
 
-    X = df[feature_cols]
+    X = df[feature_cols].copy()
     y = df[target_col]
 
-    st.markdown("### Optuna智能超参数优化")
-
-    col1, col2 = st.columns(2)
-
-
-    disable_opt = False
-    with col1:
-        trainer = EnhancedModelTrainer()
-        available_models = trainer.get_available_models()
-
-        # 支持优化的模型
-        optimizable_models = [
-            "线性回归", "Ridge回归", "Lasso回归", "ElasticNet",
-            "决策树", "随机森林", "Extra Trees", "梯度提升树", "AdaBoost",
-            "SVR", "多层感知器", "Gaussian Process (GPR)", "人工神经网络",
-            "XGBoost", "LightGBM", "CatBoost",
-            "TensorFlow Sequential"
-        ]
-        optimizable_models = [m for m in optimizable_models if m in available_models]
-
-        # 兼容：即使当前环境缺少依赖，也显示 TFS 入口（避免"功能存在但界面不显示"）
-        if "TensorFlow Sequential" not in optimizable_models:
-            optimizable_models.append("TensorFlow Sequential")
-
-
-        def _fmt_model_name(n: str) -> str:
-            if n == "TensorFlow Sequential":
-                if TENSORFLOW_AVAILABLE:
-                    return "TFS (TensorFlow Sequential) ✅"
-                return "TFS (TensorFlow Sequential) ⛔ 需要安装 TensorFlow"
-            return n
-
-        model_name = st.selectbox("选择模型", optimizable_models, format_func=_fmt_model_name)
-
-        # 未安装 TensorFlow 时：仍显示入口，但禁用优化按钮并提示安装
-        disable_opt = (model_name == "TensorFlow Sequential" and (not TENSORFLOW_AVAILABLE))
-        if disable_opt:
-            st.warning("检测到当前环境未安装 TensorFlow，TFS 模型暂不可进行 Optuna 优化。请先安装依赖：`pip install tensorflow`（或按你的硬件选择 tensorflow-cpu / tensorflow-gpu）。")
-    with col2:
-        n_trials = st.slider("优化轮数", 10, 200, DEFAULT_OPTUNA_TRIALS)
-
-    # --- [新增] 性能加速设置 ---
-    with st.expander("⚡ 优化加速设置", expanded=False):
-        fast_mode = st.checkbox("快速模式（采样 + 快速评估 + 剪枝）", value=True)
-        max_sample_upper = max(1, int(len(X)))
-        max_samples_default = min(2000, max_sample_upper) if fast_mode else 0
-        max_samples = st.number_input(
-            "最大样本数（0=不限制）",
-            min_value=0,
-            max_value=max_sample_upper,
-            value=max_samples_default,
-            step=1,
+    process_pls_workflow = st.session_state.get("process_pls_workflow")
+    use_process_pls = bool(
+        isinstance(process_pls_workflow, dict)
+        and process_pls_workflow.get("enabled")
+        and st.session_state.get(
+            "process_pls_use_in_training",
+            st.session_state.get("process_pls_enabled_default", False),
         )
-        eval_mode = st.selectbox(
-            "评估方式",
-            ["Holdout(快速)", "KFold(稳健)"],
-            index=0 if fast_mode else 1,
-        )
-        if eval_mode.startswith("Holdout"):
-            cv_strategy = "holdout"
-            val_size = st.slider("Holdout 验证集比例", 0.1, 0.4, 0.2, step=0.05)
-            cv_folds = 5
-        else:
-            cv_strategy = "kfold"
-            val_size = 0.2
-            cv_folds = st.slider("交叉验证折数", 3, 10, 5)
-        use_pruner = st.checkbox("启用剪枝（提前停止差的 trial）", value=fast_mode)
+    )
 
-        # 优化方法选择
-        optimization_method = st.selectbox(
-            "🔍 优化算法",
-            ["TPE (贝叶斯优化)", "Gaussian Process (高斯过程)", "CMA-ES (进化策略)", "Random (随机搜索)"],
+    st.markdown("### Optuna 科研级超参数优化")
+    st.caption("默认流程：外层连续目标分层独立测试集只评估一次；内层固定分层 KFold 只用于选择参数，避免刷新页面后重新随机切分。")
+
+    trainer = EnhancedModelTrainer()
+    available_models = trainer.get_available_models()
+    optimizable_models = [
+        "线性回归", "Ridge回归", "Lasso回归", "ElasticNet",
+        "决策树", "随机森林", "Extra Trees", "梯度提升树", "AdaBoost",
+        "SVR", "多层感知器", "Gaussian Process (GPR)", "人工神经网络",
+        "XGBoost", "LightGBM", "CatBoost",
+        "TensorFlow Sequential",
+    ]
+    optimizable_models = [item for item in optimizable_models if item in available_models]
+    if "TensorFlow Sequential" not in optimizable_models:
+        optimizable_models.append("TensorFlow Sequential")
+
+    def _fmt_model_name(name: str) -> str:
+        if name == "TensorFlow Sequential":
+            if TENSORFLOW_AVAILABLE:
+                return "TFS (TensorFlow Sequential) ✅"
+            return "TFS (TensorFlow Sequential) ⛔ 需要安装 TensorFlow"
+        return name
+
+    def _fmt_number(value, digits=4):
+        try:
+            number = float(value)
+        except Exception:
+            return "—"
+        if not np.isfinite(number):
+            return "—"
+        return f"{number:.{digits}f}"
+
+    def _seconds_text(value):
+        if value is None:
+            return "—"
+        try:
+            seconds = max(0, int(value))
+        except Exception:
+            return "—"
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes}m {seconds}s"
+        if minutes:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
+
+    def _json_safe(value):
+        if isinstance(value, dict):
+            return {str(key): _json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [_json_safe(item) for item in value]
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating,)):
+            number = float(value)
+            return number if np.isfinite(number) else None
+        if isinstance(value, np.ndarray):
+            return _json_safe(value.tolist())
+        if isinstance(value, pd.Series):
+            return _json_safe(value.tolist())
+        if isinstance(value, pd.DataFrame):
+            return _json_safe(value.to_dict(orient="records"))
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        return value
+
+    model_name = st.selectbox("选择模型", optimizable_models, format_func=_fmt_model_name)
+    disable_opt = model_name == "TensorFlow Sequential" and not TENSORFLOW_AVAILABLE
+    if disable_opt:
+        st.warning("检测到当前环境未安装 TensorFlow，TFS 模型暂不可进行 Optuna 优化。请先安装依赖：`pip install tensorflow`。")
+
+    with st.form(key="optimization_reliability_form"):
+        mode_label = st.radio(
+            "优化模式",
+            ["可信优化基线", "探索模式（快速评估）"],
             index=0,
-            help="TPE和GP是贝叶斯优化方法，通常效果最好；CMA-ES适合连续参数；Random适合快速探索"
+            horizontal=True,
+            help="可信优化基线用于最终泛化报告；探索模式只适合快速搜索方向。",
         )
-        # 提取方法代码
+        is_exploratory = mode_label.startswith("探索")
+        if is_exploratory:
+            st.warning("⚠️ 探索模式结果不可作为最终泛化报告")
+
+        cfg_cols = st.columns(4)
+        with cfg_cols[0]:
+            test_size = st.slider("独立测试/验证比例", 0.05, 0.40, 0.20, step=0.05)
+        with cfg_cols[1]:
+            cv_folds = st.slider("内层交叉验证折数", 2, 10, 5)
+        with cfg_cols[2]:
+            random_state = st.number_input("随机种子", min_value=0, max_value=999999, value=42, step=1)
+        with cfg_cols[3]:
+            stability_tolerance = st.number_input("稳定性容差 R²", min_value=0.0, max_value=0.05, value=0.005, step=0.001, format="%.3f")
+
+        run_cols = st.columns(4)
+        with run_cols[0]:
+            n_trials = st.number_input("Trial 数", min_value=1, max_value=2000, value=int(DEFAULT_OPTUNA_TRIALS), step=5)
+        with run_cols[1]:
+            max_sample_upper = max(1, int(len(X)))
+            max_samples = st.number_input(
+                "训练样本预算（0=不限制）",
+                min_value=0,
+                max_value=max_sample_upper,
+                value=0,
+                step=100,
+                help="只限制内层优化训练侧预算，不触碰外层独立测试集。",
+            )
+        with run_cols[2]:
+            timeout_seconds = st.number_input("超时秒数（0=不限制）", min_value=0, max_value=604800, value=0, step=60)
+        with run_cols[3]:
+            use_pruner = st.checkbox("启用剪枝", value=True)
+
+        method_cols = st.columns(2)
+        with method_cols[0]:
+            optimization_method = st.selectbox(
+                "优化算法",
+                ["TPE (贝叶斯优化)", "Gaussian Process (高斯过程)", "CMA-ES (进化策略)", "Random (随机搜索)"],
+                index=0,
+            )
+        with method_cols[1]:
+            exploratory_eval_label = st.selectbox(
+                "探索模式评估方式",
+                ["KFold(稳健)", "Holdout(快速)"],
+                index=0,
+                disabled=not is_exploratory,
+            )
+
         opt_method_map = {
             "TPE (贝叶斯优化)": "tpe",
             "Gaussian Process (高斯过程)": "gp",
             "CMA-ES (进化策略)": "cmaes",
-            "Random (随机搜索)": "random"
+            "Random (随机搜索)": "random",
         }
         opt_method = opt_method_map[optimization_method]
-
-        # CMA-ES 依赖提示
         if opt_method == "cmaes":
             try:
-                import cmaes
+                import cmaes  # noqa: F401
                 st.success("✅ CMA-ES 可用")
             except ImportError:
-                st.warning("⚠️ CMA-ES 需要安装 cmaes 包。如果未安装，将自动回退到 TPE 优化。")
-                st.code("pip install cmaes", language="bash")
+                st.warning("⚠️ CMA-ES 需要安装 cmaes 包；未安装时优化器会回退到 TPE。")
 
-    # --- [新增] 进度条组件 ---
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+        config = OptimizationEvaluationConfig(
+            test_size=float(test_size),
+            cv_folds=int(cv_folds),
+            random_state=int(random_state),
+            max_samples=(int(max_samples) if int(max_samples) > 0 else None),
+            stability_tolerance=float(stability_tolerance),
+            use_process_pls=bool(use_process_pls),
+            process_pls_config=(process_pls_workflow if use_process_pls else None),
+            mode=("exploratory" if is_exploratory else "reliable"),
+        )
+        cv_strategy = "holdout" if exploratory_eval_label.startswith("Holdout") else "kfold"
 
-    if st.button("🚀 开始优化", type="primary", disabled=disable_opt):
+        preflight_error = None
+        pipeline_error = None
+        preflight = None
+        exploratory_valid_rows = 0
+        exploratory_removed_rows = 0
+        if is_exploratory:
+            if len(X) != len(y):
+                preflight_error = "特征 X 与目标 y 的样本数必须一致"
+            else:
+                exploratory_target = pd.to_numeric(y, errors="coerce").replace(
+                    [np.inf, -np.inf],
+                    np.nan,
+                )
+                exploratory_valid_rows = int(exploratory_target.notna().sum())
+                exploratory_removed_rows = int(len(exploratory_target) - exploratory_valid_rows)
+                minimum_rows = 3 if cv_strategy == "holdout" else max(2, int(cv_folds))
+                if exploratory_valid_rows < minimum_rows:
+                    preflight_error = (
+                        f"探索模式至少需要 {minimum_rows} 个有效目标样本，"
+                        f"当前只有 {exploratory_valid_rows} 个"
+                    )
+            if use_process_pls and preflight_error is None:
+                try:
+                    trainer.build_regression_cv_pipeline(
+                        model_name,
+                        X.columns.tolist(),
+                        random_state=int(random_state),
+                        process_pls_config=process_pls_workflow,
+                        use_process_pls=True,
+                    )
+                except Exception as exc:
+                    pipeline_error = str(exc)
+        else:
+            try:
+                preflight = prepare_regression_optimization(X, y, config)
+            except Exception as exc:
+                preflight_error = str(exc)
+            try:
+                trainer.build_regression_cv_pipeline(
+                    model_name,
+                    X.columns.tolist(),
+                    random_state=int(random_state),
+                    process_pls_config=(process_pls_workflow if use_process_pls else None),
+                    use_process_pls=bool(use_process_pls),
+                )
+            except Exception as exc:
+                pipeline_error = str(exc)
+
+        st.markdown("#### 优化前检查")
+        if is_exploratory:
+            check_df = pd.DataFrame([
+                {"项目": "原始行数", "值": int(len(X))},
+                {"项目": "有效目标行数", "值": exploratory_valid_rows},
+                {"项目": "移除目标缺失行", "值": exploratory_removed_rows},
+                {"项目": "评估策略", "值": "Holdout" if cv_strategy == "holdout" else "KFold"},
+                {"项目": "独立测试集", "值": "不使用"},
+                {"项目": "交叉验证折数", "值": int(cv_folds) if cv_strategy != "holdout" else "—"},
+                {"项目": "工艺 PLS", "值": "启用" if use_process_pls else "未启用"},
+            ])
+            st.dataframe(check_df, width="stretch", hide_index=True)
+            st.caption("探索模式不使用独立测试集，结果不可作为最终泛化报告。")
+        elif preflight is not None:
+            summary = preflight.summary()
+            check_df = pd.DataFrame([
+                {"项目": "原始行数", "值": summary["original_rows"]},
+                {"项目": "有效目标行数", "值": summary["valid_target_rows"]},
+                {"项目": "移除目标缺失行", "值": summary["removed_target_rows"]},
+                {"项目": "连续目标分层数", "值": summary["quantile_bins"]},
+                {"项目": "外层训练行数", "值": summary["outer_train_rows"]},
+                {"项目": "独立测试集行数", "值": summary["outer_test_rows"]},
+                {"项目": "内层折数", "值": int(cv_folds)},
+                {"项目": "随机种子", "值": int(random_state)},
+                {"项目": "训练样本预算", "值": "不限制" if int(max_samples) <= 0 else int(max_samples)},
+                {"项目": "工艺 PLS", "值": "启用" if use_process_pls else "未启用"},
+            ])
+            st.dataframe(check_df, width="stretch", hide_index=True)
+        if preflight_error:
+            st.error(f"优化前检查失败：{preflight_error}")
+        if pipeline_error:
+            st.error(f"当前模型暂不支持可靠优化 pipeline：{pipeline_error}")
+
+        start_disabled = bool(disable_opt or preflight_error or pipeline_error)
+        start_optimization = st.form_submit_button("🚀 开始优化", type="primary", disabled=start_disabled)
+
+    progress_bar = st.progress(0.0)
+    status_box = st.empty()
+
+    if start_optimization:
         try:
+            st.session_state.optimization_result = None
             optimizer = HyperparameterOptimizer()
 
-            # 定义进度更新回调
-            def update_progress(p):
-                progress_bar.progress(min(p, 1.0))
-                status_text.text(f"正在进行优化... 进度: {int(p * 100)}%")
-
-            with st.spinner(f"正在优化 {model_name}..."):
-                # 传递 progress_callback
-                best_params, best_score, study = optimizer.optimize(
-                    model_name, X, y,
-                    n_trials=n_trials,
-                    cv=cv_folds,
-                    cv_strategy=cv_strategy,
-                    val_size=val_size,
-                    max_samples=(int(max_samples) if int(max_samples) > 0 else None),
-                    fast_mode=bool(fast_mode),
-                    use_pruner=bool(use_pruner),
-                    optimization_method=opt_method,
-                    progress_callback=update_progress
+            def update_progress(progress: OptimizationProgress) -> None:
+                finished = int(progress.completed_trials + progress.pruned_trials + progress.failed_trials)
+                if finished <= 0:
+                    return
+                total = max(1, int(progress.total_trials))
+                progress_bar.progress(min(1.0, finished / total))
+                best_text = "暂无"
+                if progress.current_best_mean_r2 is not None:
+                    best_text = f"{progress.current_best_mean_r2:.4f} ± {_fmt_number(progress.current_best_std_r2)}"
+                status_box.info(
+                    " | ".join([
+                        f"完成 {progress.completed_trials}/{total}",
+                        f"剪枝 {progress.pruned_trials}",
+                        f"失败 {progress.failed_trials}",
+                        f"当前稳定性最佳 mean±std R²: {best_text}",
+                        f"耗时 {_seconds_text(progress.elapsed_seconds)}",
+                        f"ETA {_seconds_text(progress.estimated_remaining_seconds)}",
+                        f"阶段 {progress.stage}",
+                    ])
                 )
 
-            # 优化完成，进度条满
-            progress_bar.progress(100)
-            status_text.text("优化完成！")
+            with st.spinner(f"正在优化 {model_name}..."):
+                result = optimizer.optimize(
+                    model_name,
+                    X,
+                    y,
+                    n_trials=int(n_trials),
+                    cv=int(cv_folds),
+                    random_state=int(random_state),
+                    progress_callback=update_progress,
+                    cv_strategy=(cv_strategy if is_exploratory else None),
+                    val_size=float(test_size),
+                    max_samples=(int(max_samples) if int(max_samples) > 0 else None),
+                    fast_mode=bool(is_exploratory),
+                    use_pruner=bool(use_pruner),
+                    timeout=(int(timeout_seconds) if int(timeout_seconds) > 0 else None),
+                    optimization_method=opt_method,
+                    evaluation_config=config,
+                )
 
-            st.success(f"✅ 优化完成！最佳R²分数: {best_score:.4f}")
+            progress_bar.progress(1.0)
+            status_box.success("优化完成，结果已固定在当前会话中。")
+            st.session_state.optimization_result = result
+            st.session_state.best_params = dict(result.best_params or {})
+            st.session_state.best_score = result.inner_cv.get("mean_r2")
+            st.session_state.optimized_model_name = model_name
 
-            # 保存到 session_state
-            st.session_state.best_params = best_params
-            st.session_state.best_score = best_score
-            st.session_state.optimized_model_name = model_name  # 记录优化的是哪个模型
-
-            # [新增] 记录到状态条
             try:
+                log_params = {
+                    "model": model_name,
+                    "n_trials": int(n_trials),
+                    "mode": config.mode,
+                    "exploratory": bool(config.mode == "exploratory"),
+                    "cv_folds": int(cv_folds),
+                    "test_size": float(test_size),
+                    "random_state": int(random_state),
+                    "max_samples": int(max_samples),
+                    "use_pruner": bool(use_pruner),
+                    "optimization_method": opt_method,
+                    "selected_trial_number": result.selected_trial_number,
+                    "trial_summary": result.trial_summary,
+                    **(result.best_params or {}),
+                }
+                log_message = f"mean_cv_r2={_fmt_number(result.inner_cv.get('mean_r2'))}"
+                if config.mode == "exploratory":
+                    log_message += "; exploratory=True; non_final_score=True"
+                else:
+                    log_message += f"; independent_test_r2={_fmt_number(result.independent_test.get('r2'))}"
                 log_fe_step(
                     operation="超参优化",
                     description=f"优化完成: {model_name}",
-                    params={
-                        "model": model_name,
-                        "n_trials": int(n_trials),
-                        "cv_folds": int(cv_folds),
-                        "cv_strategy": cv_strategy,
-                        "val_size": float(val_size),
-                        "max_samples": int(max_samples),
-                        "fast_mode": bool(fast_mode),
-                        "use_pruner": bool(use_pruner),
-                        "optimization_method": opt_method,
-                        **(best_params or {})
-                    },
+                    params=log_params,
                     input_df=df,
-                    status="success",
-                    message=f"best_r2={best_score:.4f}"
+                    status=("success" if result.best_params else "warning"),
+                    message=log_message,
                 )
             except Exception:
                 pass
-
-            st.markdown("### 最佳参数")
-            st.json(best_params)
-
-            # 优化历史可视化
-            if study is not None:
-                st.markdown("### 📊 优化结果可视化")
-
-                viz_tabs = st.tabs(["优化历史", "参数空间热力图", "预测性能分布"])
-
-                # Tab 1: 优化历史曲线
-                with viz_tabs[0]:
-                    try:
-                        import plotly.graph_objects as go
-
-                        trials = study.trials
-                        values = [t.value for t in trials if t.value is not None]
-
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            y=values,
-                            mode='lines+markers',
-                            name='R² Score',
-                            line=dict(color='#2E86AB', width=2),
-                            marker=dict(size=6)
-                        ))
-                        fig.update_layout(
-                            title='优化过程',
-                            xaxis_title='Trial',
-                            yaxis_title='R² Score',
-                            height=400
-                        )
-                        st.plotly_chart(fig, width="stretch")
-                    except:
-                        pass
-
-                # Tab 2: 参数空间热力图
-                with viz_tabs[1]:
-                    st.markdown("#### 参数空间搜索热力图")
-
-                    try:
-                        # 获取所有trial的参数和分数
-                        trials_data = []
-                        for trial in study.trials:
-                            if trial.value is not None:
-                                trial_params = trial.params.copy()
-                                trial_params['score'] = trial.value
-                                trials_data.append(trial_params)
-
-                        if len(trials_data) > 0:
-                            trials_df = pd.DataFrame(trials_data)
-
-                            # 选择两个数值型参数绘制热力图
-                            numeric_params = [col for col in trials_df.columns
-                                            if col != 'score' and pd.api.types.is_numeric_dtype(trials_df[col])]
-
-                            if len(numeric_params) >= 2:
-                                col_select1, col_select2 = st.columns(2)
-                                with col_select1:
-                                    param_x = st.selectbox("X轴参数", numeric_params, index=0, key="heatmap_x")
-                                with col_select2:
-                                    param_y = st.selectbox("Y轴参数", numeric_params,
-                                                          index=min(1, len(numeric_params)-1), key="heatmap_y")
-
-                                # 创建热力图
-                                import numpy as np
-                                from scipy.interpolate import griddata
-
-                                fig_heat, ax_heat = plt.subplots(figsize=(10, 8))
-
-                                x = trials_df[param_x].values
-                                y = trials_df[param_y].values
-                                z = trials_df['score'].values
-
-                                # 创建网格
-                                xi = np.linspace(x.min(), x.max(), 100)
-                                yi = np.linspace(y.min(), y.max(), 100)
-                                xi, yi = np.meshgrid(xi, yi)
-
-                                # 插值
-                                zi = griddata((x, y), z, (xi, yi), method='cubic')
-
-                                # 绘制热力图
-                                im = ax_heat.contourf(xi, yi, zi, levels=20, cmap='RdYlBu_r', alpha=0.8)
-                                cbar = plt.colorbar(im, ax=ax_heat)
-                                cbar.set_label('R² Score', fontsize=11)
-
-                                # 标注最优点
-                                best_idx = np.argmax(z)
-                                ax_heat.scatter(x[best_idx], y[best_idx], c='yellow', s=200,
-                                              marker='*', edgecolors='black', linewidths=2,
-                                              label=f'Best ({x[best_idx]:.1f}, {y[best_idx]:.1f})', zorder=5)
-
-                                ax_heat.set_xlabel(param_x, fontsize=12)
-                                ax_heat.set_ylabel(param_y, fontsize=12)
-                                ax_heat.set_title(f'参数空间搜索热力图\n(Best R²={z[best_idx]:.4f})', fontsize=13, pad=15)
-                                ax_heat.legend(loc='upper right')
-                                ax_heat.grid(True, alpha=0.3, linestyle='--')
-
-                                plt.tight_layout()
-                                st.pyplot(fig_heat, width="stretch")
-                            else:
-                                st.info("需要至少2个数值型参数才能绘制热力图")
-                        else:
-                            st.warning("没有有效的trial数据")
-                    except Exception as e:
-                        st.error(f"绘制热力图失败: {e}")
-
-                # Tab 3: 预测性能分布（带边缘直方图）
-                with viz_tabs[2]:
-                    st.markdown("#### 最优模型预测性能")
-
-                    if st.button("🎯 使用最优参数评估", key="eval_best_params"):
-                        with st.spinner("正在评估最优模型..."):
-                            try:
-                                from sklearn.model_selection import train_test_split
-
-                                # 划分数据
-                                X_train, X_test, y_train, y_test = train_test_split(
-                                    X, y, test_size=0.2, random_state=42
-                                )
-                                process_pls_workflow = st.session_state.get("process_pls_workflow")
-                                use_process_pls_for_training = bool(
-                                    isinstance(process_pls_workflow, dict)
-                                    and process_pls_workflow.get("enabled")
-                                    and st.session_state.get(
-                                        "process_pls_use_in_training",
-                                        st.session_state.get("process_pls_enabled_default", False),
-                                    )
-                                )
-
-                                # 训练模型
-                                result = trainer.train_model(
-                                    X_train, y_train,
-                                    model_name=model_name,
-                                    process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
-                                    use_process_pls=use_process_pls_for_training,
-                                    **best_params
-                                )
-
-                                # 预测
-                                model_obj = result.get('pipeline') or result['model']
-                                y_pred_train = model_obj.predict(X_train)
-                                y_pred_test = model_obj.predict(X_test)
-
-                                # 绘制带边缘直方图的散点图
-                                fig_scatter = plt.figure(figsize=(10, 10))
-                                gs = fig_scatter.add_gridspec(3, 3, hspace=0.05, wspace=0.05)
-
-                                # 主散点图
-                                ax_main = fig_scatter.add_subplot(gs[1:, :-1])
-
-                                # 训练集
-                                ax_main.scatter(y_train, y_pred_train, alpha=0.6, s=40,
-                                              c='#2E86AB', label='Train', edgecolors='white', linewidth=0.5)
-                                # 测试集
-                                ax_main.scatter(y_test, y_pred_test, alpha=0.8, s=50,
-                                              c='#E63946', marker='^', label='Test', edgecolors='white', linewidth=0.5)
-
-                                # 对角线
-                                all_vals = np.concatenate([y_train, y_test, y_pred_train, y_pred_test])
-                                lims = [all_vals.min(), all_vals.max()]
-                                ax_main.plot(lims, lims, 'k--', alpha=0.5, linewidth=2, label='Perfect')
-
-                                # 计算R²
-                                from sklearn.metrics import r2_score
-                                r2_train = r2_score(y_train, y_pred_train)
-                                r2_test = r2_score(y_test, y_pred_test)
-
-                                ax_main.set_xlabel('Observed', fontsize=12)
-                                ax_main.set_ylabel('Predicted', fontsize=12)
-                                ax_main.legend(loc='upper left', fontsize=10)
-                                ax_main.grid(True, alpha=0.3)
-
-                                # 添加R²文本
-                                ax_main.text(0.95, 0.05, f'Train R²={r2_train:.3f}\nTest R²={r2_test:.3f}',
-                                           transform=ax_main.transAxes, fontsize=11,
-                                           verticalalignment='bottom', horizontalalignment='right',
-                                           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-                                # 上方直方图（X轴）
-                                ax_top = fig_scatter.add_subplot(gs[0, :-1], sharex=ax_main)
-                                ax_top.hist(y_train, bins=30, alpha=0.6, color='#2E86AB', edgecolor='white')
-                                ax_top.hist(y_test, bins=30, alpha=0.6, color='#E63946', edgecolor='white')
-                                ax_top.set_ylabel('Count', fontsize=10)
-                                ax_top.tick_params(labelbottom=False)
-                                ax_top.grid(True, alpha=0.3, axis='y')
-
-                                # 右侧直方图（Y轴）
-                                ax_right = fig_scatter.add_subplot(gs[1:, -1], sharey=ax_main)
-                                ax_right.hist(y_pred_train, bins=30, alpha=0.6, color='#2E86AB',
-                                            orientation='horizontal', edgecolor='white')
-                                ax_right.hist(y_pred_test, bins=30, alpha=0.6, color='#E63946',
-                                            orientation='horizontal', edgecolor='white')
-                                ax_right.set_xlabel('Count', fontsize=10)
-                                ax_right.tick_params(labelleft=False)
-                                ax_right.grid(True, alpha=0.3, axis='x')
-
-                                plt.suptitle(f'{model_name} - 预测性能分布', fontsize=14, y=0.995)
-                                st.pyplot(fig_scatter, width="stretch")
-
-                            except Exception as e:
-                                st.error(f"评估失败: {e}")
-
-            # 使用最佳参数训练
-            if st.button("🎯 使用最佳参数训练模型"):
-                # [修复] 注册训练任务
-                task_mgr = get_task_manager()
-                clear_cancel()
-                opt_task_id = task_mgr.register_task(
-                    name=f"最佳参数训练: {model_name}",
-                    task_type="training",
-                    total_items=100
-                )
-                task_mgr.start_task(opt_task_id)
-                
-                try:
-                    process_pls_workflow = st.session_state.get("process_pls_workflow")
-                    use_process_pls_for_training = bool(
-                        isinstance(process_pls_workflow, dict)
-                        and process_pls_workflow.get("enabled")
-                        and st.session_state.get(
-                            "process_pls_use_in_training",
-                            st.session_state.get("process_pls_enabled_default", False),
-                        )
-                    )
-                    result = trainer.train_model(
-                        X, y,
-                        model_name=model_name,
-                        process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
-                        use_process_pls=use_process_pls_for_training,
-                        **best_params
-                    )
-
-                    print(f"[DEBUG] Training completed, result type: {type(result)}")
-                    print(f"[DEBUG] Result keys: {list(result.keys())}")
-
-                    # [关键修复] 保存训练结果到 session_state
-                    # 对于XGBoost模型,使用cache_resource防止序列化
-                    try:
-                        print(f"[DEBUG] Saving to session_state...")
-
-                        model_obj = result['model']
-
-                        # 检查是否是XGBoost模型
-                        is_xgboost = model_name == "XGBoost" or str(type(model_obj).__name__).lower().startswith('xgb')
-
-                        if is_xgboost:
-                            print(f"[DEBUG] Detected XGBoost model, storing directly in session_state...")
-                            st.session_state.model = model_obj
-                            st.session_state.xgb_model_id = None
-                            print("[DEBUG] XGBoost model stored directly")
-                        else:
-                            # 非XGBoost模型直接存储
-                            st.session_state.model = model_obj
-                            st.session_state.xgb_model_id = None
-                            print(f"[DEBUG] ✓ Non-XGBoost model saved directly")
-
-                        st.session_state.pipeline = result.get('pipeline')
-                        st.session_state.scaler = result.get('scaler')
-                        st.session_state.imputer = result.get('imputer')
-                        if is_xgboost:
-                            st.session_state.model = model_obj
-                            st.session_state.xgb_model_id = None
-                        st.session_state.feature_mask = result.get('feature_mask')  # [修复] 保存特征掩码
-                        st.session_state.X_train = result.get('X_train')
-                        st.session_state.X_test = result.get('X_test')
-                        st.session_state.X_train_raw = result.get('X_train_raw')
-                        st.session_state.X_test_raw = result.get('X_test_raw')
-                        st.session_state.y_train = result.get('y_train')
-                        st.session_state.y_test = result.get('y_test')
-                        st.session_state.model_name = model_name
-                        st.session_state.train_result = result
-                        st.session_state.cv_result = None
-                        st.session_state.best_params = best_params
-                        st.session_state.imported_model_artifact = None
-
-                        print(f"[DEBUG] ✓ Data saved successfully")
-                    except Exception as save_e:
-                        print(f"[DEBUG] ❌ Error saving: {save_e}")
-                        import traceback
-                        print(traceback.format_exc())
-                        raise
-
-                    task_mgr.complete_task(opt_task_id, success=True)
-                    st.success(f"✅ 模型训练完成！R²: {result['r2']:.4f}")
-                except Exception as train_e:
-                    task_mgr.complete_task(opt_task_id, success=False, error_message=str(train_e))
-                    st.error(f"❌ 训练失败: {train_e}")
-
-        except Exception as e:
+        except Exception as exc:
             import traceback
-            st.error(f"❌ 优化失败: {str(e)}")
+            st.error(f"❌ 优化失败: {exc}")
             st.code(traceback.format_exc())
-            # [新增] 失败也写入状态条
             try:
                 log_fe_step(
                     operation="超参优化",
@@ -21419,10 +21324,199 @@ def page_hyperparameter_optimization():
                     params={"model": model_name, "n_trials": int(n_trials), "cv_folds": int(cv_folds)},
                     input_df=df,
                     status="error",
-                    message=str(e)
+                    message=str(exc),
                 )
             except Exception:
                 pass
+
+    result = st.session_state.get("optimization_result")
+    if result is None:
+        st.info("尚无固定优化结果。完成一次优化后，下方会展示内层 CV、独立测试集和失败原因；刷新页面不会重新随机评估。")
+        return
+
+    if getattr(result, "model_name", None) != model_name:
+        st.warning(f"当前显示的是 `{result.model_name}` 的历史优化结果；如需切换模型，请重新开始优化。")
+
+    inner_cv = result.inner_cv or {}
+    independent_test = result.independent_test or {}
+    evaluation_config = result.evaluation_config or {}
+    trial_summary = result.trial_summary or {}
+
+    st.markdown("### 内层交叉验证结果（参数选择依据）")
+    cv_cols = st.columns(5)
+    cv_cols[0].metric("Mean R²", _fmt_number(inner_cv.get("mean_r2")))
+    cv_cols[1].metric("Std R²", _fmt_number(inner_cv.get("std_r2")))
+    cv_cols[2].metric("Min R²", _fmt_number(inner_cv.get("min_r2")))
+    cv_cols[3].metric("完成折数", int(inner_cv.get("completed_folds") or 0))
+    cv_cols[4].metric("选中 Trial", "—" if result.selected_trial_number is None else int(result.selected_trial_number))
+
+    fold_scores = inner_cv.get("fold_scores") or []
+    if fold_scores:
+        fold_df = pd.DataFrame({"折数": list(range(1, len(fold_scores) + 1)), "R²": [float(item) for item in fold_scores]})
+        st.dataframe(fold_df, width="stretch", hide_index=True)
+
+    st.markdown("#### 最佳参数")
+    if result.best_params:
+        st.json(result.best_params)
+    else:
+        st.warning("没有可用的优化参数，请查看失败原因。")
+
+    study = getattr(result, "study", None)
+    trial_rows = []
+    if study is not None:
+        for trial in getattr(study, "trials", []) or []:
+            attrs = getattr(trial, "user_attrs", {}) or {}
+            state_name = getattr(getattr(trial, "state", None), "name", str(getattr(trial, "state", "")))
+            trial_rows.append({
+                "trial": getattr(trial, "number", None),
+                "state": state_name,
+                "value": getattr(trial, "value", None),
+                "mean_cv_r2": attrs.get("mean_cv_r2"),
+                "std_cv_r2": attrs.get("std_cv_r2"),
+                "min_cv_r2": attrs.get("min_cv_r2"),
+                "completed_folds": attrs.get("completed_folds"),
+                "failure_reason": attrs.get("failure_reason"),
+            })
+    if trial_rows:
+        st.dataframe(pd.DataFrame(trial_rows), width="stretch", hide_index=True)
+
+    st.markdown("### 独立测试集结果（未参与调参）")
+    if evaluation_config.get("mode") == "exploratory":
+        st.warning("⚠️ 探索模式结果不可作为最终泛化报告；请用可信优化基线复跑后再报告泛化性能。")
+    elif independent_test.get("evaluated"):
+        test_cols = st.columns(5)
+        test_cols[0].metric("Test R²", _fmt_number(independent_test.get("r2")))
+        test_cols[1].metric("Test RMSE", _fmt_number(independent_test.get("rmse")))
+        test_cols[2].metric("Test MAE", _fmt_number(independent_test.get("mae")))
+        test_cols[3].metric("Train R²", _fmt_number(independent_test.get("train_r2")))
+        test_cols[4].metric("CV/Test Gap", _fmt_number(independent_test.get("cv_test_gap")))
+        st.caption("独立测试集只在稳定 trial 选定后评估一次，未参与调参。")
+    else:
+        st.warning(getattr(result, "message", "独立测试集未完成评估。"))
+
+    st.markdown("### 试验状态与失败原因")
+    status_cols = st.columns(3)
+    status_cols[0].metric("Completed", int(trial_summary.get("completed", 0)))
+    status_cols[1].metric("Pruned", int(trial_summary.get("pruned", 0)))
+    status_cols[2].metric("Failed", int(trial_summary.get("failed", 0)))
+
+    failure_reasons = result.failure_reasons or {}
+    if failure_reasons:
+        failure_df = pd.DataFrame(
+            [{"失败原因": reason, "次数": count} for reason, count in failure_reasons.items()]
+        ).sort_values("次数", ascending=False)
+        st.dataframe(failure_df, width="stretch", hide_index=True)
+    else:
+        st.success("暂无 trial 失败原因。")
+
+    st.markdown("### 导出")
+    export_cols = st.columns(2)
+    completed_trial_rows = [row for row in trial_rows if row.get("state") == "COMPLETE"]
+    with export_cols[0]:
+        if completed_trial_rows:
+            csv_bytes = pd.DataFrame(completed_trial_rows).to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ 下载完成 Trial CSV",
+                data=csv_bytes,
+                file_name="optimization_completed_trials.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("暂无可导出的完成 trial。")
+    with export_cols[1]:
+        metadata = {
+            "model_name": result.model_name,
+            "status": result.status,
+            "message": result.message,
+            "best_params": result.best_params,
+            "selected_trial_number": result.selected_trial_number,
+            "inner_cv": result.inner_cv,
+            "independent_test": result.independent_test,
+            "evaluation_config": result.evaluation_config,
+            "trial_summary": result.trial_summary,
+            "failure_reasons": result.failure_reasons,
+            "feature_columns": result.feature_columns,
+            "process_pls_workflow_hash": result.process_pls_workflow_hash,
+        }
+        json_bytes = json.dumps(_json_safe(metadata), ensure_ascii=False, indent=2).encode("utf-8")
+        st.download_button(
+            "⬇️ 下载优化结果 JSON",
+            data=json_bytes,
+            file_name="optimization_result.json",
+            mime="application/json",
+        )
+
+    result_is_exploratory = evaluation_config.get("mode") == "exploratory"
+    result_is_trainable = bool(result.best_params) and (
+        result_is_exploratory
+        or (
+            result.status == "completed"
+            and bool(independent_test.get("evaluated"))
+        )
+    )
+    if not result_is_trainable:
+        if result.best_params and not result_is_exploratory:
+            st.warning("独立测试集评估未成功，已禁止使用该组最佳参数训练模型。请修正失败原因后重新优化。")
+        else:
+            st.warning("没有可用的优化参数，请先完成至少一个有效 trial。")
+
+    if st.button("🎯 使用最佳参数训练模型", disabled=not result_is_trainable):
+        if not result_is_trainable:
+            return
+
+        train_model_name = result.model_name
+        task_mgr = get_task_manager()
+        clear_cancel()
+        opt_task_id = task_mgr.register_task(
+            name=f"最佳参数训练: {train_model_name}",
+            task_type="training",
+            total_items=100,
+        )
+        task_mgr.start_task(opt_task_id)
+
+        try:
+            process_pls_workflow = st.session_state.get("process_pls_workflow")
+            use_process_pls_for_training = bool(
+                isinstance(process_pls_workflow, dict)
+                and process_pls_workflow.get("enabled")
+                and st.session_state.get(
+                    "process_pls_use_in_training",
+                    st.session_state.get("process_pls_enabled_default", False),
+                )
+            )
+            train_result = trainer.train_model(
+                X,
+                y,
+                model_name=train_model_name,
+                process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
+                use_process_pls=use_process_pls_for_training,
+                **result.best_params,
+            )
+
+            model_obj = train_result["model"]
+            is_xgboost = train_model_name == "XGBoost" or str(type(model_obj).__name__).lower().startswith("xgb")
+            st.session_state.model = model_obj
+            st.session_state.xgb_model_id = None
+            st.session_state.pipeline = train_result.get("pipeline")
+            st.session_state.scaler = train_result.get("scaler")
+            st.session_state.imputer = train_result.get("imputer")
+            st.session_state.feature_mask = train_result.get("feature_mask")
+            st.session_state.X_train = train_result.get("X_train")
+            st.session_state.X_test = train_result.get("X_test")
+            st.session_state.X_train_raw = train_result.get("X_train_raw")
+            st.session_state.X_test_raw = train_result.get("X_test_raw")
+            st.session_state.y_train = train_result.get("y_train")
+            st.session_state.y_test = train_result.get("y_test")
+            st.session_state.model_name = train_model_name
+            st.session_state.train_result = train_result
+            st.session_state.cv_result = None
+            st.session_state.best_params = dict(result.best_params or {})
+            st.session_state.imported_model_artifact = None
+            task_mgr.complete_task(opt_task_id, success=True)
+            st.success(f"✅ 模型训练完成！R²: {train_result['r2']:.4f}")
+        except Exception as train_exc:
+            task_mgr.complete_task(opt_task_id, success=False, error_message=str(train_exc))
+            st.error(f"❌ 训练失败: {train_exc}")
 
 
 # ============================================================

@@ -396,3 +396,54 @@ def test_failed_trials_are_recorded_and_all_failures_return_a_readable_result(mo
     assert result.best_params == {}
     assert result.trial_summary["failed"] == 2
     assert "intentional fold failure" in result.failure_reasons
+
+
+def test_exploratory_optimization_with_pls_uses_fold_local_pipeline(monkeypatch):
+    X, y = _reliable_frame(rows=40)
+    optimizer = HyperparameterOptimizer()
+    optimizer.get_model_params = lambda trial, model_name, fast_mode=False: {}
+    calls = []
+    original_builder = optimizer.trainer.build_regression_cv_pipeline
+
+    def recording_builder(*args, **kwargs):
+        calls.append(kwargs.copy())
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(
+        optimizer.trainer,
+        "build_regression_cv_pipeline",
+        recording_builder,
+    )
+    process_pls_config = {
+        "schema_version": 1,
+        "enabled": True,
+        "process_feature_cols": ["process_temperature"],
+        "max_components": 1,
+        "vip_top_k": 1,
+        "missing_threshold": 0.85,
+        "cv_splits": 2,
+        "random_state": 42,
+        "selection_mode": "auto_combined_score",
+    }
+
+    result = optimizer.optimize(
+        "线性回归",
+        X,
+        y,
+        n_trials=1,
+        cv=2,
+        cv_strategy="kfold",
+        n_jobs=1,
+        use_pruner=False,
+        evaluation_config=OptimizationEvaluationConfig(
+            cv_folds=2,
+            mode="exploratory",
+            use_process_pls=True,
+            process_pls_config=process_pls_config,
+        ),
+    )
+
+    assert result.status == "completed"
+    assert calls
+    assert all(call["use_process_pls"] is True for call in calls)
+    assert all(call["process_pls_config"] == process_pls_config for call in calls)

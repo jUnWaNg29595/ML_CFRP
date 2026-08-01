@@ -510,6 +510,35 @@ def test_app_v1_snapshot_restore_clears_new_workflow_metadata(monkeypatch):
     assert app.st.session_state["molecular_feature_trace"] == []
 
 
+def test_snapshot_restore_does_not_restore_stringified_optimization_result(monkeypatch):
+    import app
+
+    app.st.session_state["optimization_result"] = "OptimizationResult(...)"
+    monkeypatch.setattr(
+        app,
+        "_load_snapshot_meta",
+        lambda tag="latest": {
+            "version": 2,
+            "saved_at": "2026-07-29T00:00:00",
+            "df_keys": [],
+            "optimization_result": "OptimizationResult(...)",
+            "molecular_feature_workflow": None,
+            "molecular_feature_trace": [],
+        },
+    )
+    monkeypatch.setattr(
+        app,
+        "_snapshot_paths",
+        lambda tag="latest": ("unused.json", {}),
+    )
+
+    restored, reason = app._restore_session_snapshot(override=True)
+
+    assert restored is True
+    assert reason == "ok"
+    assert app.st.session_state["optimization_result"] is None
+
+
 class VirtualScreeningRuleTests(unittest.TestCase):
     def test_ordinary_oxirane_is_counted(self):
         features = _calc_rule_features(

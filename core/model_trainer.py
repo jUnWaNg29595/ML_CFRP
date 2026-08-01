@@ -15,6 +15,7 @@ import os
 import pandas as pd
 import shutil
 import inspect
+import uuid
 
 from sklearn.model_selection import (
     train_test_split,
@@ -891,9 +892,16 @@ class AutoGluonWrapper(BaseEstimator, RegressorMixin):
         self.kwargs = kwargs
         self.predictor = None
         self.label_col = 'target'
-        self.save_path = f"AutogluonModels/ag-{int(time.time())}"
+        self.save_path = self._new_save_path()
+
+    @staticmethod
+    def _new_save_path():
+        return f"AutogluonModels/ag-{uuid.uuid4().hex}"
 
     def fit(self, X, y):
+        self.save_path = self._new_save_path()
+        self.predictor = None
+
         if isinstance(X, np.ndarray):
             train_data = pd.DataFrame(X, columns=[f"feat_{i}" for i in range(X.shape[1])])
         else:

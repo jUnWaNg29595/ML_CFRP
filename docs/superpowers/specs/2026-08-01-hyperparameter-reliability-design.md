@@ -1,7 +1,7 @@
 # 超参数优化可靠性设计
 
 **日期：** 2026-08-01
-**状态：** 已确认，待编写实施计划
+**状态：** 已实现并完成回归验证
 **范围：** 回归模型的 Optuna 超参数优化
 
 ## 目标
@@ -245,3 +245,21 @@ trial 真正结束、剪枝或失败后才更新计数和进度。
 - 当前普通 KFold/Holdout 模式保留为“探索模式”，但不作为默认值。
 - 未启用工艺 PLS 的模型保持现有输入处理路径；启用时必须在优化与训练中使用相同 workflow 指纹。
 - 不修改已经训练完成的模型 artifact，也不重写历史优化记录。
+
+## 验证记录
+
+**验证日期：** 2026-08-01
+
+已通过的关键命令：
+
+```powershell
+& 'C:\Users\wangj\anaconda3\envs\CFRP_env\python.exe' -m pytest 'tests\test_app_scope_regressions.py::test_hyperparameter_page_uses_persisted_result_without_second_random_split' 'tests\test_optimizer.py' -q
+& 'C:\Users\wangj\anaconda3\envs\CFRP_env\python.exe' -m py_compile 'app.py' 'core\optimizer.py' 'core\model_trainer.py'
+```
+
+验证结论：
+
+- 默认评估已切换为外层连续目标分层 holdout 加内层固定分层 KFold。
+- 未参与调参的独立测试集只在稳定 trial 选定后评估一次。
+- 探索模式 Holdout/KFold 结果已明确标记为非最终泛化报告。
+- 页面结果区从 `st.session_state.optimization_result` 渲染，刷新页面不会再次随机切分或二次评估。
