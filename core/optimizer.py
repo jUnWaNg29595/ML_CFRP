@@ -6,10 +6,20 @@
 2. 保持了之前的自动数据清洗逻辑。
 """
 
+from dataclasses import asdict, dataclass, field
+from math import ceil
+from typing import Any
+
 import optuna
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import cross_val_score, KFold, train_test_split
+from sklearn.model_selection import (
+    StratifiedKFold,
+    StratifiedShuffleSplit,
+    cross_val_score,
+    KFold,
+    train_test_split,
+)
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
@@ -21,6 +31,197 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings('ignore')
 
 from core.model_trainer import EnhancedModelTrainer
+
+
+@dataclass(frozen=True)
+class OptimizationEvaluationConfig:
+    test_size: float = 0.20
+    cv_folds: int = 5
+    quantile_bins: int | None = None
+    random_state: int = 42
+    max_samples: int | None = None
+    stability_tolerance: float = 0.005
+    use_process_pls: bool = False
+    process_pls_config: dict[str, Any] | None = None
+    mode: str = "reliable"
+
+    def validate(self) -> None:
+        if not 0.05 <= float(self.test_size) <= 0.40:
+            raise ValueError("独立测试集比例必须在 0.05 到 0.40 之间")
+        if int(self.cv_folds) < 2:
+            raise ValueError("内层交叉验证折数至少为 2")
+        if float(self.stability_tolerance) < 0:
+            raise ValueError("稳定性容差不能为负数")
+        if self.mode not in {"reliable", "exploratory"}:
+            raise ValueError("优化模式必须为 reliable 或 exploratory")
+
+
+@dataclass
+class OptimizationPreflight:
+    X: pd.DataFrame
+    y: pd.Series
+    source_indices: list[Any]
+    strata: np.ndarray
+    quantile_bins: int
+    removed_target_rows: int
+    outer_train_indices: list[Any]
+    outer_test_indices: list[Any]
+    validation_messages: list[str] = field(default_factory=list)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "original_rows": int(len(self.source_indices) + self.removed_target_rows),
+            "valid_target_rows": int(len(self.y)),
+            "removed_target_rows": int(self.removed_target_rows),
+            "quantile_bins": int(self.quantile_bins),
+            "outer_train_rows": int(len(self.outer_train_indices)),
+            "outer_test_rows": int(len(self.outer_test_indices)),
+        }
+
+
+def build_adaptive_regression_strata(
+    y,
+    cv_folds,
+    test_size,
+    requested_bins=None,
+) -> tuple[np.ndarray, int]:
+    """为连续目标构建同时支持独立测试集与交叉验证的自适应分层标签。"""
+    y_series = pd.Series(pd.to_numeric(pd.Series(y), errors="coerce"))
+    y_series = y_series.replace([np.inf, -np.inf], np.nan)
+    n_samples = len(y_series)
+    required_per_bin = max(int(cv_folds), ceil(1 / float(test_size)))
+    candidate_bins = (
+        int(requested_bins)
+        if requested_bins is not None
+        else min(10, max(2, n_samples // (2 * int(cv_folds))))
+    )
+
+    for bins in range(candidate_bins, 1, -1):
+        try:
+            categories = pd.qcut(y_series, q=bins, duplicates="drop")
+        except ValueError:
+            continue
+
+        labels, categories = pd.factorize(categories, sort=True)
+        actual_bins = len(categories)
+        if actual_bins < 2:
+            continue
+
+        counts = pd.Series(labels).value_counts()
+        if len(counts) == actual_bins and counts.min() >= required_per_bin:
+            return labels.astype(int), int(actual_bins)
+
+    raise ValueError(
+        "无法构建满足独立测试集和 "
+        f"{int(cv_folds)} 折交叉验证的连续目标分层；有效样本={n_samples}，"
+        "请减少折数、降低分箱或补充数据"
+    )
+
+
+def prepare_regression_optimization(
+    X,
+    y,
+    config: OptimizationEvaluationConfig,
+) -> OptimizationPreflight:
+    """清理连续目标并生成可靠优化所需的外层分层切分。"""
+    config.validate()
+
+    if isinstance(X, pd.DataFrame):
+        X_frame = X.copy()
+    else:
+        X_array = np.asarray(X)
+        if X_array.ndim != 2:
+            raise ValueError("特征 X 必须是二维数组或 DataFrame")
+        X_frame = pd.DataFrame(
+            X_array,
+            columns=[f"Feature_{column_index}" for column_index in range(X_array.shape[1])],
+        )
+
+    y_name = getattr(y, "name", None)
+    target_values = pd.to_numeric(pd.Series(y), errors="coerce").replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+    if len(X_frame) != len(target_values):
+        raise ValueError("特征 X 与目标 y 的样本数必须一致")
+    y_series = pd.Series(target_values.to_numpy(), index=X_frame.index, name=y_name)
+
+    valid_target_mask = np.isfinite(y_series.to_numpy(dtype=float))
+    removed_target_rows = int((~valid_target_mask).sum())
+    X_valid = X_frame.iloc[np.flatnonzero(valid_target_mask)].copy()
+    y_valid = y_series.iloc[np.flatnonzero(valid_target_mask)].copy()
+    source_indices = X_valid.index.tolist()
+
+    candidate_bins = (
+        config.quantile_bins
+        if config.quantile_bins is not None
+        else min(10, max(2, len(y_valid) // (2 * int(config.cv_folds))))
+    )
+    strata, actual_bins = build_adaptive_regression_strata(
+        y_valid,
+        cv_folds=config.cv_folds,
+        test_size=config.test_size,
+        requested_bins=candidate_bins,
+    )
+    splitter = StratifiedShuffleSplit(
+        n_splits=1,
+        test_size=config.test_size,
+        random_state=config.random_state,
+    )
+    outer_train_positions, outer_test_positions = next(splitter.split(X_valid, strata))
+
+    return OptimizationPreflight(
+        X=X_valid,
+        y=y_valid,
+        source_indices=source_indices,
+        strata=strata,
+        quantile_bins=actual_bins,
+        removed_target_rows=removed_target_rows,
+        outer_train_indices=X_valid.index.take(outer_train_positions).tolist(),
+        outer_test_indices=X_valid.index.take(outer_test_positions).tolist(),
+        validation_messages=[
+            f"已移除 {removed_target_rows} 行无效目标值。",
+            f"连续目标已使用 {actual_bins} 个自适应分层。",
+        ],
+    )
+
+
+def select_stratified_training_budget(
+    preflight: OptimizationPreflight,
+    config: OptimizationEvaluationConfig,
+) -> OptimizationPreflight:
+    """在不触碰外层测试集的前提下，按分层比例限制优化训练预算。"""
+    max_samples = int(config.max_samples) if config.max_samples is not None else 0
+    if max_samples <= 0 or max_samples >= len(preflight.outer_train_indices):
+        return preflight
+
+    train_positions = preflight.X.index.get_indexer(preflight.outer_train_indices)
+    train_strata = preflight.strata[train_positions]
+    splitter = StratifiedShuffleSplit(
+        n_splits=1,
+        train_size=max_samples,
+        random_state=config.random_state,
+    )
+    selected_positions, _ = next(
+        splitter.split(np.zeros(len(train_positions)), train_strata)
+    )
+    selected_source_positions = train_positions[selected_positions]
+    selected_indices = preflight.X.index.take(selected_source_positions).tolist()
+
+    return OptimizationPreflight(
+        X=preflight.X,
+        y=preflight.y,
+        source_indices=preflight.source_indices,
+        strata=preflight.strata,
+        quantile_bins=preflight.quantile_bins,
+        removed_target_rows=preflight.removed_target_rows,
+        outer_train_indices=selected_indices,
+        outer_test_indices=preflight.outer_test_indices,
+        validation_messages=[
+            *preflight.validation_messages,
+            f"优化训练集已按分层预算缩减为 {len(selected_indices)} 行。",
+        ],
+    )
 
 
 class HyperparameterOptimizer:
@@ -228,41 +429,25 @@ class HyperparameterOptimizer:
         # 0. 记录目标列名（用于 Epoxy PINN auto mode）
         y_name = getattr(y, 'name', None)
 
-        # 1. 可选采样加速
-        max_samples = int(max_samples) if max_samples is not None else 0
-        if max_samples > 0:
-            n_total = len(X)
-            if n_total > max_samples:
-                rng = np.random.default_rng(int(random_state))
-                idx = rng.choice(n_total, size=max_samples, replace=False)
-                if isinstance(X, (pd.DataFrame, pd.Series)):
-                    X = X.iloc[idx]
-                else:
-                    X = X[idx]
-                if isinstance(y, (pd.DataFrame, pd.Series)):
-                    y = y.iloc[idx]
-                else:
-                    y = y[idx]
+        # 1. 清理目标值并保留独立、分层的外层测试集。
+        evaluation_config = OptimizationEvaluationConfig(
+            test_size=float(val_size),
+            cv_folds=int(cv),
+            random_state=int(random_state),
+            max_samples=max_samples,
+        )
+        preflight = prepare_regression_optimization(X, y, evaluation_config)
+        preflight = select_stratified_training_budget(preflight, evaluation_config)
+        training_positions = preflight.X.index.get_indexer(preflight.outer_train_indices)
+        X = preflight.X.iloc[training_positions]
+        y = preflight.y.iloc[training_positions]
+        training_strata = preflight.strata[training_positions]
 
-        # 2. 确保输入是 numpy 数组
+        # 2. 保持现有训练器的数组接口。
         if isinstance(X, pd.DataFrame) and model_name != "Epoxy PINN (Physics-Informed)":
             X = X.values
         if isinstance(y, (pd.DataFrame, pd.Series)):
             y = y.values.ravel() if hasattr(y, 'values') else np.array(y).ravel()
-
-        # 3. 移除 y 中的 NaN 值
-        mask = ~np.isnan(y)
-        if np.sum(~mask) > 0:
-            print(f"⚠️ 警告: 检测到目标变量 y 中有 {np.sum(~mask)} 个缺失值，已在优化前自动移除对应样本。")
-            X = X[mask]
-            y = y[mask]
-
-        # 再次检查是否有无穷大
-        mask_inf = ~np.isinf(y)
-        if np.sum(~mask_inf) > 0:
-            print(f"⚠️ 警告: 检测到目标变量 y 中有 {np.sum(~mask_inf)} 个无穷大值，已移除。")
-            X = X[mask_inf]
-            y = y[mask_inf]
 
         def objective(trial):
             # 更新进度条
@@ -301,11 +486,20 @@ class HyperparameterOptimizer:
                     return r2_score(y_val, y_pred)
 
                 # 定义交叉验证策略
-                cv_obj = KFold(n_splits=int(cv), shuffle=True, random_state=random_state)
+                if str(cv_strategy).lower().startswith("strat") or evaluation_config.mode == "reliable":
+                    cv_obj = StratifiedKFold(
+                        n_splits=int(cv),
+                        shuffle=True,
+                        random_state=random_state,
+                    )
+                    cv_splits = list(cv_obj.split(X, y, training_strata))
+                else:
+                    cv_obj = KFold(n_splits=int(cv), shuffle=True, random_state=random_state)
+                    cv_splits = list(cv_obj.split(X, y))
 
                 if use_pruner:
                     scores = []
-                    for fold_idx, (tr_idx, te_idx) in enumerate(cv_obj.split(X, y)):
+                    for fold_idx, (tr_idx, te_idx) in enumerate(cv_splits):
                         X_tr = X[tr_idx] if not hasattr(X, "iloc") else X.iloc[tr_idx]
                         X_te = X[te_idx] if not hasattr(X, "iloc") else X.iloc[te_idx]
                         y_tr = y[tr_idx] if not hasattr(y, "iloc") else y.iloc[tr_idx]
@@ -323,7 +517,7 @@ class HyperparameterOptimizer:
                 # 执行交叉验证
                 scores = cross_val_score(
                     pipeline, X, y,
-                    cv=cv_obj,
+                    cv=cv_splits,
                     scoring='r2',
                     n_jobs=int(n_jobs),  # 并行计算
                     error_score='raise'
