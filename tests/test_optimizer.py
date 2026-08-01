@@ -1,7 +1,11 @@
+from types import SimpleNamespace
+
 import numpy as np
+import optuna
 import pandas as pd
 import pytest
 from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import cross_val_score
 from sklearn.model_selection import KFold as RealKFold
 from sklearn.model_selection import StratifiedKFold as RealStratifiedKFold
 
@@ -10,6 +14,7 @@ from core.optimizer import (
     OptimizationEvaluationConfig,
     build_adaptive_regression_strata,
     prepare_regression_optimization,
+    select_stable_trial,
     select_stratified_training_budget,
 )
 
@@ -251,3 +256,143 @@ def test_optimizer_pipeline_keeps_pls_and_preprocessing_fold_local(monkeypatch):
         "model",
     ]
     assert fit_row_counts == [60]
+
+
+def test_optimizer_pipeline_clones_pls_inside_real_cv(monkeypatch):
+    import core.model_trainer as trainer_module
+    from core.model_trainer import EnhancedModelTrainer
+    from core.process_pls import ProcessPLSTransformer
+
+    fit_row_counts = []
+
+    class RecordingProcessPLS(ProcessPLSTransformer):
+        def fit(self, X, y):
+            fit_row_counts.append(len(X))
+            return super().fit(X, y)
+
+    monkeypatch.setattr(trainer_module, "ProcessPLSTransformer", RecordingProcessPLS)
+    X, y = _reliable_frame(rows=90)
+    config = {
+        "schema_version": 1,
+        "enabled": True,
+        "process_feature_cols": ["process_temperature"],
+        "max_components": 1,
+        "vip_top_k": 1,
+        "missing_threshold": 0.85,
+        "cv_splits": 2,
+        "random_state": 42,
+        "selection_mode": "auto_combined_score",
+    }
+
+    pipeline = EnhancedModelTrainer(use_gpu=False).build_regression_cv_pipeline(
+        "线性回归",
+        X.columns.tolist(),
+        random_state=42,
+        process_pls_config=config,
+        use_process_pls=True,
+    )
+    scores = cross_val_score(
+        pipeline,
+        X,
+        y,
+        cv=RealKFold(n_splits=3, shuffle=True, random_state=42),
+        scoring="r2",
+    )
+
+    assert len(scores) == 3
+    assert fit_row_counts == [60, 60, 60]
+
+
+def test_optimizer_pipeline_rejects_raw_frame_and_classification_models():
+    from core.model_trainer import EnhancedModelTrainer
+
+    trainer = EnhancedModelTrainer(use_gpu=False)
+
+    with pytest.raises(ValueError, match="不支持通用回归优化 pipeline"):
+        trainer.build_regression_cv_pipeline(
+            "Transformer + BNN",
+            ["resin_feature"],
+        )
+
+    with pytest.raises(ValueError, match="仅支持回归模型"):
+        trainer.build_regression_cv_pipeline(
+            "随机森林分类",
+            ["resin_feature"],
+        )
+
+
+def test_stable_trial_selection_prefers_lower_standard_deviation_within_tolerance():
+    trials = [
+        SimpleNamespace(
+            number=4,
+            state=optuna.trial.TrialState.COMPLETE,
+            user_attrs={"mean_cv_r2": 0.801, "std_cv_r2": 0.081, "min_cv_r2": 0.70},
+        ),
+        SimpleNamespace(
+            number=2,
+            state=optuna.trial.TrialState.COMPLETE,
+            user_attrs={"mean_cv_r2": 0.798, "std_cv_r2": 0.021, "min_cv_r2": 0.75},
+        ),
+    ]
+
+    selected = select_stable_trial(trials, stability_tolerance=0.005)
+
+    assert selected.number == 2
+
+
+def test_reliable_optimization_never_uses_outer_test_rows_in_cv(monkeypatch):
+    X, y = _reliable_frame()
+    optimizer = HyperparameterOptimizer()
+    result = optimizer.optimize(
+        "线性回归",
+        X,
+        y,
+        n_trials=2,
+        evaluation_config=OptimizationEvaluationConfig(
+            cv_folds=4,
+            test_size=0.20,
+            random_state=42,
+        ),
+        use_pruner=False,
+    )
+
+    test_rows = set(result.test_indices)
+    assert result.status == "completed"
+    assert result.independent_test["evaluated"] is True
+    assert result.inner_cv["completed_folds"] == 4
+    assert all(
+        test_rows.isdisjoint(fold["train_indices"])
+        and test_rows.isdisjoint(fold["valid_indices"])
+        for fold in result.fold_source_indices
+    )
+
+
+def test_failed_trials_are_recorded_and_all_failures_return_a_readable_result(monkeypatch):
+    class AlwaysFailRegressor:
+        def fit(self, X, y):
+            raise RuntimeError("intentional fold failure")
+
+        def predict(self, X):
+            return np.zeros(len(X), dtype=float)
+
+    X, y = _reliable_frame()
+    optimizer = HyperparameterOptimizer()
+    monkeypatch.setattr(
+        optimizer.trainer,
+        "_get_model",
+        lambda model_name, random_state=42, **params: AlwaysFailRegressor(),
+    )
+
+    result = optimizer.optimize(
+        "线性回归",
+        X,
+        y,
+        n_trials=2,
+        evaluation_config=OptimizationEvaluationConfig(cv_folds=4, random_state=42),
+        use_pruner=False,
+    )
+
+    assert result.status == "failed"
+    assert result.best_params == {}
+    assert result.trial_summary["failed"] == 2
+    assert "intentional fold failure" in result.failure_reasons

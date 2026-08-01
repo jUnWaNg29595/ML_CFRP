@@ -6,8 +6,10 @@
 2. 保持了之前的自动数据清洗逻辑。
 """
 
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from math import ceil
+import time
 from typing import Any
 
 import optuna
@@ -23,7 +25,7 @@ from sklearn.model_selection import (
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import warnings
 
 # 抑制 Optuna 的日志输出，只显示进度条
@@ -31,6 +33,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings('ignore')
 
 from core.model_trainer import EnhancedModelTrainer
+from core.process_pls import fingerprint_process_pls_workflow
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,90 @@ class OptimizationEvaluationConfig:
             raise ValueError("稳定性容差不能为负数")
         if self.mode not in {"reliable", "exploratory"}:
             raise ValueError("优化模式必须为 reliable 或 exploratory")
+
+
+class TrialEvaluationError(RuntimeError):
+    """标记一个 trial 的模型评估失败，但允许 Optuna 继续搜索。"""
+
+
+@dataclass(frozen=True)
+class OptimizationProgress:
+    completed_trials: int
+    pruned_trials: int
+    failed_trials: int
+    total_trials: int
+    elapsed_seconds: float
+    estimated_remaining_seconds: float | None
+    current_best_mean_r2: float | None
+    current_best_std_r2: float | None
+    stage: str
+
+
+@dataclass
+class OptimizationResult:
+    model_name: str
+    best_params: dict[str, Any]
+    selected_trial_number: int | None
+    inner_cv: dict[str, Any]
+    independent_test: dict[str, Any]
+    train_indices: list[Any]
+    test_indices: list[Any]
+    fold_source_indices: list[dict[str, list[Any]]]
+    feature_columns: list[str]
+    process_pls_workflow_hash: str | None
+    evaluation_config: dict[str, Any]
+    trial_summary: dict[str, int]
+    failure_reasons: dict[str, int]
+    study: Any = None
+    status: str = "completed"
+    message: str = ""
+
+    def as_legacy_tuple(self):
+        return (
+            self.best_params,
+            self.inner_cv.get("mean_r2"),
+            self.study,
+        )
+
+    def __iter__(self):
+        """让旧页面仍可使用 best_params, best_score, study = result。"""
+        return iter(self.as_legacy_tuple())
+
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, item):
+        return self.as_legacy_tuple()[item]
+
+
+def select_stable_trial(trials, stability_tolerance):
+    """在最优均值附近优先选择方差更小、最差折更好的 trial。"""
+    valid_trials = [
+        trial
+        for trial in trials
+        if trial.state == optuna.trial.TrialState.COMPLETE
+        and np.isfinite(trial.user_attrs.get("mean_cv_r2", np.nan))
+        and np.isfinite(trial.user_attrs.get("std_cv_r2", np.nan))
+        and np.isfinite(trial.user_attrs.get("min_cv_r2", np.nan))
+    ]
+    if not valid_trials:
+        return None
+
+    best_mean = max(float(trial.user_attrs["mean_cv_r2"]) for trial in valid_trials)
+    candidates = [
+        trial
+        for trial in valid_trials
+        if best_mean - float(trial.user_attrs["mean_cv_r2"])
+        <= float(stability_tolerance)
+    ]
+    return min(
+        candidates,
+        key=lambda trial: (
+            float(trial.user_attrs["std_cv_r2"]),
+            -float(trial.user_attrs["min_cv_r2"]),
+            int(trial.number),
+        ),
+    )
 
 
 @dataclass
@@ -256,6 +343,101 @@ def select_stratified_training_budget(
     )
 
 
+def _coerce_evaluation_config(
+    evaluation_config,
+    *,
+    cv,
+    random_state,
+    val_size,
+    max_samples,
+    cv_strategy,
+):
+    if evaluation_config is None:
+        strategy = str(cv_strategy or "").lower()
+        mode = (
+            "exploratory"
+            if strategy.startswith("hold") or strategy.startswith("kfold")
+            else "reliable"
+        )
+        return OptimizationEvaluationConfig(
+            test_size=float(val_size),
+            cv_folds=int(cv),
+            random_state=int(random_state),
+            max_samples=max_samples,
+            mode=mode,
+        )
+    if isinstance(evaluation_config, OptimizationEvaluationConfig):
+        return evaluation_config
+    if isinstance(evaluation_config, dict):
+        allowed = {
+            field_name
+            for field_name in OptimizationEvaluationConfig.__dataclass_fields__
+        }
+        payload = {
+            key: value
+            for key, value in evaluation_config.items()
+            if key in allowed
+        }
+        return OptimizationEvaluationConfig(**payload)
+    raise TypeError("evaluation_config 必须是 OptimizationEvaluationConfig、dict 或 None")
+
+
+def _rmse(y_true, y_pred) -> float:
+    try:
+        return float(mean_squared_error(y_true, y_pred, squared=False))
+    except TypeError:
+        return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def _trial_state_summary(study) -> dict[str, int]:
+    states = [trial.state for trial in study.trials]
+    return {
+        "completed": int(sum(state == optuna.trial.TrialState.COMPLETE for state in states)),
+        "pruned": int(sum(state == optuna.trial.TrialState.PRUNED for state in states)),
+        "failed": int(sum(state == optuna.trial.TrialState.FAIL for state in states)),
+        "total": int(len(states)),
+    }
+
+
+def _failure_reason_summary(study) -> dict[str, int]:
+    reasons = [
+        str(trial.user_attrs.get("failure_reason") or "").strip()
+        for trial in study.trials
+    ]
+    return dict(Counter(reason for reason in reasons if reason))
+
+
+def _emit_optimization_progress(progress_callback, progress: OptimizationProgress) -> None:
+    if not callable(progress_callback):
+        return
+    try:
+        progress_callback(progress)
+        return
+    except Exception:
+        pass
+    try:
+        fraction = (
+            float(progress.completed_trials + progress.pruned_trials + progress.failed_trials)
+            / max(1, int(progress.total_trials))
+        )
+        progress_callback(min(max(fraction, 0.0), 1.0))
+    except Exception:
+        pass
+
+
+def _valid_process_pls_workflow_hash(config: OptimizationEvaluationConfig) -> str | None:
+    if not config.use_process_pls:
+        return None
+    payload = config.process_pls_config
+    if not isinstance(payload, dict):
+        return None
+    if not payload.get("process_feature_cols"):
+        return None
+    if payload.get("schema_version") != 1:
+        return None
+    return fingerprint_process_pls_workflow(payload)
+
+
 class HyperparameterOptimizer:
     """超参数优化器"""
 
@@ -428,6 +610,555 @@ class HyperparameterOptimizer:
 
         return params
 
+
+    def _create_sampler(self, optimization_method, random_state):
+        method = str(optimization_method or "tpe").lower()
+        if method == "random":
+            return optuna.samplers.RandomSampler(seed=int(random_state))
+        if method == "gp":
+            try:
+                return optuna.samplers.GPSampler(seed=int(random_state))
+            except AttributeError:
+                return optuna.samplers.TPESampler(seed=int(random_state))
+        if method == "cmaes":
+            try:
+                return optuna.samplers.CmaEsSampler(seed=int(random_state))
+            except Exception:
+                return optuna.samplers.TPESampler(seed=int(random_state))
+        if method == "grid":
+            return optuna.samplers.RandomSampler(seed=int(random_state))
+        return optuna.samplers.TPESampler(seed=int(random_state))
+
+    def _optimize_reliable(
+        self,
+        model_name,
+        X,
+        y,
+        *,
+        n_trials,
+        config,
+        progress_callback,
+        fast_mode,
+        use_pruner,
+        timeout,
+        optimization_method,
+    ):
+        y_name = getattr(y, "name", None)
+        y_target = y.iloc[:, 0] if isinstance(y, pd.DataFrame) else y
+        preflight = prepare_regression_optimization(X, y_target, config)
+        preflight = select_stratified_training_budget(preflight, config)
+
+        train_positions = np.asarray(preflight.outer_train_positions, dtype=int)
+        test_positions = np.asarray(preflight.outer_test_positions, dtype=int)
+        X_train = preflight.X.iloc[train_positions].copy()
+        y_train = preflight.y.iloc[train_positions].copy()
+        X_test = preflight.X.iloc[test_positions].copy()
+        y_test = preflight.y.iloc[test_positions].copy()
+        train_strata = preflight.strata[train_positions]
+
+        splitter = StratifiedKFold(
+            n_splits=int(config.cv_folds),
+            shuffle=True,
+            random_state=int(config.random_state),
+        )
+        fixed_splits = list(splitter.split(X_train, train_strata))
+        fold_source_indices = [
+            {
+                "train_indices": X_train.index.take(train_idx).tolist(),
+                "valid_indices": X_train.index.take(valid_idx).tolist(),
+            }
+            for train_idx, valid_idx in fixed_splits
+        ]
+        feature_columns = preflight.X.columns.tolist()
+        workflow_hash = _valid_process_pls_workflow_hash(config)
+        total_trials = max(1, int(n_trials))
+        started_at = time.monotonic()
+
+        def set_score_attrs(trial, scores):
+            trial.set_user_attr("fold_scores", [float(score) for score in scores])
+            trial.set_user_attr("completed_folds", int(len(scores)))
+            if scores:
+                trial.set_user_attr("mean_cv_r2", float(np.mean(scores)))
+                trial.set_user_attr(
+                    "std_cv_r2",
+                    float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0,
+                )
+                trial.set_user_attr("min_cv_r2", float(np.min(scores)))
+
+        def objective(trial):
+            scores = []
+            try:
+                params = self.get_model_params(
+                    trial,
+                    model_name,
+                    fast_mode=bool(fast_mode),
+                )
+                if model_name == "Epoxy PINN (Physics-Informed)" and y_name is not None:
+                    params.setdefault("target_name", y_name)
+
+                for fold_index, (train_idx, valid_idx) in enumerate(fixed_splits):
+                    pipeline = self.trainer.build_regression_cv_pipeline(
+                        model_name,
+                        feature_columns,
+                        random_state=int(config.random_state),
+                        process_pls_config=config.process_pls_config,
+                        use_process_pls=bool(config.use_process_pls),
+                        **params,
+                    )
+                    pipeline.fit(X_train.iloc[train_idx], y_train.iloc[train_idx])
+                    y_pred = pipeline.predict(X_train.iloc[valid_idx])
+                    score = float(r2_score(y_train.iloc[valid_idx], y_pred))
+                    if not np.isfinite(score):
+                        raise ValueError(f"fold {fold_index + 1} produced non-finite R²")
+                    scores.append(score)
+                    trial.report(float(np.mean(scores)), step=int(fold_index))
+                    if use_pruner and trial.should_prune():
+                        set_score_attrs(trial, scores)
+                        trial.set_user_attr("failure_reason", None)
+                        raise optuna.TrialPruned()
+
+                set_score_attrs(trial, scores)
+                trial.set_user_attr("failure_reason", None)
+                return float(np.mean(scores))
+            except optuna.TrialPruned:
+                raise
+            except TrialEvaluationError:
+                raise
+            except Exception as exc:
+                reason = str(exc).strip()[:300] or exc.__class__.__name__
+                trial.set_user_attr("failure_reason", reason)
+                if scores:
+                    set_score_attrs(trial, scores)
+                raise TrialEvaluationError(reason) from exc
+
+        pruner = (
+            optuna.pruners.MedianPruner(n_startup_trials=3)
+            if use_pruner
+            else optuna.pruners.NopPruner()
+        )
+        study = optuna.create_study(
+            direction="maximize",
+            pruner=pruner,
+            sampler=self._create_sampler(optimization_method, config.random_state),
+        )
+
+        def trial_finished_callback(current_study, _trial):
+            summary = _trial_state_summary(current_study)
+            elapsed = float(time.monotonic() - started_at)
+            finished = summary["completed"] + summary["pruned"] + summary["failed"]
+            estimated = (
+                float(elapsed / finished * max(0, total_trials - finished))
+                if finished > 0 and finished < total_trials
+                else (0.0 if finished >= total_trials else None)
+            )
+            complete_trials = [
+                item
+                for item in current_study.trials
+                if item.state == optuna.trial.TrialState.COMPLETE
+                and np.isfinite(item.user_attrs.get("mean_cv_r2", np.nan))
+            ]
+            best_mean = None
+            best_std = None
+            if complete_trials:
+                best_item = max(
+                    complete_trials,
+                    key=lambda item: float(item.user_attrs["mean_cv_r2"]),
+                )
+                best_mean = float(best_item.user_attrs["mean_cv_r2"])
+                best_std = float(best_item.user_attrs.get("std_cv_r2", np.nan))
+            stage = "completed" if finished >= total_trials else "running"
+            _emit_optimization_progress(
+                progress_callback,
+                OptimizationProgress(
+                    completed_trials=summary["completed"],
+                    pruned_trials=summary["pruned"],
+                    failed_trials=summary["failed"],
+                    total_trials=total_trials,
+                    elapsed_seconds=elapsed,
+                    estimated_remaining_seconds=estimated,
+                    current_best_mean_r2=best_mean,
+                    current_best_std_r2=best_std,
+                    stage=stage,
+                ),
+            )
+
+        study.optimize(
+            objective,
+            n_trials=total_trials,
+            timeout=timeout,
+            callbacks=[trial_finished_callback],
+            catch=(TrialEvaluationError,),
+        )
+        summary = _trial_state_summary(study)
+        failure_reasons = _failure_reason_summary(study)
+        selected_trial = select_stable_trial(study.trials, config.stability_tolerance)
+
+        if selected_trial is None:
+            _emit_optimization_progress(
+                progress_callback,
+                OptimizationProgress(
+                    completed_trials=summary["completed"],
+                    pruned_trials=summary["pruned"],
+                    failed_trials=summary["failed"],
+                    total_trials=total_trials,
+                    elapsed_seconds=float(time.monotonic() - started_at),
+                    estimated_remaining_seconds=0.0,
+                    current_best_mean_r2=None,
+                    current_best_std_r2=None,
+                    stage="failed",
+                ),
+            )
+            return OptimizationResult(
+                model_name=str(model_name),
+                best_params={},
+                selected_trial_number=None,
+                inner_cv={
+                    "mean_r2": None,
+                    "std_r2": None,
+                    "min_r2": None,
+                    "fold_scores": [],
+                    "completed_folds": 0,
+                },
+                independent_test={"evaluated": False},
+                train_indices=X_train.index.tolist(),
+                test_indices=X_test.index.tolist(),
+                fold_source_indices=fold_source_indices,
+                feature_columns=feature_columns,
+                process_pls_workflow_hash=workflow_hash,
+                evaluation_config=asdict(config),
+                trial_summary=summary,
+                failure_reasons=failure_reasons,
+                study=study,
+                status="failed",
+                message="全部 trial 无效，请查看失败原因并检查模型、特征或数据",
+            )
+
+        selected_scores = [
+            float(score) for score in selected_trial.user_attrs.get("fold_scores", [])
+        ]
+        mean_cv_r2 = float(selected_trial.user_attrs["mean_cv_r2"])
+        std_cv_r2 = float(selected_trial.user_attrs.get("std_cv_r2", 0.0))
+        min_cv_r2 = float(selected_trial.user_attrs.get("min_cv_r2", np.nan))
+        best_params = dict(selected_trial.params)
+
+        try:
+            final_pipeline = self.trainer.build_regression_cv_pipeline(
+                model_name,
+                feature_columns,
+                random_state=int(config.random_state),
+                process_pls_config=config.process_pls_config,
+                use_process_pls=bool(config.use_process_pls),
+                **best_params,
+            )
+            final_pipeline.fit(X_train, y_train)
+            train_pred = final_pipeline.predict(X_train)
+            test_pred = final_pipeline.predict(X_test)
+            train_r2 = float(r2_score(y_train, train_pred))
+            test_r2 = float(r2_score(y_test, test_pred))
+            test_rmse = _rmse(y_test, test_pred)
+            test_mae = float(mean_absolute_error(y_test, test_pred))
+            independent_test = {
+                "evaluated": True,
+                "r2": test_r2,
+                "rmse": test_rmse,
+                "mae": test_mae,
+                "train_r2": train_r2,
+                "cv_test_gap": float(mean_cv_r2 - test_r2),
+            }
+            status = "completed"
+            message = "可靠模式优化完成，独立测试集仅评估一次"
+        except Exception as exc:
+            reason = str(exc).strip()[:300] or exc.__class__.__name__
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+            independent_test = {"evaluated": False}
+            status = "failed"
+            message = f"最佳 trial 在独立测试集评估时失败：{reason}"
+
+        return OptimizationResult(
+            model_name=str(model_name),
+            best_params=best_params,
+            selected_trial_number=int(selected_trial.number),
+            inner_cv={
+                "mean_r2": mean_cv_r2,
+                "std_r2": std_cv_r2,
+                "min_r2": min_cv_r2,
+                "fold_scores": selected_scores,
+                "completed_folds": int(
+                    selected_trial.user_attrs.get("completed_folds", len(selected_scores))
+                ),
+            },
+            independent_test=independent_test,
+            train_indices=X_train.index.tolist(),
+            test_indices=X_test.index.tolist(),
+            fold_source_indices=fold_source_indices,
+            feature_columns=feature_columns,
+            process_pls_workflow_hash=workflow_hash,
+            evaluation_config=asdict(config),
+            trial_summary=summary,
+            failure_reasons=failure_reasons,
+            study=study,
+            status=status,
+            message=message,
+        )
+
+    def _optimize_exploratory(
+        self,
+        model_name,
+        X,
+        y,
+        *,
+        n_trials,
+        config,
+        cv_strategy,
+        progress_callback,
+        fast_mode,
+        use_pruner,
+        timeout,
+        optimization_method,
+    ):
+        y_name = getattr(y, "name", None)
+        if isinstance(y, pd.DataFrame):
+            y = y.iloc[:, 0]
+        if isinstance(X, pd.DataFrame):
+            X_work = X.copy()
+        else:
+            X_array = np.asarray(X)
+            if X_array.ndim != 2:
+                raise ValueError("特征 X 必须是二维数组或 DataFrame")
+            X_work = pd.DataFrame(
+                X_array,
+                columns=[f"Feature_{index}" for index in range(X_array.shape[1])],
+            )
+
+        if len(X_work) != len(y):
+            raise ValueError("特征 X 与目标 y 的样本数必须一致")
+        if config.max_samples is not None and int(config.max_samples) > 0:
+            max_samples = int(config.max_samples)
+            if len(X_work) > max_samples:
+                rng = np.random.default_rng(int(config.random_state))
+                positions = rng.choice(len(X_work), size=max_samples, replace=False)
+                X_work = X_work.iloc[positions]
+                y = pd.Series(y).iloc[positions]
+
+        target_values = pd.to_numeric(pd.Series(y), errors="coerce").replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        valid_mask = np.isfinite(target_values.to_numpy(dtype=float))
+        X_work = X_work.iloc[np.flatnonzero(valid_mask)].copy()
+        y_work = target_values.iloc[np.flatnonzero(valid_mask)].copy()
+        feature_columns = X_work.columns.tolist()
+        all_indices = X_work.index.tolist()
+        strategy = str(cv_strategy or "kfold").lower()
+        if strategy.startswith("hold"):
+            train_idx, valid_idx = train_test_split(
+                np.arange(len(X_work)),
+                test_size=float(config.test_size),
+                random_state=int(config.random_state),
+            )
+            fixed_splits = [(np.asarray(train_idx), np.asarray(valid_idx))]
+        else:
+            cv_obj = KFold(
+                n_splits=int(config.cv_folds),
+                shuffle=True,
+                random_state=int(config.random_state),
+            )
+            fixed_splits = list(cv_obj.split(X_work, y_work))
+
+        fold_source_indices = [
+            {
+                "train_indices": X_work.index.take(train_idx).tolist(),
+                "valid_indices": X_work.index.take(valid_idx).tolist(),
+            }
+            for train_idx, valid_idx in fixed_splits
+        ]
+        workflow_hash = _valid_process_pls_workflow_hash(config)
+        total_trials = max(1, int(n_trials))
+        started_at = time.monotonic()
+
+        def build_legacy_pipeline(params):
+            base_model = self.trainer._get_model(
+                model_name,
+                random_state=int(config.random_state),
+                **params,
+            )
+            if model_name == "Epoxy PINN (Physics-Informed)":
+                return base_model
+            return make_pipeline(
+                SimpleImputer(strategy="median"),
+                StandardScaler(),
+                base_model,
+            )
+
+        def set_score_attrs(trial, scores):
+            trial.set_user_attr("fold_scores", [float(score) for score in scores])
+            trial.set_user_attr("completed_folds", int(len(scores)))
+            if scores:
+                trial.set_user_attr("mean_cv_r2", float(np.mean(scores)))
+                trial.set_user_attr(
+                    "std_cv_r2",
+                    float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0,
+                )
+                trial.set_user_attr("min_cv_r2", float(np.min(scores)))
+
+        def objective(trial):
+            scores = []
+            try:
+                params = self.get_model_params(
+                    trial,
+                    model_name,
+                    fast_mode=bool(fast_mode),
+                )
+                if model_name == "Epoxy PINN (Physics-Informed)" and y_name is not None:
+                    params.setdefault("target_name", y_name)
+                for fold_index, (train_idx, valid_idx) in enumerate(fixed_splits):
+                    pipeline = build_legacy_pipeline(params)
+                    pipeline.fit(X_work.iloc[train_idx], y_work.iloc[train_idx])
+                    y_pred = pipeline.predict(X_work.iloc[valid_idx])
+                    score = float(r2_score(y_work.iloc[valid_idx], y_pred))
+                    if not np.isfinite(score):
+                        raise ValueError(f"fold {fold_index + 1} produced non-finite R²")
+                    scores.append(score)
+                    if use_pruner:
+                        trial.report(float(np.mean(scores)), step=int(fold_index))
+                        if trial.should_prune():
+                            set_score_attrs(trial, scores)
+                            trial.set_user_attr("failure_reason", None)
+                            raise optuna.TrialPruned()
+                set_score_attrs(trial, scores)
+                trial.set_user_attr("failure_reason", None)
+                return float(np.mean(scores))
+            except optuna.TrialPruned:
+                raise
+            except TrialEvaluationError:
+                raise
+            except Exception as exc:
+                reason = str(exc).strip()[:300] or exc.__class__.__name__
+                trial.set_user_attr("failure_reason", reason)
+                if scores:
+                    set_score_attrs(trial, scores)
+                raise TrialEvaluationError(reason) from exc
+
+        pruner = (
+            optuna.pruners.MedianPruner(n_startup_trials=3)
+            if use_pruner
+            else optuna.pruners.NopPruner()
+        )
+        study = optuna.create_study(
+            direction="maximize",
+            pruner=pruner,
+            sampler=self._create_sampler(optimization_method, config.random_state),
+        )
+
+        def trial_finished_callback(current_study, _trial):
+            summary = _trial_state_summary(current_study)
+            elapsed = float(time.monotonic() - started_at)
+            finished = summary["completed"] + summary["pruned"] + summary["failed"]
+            estimated = (
+                float(elapsed / finished * max(0, total_trials - finished))
+                if finished > 0 and finished < total_trials
+                else (0.0 if finished >= total_trials else None)
+            )
+            complete_trials = [
+                item
+                for item in current_study.trials
+                if item.state == optuna.trial.TrialState.COMPLETE
+                and np.isfinite(item.user_attrs.get("mean_cv_r2", np.nan))
+            ]
+            best_mean = None
+            best_std = None
+            if complete_trials:
+                best_item = max(
+                    complete_trials,
+                    key=lambda item: float(item.user_attrs["mean_cv_r2"]),
+                )
+                best_mean = float(best_item.user_attrs["mean_cv_r2"])
+                best_std = float(best_item.user_attrs.get("std_cv_r2", np.nan))
+            _emit_optimization_progress(
+                progress_callback,
+                OptimizationProgress(
+                    completed_trials=summary["completed"],
+                    pruned_trials=summary["pruned"],
+                    failed_trials=summary["failed"],
+                    total_trials=total_trials,
+                    elapsed_seconds=elapsed,
+                    estimated_remaining_seconds=estimated,
+                    current_best_mean_r2=best_mean,
+                    current_best_std_r2=best_std,
+                    stage="completed" if finished >= total_trials else "running",
+                ),
+            )
+
+        study.optimize(
+            objective,
+            n_trials=total_trials,
+            timeout=timeout,
+            callbacks=[trial_finished_callback],
+            catch=(TrialEvaluationError,),
+        )
+        summary = _trial_state_summary(study)
+        failure_reasons = _failure_reason_summary(study)
+        selected_trial = select_stable_trial(study.trials, config.stability_tolerance)
+        independent_test = {
+            "evaluated": False,
+            "label": "探索模式，不可作为最终泛化报告",
+        }
+        if selected_trial is None:
+            return OptimizationResult(
+                model_name=str(model_name),
+                best_params={},
+                selected_trial_number=None,
+                inner_cv={
+                    "mean_r2": None,
+                    "std_r2": None,
+                    "min_r2": None,
+                    "fold_scores": [],
+                    "completed_folds": 0,
+                },
+                independent_test=independent_test,
+                train_indices=all_indices,
+                test_indices=[],
+                fold_source_indices=fold_source_indices,
+                feature_columns=feature_columns,
+                process_pls_workflow_hash=workflow_hash,
+                evaluation_config=asdict(config),
+                trial_summary=summary,
+                failure_reasons=failure_reasons,
+                study=study,
+                status="failed",
+                message="全部 trial 无效，请查看失败原因并检查模型、特征或数据",
+            )
+
+        selected_scores = [
+            float(score) for score in selected_trial.user_attrs.get("fold_scores", [])
+        ]
+        return OptimizationResult(
+            model_name=str(model_name),
+            best_params=dict(selected_trial.params),
+            selected_trial_number=int(selected_trial.number),
+            inner_cv={
+                "mean_r2": float(selected_trial.user_attrs["mean_cv_r2"]),
+                "std_r2": float(selected_trial.user_attrs.get("std_cv_r2", 0.0)),
+                "min_r2": float(selected_trial.user_attrs.get("min_cv_r2", np.nan)),
+                "fold_scores": selected_scores,
+                "completed_folds": int(
+                    selected_trial.user_attrs.get("completed_folds", len(selected_scores))
+                ),
+            },
+            independent_test=independent_test,
+            train_indices=all_indices,
+            test_indices=[],
+            fold_source_indices=fold_source_indices,
+            feature_columns=feature_columns,
+            process_pls_workflow_hash=workflow_hash,
+            evaluation_config=asdict(config),
+            trial_summary=summary,
+            failure_reasons=failure_reasons,
+            study=study,
+            status="completed",
+            message="探索模式优化完成；当前分数不代表独立测试集泛化性能",
+        )
+
     def optimize(
         self,
         model_name,
@@ -445,222 +1176,43 @@ class HyperparameterOptimizer:
         use_pruner: bool = True,
         timeout: int | None = None,
         optimization_method: str = "tpe",
+        evaluation_config: OptimizationEvaluationConfig | dict[str, Any] | None = None,
     ):
-        """
-        执行超参数优化
-        Args:
-            progress_callback: 回调函数，接收一个 0-1 之间的浮点数表示进度
-            optimization_method: 优化方法，可选:
-                - "tpe": Tree-structured Parzen Estimator (贝叶斯优化，默认)
-                - "gp": Gaussian Process (高斯过程贝叶斯优化)
-                - "cmaes": CMA-ES (协方差矩阵自适应进化策略)
-                - "random": 随机搜索
-                - "grid": 网格搜索 (需要较少trials)
-        """
-
-        # 0. 记录目标列名（用于 Epoxy PINN auto mode）
-        y_name = getattr(y, 'name', None)
-        requested_cv_strategy = (
-            str(cv_strategy).lower() if cv_strategy is not None else None
+        config = _coerce_evaluation_config(
+            evaluation_config,
+            cv=cv,
+            random_state=random_state,
+            val_size=val_size,
+            max_samples=max_samples,
+            cv_strategy=cv_strategy,
         )
-        use_reliable_preflight = (
-            requested_cv_strategy is None
-            or requested_cv_strategy.startswith("strat")
+        config.validate()
+        if config.mode == "exploratory":
+            return self._optimize_exploratory(
+                model_name,
+                X,
+                y,
+                n_trials=n_trials,
+                config=config,
+                cv_strategy=cv_strategy,
+                progress_callback=progress_callback,
+                fast_mode=fast_mode,
+                use_pruner=use_pruner,
+                timeout=timeout,
+                optimization_method=optimization_method,
+            )
+        return self._optimize_reliable(
+            model_name,
+            X,
+            y,
+            n_trials=n_trials,
+            config=config,
+            progress_callback=progress_callback,
+            fast_mode=fast_mode,
+            use_pruner=use_pruner,
+            timeout=timeout,
+            optimization_method=optimization_method,
         )
-
-        if use_reliable_preflight:
-            # 1. 清理目标值并保留独立、分层的外层测试集。
-            evaluation_config = OptimizationEvaluationConfig(
-                test_size=float(val_size),
-                cv_folds=int(cv),
-                random_state=int(random_state),
-                max_samples=max_samples,
-            )
-            preflight = prepare_regression_optimization(X, y, evaluation_config)
-            preflight = select_stratified_training_budget(preflight, evaluation_config)
-            training_positions = np.asarray(preflight.outer_train_positions, dtype=int)
-            X = preflight.X.iloc[training_positions]
-            y = preflight.y.iloc[training_positions]
-            training_strata = preflight.strata[training_positions]
-        else:
-            # 显式 legacy kfold/holdout 保持旧行为：只清理目标值，不要求可靠分层预检。
-            max_samples = int(max_samples) if max_samples is not None else 0
-            if max_samples > 0:
-                n_total = len(X)
-                if n_total > max_samples:
-                    rng = np.random.default_rng(int(random_state))
-                    idx = rng.choice(n_total, size=max_samples, replace=False)
-                    if isinstance(X, (pd.DataFrame, pd.Series)):
-                        X = X.iloc[idx]
-                    else:
-                        X = np.asarray(X)[idx]
-                    if isinstance(y, (pd.DataFrame, pd.Series)):
-                        y = y.iloc[idx]
-                    else:
-                        y = np.asarray(y)[idx]
-
-            y_raw = y.iloc[:, 0] if isinstance(y, pd.DataFrame) else y
-            target_values = pd.to_numeric(pd.Series(y_raw), errors="coerce").replace(
-                [np.inf, -np.inf],
-                np.nan,
-            )
-            if len(X) != len(target_values):
-                raise ValueError("特征 X 与目标 y 的样本数必须一致")
-            valid_target_mask = np.isfinite(target_values.to_numpy(dtype=float))
-            if np.sum(~valid_target_mask) > 0:
-                print(
-                    f"⚠️ 警告: 检测到目标变量 y 中有 {np.sum(~valid_target_mask)} 个无效值，"
-                    "已在优化前自动移除对应样本。"
-                )
-                valid_positions = np.flatnonzero(valid_target_mask)
-                if isinstance(X, (pd.DataFrame, pd.Series)):
-                    X = X.iloc[valid_positions]
-                else:
-                    X = np.asarray(X)[valid_positions]
-            y = target_values.to_numpy(dtype=float)[valid_target_mask]
-            training_strata = None
-
-        # 2. 保持现有训练器的数组接口。
-        if isinstance(X, pd.DataFrame) and model_name != "Epoxy PINN (Physics-Informed)":
-            X = X.values
-        if isinstance(y, (pd.DataFrame, pd.Series)):
-            y = y.values.ravel() if hasattr(y, 'values') else np.array(y).ravel()
-
-        def objective(trial):
-            # 更新进度条
-            if progress_callback:
-                progress_callback((trial.number + 1) / n_trials)
-
-            # 获取建议参数
-            params = self.get_model_params(trial, model_name, fast_mode=fast_mode)
-
-            # Epoxy PINN: 传入目标列名用于 auto mode
-            if model_name == "Epoxy PINN (Physics-Informed)" and y_name is not None:
-                params.setdefault("target_name", y_name)
-
-
-            try:
-                # 调用正确的方法名 _get_model
-                base_model = self.trainer._get_model(model_name, **params)
-
-                # 增加 SimpleImputer 处理特征缺失
-                # Epoxy PINN: 允许原始 DataFrame（含字符串列），前处理由模型内部完成
-                if model_name == "Epoxy PINN (Physics-Informed)":
-                    pipeline = base_model
-                else:
-                    pipeline = make_pipeline(
-                        SimpleImputer(strategy='median'),
-                        StandardScaler(),
-                        base_model
-                    )
-
-                if requested_cv_strategy is not None and requested_cv_strategy.startswith("hold"):
-                    X_train, X_val, y_train, y_val = train_test_split(
-                        X, y, test_size=float(val_size), random_state=random_state
-                    )
-                    pipeline.fit(X_train, y_train)
-                    y_pred = pipeline.predict(X_val)
-                    return r2_score(y_val, y_pred)
-
-                # 定义交叉验证策略
-                if requested_cv_strategy is None or requested_cv_strategy.startswith("strat"):
-                    cv_obj = StratifiedKFold(
-                        n_splits=int(cv),
-                        shuffle=True,
-                        random_state=random_state,
-                    )
-                    cv_splits = list(cv_obj.split(X, y, training_strata))
-                else:
-                    cv_obj = KFold(n_splits=int(cv), shuffle=True, random_state=random_state)
-                    cv_splits = list(cv_obj.split(X, y))
-
-                if use_pruner:
-                    scores = []
-                    for fold_idx, (tr_idx, te_idx) in enumerate(cv_splits):
-                        X_tr = X[tr_idx] if not hasattr(X, "iloc") else X.iloc[tr_idx]
-                        X_te = X[te_idx] if not hasattr(X, "iloc") else X.iloc[te_idx]
-                        y_tr = y[tr_idx] if not hasattr(y, "iloc") else y.iloc[tr_idx]
-                        y_te = y[te_idx] if not hasattr(y, "iloc") else y.iloc[te_idx]
-
-                        pipeline.fit(X_tr, y_tr)
-                        y_pred = pipeline.predict(X_te)
-                        score = r2_score(y_te, y_pred)
-                        scores.append(score)
-                        trial.report(float(np.mean(scores)), step=fold_idx)
-                        if trial.should_prune():
-                            raise optuna.TrialPruned()
-                    return float(np.mean(scores))
-
-                # 执行交叉验证
-                scores = cross_val_score(
-                    pipeline, X, y,
-                    cv=cv_splits,
-                    scoring='r2',
-                    n_jobs=int(n_jobs),  # 并行计算
-                    error_score='raise'
-                )
-
-                return float(scores.mean())
-
-            except Exception as e:
-                print(f"❌ Trial {trial.number} failed: {str(e)}")
-                return -float('inf')
-
-        # 创建 Study 对象
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=3) if use_pruner else optuna.pruners.NopPruner()
-
-        # 根据优化方法选择采样器
-        optimization_method = str(optimization_method).lower()
-
-        if optimization_method == "tpe":
-            # TPE: Tree-structured Parzen Estimator (贝叶斯优化)
-            sampler = optuna.samplers.TPESampler(seed=int(random_state))
-            print("🔍 使用 TPE 贝叶斯优化")
-
-        elif optimization_method == "gp":
-            # GP: Gaussian Process (高斯过程贝叶斯优化)
-            try:
-                sampler = optuna.samplers.GPSampler(seed=int(random_state))
-                print("🔍 使用 Gaussian Process 贝叶斯优化")
-            except AttributeError:
-                print("⚠️ GPSampler 不可用，回退到 TPE")
-                sampler = optuna.samplers.TPESampler(seed=int(random_state))
-
-        elif optimization_method == "cmaes":
-            # CMA-ES: Covariance Matrix Adaptation Evolution Strategy
-            try:
-                sampler = optuna.samplers.CmaEsSampler(seed=int(random_state))
-                print("🔍 使用 CMA-ES 优化")
-            except Exception as e:
-                print(f"⚠️ CMA-ES 不可用 ({str(e)})，回退到 TPE")
-                print("💡 提示: 安装 cmaes 包以启用 CMA-ES: pip install cmaes")
-                sampler = optuna.samplers.TPESampler(seed=int(random_state))
-
-        elif optimization_method == "random":
-            # 随机搜索
-            sampler = optuna.samplers.RandomSampler(seed=int(random_state))
-            print("🔍 使用随机搜索")
-
-        elif optimization_method == "grid":
-            # 网格搜索 (需要预定义搜索空间)
-            sampler = optuna.samplers.GridSampler(seed=int(random_state))
-            print("🔍 使用网格搜索")
-
-        else:
-            # 默认使用 TPE
-            sampler = optuna.samplers.TPESampler(seed=int(random_state))
-            print(f"⚠️ 未知优化方法 '{optimization_method}'，使用默认 TPE")
-
-        study = optuna.create_study(direction="maximize", pruner=pruner, sampler=sampler)
-
-        # 执行优化
-        study.optimize(objective, n_trials=n_trials, timeout=timeout)
-
-        # 确保进度条走完
-        if progress_callback:
-            progress_callback(1.0)
-
-        return study.best_params, study.best_value, study
 
 
 class InverseDesigner:
