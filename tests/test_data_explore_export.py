@@ -1,9 +1,12 @@
 from io import BytesIO
 from zipfile import ZipFile
 
+import matplotlib.pyplot as plt
 import pandas as pd
+import plotly.graph_objects as go
 import pytest
 
+from core.data_explorer import EnhancedDataExplorer
 from core.data_explore_export import (
     build_export_zip,
     dataframe_to_csv_bytes,
@@ -83,3 +86,72 @@ def test_figure_to_bytes_uses_requested_format():
             buffer.write(b"png")
 
     assert figure_to_bytes(Figure(), "png") == b"png"
+
+
+def test_correlation_data_matches_selected_numeric_columns():
+    frame = pd.DataFrame(
+        {"a": [1.0, 2.0, 3.0], "b": [2.0, 4.0, 8.0], "label": ["x", "y", "z"]}
+    )
+    explorer = EnhancedDataExplorer(frame)
+
+    result = explorer.correlation_data(["a", "b"])
+
+    assert list(result.index) == ["a", "b"]
+    assert list(result.columns) == ["a", "b"]
+    assert result.loc["a", "a"] == 1.0
+
+
+def test_distribution_data_is_long_form_and_excludes_missing_values():
+    frame = pd.DataFrame({"a": [1.0, None], "b": [3.0, 4.0]})
+    result = EnhancedDataExplorer(frame).distribution_data(["a", "b"])
+
+    assert list(result.columns) == ["feature", "value"]
+    assert result.to_dict("records") == [
+        {"feature": "a", "value": 1.0},
+        {"feature": "b", "value": 3.0},
+        {"feature": "b", "value": 4.0},
+    ]
+
+
+def test_missing_values_data_contains_count_and_percentage():
+    frame = pd.DataFrame({"a": [1.0, None], "b": [1.0, 2.0]})
+    result = EnhancedDataExplorer(frame).missing_values_data()
+
+    assert result.to_dict("records") == [
+        {"feature": "a", "missing_count": 1, "missing_percent": 50.0}
+    ]
+
+
+def test_boxplot_data_uses_same_long_form_as_distribution_data():
+    frame = pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]})
+    result = EnhancedDataExplorer(frame).boxplot_data(["b"])
+
+    assert result.to_dict("records") == [
+        {"feature": "b", "value": 3.0},
+        {"feature": "b", "value": 4.0},
+    ]
+
+
+def test_figure_to_bytes_exports_plotly_html():
+    figure = go.Figure(go.Bar(x=["a"], y=[1]))
+
+    payload = figure_to_bytes(figure, "html")
+
+    assert b"<html" in payload.lower()
+    assert b"plotly" in payload.lower()
+
+
+def test_figure_to_bytes_rejects_unknown_format():
+    with pytest.raises(ValueError, match="不支持的图表格式"):
+        figure_to_bytes(go.Figure(), "pdf")
+
+
+def test_figure_to_bytes_exports_matplotlib_svg():
+    figure, axis = plt.subplots()
+    axis.plot([0, 1], [0, 1])
+    try:
+        payload = figure_to_bytes(figure, "svg")
+    finally:
+        plt.close(figure)
+
+    assert payload.lstrip().startswith(b"<?xml")

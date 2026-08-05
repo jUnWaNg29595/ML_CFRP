@@ -29,6 +29,49 @@ class EnhancedDataExplorer:
             'missing_by_column': self.data.isnull().sum().to_dict()
         }
 
+    def _valid_numeric_columns(self, cols=None):
+        if cols is None:
+            return self.numeric_cols.copy()
+
+        return list(dict.fromkeys(
+            col for col in cols
+            if col in self.data.columns and col in self.numeric_cols
+        ))
+
+    def correlation_data(self, cols=None):
+        cols = self._valid_numeric_columns(cols)
+        if len(cols) < 2:
+            return pd.DataFrame(index=cols, columns=cols, dtype=float)
+        return self.data.loc[:, cols].corr()
+
+    def distribution_data(self, cols=None):
+        cols = self._valid_numeric_columns(cols)
+        records = []
+        for col in cols:
+            records.extend(
+                {"feature": col, "value": value}
+                for value in self.data[col].dropna().tolist()
+            )
+        return pd.DataFrame(records, columns=["feature", "value"])
+
+    def missing_values_data(self):
+        missing = self.data.isnull().sum()
+        missing = missing[missing > 0].sort_values()
+        return pd.DataFrame(
+            {
+                "feature": missing.index.tolist(),
+                "missing_count": missing.astype(int).tolist(),
+                "missing_percent": (
+                    (missing / len(self.data) * 100).round(4).tolist()
+                    if len(self.data)
+                    else [0.0] * len(missing)
+                ),
+            }
+        )
+
+    def boxplot_data(self, cols=None):
+        return self.distribution_data(cols)
+
     def plot_correlation_matrix(self, cols=None, width=1200, height=800):
         """绘制相关性热图（支持自定义列子集）"""
         # 默认使用全部数值列

@@ -1,5 +1,7 @@
 from collections.abc import Mapping, Sequence
+import base64
 from io import BytesIO
+from io import StringIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pandas as pd
@@ -64,8 +66,49 @@ def dataframe_to_excel_bytes(
 
 
 def figure_to_bytes(figure: object, fmt: str) -> bytes:
+    normalized_fmt = str(fmt).lower().lstrip(".")
+    if normalized_fmt not in {"html", "png", "svg"}:
+        raise ValueError("不支持的图表格式")
+
+    if figure.__class__.__module__.startswith("plotly"):
+        if normalized_fmt == "html":
+            output = StringIO()
+            figure.write_html(output)
+            return output.getvalue().encode("utf-8")
+        try:
+            return bytes(figure.to_image(format=normalized_fmt))
+        except (ImportError, ModuleNotFoundError, ValueError) as exc:
+            raise RuntimeError(
+                f"导出 {normalized_fmt} 需要 Plotly 图像依赖 kaleido"
+            ) from exc
+
+    if figure.__class__.__module__.startswith("matplotlib"):
+        if normalized_fmt == "html":
+            image_buffer = BytesIO()
+            try:
+                figure.savefig(image_buffer, format="png")
+            except (ImportError, ModuleNotFoundError) as exc:
+                raise RuntimeError(
+                    "导出 html 需要 Matplotlib 图像依赖"
+                ) from exc
+            encoded = base64.b64encode(image_buffer.getvalue()).decode("ascii")
+            return (
+                "<!DOCTYPE html><html><body>"
+                f'<img src="data:image/png;base64,{encoded}">'
+                "</body></html>"
+            ).encode("utf-8")
+
+        buffer = BytesIO()
+        try:
+            figure.savefig(buffer, format=normalized_fmt)
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise RuntimeError(
+                f"导出 {normalized_fmt} 需要 Matplotlib 图像依赖"
+            ) from exc
+        return buffer.getvalue()
+
     buffer = BytesIO()
-    figure.savefig(buffer, format=fmt)
+    figure.savefig(buffer, format=normalized_fmt)
     return buffer.getvalue()
 
 
