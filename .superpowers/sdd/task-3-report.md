@@ -33,3 +33,31 @@
 
 - PNG/SVG 是否可用取决于 Plotly 的 `kaleido` 依赖；依赖缺失时页面会仅提示对应格式不可用，HTML 和数据导出仍可继续。
 - 未运行完整项目测试套件；本任务使用了 brief 指定的页面回归测试和导出核心测试。
+
+## Task 3 审查修复报告
+
+### 修复内容
+
+- 将数据探索页的预览测试从纯源码字符串断言替换为真实辅助函数交互测试。
+- 覆盖预览数据源选择、显式空列选择、最多 5000 行、列选择在数据源切换时保留有效交集，以及图表导出按钮的实际 payload、文件名和稳定 key。
+- 修复数据源切换逻辑：保留仍存在的列；仅在切换后没有有效列选择时回退当前数据源前 8 列；显式空选择在同一数据源下仍保持空并隐藏表格。
+
+### TDD 验证
+
+1. RED：
+   - 命令：`C:\Users\wangj\anaconda3\envs\CFRP_env\python.exe -m pytest tests\test_app_scope_regressions.py tests\test_data_explore_export.py -q`
+   - 输出：`1 failed, 27 passed`
+   - 失败：数据源切换后预期保留 `shared`，实际回退为原始数据前 8 列。
+2. GREEN：
+   - 同一命令输出：`28 passed in 20.79s`
+3. 提交前新鲜验证：
+   - 同一聚焦测试命令输出：`28 passed in 20.68s`
+   - 命令：`C:\Users\wangj\anaconda3\envs\CFRP_env\python.exe -m py_compile app.py`
+   - 输出：无；退出码 `0`。
+
+### 边界与顾虑
+
+- 未运行完整项目测试套件；本次仅运行 Task 3 相关回归/导出测试和 `app.py` 编译检查。
+- Streamlit 可导入并支持行为级测试；未启动交互式 Streamlit 服务。
+- PNG/SVG 仍依赖 Plotly `kaleido`，依赖缺失时由现有逻辑逐格式提示，不影响 HTML、CSV、Excel 按钮。
+- `app.py` 中已有的其他未提交修改、缓存、备份和未跟踪文件未纳入本次修复提交。

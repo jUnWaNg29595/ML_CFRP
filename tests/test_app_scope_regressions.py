@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
 
+import pandas as pd
+
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
 
@@ -59,32 +61,140 @@ def test_hyperparameter_page_does_not_apply_reliable_preflight_to_exploration():
     assert "if use_process_pls and preflight_error is None:" in page_source
 
 
-def test_data_explore_page_has_searchable_preview_and_explicit_selection():
-    source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8-sig")
-    start = source.index("def page_data_explore():")
-    end = source.index(
-        "\n\n# ============================================================\n# 页面：数据清洗",
-        start,
+def test_data_explore_preview_uses_selected_source_and_caps_rows_at_5000(monkeypatch):
+    import app
+
+    raw = pd.DataFrame(
+        {
+            "raw_feature": range(6000),
+            "raw_target": range(6000, 12000),
+        }
     )
-    page_source = source[start:end]
+    processed = pd.DataFrame({"processed_feature": range(6000)})
+    state = {}
+    captured = {}
 
-    assert "数据预览" in page_source
-    assert "预览特征/列" in page_source
-    assert "至少选择一列" in page_source
-    assert "processed_data" in page_source
-    assert "原始数据" in page_source
-
-
-def test_data_explore_page_has_both_quick_export_formats():
-    source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8-sig")
-    start = source.index("def page_data_explore():")
-    end = source.index(
-        "\n\n# ============================================================\n# 页面：数据清洗",
-        start,
+    monkeypatch.setattr(app.st, "session_state", state, raising=False)
+    monkeypatch.setattr(
+        app.st,
+        "radio",
+        lambda label, options, **kwargs: "原始数据",
     )
-    page_source = source[start:end]
 
-    assert "导出图表数据" in page_source
-    assert "导出图表" in page_source
-    assert "HTML" in page_source
-    assert "Excel" in page_source
+    def slider(label, **kwargs):
+        captured["slider"] = kwargs
+        return kwargs["max_value"]
+
+    def multiselect(label, options, **kwargs):
+        captured["options"] = options
+        state[kwargs["key"]] = kwargs["default"]
+        return kwargs["default"]
+
+    monkeypatch.setattr(app.st, "slider", slider)
+    monkeypatch.setattr(app.st, "multiselect", multiselect)
+    monkeypatch.setattr(app.st, "caption", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        app.st,
+        "dataframe",
+        lambda frame, **kwargs: captured.update({"frame": frame}),
+    )
+
+    app._render_data_explore_preview(raw, processed)
+
+    assert state["_explore_preview_source_key"] == "raw"
+    assert captured["options"] == ["raw_feature", "raw_target"]
+    assert captured["slider"]["max_value"] == 5000
+    assert len(captured["frame"]) == 5000
+    assert list(captured["frame"].columns) == ["raw_feature", "raw_target"]
+
+
+def test_data_explore_preview_keeps_only_valid_selected_columns_after_source_switch(
+    monkeypatch,
+):
+    import app
+
+    raw = pd.DataFrame(
+        {
+            **{f"raw_{index}": [index] for index in range(8)},
+            "shared": [1],
+            "raw_extra": [2],
+        }
+    )
+    processed = pd.DataFrame(
+        {
+            "shared": [1],
+            "processed_only": [2],
+        }
+    )
+    state = {}
+    source_labels = iter(["当前处理数据", "原始数据"])
+    defaults = []
+    selections = iter([["shared", "processed_only"], None])
+
+    monkeypatch.setattr(app.st, "session_state", state, raising=False)
+    monkeypatch.setattr(
+        app.st,
+        "radio",
+        lambda label, options, **kwargs: next(source_labels),
+    )
+    monkeypatch.setattr(
+        app.st,
+        "slider",
+        lambda label, **kwargs: kwargs["min_value"],
+    )
+
+    def multiselect(label, options, **kwargs):
+        defaults.append(kwargs["default"])
+        selection = next(selections)
+        if selection is None:
+            selection = kwargs["default"]
+        state[kwargs["key"]] = selection
+        return selection
+
+    monkeypatch.setattr(app.st, "multiselect", multiselect)
+    monkeypatch.setattr(app.st, "caption", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app.st, "dataframe", lambda *args, **kwargs: None)
+
+    app._render_data_explore_preview(raw, processed)
+    app._render_data_explore_preview(raw, processed)
+
+    assert defaults == [["shared", "processed_only"], ["shared"]]
+
+
+def test_data_explore_preview_keeps_explicit_empty_selection_hidden(monkeypatch):
+    import app
+
+    frame = pd.DataFrame({"feature": [1, 2]})
+    state = {}
+    notices = []
+    displayed = []
+
+    monkeypatch.setattr(app.st, "session_state", state, raising=False)
+    monkeypatch.setattr(
+        app.st,
+        "radio",
+        lambda label, options, **kwargs: "当前处理数据",
+    )
+    monkeypatch.setattr(
+        app.st,
+        "slider",
+        lambda label, **kwargs: kwargs["min_value"],
+    )
+
+    def multiselect(label, options, **kwargs):
+        state[kwargs["key"]] = []
+        return []
+
+    monkeypatch.setattr(app.st, "multiselect", multiselect)
+    monkeypatch.setattr(app.st, "caption", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app.st, "info", lambda message: notices.append(message))
+    monkeypatch.setattr(
+        app.st,
+        "dataframe",
+        lambda *args, **kwargs: displayed.append(args[0]),
+    )
+
+    app._render_data_explore_preview(None, frame)
+
+    assert notices == ["至少选择一列后显示预览表。"]
+    assert displayed == []

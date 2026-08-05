@@ -3145,14 +3145,17 @@ def _render_data_explore_preview(raw_df, processed_df) -> None:
     preview_df, _ = resolve_data_source(raw_df, processed_df, source_key)
     available_cols = preview_df.columns.tolist()
 
-    if st.session_state.get("_explore_preview_source_key") != source_key:
-        st.session_state["explore_preview_cols"] = available_cols[:8]
-        st.session_state["_explore_preview_source_key"] = source_key
+    previous_source_key = st.session_state.get("_explore_preview_source_key")
+    previous_columns = st.session_state.get("explore_preview_cols")
+    valid_columns = sanitize_preview_columns(previous_columns or [], available_cols)
+    if previous_source_key is None and previous_columns is None:
+        selected_columns = available_cols[:8]
+    elif previous_source_key != source_key and not valid_columns:
+        selected_columns = available_cols[:8]
     else:
-        st.session_state["explore_preview_cols"] = sanitize_preview_columns(
-            st.session_state.get("explore_preview_cols", available_cols[:8]),
-            available_cols,
-        )
+        selected_columns = valid_columns
+    st.session_state["explore_preview_cols"] = selected_columns
+    st.session_state["_explore_preview_source_key"] = source_key
 
     max_rows = max(5, min(5000, len(preview_df)))
     row_count = st.slider(

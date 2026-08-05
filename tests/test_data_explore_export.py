@@ -224,3 +224,54 @@ def test_figure_to_bytes_exports_matplotlib_svg():
         plt.close(figure)
 
     assert payload.lstrip().startswith(b"<?xml")
+
+
+def test_data_explore_export_controls_send_real_payloads_to_each_download_button(
+    monkeypatch,
+):
+    import app
+
+    class Column:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class Figure:
+        def savefig(self, buffer, format):
+            buffer.write(f"{format}-payload".encode("ascii"))
+
+    buttons = []
+    frame = pd.DataFrame({"feature": [1, 2]})
+    monkeypatch.setattr(app.st, "columns", lambda count: [Column(), Column()])
+    monkeypatch.setattr(app.st, "markdown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app.st, "caption", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app.st, "download_button", lambda *args, **kwargs: buttons.append((args, kwargs)))
+
+    app._render_figure_export_controls(
+        Figure(),
+        frame,
+        "demo_chart",
+        "data_explore_demo",
+    )
+
+    assert [args[0] for args, _ in buttons] == [
+        "📥 导出图表数据 CSV",
+        "📥 导出图表数据 Excel",
+        "📈 导出图表 HTML",
+        "📈 导出图表 PNG",
+        "📈 导出图表 SVG",
+    ]
+    assert buttons[0][0][1].startswith(b"\xef\xbb\xbf")
+    assert pd.read_excel(BytesIO(buttons[1][0][1]))["feature"].tolist() == [1, 2]
+    assert buttons[2][0][1] == b"html-payload"
+    assert buttons[3][0][1] == b"png-payload"
+    assert buttons[4][0][1] == b"svg-payload"
+    assert [kwargs["key"] for _, kwargs in buttons] == [
+        "data_explore_demo_csv",
+        "data_explore_demo_xlsx",
+        "data_explore_demo_html",
+        "data_explore_demo_png",
+        "data_explore_demo_svg",
+    ]
