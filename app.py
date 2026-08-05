@@ -1013,6 +1013,7 @@ def _quick_rdkit_parse_stats(smiles_list, max_check: int = 200):
 import numpy as np
 import os
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 
 # 尝试导入 torch
 try:
@@ -1122,6 +1123,7 @@ from core.ui_config import (
     DEFAULT_TEST_SIZE,
     DEFAULT_RANDOM_STATE,
     RECOMMENDED_PRESETS,
+    prepare_manual_training_params,
 )
 
 from config import APP_NAME, VERSION, DATA_DIR, CACHE_DIR
@@ -9326,6 +9328,7 @@ def page_molecular_features():
             batch_failed = False
             batch_progress = st.progress(0)
             batch_status = st.empty()
+            used_batch_prefix_keys = set()
             
             for batch_idx, current_smiles_col in enumerate(batch_smiles_cols):
                 batch_status.markdown(f"**正在处理第 {batch_idx + 1}/{len(batch_smiles_cols)} 列：`{current_smiles_col}`**")
@@ -9354,6 +9357,18 @@ def page_molecular_features():
                 # [修复] 最终确保 col_prefix 不是 None 或空字符串
                 if not col_prefix:
                     col_prefix = f"col{batch_idx}"
+
+                base_prefix = col_prefix.rstrip("_") or f"col{batch_idx}"
+                prefix_key = base_prefix.lower()
+                if prefix_key in used_batch_prefix_keys:
+                    suffix = 2
+                    candidate_prefix = f"{base_prefix}_{suffix}"
+                    while candidate_prefix.lower() in used_batch_prefix_keys:
+                        suffix += 1
+                        candidate_prefix = f"{base_prefix}_{suffix}"
+                    col_prefix = candidate_prefix
+                    prefix_key = candidate_prefix.lower()
+                used_batch_prefix_keys.add(prefix_key)
 
                 workflow_step = {
                     "step_id": f"batch_{batch_idx + 1}",
@@ -12557,23 +12572,6 @@ def page_model_training():
                     st.session_state[f"param_{model_name}_{k}"] = v
                 st.toast("✅ 已应用最佳参数", icon="✅")
 
-        # ANN 推荐设置按钮
-        if model_name == "人工神经网络":
-            if st.button("⭐ 应用推荐设置", key=f"apply_ann_rec_{model_name}"):
-                _ann_rec = {
-                    'hidden_layer_sizes': '256,128,64',
-                    'activation': 'relu',
-                    'dropout_rate': 0.2,
-                    'learning_rate': 0.001,
-                    'epochs': 300,
-                    'batch_size': 64,
-                    'scaler_type': 'standard',
-                    'normalize_target': True,
-                }
-                for k, v in _ann_rec.items():
-                    st.session_state[f"param_{model_name}_{k}"] = v
-                st.toast("✅ 已应用推荐设置", icon="⭐")
-
         # TabNet 最佳参数按钮
         if model_name == "TabNet":
             st.markdown("#### 🎯 快速配置")
@@ -12764,7 +12762,13 @@ def page_model_training():
             with st.form(key=f"param_form_{model_name}"):
                 st.caption("调整参数后点击下方「确认参数」按钮生效，避免每次调参都刷新页面")
                 p_cols = st.columns(2)
+                current_section = None
                 for i, config in enumerate(configs):
+                    section = config.get("section")
+                    if section and section != current_section:
+                        st.markdown(f"#### {section}")
+                        current_section = section
+
                     with p_cols[i % 2]:
                         key = f"param_{model_name}_{config['name']}"
                         if key not in st.session_state:
@@ -12773,24 +12777,70 @@ def page_model_training():
                         help_txt = config.get('help', None)
                         widget = config.get('widget', 'text_input')
                         args = config.get('args', {}) or {}
+                        option_labels = config.get("option_labels") or {}
 
                         # 对 TFS：若关闭 early_stopping，则 patience 不必填写
                         disabled_flag = False
                         if model_name == "TensorFlow Sequential" and config.get('name') == 'patience':
                             disabled_flag = (not bool(manual_params.get('early_stopping', True)))
+                        if model_name == "人工神经网络" and config.get("name") in {"patience", "min_delta"}:
+                            disabled_flag = not bool(manual_params.get("early_stopping", True))
 
                         if widget == 'slider':
                             manual_params[config['name']] = st.slider(config['label'], key=key, help=help_txt, disabled=disabled_flag, **args)
                         elif widget == 'number_input':
                             manual_params[config['name']] = st.number_input(config['label'], key=key, help=help_txt, disabled=disabled_flag, **args)
                         elif widget == 'selectbox':
-                            manual_params[config['name']] = st.selectbox(config['label'], options=args.get('options', []), key=key, help=help_txt, disabled=disabled_flag)
+                            manual_params[config['name']] = st.selectbox(
+                                config['label'],
+                                options=args.get('options', []),
+                                format_func=(
+                                    lambda value, labels=option_labels: labels.get(value, value)
+                                ) if option_labels else str,
+                                key=key,
+                                help=help_txt,
+                                disabled=disabled_flag,
+                            )
                         elif widget == 'text_input':
                             manual_params[config['name']] = st.text_input(config['label'], key=key, help=help_txt, disabled=disabled_flag)
                         elif widget == 'checkbox':
                             manual_params[config['name']] = st.checkbox(config['label'], key=key, help=help_txt, disabled=disabled_flag)
 
                 st.form_submit_button("✅ 确认参数", type="primary")
+
+            if model_name == "人工神经网络":
+                hidden_text = str(manual_params.get("hidden_layer_sizes", "") or "")
+                hidden_widths = []
+                for token in re.split(r"[,，\s]+", hidden_text.strip()):
+                    if not token:
+                        continue
+                    try:
+                        width = int(token)
+                    except (TypeError, ValueError):
+                        hidden_widths = []
+                        break
+                    if width <= 0:
+                        hidden_widths = []
+                        break
+                    hidden_widths.append(width)
+
+                if hidden_widths:
+                    x_shape = getattr(X, "shape", ())
+                    input_dim = max(0, int(x_shape[1])) if len(x_shape) > 1 else 0
+                    layer_dims = [input_dim] + hidden_widths + [1]
+                    estimated_parameters = sum(
+                        left * right + right
+                        for left, right in zip(layer_dims, layer_dims[1:])
+                    )
+                    architecture = " → ".join(
+                        [str(input_dim)] + [str(width) for width in hidden_widths] + ["1"]
+                    )
+                    st.info(
+                        f"网络结构摘要：{architecture} | "
+                        f"估算参数量约 {estimated_parameters:,}（不含 Dropout 参数）"
+                    )
+                else:
+                    st.warning("隐藏层结构需填写逗号分隔的正整数，例如 `256,128,64`。")
         else:
             st.info("当前模型没有额外的手动调参项，或参数由模型内部自动管理。")
 
@@ -12970,7 +13020,7 @@ def page_model_training():
                         raise RuntimeError("用户取消")
                     
                     # 准备参数
-                    params = manual_params.copy()
+                    params = prepare_manual_training_params(manual_params)
                     params['train_n_jobs'] = int(train_n_jobs)
                     if model_name == "Bayesian Neural Network (BNN)":
                         params.setdefault("missing_value_strategy", "median")
@@ -13003,9 +13053,6 @@ def page_model_training():
                     if model_name in smiles_aware_models and _dev_pref in ["cpu", "cuda"]:
                         if params.get('device', 'auto') == 'auto':
                             params['device'] = _dev_pref
-
-                    if 'random_state' in params:
-                        params.pop('random_state')
 
                     if model_name == "Transformer + BNN" and tbnn_progress is not None:
                         def _transformer_bnn_epoch_callback(info):

@@ -625,6 +625,66 @@ def test_executor_rejects_duplicate_feature_columns(monkeypatch):
         execute_molecular_feature_workflow(data, workflow)
 
 
+def test_executor_resolves_cross_step_duplicates_using_feature_source_map(monkeypatch):
+    data = pd.DataFrame({"smiles": ["A", "B"]})
+    workflow = MolecularFeatureWorkflow.from_dict(
+        {
+            "schema_version": 2,
+            "steps": [
+                {
+                    "step_id": "resin_xtb",
+                    "source_columns": ["smiles"],
+                    "method": "test",
+                    "prefix": "resin",
+                    "feature_names": ["resin_shared", "resin_xtb_only"],
+                },
+                {
+                    "step_id": "resin_fingerprint",
+                    "source_columns": ["smiles"],
+                    "method": "test",
+                    "prefix": "resin",
+                    "feature_names": ["resin_shared", "resin_fp_only"],
+                },
+            ],
+            "merge_order": ["resin_xtb", "resin_fingerprint"],
+            "final_feature_names": [
+                "resin_shared",
+                "resin_xtb_only",
+                "resin_fp_only",
+            ],
+            "feature_source_map": {"resin_shared": "resin_fingerprint"},
+        }
+    )
+
+    def duplicate_across_steps(smiles, step, **_kwargs):
+        values = [1.0, 2.0] if step["step_id"] == "resin_xtb" else [10.0, 20.0]
+        return (
+            pd.DataFrame(
+                {
+                    "shared": values,
+                    "xtb_only" if step["step_id"] == "resin_xtb" else "fp_only": values,
+                }
+            ),
+            [0, 1],
+            [],
+        )
+
+    monkeypatch.setattr(
+        "core.molecular_feature_workflow.execute_feature_step",
+        duplicate_across_steps,
+    )
+
+    result = execute_molecular_feature_workflow(data, workflow)
+
+    assert result.features.columns.tolist() == [
+        "resin_shared",
+        "resin_xtb_only",
+        "resin_fp_only",
+    ]
+    assert result.features["resin_shared"].tolist() == [10.0, 20.0]
+    assert any("resin_shared" in warning for warning in result.warnings)
+
+
 def test_executor_rejects_missing_required_feature(monkeypatch):
     data = pd.DataFrame({"smiles": ["A"]})
     workflow = MolecularFeatureWorkflow.from_dict(

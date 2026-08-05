@@ -1324,6 +1324,64 @@ def _restore_step_rows(
     return restored
 
 
+def _merge_workflow_feature_frames(
+    frames: Sequence[pd.DataFrame],
+    step_ids: Sequence[str],
+    feature_source_map: Mapping[str, Any] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Merge step outputs while resolving cross-step names deterministically."""
+    selected: dict[str, pd.Series] = {}
+    selected_step: dict[str, str] = {}
+    emitted_order: list[str] = []
+    duplicate_steps: dict[str, list[str]] = {}
+    source_map = dict(feature_source_map or {})
+
+    for step_id, frame in zip(step_ids, frames):
+        current_step = str(step_id)
+        for position, column in enumerate(frame.columns):
+            name = str(column)
+            series = frame.iloc[:, position].rename(name)
+            if name not in selected:
+                selected[name] = series
+                selected_step[name] = current_step
+                emitted_order.append(name)
+                duplicate_steps[name] = [current_step]
+                continue
+
+            if current_step not in duplicate_steps[name]:
+                duplicate_steps[name].append(current_step)
+            owner = str(source_map.get(name) or "").strip()
+            if owner == current_step:
+                selected[name] = series
+                selected_step[name] = current_step
+
+    if not selected:
+        index = frames[0].index if frames else None
+        return pd.DataFrame(index=index), []
+
+    merged = pd.concat(
+        [selected[name] for name in emitted_order],
+        axis=1,
+    )
+    warnings = []
+    for name in emitted_order:
+        steps = duplicate_steps.get(name, [])
+        if len(steps) < 2:
+            continue
+        retained_step = selected_step[name]
+        owner = str(source_map.get(name) or "").strip()
+        if owner == retained_step:
+            reason = "according to feature_source_map"
+        else:
+            reason = "using first emitted step because feature_source_map has no matching owner"
+        warnings.append(
+            "workflow emitted duplicate feature "
+            f"'{name}' in steps {', '.join(steps)}; retained '{retained_step}' "
+            f"{reason}"
+        )
+    return merged, warnings
+
+
 def execute_molecular_feature_workflow(
     data: pd.DataFrame,
     workflow: MolecularFeatureWorkflow | Mapping[str, Any],
@@ -1416,13 +1474,12 @@ def execute_molecular_feature_workflow(
         if progress_callback is not None:
             progress_callback(dict(trace))
 
-    merged = pd.concat(frames, axis=1) if frames else pd.DataFrame(index=data.index)
-    duplicate_columns = merged.columns[merged.columns.duplicated()].tolist()
-    if duplicate_columns:
-        raise ValueError(
-            "workflow produced duplicate feature columns: "
-            + ", ".join(map(str, duplicate_columns))
-        )
+    merged, merge_warnings = _merge_workflow_feature_frames(
+        frames,
+        ordered_ids,
+        normalized.get("feature_source_map"),
+    )
+    warnings.extend(merge_warnings)
     final_feature_names = [str(name) for name in normalized["final_feature_names"]]
     missing = [name for name in final_feature_names if name not in merged.columns]
     if missing:

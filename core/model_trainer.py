@@ -396,6 +396,74 @@ class FeatureMaskTransformer(BaseEstimator, TransformerMixin):
         return X_arr[:, feature_mask]
 
 
+def _make_median_imputer():
+    imputer_params = {'strategy': 'median'}
+    try:
+        if 'keep_empty_features' in inspect.signature(SimpleImputer).parameters:
+            imputer_params['keep_empty_features'] = True
+    except (TypeError, ValueError):
+        pass
+    return SimpleImputer(**imputer_params)
+
+
+def _apply_feature_keep_mask(feature_mask, keep_mask):
+    current_mask = np.asarray(feature_mask, dtype=bool)
+    current_keep_mask = np.asarray(keep_mask, dtype=bool).ravel()
+    active_indices = np.flatnonzero(current_mask)
+    if len(active_indices) != len(current_keep_mask):
+        raise ValueError(
+            '特征列数与特征掩码不同步：'
+            f'当前有效特征 {len(active_indices)} 列，'
+            f'列筛选掩码 {len(current_keep_mask)} 列'
+        )
+    updated_mask = np.zeros_like(current_mask, dtype=bool)
+    updated_mask[active_indices[current_keep_mask]] = True
+    return updated_mask
+
+
+def _infer_imputer_keep_mask(imputer, input_feature_count, output_feature_count):
+    if int(input_feature_count) == int(output_feature_count):
+        return np.ones(int(input_feature_count), dtype=bool)
+
+    statistics = getattr(imputer, 'statistics_', None)
+    if statistics is not None:
+        statistics = np.asarray(statistics)
+        if statistics.ndim == 1 and len(statistics) == int(input_feature_count):
+            try:
+                keep_mask = ~np.isnan(statistics.astype(float))
+            except (TypeError, ValueError):
+                keep_mask = None
+            if keep_mask is not None and int(keep_mask.sum()) == int(output_feature_count):
+                return keep_mask
+
+    raise ValueError(
+        '缺失值填补器改变了特征列数，但无法恢复原始列映射：'
+        f'{input_feature_count} -> {output_feature_count}'
+    )
+
+
+def _align_feature_mask_after_imputer(
+    feature_mask,
+    feature_names,
+    imputer,
+    input_feature_count,
+    output_feature_count,
+):
+    keep_mask = _infer_imputer_keep_mask(
+        imputer,
+        input_feature_count,
+        output_feature_count,
+    )
+    updated_feature_mask = _apply_feature_keep_mask(feature_mask, keep_mask)
+    if feature_names is not None and len(feature_names) == len(keep_mask):
+        feature_names = [
+            name
+            for name, keep_feature in zip(feature_names, keep_mask)
+            if keep_feature
+        ]
+    return updated_feature_mask, feature_names
+
+
 def apply_feature_mask(X, feature_mask):
     """
     应用特征掩码，过滤掉训练时被删除的特征
@@ -1392,7 +1460,7 @@ def _build_missing_value_imputer(
                 f"⚠️ MissingValueHandler unavailable, fallback to median imputation "
                 f"(requested={strategy_norm})"
             )
-        return SimpleImputer(strategy="median")
+        return _make_median_imputer()
     return MissingValueHandler(
         strategy=strategy_norm,
         random_state=int(random_state),
@@ -2204,9 +2272,10 @@ class EnhancedModelTrainer:
             # 参数名映射：UI使用 hidden_layer_sizes，模型使用 hidden_layer_sizes_str
             if 'hidden_layer_sizes' in params_clean:
                 params_clean['hidden_layer_sizes_str'] = str(params_clean.pop('hidden_layer_sizes'))
-            # 移除ANN不支持的参数（UI配置可能包含这些）
-            ann_unsupported = ['activation', 'dropout_rate', 'use_gpu', 'scaler_type', 'normalize_target']
-            for key in ann_unsupported:
+            # legacy use_gpu remains accepted when _get_model is called directly
+            if 'use_gpu' in params and 'device' not in params_clean:
+                params_clean['device'] = 'cuda' if bool(params['use_gpu']) else 'cpu'
+            for key in ('scaler_type', 'normalize_target'):
                 params_clean.pop(key, None)
             return ANNRegressor(random_state=random_state, **params_clean)
 
@@ -3184,7 +3253,7 @@ class EnhancedModelTrainer:
         missing_tolerant_models = {"XGBoost分类", "LightGBM分类", "CatBoost分类"}
         use_imputer = model_name not in missing_tolerant_models
         use_scaler = model_name == "逻辑回归分类"
-        imputer = SimpleImputer(strategy="median") if use_imputer else None
+        imputer = _make_median_imputer() if use_imputer else None
         scaler = StandardScaler() if use_scaler else None
 
         X_train_proc = X_train_raw.to_numpy(dtype=float, copy=True)
@@ -3370,7 +3439,7 @@ class EnhancedModelTrainer:
             y_train = y_encoded[tr_idx]
             y_valid = y_encoded[va_idx]
 
-            imputer = SimpleImputer(strategy="median") if use_imputer else None
+            imputer = _make_median_imputer() if use_imputer else None
             scaler = StandardScaler() if use_scaler else None
             if imputer is not None:
                 X_train = imputer.fit_transform(X_train)
@@ -3479,7 +3548,7 @@ class EnhancedModelTrainer:
             steps.append(process_pls_step)
         steps.extend([
             ("inf_cleaner", InfCleaner()),
-            ("imputer", SimpleImputer(strategy="median")),
+            ("imputer", _make_median_imputer()),
             ("nan_col_dropper", AllNaNColumnDropper()),
             ("scaler", StandardScaler()),
             ("model", model),
@@ -3771,7 +3840,7 @@ class EnhancedModelTrainer:
         elif model_name in missing_tolerant_models:
             imputer = None
         else:
-            imputer = SimpleImputer(strategy='median')
+            imputer = _make_median_imputer()
 
         # ANN 支持自定义 scaler 类型和目标归一化
         scaler_type = model_params.pop('scaler_type', 'standard') if model_name == "人工神经网络" else 'standard'
@@ -3811,8 +3880,16 @@ class EnhancedModelTrainer:
         print(f"[DEBUG] 初始特征数: 训练集={X_train_proc.shape[1]}, 测试集={X_test_proc.shape[1]}")
 
         if imputer is not None:
+            input_feature_count = X_train_proc.shape[1]
             X_train_proc = imputer.fit_transform(X_train_proc)
             X_test_proc = imputer.transform(X_test_proc)
+            feature_mask, feature_names = _align_feature_mask_after_imputer(
+                feature_mask,
+                feature_names,
+                imputer,
+                input_feature_count,
+                X_train_proc.shape[1],
+            )
             print(f"[DEBUG] Imputer后特征数: 训练集={X_train_proc.shape[1]}, 测试集={X_test_proc.shape[1]}")
 
         # [修复] 检查并删除全NaN列（确保训练集和测试集特征数一致）
@@ -3829,7 +3906,7 @@ class EnhancedModelTrainer:
                 X_test_proc = X_test_proc[:, keep_mask]
 
                 # [修复] 更新全局特征掩码
-                feature_mask[feature_mask] = keep_mask
+                feature_mask = _apply_feature_keep_mask(feature_mask, keep_mask)
 
                 # 更新特征名称
                 if feature_names:
@@ -3843,8 +3920,16 @@ class EnhancedModelTrainer:
         X_test_proc = np.where(np.isinf(X_test_proc), np.nan, X_test_proc)
 
         if imputer is not None and np.isnan(X_train_proc).any():
+            input_feature_count = X_train_proc.shape[1]
             X_train_proc = imputer.fit_transform(X_train_proc)
             X_test_proc = imputer.transform(X_test_proc)
+            feature_mask, feature_names = _align_feature_mask_after_imputer(
+                feature_mask,
+                feature_names,
+                imputer,
+                input_feature_count,
+                X_train_proc.shape[1],
+            )
         print(f"[DEBUG] 清理inf并完成缺失值处理后特征数: 训练集={X_train_proc.shape[1]}, 测试集={X_test_proc.shape[1]}")
 
         if scaler is not None:
@@ -3859,7 +3944,7 @@ class EnhancedModelTrainer:
                     X_test_proc = X_test_proc[:, keep_mask]
 
                     # [修复] 更新全局特征掩码
-                    feature_mask[feature_mask] = keep_mask
+                    feature_mask = _apply_feature_keep_mask(feature_mask, keep_mask)
 
                     if feature_names:
                         removed_features = [feature_names[i] for i in nan_col_indices]
@@ -3881,7 +3966,7 @@ class EnhancedModelTrainer:
                 X_test_proc = X_test_proc[:, keep_mask]
 
                 # [修复] 更新全局特征掩码
-                feature_mask[feature_mask] = keep_mask
+                feature_mask = _apply_feature_keep_mask(feature_mask, keep_mask)
 
                 # 更新特征名称
                 if feature_names:
@@ -3902,7 +3987,7 @@ class EnhancedModelTrainer:
 
                 # 用中位数填充新产生的 NaN
                 if np.isnan(X_train_proc).any():
-                    post_imputer = SimpleImputer(strategy='median')
+                    post_imputer = _make_median_imputer()
                     X_train_proc = post_imputer.fit_transform(X_train_proc)
                     X_test_proc = post_imputer.transform(X_test_proc)
                     # 如果原来没有 imputer，现在需要一个
@@ -4402,7 +4487,7 @@ class EnhancedModelTrainer:
                         y_train=y_train,
                         X_test_raw=X_test_raw,
                         y_test=y_test,
-                        imputer_factory=(lambda: SimpleImputer(strategy='median')) if imputer is not None else None,
+                        imputer_factory=(lambda: _make_median_imputer()) if imputer is not None else None,
                         scaler_factory=(lambda: StandardScaler()) if scaler is not None else None,
                         random_state=random_state,
                     )
@@ -5556,7 +5641,7 @@ class EnhancedModelTrainer:
                     pred = base_model.predict(X_valid_fold)
                 else:
                     pipe = Pipeline(steps=[
-                        ('imputer', SimpleImputer(strategy='median')),
+                        ('imputer', _make_median_imputer()),
                         ('inf_cleaner', InfCleaner()),
                         ('nan_col_dropper', AllNaNColumnDropper()),
                         ('scaler', StandardScaler()),

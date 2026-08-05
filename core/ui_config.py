@@ -7,7 +7,14 @@ DEFAULT_OPTUNA_TRIALS = 50
 INVERSE_DESIGN_SPACE = {}
 
 
-def _slider(name, label, default, min_value, max_value, step, help_text=None):
+def prepare_manual_training_params(manual_params):
+    """Copy UI parameters without duplicating the global training seed."""
+    params = dict(manual_params)
+    params.pop("random_state", None)
+    return params
+
+
+def _slider(name, label, default, min_value, max_value, step, help_text=None, section=None):
     item = {
         "name": name,
         "widget": "slider",
@@ -21,10 +28,12 @@ def _slider(name, label, default, min_value, max_value, step, help_text=None):
     }
     if help_text:
         item["help"] = help_text
+    if section:
+        item["section"] = section
     return item
 
 
-def _number(name, label, default, min_value, max_value, step, fmt=None, help_text=None):
+def _number(name, label, default, min_value, max_value, step, fmt=None, help_text=None, section=None):
     args = {
         "min_value": min_value,
         "max_value": max_value,
@@ -41,10 +50,12 @@ def _number(name, label, default, min_value, max_value, step, fmt=None, help_tex
     }
     if help_text:
         item["help"] = help_text
+    if section:
+        item["section"] = section
     return item
 
 
-def _select(name, label, default, options, help_text=None):
+def _select(name, label, default, options, help_text=None, section=None, option_labels=None):
     item = {
         "name": name,
         "widget": "selectbox",
@@ -54,10 +65,14 @@ def _select(name, label, default, options, help_text=None):
     }
     if help_text:
         item["help"] = help_text
+    if section:
+        item["section"] = section
+    if option_labels:
+        item["option_labels"] = dict(option_labels)
     return item
 
 
-def _text(name, label, default, help_text=None):
+def _text(name, label, default, help_text=None, section=None):
     item = {
         "name": name,
         "widget": "text_input",
@@ -67,10 +82,12 @@ def _text(name, label, default, help_text=None):
     }
     if help_text:
         item["help"] = help_text
+    if section:
+        item["section"] = section
     return item
 
 
-def _check(name, label, default, help_text=None):
+def _check(name, label, default, help_text=None, section=None):
     item = {
         "name": name,
         "widget": "checkbox",
@@ -80,6 +97,8 @@ def _check(name, label, default, help_text=None):
     }
     if help_text:
         item["help"] = help_text
+    if section:
+        item["section"] = section
     return item
 
 
@@ -298,11 +317,24 @@ CATBOOST_DEFAULTS = {
 
 ANN_DEFAULTS = {
     "hidden_layer_sizes": "256,128,64",
+    "activation": "relu",
+    "dropout_rate": 0.2,
+    "optimizer": "adamw",
     "learning_rate": 0.001,
+    "weight_decay": 0.0001,
     "batch_size": 512,
     "epochs": 150,
+    "validation_split": 0.15,
+    "early_stopping": True,
+    "patience": 30,
+    "min_delta": 0.0001,
+    "lr_scheduler": "reduce_on_plateau",
+    "scheduler_factor": 0.5,
+    "min_learning_rate": 0.000001,
+    "gradient_clip": 1.0,
     "device": "auto",
     "use_data_parallel": True,
+    "use_amp": False,
     "scaler_type": "standard",
     "normalize_target": False,
     "random_state": 42,
@@ -771,7 +803,7 @@ MANUAL_TUNING_PARAMS = {
         _slider("verbose", "Verbose Level", RANDOM_FOREST_CLASSIFIER_DEFAULTS["verbose"], 0, 2, 1),
     ],
     "XGBoost分类": [
-        _slider("n_estimators", "Number of Trees", XGBOOST_CLASSIFIER_DEFAULTS["n_estimators"], 50, 3000, 50),
+        _slider("n_estimators", "Number of Trees", XGBOOST_CLASSIFIER_DEFAULTS["n_estimators"], 50, 10000, 50),
         _slider("max_depth", "Max Depth", XGBOOST_CLASSIFIER_DEFAULTS["max_depth"], 2, 16, 1),
         _number("learning_rate", "Learning Rate", XGBOOST_CLASSIFIER_DEFAULTS["learning_rate"], 0.001, 0.3, 0.001, "%.3f"),
         _slider("subsample", "Subsample", XGBOOST_CLASSIFIER_DEFAULTS["subsample"], 0.3, 1.0, 0.05),
@@ -808,7 +840,7 @@ MANUAL_TUNING_PARAMS = {
         _slider("verbose", "Verbose Interval", CATBOOST_CLASSIFIER_DEFAULTS["verbose"], 0, 200, 10),
     ],
     "XGBoost": [
-        _slider("n_estimators", "Number of Trees", XGBOOST_DEFAULTS["n_estimators"], 50, 3000, 50),
+        _slider("n_estimators", "Number of Trees", XGBOOST_DEFAULTS["n_estimators"], 50, 10000, 50),
         _slider("max_depth", "Max Depth", XGBOOST_DEFAULTS["max_depth"], 2, 16, 1),
         _number("learning_rate", "Learning Rate", XGBOOST_DEFAULTS["learning_rate"], 0.001, 0.3, 0.001, "%.3f"),
         _slider("subsample", "Subsample", XGBOOST_DEFAULTS["subsample"], 0.3, 1.0, 0.05),
@@ -844,16 +876,213 @@ MANUAL_TUNING_PARAMS = {
         _slider("verbose", "Verbose Interval", CATBOOST_DEFAULTS["verbose"], 0, 200, 10),
     ],
     "人工神经网络": [
-        _text("hidden_layer_sizes", "Hidden Layer Sizes", ANN_DEFAULTS["hidden_layer_sizes"], "Comma-separated widths, for example 256,128,64."),
-        _number("learning_rate", "Learning Rate", ANN_DEFAULTS["learning_rate"], 0.00001, 0.05, 0.00001, "%.5f"),
-        _slider("batch_size", "Batch Size", ANN_DEFAULTS["batch_size"], 32, 4096, 32),
-        _slider("epochs", "Epochs", ANN_DEFAULTS["epochs"], 20, 1000, 20),
-        _select("device", "Device", ANN_DEFAULTS["device"], ["auto", "cpu", "cuda"]),
-        _check("use_data_parallel", "Use Multi-GPU DataParallel", ANN_DEFAULTS["use_data_parallel"]),
-        _select("scaler_type", "Feature Scaler", ANN_DEFAULTS["scaler_type"], ["standard", "minmax", "robust"]),
-        _check("normalize_target", "Normalize Target", ANN_DEFAULTS["normalize_target"]),
-        _number("random_state", "Random Seed", ANN_DEFAULTS["random_state"], 0, 9999, 1),
-        _check("verbose", "Verbose Logging", ANN_DEFAULTS["verbose"]),
+        _text(
+            "hidden_layer_sizes",
+            "Hidden Layer Sizes",
+            ANN_DEFAULTS["hidden_layer_sizes"],
+            "Comma-separated positive widths, for example 256,128,64.",
+            "网络结构",
+        ),
+        _select(
+            "activation",
+            "Activation",
+            ANN_DEFAULTS["activation"],
+            ["relu", "gelu", "silu", "elu", "tanh", "leaky_relu"],
+            "Activation applied after each hidden layer.",
+            "网络结构",
+        ),
+        _slider(
+            "dropout_rate",
+            "Dropout",
+            ANN_DEFAULTS["dropout_rate"],
+            0.0,
+            0.8,
+            0.05,
+            "Dropout applied after each hidden layer; 0 disables it.",
+            "网络结构",
+        ),
+        _select(
+            "optimizer",
+            "Optimizer",
+            ANN_DEFAULTS["optimizer"],
+            ["adam", "adamw", "rmsprop", "sgd"],
+            "Optimizer used by the ANN training loop.",
+            "基础训练",
+        ),
+        _number(
+            "learning_rate",
+            "Learning Rate",
+            ANN_DEFAULTS["learning_rate"],
+            0.000001,
+            0.05,
+            0.000001,
+            "%.6f",
+            "Initial learning rate.",
+            "基础训练",
+        ),
+        _number(
+            "weight_decay",
+            "Weight Decay",
+            ANN_DEFAULTS["weight_decay"],
+            0.0,
+            0.1,
+            0.0001,
+            "%.4f",
+            "L2 regularization coefficient.",
+            "基础训练",
+        ),
+        _slider(
+            "batch_size",
+            "Batch Size",
+            ANN_DEFAULTS["batch_size"],
+            32,
+            4096,
+            32,
+            section="基础训练",
+        ),
+        _slider(
+            "epochs",
+            "Epochs",
+            ANN_DEFAULTS["epochs"],
+            20,
+            1000,
+            10,
+            section="基础训练",
+        ),
+        _slider(
+            "validation_split",
+            "Validation Split",
+            ANN_DEFAULTS["validation_split"],
+            0.0,
+            0.4,
+            0.05,
+            "Fraction of the training data reserved for internal validation.",
+            "训练稳定性/验证",
+        ),
+        _check(
+            "early_stopping",
+            "Early Stopping",
+            ANN_DEFAULTS["early_stopping"],
+            "Stop when validation loss no longer improves.",
+            "训练稳定性/验证",
+        ),
+        _slider(
+            "patience",
+            "Early Stopping Patience",
+            ANN_DEFAULTS["patience"],
+            0,
+            200,
+            5,
+            section="训练稳定性/验证",
+        ),
+        _number(
+            "min_delta",
+            "Minimum Improvement",
+            ANN_DEFAULTS["min_delta"],
+            0.0,
+            0.1,
+            0.0001,
+            "%.4f",
+            "Minimum validation-loss improvement counted as progress.",
+            "训练稳定性/验证",
+        ),
+        _select(
+            "lr_scheduler",
+            "Learning Rate Scheduler",
+            ANN_DEFAULTS["lr_scheduler"],
+            ["none", "reduce_on_plateau", "cosine_annealing"],
+            "Choose no scheduler, ReduceLROnPlateau, or CosineAnnealing.",
+            "训练稳定性/验证",
+            {
+                "none": "无",
+                "reduce_on_plateau": "ReduceLROnPlateau",
+                "cosine_annealing": "CosineAnnealing",
+            },
+        ),
+        _number(
+            "scheduler_factor",
+            "Scheduler Factor",
+            ANN_DEFAULTS["scheduler_factor"],
+            0.1,
+            0.9,
+            0.05,
+            "%.2f",
+            "Reduction factor for ReduceLROnPlateau.",
+            "训练稳定性/验证",
+        ),
+        _number(
+            "min_learning_rate",
+            "Minimum Learning Rate",
+            ANN_DEFAULTS["min_learning_rate"],
+            0.00000001,
+            0.001,
+            0.00000001,
+            "%.8f",
+            "Learning-rate floor; must not exceed the initial learning rate.",
+            "训练稳定性/验证",
+        ),
+        _number(
+            "gradient_clip",
+            "Gradient Clipping",
+            ANN_DEFAULTS["gradient_clip"],
+            0.0,
+            10.0,
+            0.1,
+            "%.1f",
+            "Gradient norm threshold; 0 disables clipping.",
+            "设备与性能",
+        ),
+        _select(
+            "device",
+            "Device",
+            ANN_DEFAULTS["device"],
+            ["auto", "cpu", "cuda"],
+            "Training device; unavailable CUDA falls back to CPU.",
+            "设备与性能",
+        ),
+        _check(
+            "use_data_parallel",
+            "Use Multi-GPU DataParallel",
+            ANN_DEFAULTS["use_data_parallel"],
+            section="设备与性能",
+        ),
+        _check(
+            "use_amp",
+            "Use CUDA AMP",
+            ANN_DEFAULTS["use_amp"],
+            "Use automatic mixed precision when CUDA is active.",
+            "设备与性能",
+        ),
+        _select(
+            "scaler_type",
+            "Feature Scaler",
+            ANN_DEFAULTS["scaler_type"],
+            ["standard", "minmax", "robust"],
+            "Training-pipeline feature scaler; kept separate from ANN model parameters.",
+            section="设备与性能",
+        ),
+        _check(
+            "normalize_target",
+            "Normalize Target",
+            ANN_DEFAULTS["normalize_target"],
+            "Training-pipeline target normalization; kept separate from ANN model parameters.",
+            section="设备与性能",
+        ),
+        _number(
+            "random_state",
+            "Random Seed",
+            ANN_DEFAULTS["random_state"],
+            0,
+            9999,
+            1,
+            section="设备与性能",
+        ),
+        _check(
+            "verbose",
+            "Verbose Logging",
+            ANN_DEFAULTS["verbose"],
+            section="设备与性能",
+        ),
     ],
     "Bayesian Neural Network (BNN)": [
         _text("hidden_layer_sizes", "Hidden Layer Sizes", BNN_DEFAULTS["hidden_layer_sizes"], "Comma-separated widths, for example 256,128,64."),
@@ -1250,6 +1479,49 @@ RECOMMENDED_PRESETS = {
                 "bagging_temperature": 1.0,
                 "loss_function": "RMSE",
             },
+        },
+    },
+    "人工神经网络": {
+        "稳健小样本": {
+            "desc": "Smaller network with stronger regularization, validation, and early stopping for limited datasets.",
+            "params": {
+                **ANN_DEFAULTS,
+                "hidden_layer_sizes": "128,64",
+                "dropout_rate": 0.3,
+                "learning_rate": 0.0005,
+                "batch_size": 64,
+                "epochs": 250,
+                "validation_split": 0.2,
+                "patience": 40,
+            },
+        },
+        "快速 GPU": {
+            "desc": "Larger batches, AMP, and shorter training for CUDA-equipped experiments.",
+            "params": {
+                **ANN_DEFAULTS,
+                "hidden_layer_sizes": "512,256,128",
+                "dropout_rate": 0.1,
+                "batch_size": 1024,
+                "epochs": 100,
+                "use_amp": True,
+                "verbose": False,
+            },
+        },
+        "高容量网络": {
+            "desc": "Wider and deeper network for larger datasets with enough samples to support higher capacity.",
+            "params": {
+                **ANN_DEFAULTS,
+                "hidden_layer_sizes": "512,256,128,64",
+                "dropout_rate": 0.2,
+                "learning_rate": 0.0008,
+                "batch_size": 512,
+                "epochs": 300,
+                "validation_split": 0.15,
+            },
+        },
+        "恢复默认": {
+            "desc": "Restore every ANN parameter to ANN_DEFAULTS.",
+            "params": dict(ANN_DEFAULTS),
         },
     },
     "Bayesian Neural Network (BNN)": {
