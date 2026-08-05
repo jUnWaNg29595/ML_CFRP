@@ -198,3 +198,32 @@ def test_data_explore_preview_keeps_explicit_empty_selection_hidden(monkeypatch)
 
     assert notices == ["至少选择一列后显示预览表。"]
     assert displayed == []
+
+
+def test_data_explore_export_center_supports_raw_and_processed_data():
+    source = APP_PATH.read_text(encoding="utf-8-sig")
+    start = source.index("def page_data_explore():")
+    end = source.index(
+        "\n\n# ============================================================\n# 页面：数据清洗",
+        start,
+    )
+    page_source = source[start:end]
+
+    assert "导出数据源" in page_source
+    assert "生成统一导出包" in page_source
+    assert "build_export_zip" in page_source
+    assert "当前处理数据" in page_source
+    assert "原始数据" in page_source
+    assert "图表数据" in page_source
+    assert "图表文件" in page_source
+    assert "描述统计" in page_source
+    assert "相关性矩阵" in page_source
+    assert "分布图" in page_source
+    assert "箱线图" in page_source
+    assert "缺失值" in page_source
+    assert "CSV" in page_source
+    assert "Excel" in page_source
+    assert "HTML" in page_source
+    assert "PNG" in page_source
+    assert "SVG" in page_source
+    assert "data_explore_export_" in page_source

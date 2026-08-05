@@ -82,6 +82,26 @@ def test_build_export_zip_contains_all_named_files():
         assert set(archive.namelist()) == {"data.csv", "chart.html"}
 
 
+def test_build_export_zip_preserves_nested_export_names():
+    payload = build_export_zip({
+        "correlation/data.csv": b"a,b\n1,2\n",
+        "correlation/chart.html": b"<html></html>",
+    })
+
+    with ZipFile(BytesIO(payload)) as archive:
+        assert archive.namelist() == [
+            "correlation/data.csv",
+            "correlation/chart.html",
+        ]
+
+
+def test_preview_dataframe_does_not_fallback_to_all_columns():
+    frame = pd.DataFrame({"a": [1], "b": [2]})
+
+    with pytest.raises(ValueError, match="至少选择一列"):
+        preview_dataframe(frame, [], 50)
+
+
 def test_figure_to_bytes_uses_requested_format():
     class Figure:
         def savefig(self, buffer, format):

@@ -1054,6 +1054,7 @@ except Exception:
 from core.data_processor import AdvancedDataCleaner, SparseDataHandler, DataEnhancer
 from core.data_explorer import EnhancedDataExplorer
 from core.data_explore_export import (
+    build_export_zip,
     dataframe_to_csv_bytes,
     dataframe_to_excel_bytes,
     figure_to_bytes,
@@ -4305,25 +4306,166 @@ def page_data_explore():
             st.success("✅ 数据无缺失值")
 
     with tab5:
-        st.markdown("### 导出数据")
-        col1, col2 = st.columns(2)
+        st.markdown("### 统一导出中心")
+        export_source_label = st.radio(
+            "导出数据源",
+            ["当前处理数据", "原始数据"],
+            index=0,
+            horizontal=True,
+            key="data_explore_export_source",
+        )
+        export_source = "processed" if export_source_label == "当前处理数据" else "raw"
+        export_df, resolved_export_label = resolve_data_source(
+            raw_df,
+            processed_df,
+            export_source,
+        )
+        if resolved_export_label != export_source_label:
+            st.caption(f"所选数据源不可用，已回退为：{resolved_export_label}")
 
-        with col1:
-            csv = _cached_csv_bytes(df)
-            st.download_button(
-                "📥 下载CSV",
-                csv,
-                "data_export.csv",
-                "text/csv"
-            )
+        export_content = st.multiselect(
+            "导出内容",
+            ["图表数据", "图表文件"],
+            default=["图表数据", "图表文件"],
+            key="data_explore_export_content",
+        )
+        export_charts = st.multiselect(
+            "图表",
+            ["描述统计", "相关性矩阵", "分布图", "箱线图", "缺失值"],
+            default=["描述统计", "相关性矩阵", "分布图", "箱线图", "缺失值"],
+            key="data_explore_export_charts",
+        )
+        export_data_formats = st.multiselect(
+            "数据格式",
+            ["CSV", "Excel"],
+            default=["CSV"],
+            key="data_explore_export_data_formats",
+        )
+        export_figure_formats = st.multiselect(
+            "图表格式",
+            ["HTML", "PNG", "SVG"],
+            default=["HTML"],
+            key="data_explore_export_figure_formats",
+        )
 
-        with col2:
-            st.download_button(
-                "📥 下载Excel",
-                _cached_excel_bytes(df),
-                "data_export.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        if st.button("生成统一导出包", key="data_explore_generate_export"):
+            files = {}
+            export_errors = []
+            explorer = EnhancedDataExplorer(export_df)
+            numeric_export_cols = explorer.numeric_cols
+            chart_payloads = {}
+
+            if "描述统计" in export_charts:
+                if numeric_export_cols:
+                    summary_data = _cached_numeric_describe(
+                        export_df,
+                        tuple(numeric_export_cols),
+                    ).reset_index()
+                else:
+                    summary_data = pd.DataFrame(
+                        {
+                            "指标": ["行数", "列数"],
+                            "值": [len(export_df), len(export_df.columns)],
+                        }
+                    )
+                chart_payloads["描述统计"] = (None, summary_data, "summary")
+
+            chart_builders = {
+                "相关性矩阵": (
+                    lambda: (
+                        _cached_corr_fig(
+                            export_df,
+                            tuple(numeric_export_cols),
+                        ),
+                        explorer.correlation_data(numeric_export_cols),
+                        "correlation",
+                    )
+                    if len(numeric_export_cols) >= 2
+                    else (None, pd.DataFrame(), "correlation")
+                ),
+                "分布图": (
+                    lambda: (
+                        _cached_distribution_fig(export_df),
+                        explorer.distribution_data(numeric_export_cols[:15]),
+                        "distribution",
+                    )
+                ),
+                "箱线图": (
+                    lambda: (
+                        _cached_boxplot_fig(export_df),
+                        explorer.boxplot_data(numeric_export_cols[:10]),
+                        "boxplots",
+                    )
+                ),
+                "缺失值": (
+                    lambda: (
+                        _cached_missing_fig(export_df),
+                        explorer.missing_values_data(),
+                        "missing_values",
+                    )
+                ),
+            }
+
+            for chart_name in export_charts:
+                if chart_name not in chart_builders:
+                    continue
+                try:
+                    figure, data_payload, directory = chart_builders[chart_name]()
+                    if isinstance(data_payload, pd.DataFrame) and not data_payload.empty:
+                        chart_payloads[chart_name] = (
+                            figure,
+                            data_payload,
+                            directory,
+                        )
+                    elif figure is None:
+                        st.info(f"{chart_name}暂无可导出的数据或图表。")
+                except Exception as exc:
+                    export_errors.append(f"{chart_name}：{exc}")
+
+            if not export_content:
+                st.info("请至少选择一项导出内容。")
+            else:
+                for chart_name in export_charts:
+                    payload = chart_payloads.get(chart_name)
+                    if payload is None:
+                        continue
+                    figure, data_payload, directory = payload
+                    if "图表数据" in export_content:
+                        if "CSV" in export_data_formats:
+                            files[f"{directory}/data.csv"] = dataframe_to_csv_bytes(data_payload)
+                        if "Excel" in export_data_formats:
+                            try:
+                                files[f"{directory}/data.xlsx"] = dataframe_to_excel_bytes(
+                                    data_payload
+                                )
+                            except RuntimeError as exc:
+                                export_errors.append(f"{chart_name} Excel：{exc}")
+                    if "图表文件" in export_content and figure is not None:
+                        for fmt in export_figure_formats:
+                            try:
+                                files[f"{directory}/chart.{fmt.lower()}"] = figure_to_bytes(
+                                    figure,
+                                    fmt,
+                                )
+                            except (RuntimeError, ValueError) as exc:
+                                export_errors.append(
+                                    f"{chart_name} {fmt}：{exc}"
+                                )
+
+                if files:
+                    export_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    st.download_button(
+                        "📦 下载统一导出包",
+                        build_export_zip(files),
+                        f"data_explore_export_{export_timestamp}.zip",
+                        "application/zip",
+                        key="data_explore_export_zip",
+                    )
+                else:
+                    st.info("没有可导出的内容，未生成 ZIP。")
+
+            for error in export_errors:
+                st.warning(f"导出失败，已继续处理其他内容：{error}")
 
 
 # ============================================================
