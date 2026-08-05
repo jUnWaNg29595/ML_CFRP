@@ -1053,6 +1053,14 @@ except Exception:
 # 导入核心模块
 from core.data_processor import AdvancedDataCleaner, SparseDataHandler, DataEnhancer
 from core.data_explorer import EnhancedDataExplorer
+from core.data_explore_export import (
+    dataframe_to_csv_bytes,
+    dataframe_to_excel_bytes,
+    figure_to_bytes,
+    preview_dataframe,
+    resolve_data_source,
+    sanitize_preview_columns,
+)
 from core.model_trainer import EnhancedModelTrainer, AutoGluonWrapper, GRAPH_MODEL_NAMES, CLASSIFICATION_MODEL_NAMES  # 确保引入 Wrapper
 # 延迟导入 model_interpreter 以避免 SHAP 兼容性问题
 try:
@@ -3122,6 +3130,112 @@ def _cached_excel_bytes(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
+def _render_data_explore_preview(raw_df, processed_df) -> None:
+    source_options = ["当前处理数据"]
+    if isinstance(raw_df, pd.DataFrame):
+        source_options.append("原始数据")
+
+    source_label = st.radio(
+        "预览数据源",
+        source_options,
+        horizontal=True,
+        key="explore_preview_source",
+    )
+    source_key = "raw" if source_label == "原始数据" else "processed"
+    preview_df, _ = resolve_data_source(raw_df, processed_df, source_key)
+    available_cols = preview_df.columns.tolist()
+
+    if st.session_state.get("_explore_preview_source_key") != source_key:
+        st.session_state["explore_preview_cols"] = available_cols[:8]
+        st.session_state["_explore_preview_source_key"] = source_key
+    else:
+        st.session_state["explore_preview_cols"] = sanitize_preview_columns(
+            st.session_state.get("explore_preview_cols", available_cols[:8]),
+            available_cols,
+        )
+
+    max_rows = max(5, min(5000, len(preview_df)))
+    row_count = st.slider(
+        "预览行数",
+        min_value=5,
+        max_value=max_rows,
+        value=min(max(50, 5), max_rows),
+        key="explore_preview_rows",
+    )
+    selected_cols = st.multiselect(
+        "预览特征/列",
+        options=available_cols,
+        default=st.session_state["explore_preview_cols"],
+        key="explore_preview_cols",
+        help="支持搜索和多选，显示顺序按选择顺序保留。",
+    )
+    st.caption(f"已选 {len(selected_cols)} / {len(available_cols)} 列")
+    if not selected_cols:
+        st.info("至少选择一列后显示预览表。")
+        return
+
+    st.dataframe(
+        preview_dataframe(preview_df, selected_cols, row_count),
+        width="stretch",
+    )
+
+
+def _render_figure_export_controls(
+    figure,
+    data_df,
+    base_name: str,
+    key_prefix: str,
+) -> None:
+    if figure is None:
+        return
+    if not isinstance(data_df, pd.DataFrame) or data_df.empty:
+        st.info("当前图表没有可导出的数据。")
+        return
+
+    st.markdown("#### 导出当前图表")
+    data_col, figure_col = st.columns(2)
+    with data_col:
+        st.markdown("**导出图表数据**")
+        st.download_button(
+            "📥 导出图表数据 CSV",
+            dataframe_to_csv_bytes(data_df),
+            f"{base_name}.csv",
+            "text/csv",
+            key=f"{key_prefix}_csv",
+        )
+        try:
+            excel_bytes = dataframe_to_excel_bytes(data_df)
+            st.download_button(
+                "📥 导出图表数据 Excel",
+                excel_bytes,
+                f"{base_name}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"{key_prefix}_xlsx",
+            )
+        except RuntimeError as exc:
+            st.caption(f"该格式暂不可用：Excel - {exc}")
+
+    with figure_col:
+        st.markdown("**导出图表**")
+        for fmt, mime in (
+            ("html", "text/html"),
+            ("png", "image/png"),
+            ("svg", "image/svg+xml"),
+        ):
+            try:
+                payload = figure_to_bytes(figure, fmt)
+            except (RuntimeError, ValueError) as exc:
+                st.caption(f"该格式暂不可用：{fmt.upper()} - {exc}")
+                continue
+            st.download_button(
+                f"📈 导出图表 {fmt.upper()}",
+                payload,
+                f"{base_name}.{fmt}",
+                mime,
+                key=f"{key_prefix}_{fmt}",
+            )
+
+
 def _get_gnn_featurizer(config: dict):
     """获取 GNN 特征提取器 - 带自动恢复"""
     if not GNN_AVAILABLE:
@@ -3833,12 +3947,19 @@ def page_data_explore():
     """数据探索页面"""
     st.title("🔍 数据探索")
 
-    if st.session_state.data is None:
+    raw_df = st.session_state.get("data")
+    processed_df = st.session_state.get("processed_data")
+    if not isinstance(raw_df, pd.DataFrame) and not isinstance(processed_df, pd.DataFrame):
         st.warning("⚠️ 请先上传数据")
         return
 
-    df = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
+    df, _ = resolve_data_source(raw_df, processed_df, "processed")
     basic_stats, numeric_cols, _categorical_cols = _cached_basic_stats(df)
+
+    st.markdown("### 数据预览")
+    st.caption("预览特征/列支持搜索和多选；至少选择一列；可切换当前处理数据和原始数据。")
+    _render_data_explore_preview(raw_df, processed_df)
+    st.caption("各图表支持导出图表数据 CSV/Excel，以及导出图表 HTML/PNG/SVG。")
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 描述统计", "🔗 相关性分析", "📈 分布图", "❓ 缺失值", "💾 导出"
@@ -3959,6 +4080,13 @@ def page_data_explore():
             fig = _cached_corr_fig(df_corr, tuple(selected_cols))
             if fig:
                 st.plotly_chart(fig, width="stretch")
+                corr_data = EnhancedDataExplorer(df_corr).correlation_data(selected_cols)
+                _render_figure_export_controls(
+                    fig,
+                    corr_data,
+                    "correlation_matrix",
+                    "data_explore_correlation",
+                )
 
             # ============ 新增：Pearson相关性综合分析 ============
             st.markdown("---")
@@ -4108,9 +4236,12 @@ def page_data_explore():
                     plt.tight_layout()
 
                     st.pyplot(fig_pearson, width="stretch")
-
-                    # 导出功能
-                    _export_matplotlib_fig(fig_pearson, base_name="pearson_correlation", key_prefix="pearson_fig")
+                    _render_figure_export_controls(
+                        fig_pearson,
+                        corr_matrix.reset_index(),
+                        "pearson_correlation",
+                        "data_explore_pearson",
+                    )
 
                     # 显示筛选建议
                     st.info(f"💡 建议保留的低相关性特征（{len(features_to_keep)}个）: {', '.join(features_to_keep[:10])}")
@@ -4130,17 +4261,43 @@ def page_data_explore():
         fig = _cached_distribution_fig(df)
         if fig:
             st.plotly_chart(fig, width="stretch")
+            distribution_explorer = EnhancedDataExplorer(df)
+            distribution_cols = distribution_explorer.numeric_cols[:15]
+            _render_figure_export_controls(
+                fig,
+                distribution_explorer.distribution_data(distribution_cols),
+                "feature_distributions",
+                "data_explore_distribution",
+            )
+        else:
+            st.info("没有可用于分布图的数值数据。")
 
         st.markdown("### 箱线图")
         fig_box = _cached_boxplot_fig(df)
         if fig_box:
             st.plotly_chart(fig_box, width="stretch")
+            boxplot_explorer = EnhancedDataExplorer(df)
+            boxplot_cols = boxplot_explorer.numeric_cols[:10]
+            _render_figure_export_controls(
+                fig_box,
+                boxplot_explorer.boxplot_data(boxplot_cols),
+                "feature_boxplots",
+                "data_explore_boxplot",
+            )
+        else:
+            st.info("没有可用于箱线图的数值数据。")
 
     with tab4:
         st.markdown("### 缺失值分析")
         fig_missing = _cached_missing_fig(df)
         if fig_missing:
             st.plotly_chart(fig_missing, width="stretch")
+            _render_figure_export_controls(
+                fig_missing,
+                EnhancedDataExplorer(df).missing_values_data(),
+                "missing_values",
+                "data_explore_missing",
+            )
         else:
             st.success("✅ 数据无缺失值")
 
