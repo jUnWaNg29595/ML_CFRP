@@ -1,10 +1,13 @@
 from io import BytesIO
 from zipfile import ZipFile
 
-import matplotlib.pyplot as plt
+import matplotlib
 import pandas as pd
 import plotly.graph_objects as go
 import pytest
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from core.data_explorer import EnhancedDataExplorer
 from core.data_explore_export import (
@@ -139,6 +142,59 @@ def test_figure_to_bytes_exports_plotly_html():
 
     assert b"<html" in payload.lower()
     assert b"plotly" in payload.lower()
+
+
+def test_figure_to_bytes_exports_matplotlib_html_and_png():
+    figure, axis = plt.subplots()
+    axis.plot([0, 1], [0, 1])
+    try:
+        html_payload = figure_to_bytes(figure, ".HTML")
+        png_payload = figure_to_bytes(figure, ".PNG")
+    finally:
+        plt.close(figure)
+
+    assert b"<html" in html_payload.lower()
+    assert png_payload.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.parametrize("fmt", ["png", "svg"])
+def test_figure_to_bytes_reports_plotly_kaleido_dependency_for_image_formats(
+    monkeypatch,
+    fmt,
+):
+    figure = go.Figure()
+
+    def raise_missing_dependency(*args, **kwargs):
+        raise ValueError("Image export using the 'kaleido' engine requires the kaleido package")
+
+    monkeypatch.setattr(figure, "to_image", raise_missing_dependency)
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"(?=.*Plotly)(?=.*kaleido)(?=.*{fmt})",
+    ):
+        figure_to_bytes(figure, fmt)
+
+
+@pytest.mark.parametrize("fmt", ["html", "png"])
+def test_figure_to_bytes_reports_matplotlib_dependency_and_format(
+    monkeypatch,
+    fmt,
+):
+    figure, _ = plt.subplots()
+
+    def raise_missing_dependency(*args, **kwargs):
+        raise ImportError("No module named 'matplotlib'")
+
+    monkeypatch.setattr(figure, "savefig", raise_missing_dependency)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match=rf"(?=.*Matplotlib)(?=.*matplotlib)(?=.*{fmt})",
+        ):
+            figure_to_bytes(figure, fmt)
+    finally:
+        plt.close(figure)
 
 
 def test_figure_to_bytes_rejects_unknown_format():

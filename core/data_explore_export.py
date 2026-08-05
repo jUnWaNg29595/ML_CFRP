@@ -89,7 +89,7 @@ def figure_to_bytes(figure: object, fmt: str) -> bytes:
                 figure.savefig(image_buffer, format="png")
             except (ImportError, ModuleNotFoundError) as exc:
                 raise RuntimeError(
-                    "导出 html 需要 Matplotlib 图像依赖"
+                    "导出 html 需要 Matplotlib 依赖 matplotlib"
                 ) from exc
             encoded = base64.b64encode(image_buffer.getvalue()).decode("ascii")
             return (
@@ -103,7 +103,7 @@ def figure_to_bytes(figure: object, fmt: str) -> bytes:
             figure.savefig(buffer, format=normalized_fmt)
         except (ImportError, ModuleNotFoundError) as exc:
             raise RuntimeError(
-                f"导出 {normalized_fmt} 需要 Matplotlib 图像依赖"
+                f"导出 {normalized_fmt} 需要 Matplotlib 依赖 matplotlib"
             ) from exc
         return buffer.getvalue()
 
