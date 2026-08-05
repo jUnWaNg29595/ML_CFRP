@@ -65,6 +65,20 @@ def dataframe_to_excel_bytes(
     return buffer.getvalue()
 
 
+def _is_plotly_image_dependency_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    if "kaleido" in message:
+        return True
+    return (
+        ("plotly" in message or "image export" in message)
+        and "image" in message
+        and any(
+            keyword in message
+            for keyword in ("depend", "require", "install", "missing")
+        )
+    )
+
+
 def figure_to_bytes(figure: object, fmt: str) -> bytes:
     normalized_fmt = str(fmt).lower().lstrip(".")
     if normalized_fmt not in {"html", "png", "svg"}:
@@ -78,6 +92,8 @@ def figure_to_bytes(figure: object, fmt: str) -> bytes:
         try:
             return bytes(figure.to_image(format=normalized_fmt))
         except (ImportError, ModuleNotFoundError, ValueError) as exc:
+            if not _is_plotly_image_dependency_error(exc):
+                raise
             raise RuntimeError(
                 f"导出 {normalized_fmt} 需要 Plotly 图像依赖 kaleido"
             ) from exc

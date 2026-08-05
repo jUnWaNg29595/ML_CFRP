@@ -176,6 +176,19 @@ def test_figure_to_bytes_reports_plotly_kaleido_dependency_for_image_formats(
         figure_to_bytes(figure, fmt)
 
 
+def test_figure_to_bytes_preserves_plotly_configuration_value_error(monkeypatch):
+    figure = go.Figure()
+    expected_message = "invalid figure configuration"
+
+    def raise_configuration_error(*args, **kwargs):
+        raise ValueError(expected_message)
+
+    monkeypatch.setattr(figure, "to_image", raise_configuration_error)
+
+    with pytest.raises(ValueError, match=expected_message):
+        figure_to_bytes(figure, "png")
+
+
 @pytest.mark.parametrize("fmt", ["html", "png"])
 def test_figure_to_bytes_reports_matplotlib_dependency_and_format(
     monkeypatch,
