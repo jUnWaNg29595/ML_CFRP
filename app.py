@@ -1109,6 +1109,13 @@ from core.post_feature_mapping import (
     validate_mapping,
     validate_mapping_for_prediction,
 )
+from core.prediction_contract import resolve_prediction_feature_contract
+from core.prediction_molecular_baseline import (
+    build_single_row_source_frame,
+    collect_workflow_source_columns,
+    validate_single_row_source_values,
+    workflow_requires_manual_molecular_input,
+)
 from core.navigation import (
     NAVIGATION_PAGES,
     resolve_navigation_page,
@@ -2828,6 +2835,142 @@ def _run_imported_molecular_feature_workflow(
         "warnings": execution.warnings,
         "valid_row_indices": execution.valid_row_indices,
     }
+
+
+def _build_prediction_molecular_baseline(
+    source_values,
+    workflow_payload,
+    *,
+    model_feature_cols=None,
+    device=None,
+):
+    """Build one molecular prediction row by replaying the saved workflow."""
+    workflow = _resolve_imported_molecular_feature_workflow(
+        workflow_payload,
+        model_feature_cols=model_feature_cols,
+    )
+    workflow_dict = workflow.to_dict()
+    source_columns = collect_workflow_source_columns(workflow_dict)
+    if not source_columns:
+        raise ValueError("保存的分子特征流程没有声明可用的 SMILES/BigSMILES 来源列。")
+
+    source_frame = build_single_row_source_frame(source_columns, source_values)
+    source_report = validate_single_row_source_values(source_frame, source_columns)
+    if not source_report.get("ok"):
+        missing = source_report.get("missing_columns") or []
+        empty = source_report.get("empty_columns") or []
+        details = []
+        if missing:
+            details.append("缺少列：" + "、".join(missing))
+        if empty:
+            details.append("空值列：" + "、".join(empty))
+        raise ValueError("分子输入不完整；" + "；".join(details))
+
+    result = _run_imported_molecular_feature_workflow(
+        source_frame,
+        workflow_dict,
+        device=device,
+        mode="prediction",
+        model_feature_cols=model_feature_cols,
+    )
+    result["source_columns"] = source_columns
+    result["source_frame"] = source_frame
+    result["source_report"] = source_report
+    return result
+
+
+def _render_prediction_molecular_input_panel(model_feature_cols):
+    """Render manual resin/hardener source inputs for an imported workflow."""
+    st.session_state["_prediction_requires_molecular_input"] = False
+    workflow_payload = st.session_state.get("molecular_feature_workflow")
+    if not isinstance(workflow_payload, dict):
+        artifact = st.session_state.get("imported_model_artifact") or {}
+        extra = artifact.get("extra") if isinstance(artifact, dict) else {}
+        workflow_payload = extra.get("molecular_feature_workflow") if isinstance(extra, dict) else None
+    if not isinstance(workflow_payload, dict):
+        return None
+
+    try:
+        workflow = _resolve_imported_molecular_feature_workflow(
+            workflow_payload,
+            model_feature_cols=model_feature_cols,
+        )
+        source_columns = collect_workflow_source_columns(workflow.to_dict())
+    except Exception as exc:
+        st.warning(f"无法读取模型中的分子特征输入流程：{exc}")
+        return None
+    if not source_columns:
+        st.warning("模型流程未声明树脂/固化剂的 SMILES 或 BigSMILES 来源列。")
+        return None
+
+    st.session_state["_prediction_requires_molecular_input"] = (
+        workflow_requires_manual_molecular_input(workflow.to_dict())
+    )
+
+    role_labels = {
+        "resin": "树脂/主体",
+        "hardener": "固化剂",
+        "neutral": "其他组分",
+    }
+    with st.expander("🧬 分子级配方输入（按训练 workflow 重放）", expanded=True):
+        st.caption(
+            "请手动输入与训练时对应的 SMILES/BigSMILES。系统严格按保存的步骤、顺序和参数提取，"
+            "不会回退到 MACCS、Morgan 或零值。"
+        )
+        source_values = {}
+        with st.form(key="prediction_molecular_input_form", clear_on_submit=False):
+            input_columns = st.columns(2)
+            for index, item in enumerate(source_columns):
+                column = str(item["column"])
+                roles = [role_labels.get(role, role) for role in item.get("roles", [])]
+                role_text = " / ".join(roles) if roles else "分子来源"
+                with input_columns[index % 2]:
+                    source_values[column] = st.text_area(
+                        f"{column}（{role_text}）",
+                        value="",
+                        height=86,
+                        key=f"prediction_molecular_source_{index}",
+                        help="保留原始 SMILES/BigSMILES 文本，不要输入分子名称或 CID。",
+                    )
+            submitted = st.form_submit_button(
+                "提取分子特征并用于预测",
+                type="primary",
+                width="stretch",
+            )
+
+        if submitted:
+            try:
+                with st.spinner("正在按训练流程提取分子特征…"):
+                    result = _build_prediction_molecular_baseline(
+                        source_values,
+                        workflow.to_dict(),
+                        model_feature_cols=model_feature_cols,
+                        device=st.session_state.get("compute_device"),
+                    )
+                st.session_state["_prediction_molecular_baseline"] = result
+                st.success(
+                    f"分子特征提取完成：生成 {len(result['feature_names'])} 个特征，"
+                    f"workflow 顺序已保留。"
+                )
+            except Exception as exc:
+                st.session_state.pop("_prediction_molecular_baseline", None)
+                st.error(f"分子特征提取失败：{exc}")
+
+        result = st.session_state.get("_prediction_molecular_baseline")
+        if isinstance(result, dict):
+            result_source_columns = result.get("source_columns") or []
+            result_features = result.get("features")
+            if isinstance(result_features, pd.DataFrame) and not result_features.empty:
+                st.caption(
+                    f"当前分子基线已就绪：{len(result_source_columns)} 个来源列，"
+                    f"{result_features.shape[1]} 个提取特征。"
+                )
+                preview = result_features.iloc[:, : min(8, result_features.shape[1])]
+                st.dataframe(preview, width="stretch", hide_index=True)
+            for warning in result.get("warnings") or []:
+                st.warning(warning)
+            return result
+    return st.session_state.get("_prediction_molecular_baseline")
 
 
 def _current_molecular_feature_artifact_extra():
@@ -16062,16 +16205,20 @@ def page_prediction():
                         imported_artifact=artifact,
                         pipeline=artifact.get("pipeline", None),
                     )
-                    imported_feature_cols = _resolve_effective_feature_cols(
-                        selected_feature_cols=artifact.get("feature_cols") or st.session_state.get("feature_cols", []),
-                        model=imported_model,
+                    imported_contract = resolve_prediction_feature_contract(
+                        model=artifact.get("model", None),
                         pipeline=artifact.get("pipeline", None),
-                        imported_artifact=artifact,
-                    )[0]
+                        artifact=artifact,
+                        session_feature_cols=st.session_state.get("feature_cols", []),
+                    )
+                    imported_feature_cols = imported_contract.get("feature_cols") or []
                     st.session_state.feature_cols = (
                         imported_feature_cols
-                        or sanitize_feature_columns(artifact.get("feature_cols"))
-                        or sanitize_feature_columns(st.session_state.get("feature_cols"))
+                        or (
+                            sanitize_feature_columns(artifact.get("feature_cols"))
+                            if imported_contract.get("ok")
+                            else []
+                        )
                     )
                     st.session_state.pipeline = artifact.get("pipeline", None)
 
@@ -16103,6 +16250,7 @@ def page_prediction():
                         st.session_state.xgb_model_id = None
                     st.session_state.imported_model_artifact = artifact
                     st.session_state._last_import_hash = file_hash
+                    st.session_state["_prediction_feature_contract"] = imported_contract
 
                     try:
                         diag_expected = _get_expected_model_feature_count(
@@ -16188,34 +16336,34 @@ def page_prediction():
     scaler = st.session_state.get("scaler", None)
     imputer = st.session_state.get("imputer", None)
     imported_artifact = st.session_state.get("imported_model_artifact") or {}
-    feature_cols, expected_n_features, feature_source = _resolve_effective_feature_cols(
-        train_result=st.session_state.get("train_result") or {},
-        selected_feature_cols=st.session_state.get("feature_cols") or [],
+    train_result = st.session_state.get("train_result") or {}
+    feature_contract = resolve_prediction_feature_contract(
         model=model,
         pipeline=pipeline,
-        imported_artifact=imported_artifact,
+        artifact=imported_artifact,
+        session_feature_cols=st.session_state.get("feature_cols") or [],
+        train_result=train_result,
     )
+    feature_cols = list(feature_contract.get("feature_cols") or [])
+    expected_n_features = feature_contract.get("expected_count")
+    feature_source = feature_contract.get("source")
     st.session_state.feature_cols = feature_cols
-    feature_note = None
-    session_feature_cols = _deduplicate_feature_list(st.session_state.get("feature_cols") or [])
-    if expected_n_features is not None:
-        if len(feature_cols) != expected_n_features:
-            feature_note = f"妯″瀷瑕佹眰 {expected_n_features} 涓壒寰侊紝浣嗗綋鍓嶅彲瑙ｆ瀽鍒扮殑鐗瑰緛鍒楄〃鏄?{len(feature_cols)} 涓€?"
-        elif session_feature_cols and len(session_feature_cols) != expected_n_features and feature_source != "session.feature_cols":
-            feature_note = f"褰撳墠浼氳瘽鐗瑰緛鏁版槸 {len(session_feature_cols)}锛屼笌妯″瀷瑕佹眰鐨?{expected_n_features} 涓嶄竴鑷达紝宸茶嚜鍔ㄦ敼鐢?{feature_source}銆?"
-    elif feature_source and feature_source != "session.feature_cols":
-        feature_note = f"宸蹭紭鍏堜娇鐢?{feature_source} 浣滀负棰勬祴鐗瑰緛鍒楄〃銆?"
-
-    if feature_note:
-        st.warning(feature_note)
-    if expected_n_features is not None and len(feature_cols) != expected_n_features:
-        st.caption(
-            f"模型内部期望特征数: {expected_n_features} | 当前解析到的特征数: {len(feature_cols)} | 当前来源: {feature_source or '-'}"
+    st.session_state["_prediction_feature_contract"] = feature_contract
+    if feature_contract.get("extra_features"):
+        st.warning(
+            "模型导出清单包含未参与模型预测的多余特征列："
+            + "、".join(feature_contract["extra_features"][:12])
+            + ("……" if len(feature_contract["extra_features"]) > 12 else "")
         )
-        st.error(
-            f"当前预测特征列表仍与模型不一致：模型要求 {expected_n_features} 个，但当前解析到 {len(feature_cols)} 个。"
+    if feature_contract.get("order_mismatch"):
+        st.info("已按模型训练时的特征顺序重排预测输入。")
+    if not feature_contract.get("ok"):
+        errors = feature_contract.get("errors") or ["无法解析模型输入特征契约。"]
+        st.error("当前模型输入契约不可安全解析：\n\n- " + "\n- ".join(errors))
+        st.info(
+            "请重新导出包含真实特征列名的模型；如果模型只有 n_features_in_，"
+            "还需要同步导出与模型输入一致的 feature_process.json。"
         )
-        st.info("请重新导入由本系统导出的模型，或检查该模型文件是否完整保存了 feature_cols。")
         return
 
     train_result = st.session_state.get("train_result") or {}
@@ -16291,9 +16439,55 @@ def page_prediction():
         st.markdown("### 单样本预测")
 
         input_df = None
+        molecular_baseline = _render_prediction_molecular_input_panel(feature_cols)
+        if isinstance(molecular_baseline, dict):
+            molecular_candidate_df = molecular_baseline.get("data")
+            molecular_feature_names = molecular_baseline.get("feature_names") or []
+            if isinstance(molecular_candidate_df, pd.DataFrame) and not molecular_candidate_df.empty:
+                molecular_base_df = molecular_candidate_df.reindex(
+                    columns=feature_cols,
+                    fill_value=np.nan,
+                ).copy()
+                molecular_mapping, molecular_mapping_report = _render_post_feature_mapping_panel(
+                    model_feature_cols=feature_cols,
+                    molecular_feature_cols=list(molecular_feature_names),
+                    candidate_df=molecular_candidate_df,
+                    workflow_fingerprint=(
+                        molecular_baseline.get("workflow") or {}
+                    ).get("workflow_hash"),
+                    model_fingerprint=_post_feature_mapping_model_fingerprint(
+                        feature_cols
+                    ),
+                    missing_input_tolerant=pipeline is not None or imputer is not None,
+                    panel_key="prediction_molecular_single",
+                )
+                if molecular_mapping is not None and molecular_mapping_report.get("ok"):
+                    try:
+                        input_df = apply_mapping(
+                            molecular_base_df,
+                            molecular_candidate_df,
+                            molecular_mapping,
+                            model_feature_cols=feature_cols,
+                        )
+                        st.session_state["_prediction_molecular_input_df"] = input_df.copy()
+                    except Exception as exc:
+                        st.session_state.pop("_prediction_molecular_input_df", None)
+                        st.error(f"应用分子特征来源映射失败：{exc}")
+                else:
+                    st.session_state.pop("_prediction_molecular_input_df", None)
+                    st.info("请先完成分子特征来源确认，再执行单样本预测。")
+
+        requires_molecular_input = bool(
+            st.session_state.get("_prediction_requires_molecular_input")
+        )
+        if requires_molecular_input and input_df is None:
+            st.warning(
+                "当前模型包含已保存的分子特征流程。请先输入 SMILES/BigSMILES、"
+                "完成分子特征提取和人工来源映射，不能回退到普通数值输入或单行文件。"
+            )
 
         # 特征过多时，禁止渲染大量 number_input（会卡死）
-        if len(feature_cols) <= 60:
+        if not requires_molecular_input and input_df is None and len(feature_cols) <= 60:
             input_values = {}
             cols = st.columns(3)
             for i, feature in enumerate(feature_cols):
@@ -16305,7 +16499,7 @@ def page_prediction():
                         format="%.10f",
                     )
             input_df = pd.DataFrame([input_values])
-        else:
+        elif not requires_molecular_input and input_df is None:
             st.info(f"当前特征数量较多（{len(feature_cols)}），建议用【单行文件】上传进行单样本预测。")
             single_file = st.file_uploader("上传单样本文件（CSV/Excel，至少包含所选特征列）", type=['csv', 'xlsx', 'xls'], key="single_pred_file")
             if single_file is not None:
@@ -16766,9 +16960,17 @@ def page_prediction():
                     f"`{y_feature}` 已超出训练范围 [{y_stats['min']:.6g}, {y_stats['max']:.6g}]"
                 )
 
+            molecular_input_df = st.session_state.get("_prediction_molecular_input_df")
+            has_molecular_baseline = (
+                isinstance(molecular_input_df, pd.DataFrame)
+                and len(molecular_input_df) == 1
+                and all(feature in molecular_input_df.columns for feature in feature_cols)
+            )
             baseline_options = ["训练集均值", "训练集中位数"]
             if st.session_state.get("_single_pred_input_values"):
                 baseline_options.append("当前单样本输入")
+            if has_molecular_baseline:
+                baseline_options.append("当前分子级输入")
 
             baseline_mode = st.selectbox(
                 "其余变量默认值",
@@ -16789,6 +16991,16 @@ def page_prediction():
                 if baseline_mode == "当前单样本输入" and feature in single_input_values:
                     try:
                         default_value = float(single_input_values[feature])
+                    except Exception:
+                        pass
+                if baseline_mode == "当前分子级输入" and has_molecular_baseline:
+                    try:
+                        molecular_value = pd.to_numeric(
+                            molecular_input_df.iloc[0][feature],
+                            errors="coerce",
+                        )
+                        if pd.notna(molecular_value) and np.isfinite(float(molecular_value)):
+                            default_value = float(molecular_value)
                     except Exception:
                         pass
 
