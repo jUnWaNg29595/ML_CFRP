@@ -13,6 +13,33 @@ from .prediction_molecular_baseline import collect_workflow_source_columns
 
 
 CONTRACT_SCHEMA_VERSION = 1
+_CONTRACT_FIELDS = {
+    "schema_version",
+    "feature_cols",
+    "target_col",
+    "workflow_hash",
+    "workflow_schema_version",
+    "source_columns",
+    "workflow_source_columns",
+    "workflow_present",
+    "molecular_features_indicated",
+    "pipeline_present",
+    "imputer_present",
+    "scaler_present",
+    "numeric_ranges",
+}
+_MOLECULAR_FEATURE_TOKENS = (
+    "xtb",
+    "maccs",
+    "fingerprint",
+    "molecular",
+    "smiles",
+    "bigsmiles",
+    "selfies",
+    "resin_",
+    "curing_agent_",
+    "hardener_",
+)
 
 
 def _as_mapping(value: Any) -> Mapping[str, Any]:
@@ -53,17 +80,50 @@ def _pipeline_steps(pipeline: Any) -> list[Any]:
         return []
 
 
-def _has_preprocessor(artifact: Mapping[str, Any], kind: str) -> bool:
-    if artifact.get(kind) is not None:
+def _is_usable_preprocessor(value: Any) -> bool:
+    if value is None or not callable(getattr(value, "transform", None)):
+        return False
+    if any(
+        hasattr(value, attribute)
+        for attribute in (
+            "statistics_",
+            "mean_",
+            "scale_",
+            "center_",
+            "n_features_in_",
+            "feature_names_in_",
+        )
+    ):
+        return True
+    return False
+
+
+def _is_usable_pipeline(value: Any) -> bool:
+    return callable(getattr(value, "predict", None)) and bool(_pipeline_steps(value))
+
+
+def _has_usable_preprocessor(artifact: Mapping[str, Any], kind: str) -> bool:
+    if _is_usable_preprocessor(artifact.get(kind)):
         return True
     pipeline = artifact.get("pipeline")
     for step in _pipeline_steps(pipeline):
         name = type(step).__name__.lower()
-        if kind == "imputer" and "imput" in name:
+        if kind == "imputer" and "imput" in name and _is_usable_preprocessor(step):
             return True
-        if kind == "scaler" and ("scaler" in name or "standardize" in name):
+        if (
+            kind == "scaler"
+            and ("scaler" in name or "standardize" in name)
+            and _is_usable_preprocessor(step)
+        ):
             return True
     return False
+
+
+def _is_molecular_feature_set(feature_cols: Sequence[str]) -> bool:
+    return any(
+        any(token in str(column).strip().lower() for token in _MOLECULAR_FEATURE_TOKENS)
+        for column in feature_cols
+    )
 
 
 def _numeric_ranges(frame: Any, feature_cols: list[str]) -> dict[str, dict[str, float]]:
@@ -132,10 +192,14 @@ def build_prediction_contract(
         "workflow_hash": workflow_payload.get("workflow_hash"),
         "workflow_schema_version": workflow_payload.get("schema_version"),
         "source_columns": source_columns,
+        "workflow_source_columns": copy.deepcopy(source_columns),
         "workflow_present": bool(workflow_payload),
-        "pipeline_present": pipeline is not None,
-        "imputer_present": _has_preprocessor(artifact, "imputer"),
-        "scaler_present": _has_preprocessor(artifact, "scaler"),
+        "molecular_features_indicated": bool(
+            source_columns or _is_molecular_feature_set(resolved_features)
+        ),
+        "pipeline_present": _is_usable_pipeline(pipeline),
+        "imputer_present": _has_usable_preprocessor(artifact, "imputer"),
+        "scaler_present": _has_usable_preprocessor(artifact, "scaler"),
         "numeric_ranges": _numeric_ranges(numeric_frame, resolved_features),
     }
 
@@ -162,6 +226,14 @@ def validate_publication_artifact(
         }
     resolved_contract = _as_mapping(resolved_contract)
 
+    missing_contract_fields = sorted(_CONTRACT_FIELDS - set(resolved_contract))
+    if missing_contract_fields:
+        errors.append(
+            "prediction_contract 缺少必需字段：" + ", ".join(missing_contract_fields)
+        )
+    if resolved_contract.get("schema_version") != CONTRACT_SCHEMA_VERSION:
+        errors.append("prediction_contract 的 schema_version 不受支持。")
+
     if artifact.get("model") is None and artifact.get("pipeline") is None:
         errors.append("artifact 缺少 model 或 pipeline。")
     artifact_target = str(artifact.get("target_col") or "").strip()
@@ -179,6 +251,30 @@ def validate_publication_artifact(
         errors.append("artifact 缺少精确 feature_cols。")
     elif contract_features and artifact_features != contract_features:
         errors.append("artifact 与 prediction_contract 的 feature_cols 顺序或内容不一致。")
+
+    if not isinstance(resolved_contract.get("source_columns"), list):
+        errors.append("prediction_contract 的 source_columns 必须是列表。")
+    if not isinstance(resolved_contract.get("workflow_source_columns"), list):
+        errors.append("prediction_contract 的 workflow_source_columns 必须是列表。")
+    elif resolved_contract.get("source_columns") != resolved_contract.get(
+        "workflow_source_columns"
+    ):
+        errors.append("prediction_contract 的 workflow source 列记录不一致。")
+    if not isinstance(resolved_contract.get("numeric_ranges"), Mapping):
+        errors.append("prediction_contract 的 numeric_ranges 必须是映射。")
+    else:
+        for column, value in resolved_contract["numeric_ranges"].items():
+            if not isinstance(value, Mapping) or set(value) != {"min", "max"}:
+                errors.append(f"numeric_ranges[{column}] 缺少 min/max。")
+                continue
+            try:
+                minimum = float(value["min"])
+                maximum = float(value["max"])
+            except (TypeError, ValueError):
+                errors.append(f"numeric_ranges[{column}] 不是数值范围。")
+                continue
+            if not np.isfinite([minimum, maximum]).all() or minimum > maximum:
+                errors.append(f"numeric_ranges[{column}] 不是有限的有效范围。")
 
     resolution = resolve_prediction_feature_contract(
         model=artifact.get("model"),
@@ -198,12 +294,40 @@ def validate_publication_artifact(
         errors.append("workflow 缺少 workflow_hash。")
     if workflow_present and resolved_contract.get("workflow_schema_version") is None:
         errors.append("workflow 缺少 schema_version。")
-    if source_columns and not (
-        resolved_contract.get("pipeline_present")
-        or resolved_contract.get("imputer_present")
-        or resolved_contract.get("scaler_present")
-    ):
-        errors.append("分子特征 artifact 缺少 pipeline、imputer 或 scaler 预处理元数据。")
+    molecular_indicated = bool(
+        resolved_contract.get("molecular_features_indicated")
+        or source_columns
+        or _is_molecular_feature_set(contract_features)
+    )
+    if molecular_indicated and not workflow_present:
+        errors.append("模型包含分子特征，但缺少可复现 molecular workflow。")
+    if molecular_indicated:
+        actual_imputer = _has_usable_preprocessor(artifact, "imputer")
+        actual_scaler = _has_usable_preprocessor(artifact, "scaler")
+        if bool(resolved_contract.get("imputer_present")) != actual_imputer:
+            errors.append("prediction_contract 的 imputer_present 与 artifact 不一致或不可用。")
+        if bool(resolved_contract.get("scaler_present")) != actual_scaler:
+            errors.append("prediction_contract 的 scaler_present 与 artifact 不一致或不可用。")
+        actual_pipeline = _is_usable_pipeline(artifact.get("pipeline"))
+        if bool(resolved_contract.get("pipeline_present")) != actual_pipeline:
+            errors.append("prediction_contract 的 pipeline_present 与 artifact 不一致或不可用。")
+        if not (actual_pipeline or actual_imputer or actual_scaler):
+            errors.append("分子特征 artifact 缺少可用 pipeline、imputer 或 scaler。")
+
+    extra = _as_mapping(artifact.get("extra"))
+    workflow_payload = extra.get("molecular_feature_workflow")
+    if workflow_present and not isinstance(workflow_payload, Mapping):
+        errors.append("prediction_contract 声明存在 workflow，但 artifact 未保存 workflow。")
+    elif workflow_present and isinstance(workflow_payload, Mapping):
+        if workflow_payload.get("workflow_hash") != resolved_contract.get("workflow_hash"):
+            errors.append("artifact workflow_hash 与 prediction_contract 不一致。")
+        if workflow_payload.get("schema_version") != resolved_contract.get(
+            "workflow_schema_version"
+        ):
+            errors.append("artifact workflow schema_version 与 prediction_contract 不一致。")
+        actual_sources = collect_workflow_source_columns(workflow_payload)
+        if actual_sources != resolved_contract.get("workflow_source_columns"):
+            errors.append("artifact workflow source 列与 prediction_contract 不一致。")
 
     status = "valid" if not errors else "invalid"
     return {"ok": not errors, "status": status, "errors": errors}
@@ -280,18 +404,23 @@ def activate_publication(
 def rollback_publication(
     config: dict[str, Any], *, material_key: str, target_key: str, version: str
 ) -> dict[str, Any]:
-    models = _publication_models(config, material_key, target_key)
+    materials = config.get("materials")
+    material = materials.get(material_key) if isinstance(materials, Mapping) else None
+    targets = material.get("targets") if isinstance(material, Mapping) else None
+    target = targets.get(target_key) if isinstance(targets, Mapping) else None
+    models = target.get("models") if isinstance(target, Mapping) else None
+    if not isinstance(models, list):
+        raise ValueError("门户配置中不存在可回退的 models 列表。")
     requested = str(version).strip()
-    found = False
+    if not any(
+        isinstance(model, dict) and str(model.get("version") or "") == requested
+        for model in models
+    ):
+        raise ValueError(f"Unknown publication version（未知发布版本）: {requested}")
     for model in models:
         if not isinstance(model, dict):
             continue
-        is_requested = str(model.get("version") or "") == requested
-        model["enabled"] = is_requested
-        if is_requested:
-            found = True
-    if not found:
-        raise ValueError(f"Unknown publication version（未知发布版本）: {requested}")
+        model["enabled"] = str(model.get("version") or "") == requested
     return config
 
 
@@ -309,7 +438,7 @@ def should_show_publication(contract_report: Mapping[str, Any]) -> bool:
 
 
 def select_active_publication(models: list[dict[str, Any]]) -> dict[str, Any] | None:
-    for model in models:
-        if isinstance(model, dict) and model.get("enabled"):
-            return model
-    return None
+    active = [model for model in models if isinstance(model, dict) and model.get("enabled")]
+    if len(active) > 1:
+        raise ValueError("Multiple enabled publication releases（多个启用版本）")
+    return active[0] if active else None

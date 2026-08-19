@@ -18,6 +18,14 @@ class _NamedModel:
     n_features_in_ = 2
 
 
+class _UnfittedPreprocessor:
+    def fit(self, values):
+        return self
+
+    def transform(self, values):
+        return values
+
+
 def test_publication_contract_records_numeric_ranges_and_workflow_sources():
     artifact = {
         "model": _NamedModel(),
@@ -183,3 +191,173 @@ def test_publication_gate_accepts_only_valid_contract_report():
     assert should_show_publication({"ok": True}) is True
     assert should_show_publication({"ok": False}) is False
     assert should_show_publication({"ok": True, "status": "needs_validation"}) is False
+
+
+def _molecular_contract(**overrides):
+    contract = {
+        "schema_version": 1,
+        "feature_cols": ["resin_xtb_gap"],
+        "target_col": "Tg",
+        "workflow_hash": "workflow-123",
+        "workflow_schema_version": 3,
+        "source_columns": [
+            {"column": "resin_smiles_1", "roles": ["resin"]}
+        ],
+        "workflow_source_columns": [
+            {"column": "resin_smiles_1", "roles": ["resin"]}
+        ],
+        "workflow_present": True,
+        "molecular_features_indicated": True,
+        "pipeline_present": False,
+        "imputer_present": True,
+        "scaler_present": False,
+        "numeric_ranges": {"resin_xtb_gap": {"min": 1.0, "max": 2.0}},
+    }
+    contract.update(overrides)
+    return contract
+
+
+def test_validation_requires_full_contract_schema_and_consistent_workflow_metadata():
+    report = validate_publication_artifact(
+        {
+            "model": _NamedModel(),
+            "pipeline": None,
+            "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+            "target_col": "Tg",
+            "extra": {},
+        },
+        {"feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"]},
+    )
+
+    assert report["ok"] is False
+    assert any("schema" in error.lower() for error in report["errors"])
+    assert any("workflow" in error.lower() for error in report["errors"])
+
+
+def test_molecular_features_without_workflow_are_not_publishable():
+    report = validate_publication_artifact(
+        {
+            "model": _NamedModel(),
+            "pipeline": None,
+            "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+            "target_col": "Tg",
+            "imputer": object(),
+            "extra": {},
+        },
+        {
+            "schema_version": 1,
+            "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+            "target_col": "Tg",
+            "workflow_hash": None,
+            "workflow_schema_version": None,
+            "source_columns": [],
+            "workflow_source_columns": [],
+            "workflow_present": False,
+            "molecular_features_indicated": True,
+            "pipeline_present": False,
+            "imputer_present": False,
+            "scaler_present": False,
+            "numeric_ranges": {
+                "resin_xtb_gap": {"min": 1.0, "max": 2.0},
+                "curing_agent_xtb_gap": {"min": 3.0, "max": 5.0},
+            },
+        },
+    )
+
+    assert report["ok"] is False
+    assert any("workflow" in error.lower() for error in report["errors"])
+
+
+def test_validation_rejects_inconsistent_workflow_source_metadata():
+    contract = _molecular_contract(
+        workflow_source_columns=[
+            {"column": "other_smiles", "roles": ["resin"]}
+        ]
+    )
+    report = validate_publication_artifact(
+        {
+            "model": _NamedModel(),
+            "pipeline": None,
+            "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+            "target_col": "Tg",
+            "imputer": object(),
+            "extra": {},
+        },
+        contract,
+    )
+
+    assert report["ok"] is False
+    assert any("source" in error.lower() for error in report["errors"])
+
+
+def test_validation_rejects_non_usable_preprocessor_placeholder():
+    report = validate_publication_artifact(
+        {
+            "model": _NamedModel(),
+            "pipeline": None,
+            "imputer": _UnfittedPreprocessor(),
+            "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+            "target_col": "Tg",
+            "extra": {},
+        },
+        _molecular_contract(),
+    )
+
+    assert report["ok"] is False
+    assert any("imputer" in error.lower() or "preprocessor" in error.lower() for error in report["errors"])
+
+
+def test_validation_rejects_missing_or_mismatched_artifact_workflow_metadata():
+    contract = _molecular_contract()
+    artifact = {
+        "model": _NamedModel(),
+        "pipeline": None,
+        "imputer": object(),
+        "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+        "target_col": "Tg",
+        "extra": {
+            "molecular_feature_workflow": {
+                "schema_version": 4,
+                "workflow_hash": "different-workflow",
+                "steps": [],
+            }
+        },
+    }
+
+    report = validate_publication_artifact(artifact, contract)
+
+    assert report["ok"] is False
+    assert any("workflow_hash" in error for error in report["errors"])
+    assert any("schema_version" in error for error in report["errors"])
+    assert any("source" in error.lower() for error in report["errors"])
+
+
+def test_rollback_unknown_version_does_not_change_active_release():
+    config = {
+        "materials": {
+            "epoxy_resin": {
+                "targets": {
+                    "tg": {
+                        "models": [
+                            {"version": "v1", "enabled": True},
+                            {"version": "v2", "enabled": False},
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    before = {"version": "v1", "enabled": True}
+
+    with pytest.raises(ValueError, match="version"):
+        rollback_publication(config, material_key="epoxy_resin", target_key="tg", version="v9")
+
+    assert config["materials"]["epoxy_resin"]["targets"]["tg"]["models"][0] == before
+    assert config["materials"]["epoxy_resin"]["targets"]["tg"]["models"][1]["enabled"] is False
+
+
+def test_multiple_enabled_releases_are_rejected_instead_of_first_match():
+    with pytest.raises(ValueError, match="multiple|多个"):
+        select_active_publication(
+            [{"id": "v1", "enabled": True}, {"id": "v2", "enabled": True}]
+        )
