@@ -75,27 +75,57 @@ def _normalized_columns(values: Any) -> list[str]:
 
 def _pipeline_steps(pipeline: Any) -> list[Any]:
     try:
-        return [step for _, step in pipeline.steps]
+        steps = pipeline.steps
+        if not isinstance(steps, Sequence) or not steps:
+            return []
+        parsed: list[Any] = []
+        for item in steps:
+            if (
+                not isinstance(item, Sequence)
+                or isinstance(item, (str, bytes))
+                or len(item) != 2
+                or not str(item[0]).strip()
+                or item[1] is None
+            ):
+                return []
+            parsed.append(item[1])
+        return parsed
     except (AttributeError, TypeError, ValueError):
         return []
+
+
+def _has_meaningful_learned_attribute(value: Any) -> bool:
+    try:
+        attributes = vars(value)
+    except TypeError:
+        return False
+    ignored = {
+        "n_features_in_",
+        "feature_names_in_",
+        "n_outputs_",
+        "n_iter_",
+    }
+    for name, learned in attributes.items():
+        if not name.endswith("_") or name.startswith("__") or name in ignored:
+            continue
+        if learned is None:
+            continue
+        if isinstance(learned, (str, bytes)):
+            if learned:
+                return True
+            continue
+        try:
+            if np.asarray(learned).size > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def _is_usable_preprocessor(value: Any) -> bool:
     if value is None or not callable(getattr(value, "transform", None)):
         return False
-    if any(
-        hasattr(value, attribute)
-        for attribute in (
-            "statistics_",
-            "mean_",
-            "scale_",
-            "center_",
-            "n_features_in_",
-            "feature_names_in_",
-        )
-    ):
-        return True
-    return False
+    return _has_meaningful_learned_attribute(value)
 
 
 def _is_usable_pipeline(value: Any) -> bool:
@@ -210,6 +240,10 @@ def _contract_from_artifact(artifact: Mapping[str, Any]) -> Mapping[str, Any] | 
     return contract if isinstance(contract, Mapping) else None
 
 
+def _contracts_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return dict(left) == dict(right)
+
+
 def validate_publication_artifact(
     artifact: Mapping[str, Any], contract: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -217,7 +251,11 @@ def validate_publication_artifact(
 
     artifact = _as_mapping(artifact)
     errors: list[str] = []
-    resolved_contract = contract or _contract_from_artifact(artifact)
+    saved_contract = _contract_from_artifact(artifact)
+    if contract is not None and saved_contract is not None:
+        if not _contracts_match(_as_mapping(contract), saved_contract):
+            errors.append("显式 prediction_contract 与 artifact 已保存的 prediction_contract 不一致。")
+    resolved_contract = contract if contract is not None else saved_contract
     if resolved_contract is None:
         return {
             "ok": False,
@@ -301,16 +339,16 @@ def validate_publication_artifact(
     )
     if molecular_indicated and not workflow_present:
         errors.append("模型包含分子特征，但缺少可复现 molecular workflow。")
+    actual_imputer = _has_usable_preprocessor(artifact, "imputer")
+    actual_scaler = _has_usable_preprocessor(artifact, "scaler")
+    if bool(resolved_contract.get("imputer_present")) != actual_imputer:
+        errors.append("prediction_contract 的 imputer_present 与 artifact 不一致或不可用。")
+    if bool(resolved_contract.get("scaler_present")) != actual_scaler:
+        errors.append("prediction_contract 的 scaler_present 与 artifact 不一致或不可用。")
+    actual_pipeline = _is_usable_pipeline(artifact.get("pipeline"))
+    if bool(resolved_contract.get("pipeline_present")) != actual_pipeline:
+        errors.append("prediction_contract 的 pipeline_present 与 artifact 不一致或不可用。")
     if molecular_indicated:
-        actual_imputer = _has_usable_preprocessor(artifact, "imputer")
-        actual_scaler = _has_usable_preprocessor(artifact, "scaler")
-        if bool(resolved_contract.get("imputer_present")) != actual_imputer:
-            errors.append("prediction_contract 的 imputer_present 与 artifact 不一致或不可用。")
-        if bool(resolved_contract.get("scaler_present")) != actual_scaler:
-            errors.append("prediction_contract 的 scaler_present 与 artifact 不一致或不可用。")
-        actual_pipeline = _is_usable_pipeline(artifact.get("pipeline"))
-        if bool(resolved_contract.get("pipeline_present")) != actual_pipeline:
-            errors.append("prediction_contract 的 pipeline_present 与 artifact 不一致或不可用。")
         if not (actual_pipeline or actual_imputer or actual_scaler):
             errors.append("分子特征 artifact 缺少可用 pipeline、imputer 或 scaler。")
 
@@ -412,11 +450,15 @@ def rollback_publication(
     if not isinstance(models, list):
         raise ValueError("门户配置中不存在可回退的 models 列表。")
     requested = str(version).strip()
-    if not any(
-        isinstance(model, dict) and str(model.get("version") or "") == requested
+    matches = [
+        model
         for model in models
-    ):
+        if isinstance(model, dict) and str(model.get("version") or "") == requested
+    ]
+    if not matches:
         raise ValueError(f"Unknown publication version（未知发布版本）: {requested}")
+    if len(matches) > 1:
+        raise ValueError(f"Duplicate publication version（重复发布版本）: {requested}")
     for model in models:
         if not isinstance(model, dict):
             continue

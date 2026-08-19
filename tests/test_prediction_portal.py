@@ -1,3 +1,5 @@
+import copy
+
 import pandas as pd
 import pytest
 
@@ -23,6 +25,21 @@ class _UnfittedPreprocessor:
         return self
 
     def transform(self, values):
+        return values
+
+
+class _NoneLearnedPreprocessor:
+    statistics_ = None
+    n_features_in_ = 2
+
+    def transform(self, values):
+        return values
+
+
+class _PlaceholderPipeline:
+    steps = [("model", None)]
+
+    def predict(self, values):
         return values
 
 
@@ -217,6 +234,96 @@ def _molecular_contract(**overrides):
     return contract
 
 
+def _numeric_contract(**overrides):
+    contract = {
+        "schema_version": 1,
+        "feature_cols": ["temperature"],
+        "target_col": "Tg",
+        "workflow_hash": None,
+        "workflow_schema_version": None,
+        "source_columns": [],
+        "workflow_source_columns": [],
+        "workflow_present": False,
+        "molecular_features_indicated": False,
+        "pipeline_present": False,
+        "imputer_present": False,
+        "scaler_present": False,
+        "numeric_ranges": {"temperature": {"min": 80.0, "max": 180.0}},
+    }
+    contract.update(overrides)
+    return contract
+
+
+def test_validation_reconciles_preprocessing_flags_for_non_molecular_artifacts():
+    artifact = {
+        "model": _NamedModel(),
+        "pipeline": None,
+        "feature_cols": ["temperature"],
+        "target_col": "Tg",
+        "extra": {},
+    }
+
+    report = validate_publication_artifact(
+        artifact,
+        _numeric_contract(pipeline_present=True, imputer_present=True, scaler_present=True),
+    )
+
+    assert report["ok"] is False
+    assert sum("与 artifact 不一致" in error for error in report["errors"]) == 3
+
+
+def test_validation_rejects_explicit_contract_mismatch_with_saved_contract():
+    saved_contract = _numeric_contract()
+    explicit_contract = _numeric_contract(
+        numeric_ranges={"temperature": {"min": 90.0, "max": 180.0}}
+    )
+    artifact = {
+        "model": _NamedModel(),
+        "pipeline": None,
+        "feature_cols": ["temperature"],
+        "target_col": "Tg",
+        "extra": {"prediction_contract": saved_contract},
+    }
+
+    report = validate_publication_artifact(artifact, explicit_contract)
+
+    assert report["ok"] is False
+    assert any("saved" in error.lower() or "已保存" in error for error in report["errors"])
+
+
+def test_validation_rejects_none_valued_learned_preprocessor_attribute():
+    report = validate_publication_artifact(
+        {
+            "model": _NamedModel(),
+            "pipeline": None,
+            "imputer": _NoneLearnedPreprocessor(),
+            "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+            "target_col": "Tg",
+            "extra": {},
+        },
+        _molecular_contract(),
+    )
+
+    assert report["ok"] is False
+    assert any("imputer" in error.lower() or "preprocessor" in error.lower() for error in report["errors"])
+
+
+def test_validation_rejects_pipeline_with_placeholder_step():
+    report = validate_publication_artifact(
+        {
+            "model": None,
+            "pipeline": _PlaceholderPipeline(),
+            "feature_cols": ["temperature"],
+            "target_col": "Tg",
+            "extra": {},
+        },
+        _numeric_contract(pipeline_present=True),
+    )
+
+    assert report["ok"] is False
+    assert any("pipeline" in error.lower() for error in report["errors"])
+
+
 def test_validation_requires_full_contract_schema_and_consistent_workflow_metadata():
     report = validate_publication_artifact(
         {
@@ -361,3 +468,27 @@ def test_multiple_enabled_releases_are_rejected_instead_of_first_match():
         select_active_publication(
             [{"id": "v1", "enabled": True}, {"id": "v2", "enabled": True}]
         )
+
+
+def test_rollback_rejects_duplicate_requested_versions_without_mutation():
+    config = {
+        "materials": {
+            "epoxy_resin": {
+                "targets": {
+                    "tg": {
+                        "models": [
+                            {"id": "v1", "version": "v1", "enabled": True},
+                            {"id": "v2-a", "version": "v2", "enabled": False},
+                            {"id": "v2-b", "version": "v2", "enabled": False},
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    before = copy.deepcopy(config)
+
+    with pytest.raises(ValueError, match="duplicate|重复"):
+        rollback_publication(config, material_key="epoxy_resin", target_key="tg", version="v2")
+
+    assert config == before

@@ -2,7 +2,7 @@
 
 Status: complete
 
-Commit hash: 1b8e61c16a9cb1c4d3b89a5d3e7b9cbf418b3210
+Commit hash: 76c28263e8ebaff6af20e6bb822e796df2875a0a
 
 ## Tests
 
@@ -19,7 +19,6 @@ Commit hash: 1b8e61c16a9cb1c4d3b89a5d3e7b9cbf418b3210
 
 ## Concerns
 
-- Existing molecular contract helper files were copied into this isolated worktree only as local test dependencies; they are unrelated to Task 1 and are intentionally excluded from the commit.
 - Main-platform export wiring and external portal integration remain for later plan tasks.
 
 ## Review Fixes
@@ -29,9 +28,13 @@ Commit hash: 1b8e61c16a9cb1c4d3b89a5d3e7b9cbf418b3210
 - Blocked molecular feature artifacts without a saved reproducible workflow.
 - Validated rollback versions before mutating enabled flags; unknown versions leave the active release unchanged.
 - Rejected multiple enabled releases instead of silently selecting the first one.
+- Reconciled pipeline, imputer, and scaler presence flags for every artifact type.
+- Rejected explicit contracts that differ from a saved artifact contract.
+- Rejected preprocessors with empty or None-valued learned state and pipelines with placeholder steps.
+- Rejected duplicate rollback versions before mutating configuration.
 
 ## Review Fix Tests
 
 - `& 'C:\Users\wangj\anaconda3\envs\CFRP_env\python.exe' -m pytest 'tests/test_prediction_portal.py' 'tests/test_prediction_feature_contract.py' 'tests/test_prediction_molecular_baseline.py' -q`
-  - Output: `23 passed in 0.33s`
+  - Output: `............................                                             [100%]` / `28 passed in 0.33s`
 - `git diff --check` passed.
