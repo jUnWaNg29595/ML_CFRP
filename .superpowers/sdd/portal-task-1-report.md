@@ -2,7 +2,7 @@
 
 Status: complete
 
-Commit hash: to be filled after commit
+Commit hash: 1b8e61c16a9cb1c4d3b89a5d3e7b9cbf418b3210
 
 ## Tests
 
