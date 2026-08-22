@@ -381,6 +381,124 @@ def generate_rule_based_variants(
     return products
 
 
+def _score_sort_key(product: DesignProduct) -> tuple[float, str, str]:
+    score = product.model_score
+    numeric = float(score) if score is not None and math.isfinite(float(score)) else float("-inf")
+    return (-numeric, str(product.product_smiles), str(product.template_id))
+
+
+def score_design_products(products: Sequence[DesignProduct], scorer=None) -> list[DesignProduct]:
+    """Attach model scores supplied by the screening layer and sort stably."""
+    items = list(products)
+    if not items:
+        return []
+    if scorer is not None:
+        scores = list(scorer(items))
+        if len(scores) != len(items):
+            raise ValueError("设计评分器返回的分数数量与候选数量不一致")
+        for product, score in zip(items, scores):
+            try:
+                product.model_score = float(score)
+                product.score_source = "model"
+            except (TypeError, ValueError):
+                product.model_score = None
+                product.score_source = "invalid_score"
+    return sorted(items, key=_score_sort_key)
+
+
+class ModelGuidedGraphSearch:
+    """Deterministic beam search over chemically validated template edits."""
+
+    def __init__(self, config: SearchConfig, scorer=None, template_ids: Sequence[str] | None = None):
+        self.config = config
+        self.scorer = scorer
+        self.template_ids = list(template_ids or [template.template_id for template in ReactionTemplateRegistry.all()])
+
+    def search(self, seeds: Sequence[DesignProduct]) -> list[DesignProduct]:
+        beam = score_design_products(list(seeds), self.scorer)
+        if not beam:
+            return []
+        beam = beam[: max(1, int(self.config.beam_width))]
+        for _depth in range(max(0, int(self.config.depth))):
+            expanded: list[DesignProduct] = list(beam)
+            for parent in beam:
+                for template_id in self.template_ids:
+                    children = apply_design_template(parent.product_smiles, template_id, role=parent.role)
+                    for child in children[: max(1, int(self.config.candidates_per_parent))]:
+                        child.parent_smiles = parent.product_smiles
+                        child.design_depth = parent.design_depth + 1
+                        child.edit_trace = list(parent.edit_trace) + list(child.edit_trace)
+                        expanded.append(child)
+            deduped: dict[tuple[str, str], DesignProduct] = {}
+            for item in expanded:
+                key = (str(item.product_smiles), str(item.role))
+                deduped.setdefault(key, item)
+            ranked = score_design_products(list(deduped.values()), self.scorer)
+            beam = ranked[: max(1, int(self.config.beam_width))]
+            if not beam:
+                break
+        return score_design_products(beam, self.scorer)[: max(1, int(self.config.max_products))]
+
+
+def search_design_space(
+    seeds: Sequence[DesignProduct],
+    config: SearchConfig,
+    scorer=None,
+) -> list[DesignProduct]:
+    return ModelGuidedGraphSearch(config, scorer=scorer).search(seeds)
+
+
+MoleculeDesignResult = DesignResult
+
+
+def design_molecules(
+    scaffolds: Sequence[Scaffold],
+    config: DesignConfig,
+    *,
+    model=None,
+    pipeline=None,
+    feature_cols=None,
+    scorer=None,
+) -> DesignResult:
+    """Orchestrate rule edits and optional model-guided graph search.
+
+    The screening page owns feature extraction because the saved workflow may
+    be multi-step. It passes a scorer callback here after that workflow has
+    produced a contract-validated feature matrix.
+    """
+    del pipeline, feature_cols
+    scaffold_list = list(scaffolds or [])[: max(0, int(config.max_scaffolds))]
+    result = DesignResult(config=config, design_hash=compute_design_hash({"config": config, "scaffolds": scaffold_list}))
+    if not scaffold_list:
+        result.prediction_block_reason = "没有可用于分子设计的有效骨架"
+        result.stage_counts = {"scaffolds": 0, "template_products": 0, "valid_products": 0, "scored_products": 0}
+        return result
+    variants = generate_rule_based_variants(scaffold_list, config)
+    result.stage_counts["scaffolds"] = len(scaffold_list)
+    result.stage_counts["template_products"] = len(variants)
+    if not variants:
+        result.prediction_block_reason = "骨架没有生成任何满足角色规则的结构变体"
+        result.stage_counts.update({"valid_products": 0, "scored_products": 0})
+        return result
+    if int(config.max_variants_per_scaffold) > 0:
+        search_config = SearchConfig(
+            depth=1,
+            beam_width=max(1, min(int(config.max_variants_per_scaffold), 32)),
+            max_products=max(1, int(config.max_variants_per_scaffold) * max(1, len(scaffold_list))),
+            random_state=int(config.random_state),
+        )
+        variants = search_design_space(variants, search_config, scorer=scorer)
+    result.products = variants
+    result.stage_counts["valid_products"] = len(variants)
+    result.stage_counts["scored_products"] = sum(item.model_score is not None for item in variants)
+    if scorer is None and model is None:
+        result.prediction_block_reason = "未提供模型或特征评分器，不能进入预测阶段"
+        result.can_predict = False
+    else:
+        result.can_predict = bool(variants)
+    return result
+
+
 def _json_safe(value: Any) -> Any:
     """Convert dataclasses and common dataframe scalar values to JSON values."""
 
@@ -507,4 +625,9 @@ __all__ = [
     "validate_product",
     "apply_design_template",
     "generate_rule_based_variants",
+    "score_design_products",
+    "ModelGuidedGraphSearch",
+    "search_design_space",
+    "MoleculeDesignResult",
+    "design_molecules",
 ]

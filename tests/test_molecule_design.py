@@ -67,6 +67,21 @@ def test_generated_resin_and_hardener_keep_role_specific_functionality():
     assert all(validate_product(x.product_smiles, "hardener").role_valid for x in hardener)
 
 
+def test_beam_search_is_seed_stable_and_uses_model_score():
+    from core.molecule_design import DesignProduct, SearchConfig, search_design_space
+
+    seeds = [DesignProduct("C1CO1", "C1CO1", "resin", "parent", "", [], 0, True)]
+    config = SearchConfig(depth=2, beam_width=3, random_state=11)
+
+    def scorer(items):
+        return [1.0 + i for i, _ in enumerate(items)]
+
+    first = search_design_space(seeds, config, scorer=scorer)
+    second = search_design_space(seeds, config, scorer=scorer)
+    assert [x.product_smiles for x in first] == [x.product_smiles for x in second]
+    assert first[0].model_score >= first[-1].model_score
+
+
 def test_scaffold_miner_keeps_valid_training_scaffolds_in_order():
     frame = pd.DataFrame({"smiles": ["C1CO1", "invalid", "C1CO1", "NCCN"]})
 
