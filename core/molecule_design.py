@@ -113,6 +113,56 @@ class DesignResult:
     prediction_block_reason: str | None = None
     can_predict: bool = False
     stage_counts: dict[str, int] = field(default_factory=dict)
+    design_payload: Any = None
+
+    def to_frame(self) -> pd.DataFrame:
+        columns = [
+            "parent_smiles", "product_smiles", "role", "design_method", "template_id",
+            "edit_trace", "design_depth", "chemical_validity", "filter_reason",
+            "prediction", "prediction_std", "applicability_score", "synth_score",
+            "model_score", "score_source",
+        ]
+        rows = [asdict(product) for product in self.products]
+        return pd.DataFrame(rows, columns=columns)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "products": [_json_safe(product) for product in self.products],
+            "failures": _json_safe(self.failures),
+            "config": _json_safe(self.config),
+            "design_hash": self.design_hash,
+            "prediction_block_reason": self.prediction_block_reason,
+            "can_predict": bool(self.can_predict),
+            "stage_counts": _json_safe(self.stage_counts),
+            "design_payload": _json_safe(self.design_payload),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "DesignResult":
+        if not isinstance(payload, Mapping):
+            raise TypeError("design result payload must be a mapping")
+        config_payload = payload.get("config")
+        config = DesignConfig(**dict(config_payload)) if isinstance(config_payload, Mapping) else None
+        products = []
+        for item in payload.get("products") or []:
+            if isinstance(item, Mapping):
+                products.append(DesignProduct(**dict(item)))
+        result = cls(
+            products=products,
+            failures=list(payload.get("failures") or []),
+            config=config,
+            design_hash=payload.get("design_hash"),
+            prediction_block_reason=payload.get("prediction_block_reason"),
+            can_predict=bool(payload.get("can_predict", False)),
+            stage_counts=dict(payload.get("stage_counts") or {}),
+            design_payload=payload.get("design_payload"),
+        )
+        if result.design_hash and result.design_payload is not None:
+            expected = compute_design_hash(result.design_payload)
+            if expected != result.design_hash:
+                raise ValueError("设计结果 hash 校验失败，配置或骨架已被修改")
+        return result
 
 
 @dataclass(frozen=True)
@@ -471,7 +521,8 @@ def design_molecules(
     """
     del pipeline, feature_cols
     scaffold_list = list(scaffolds or [])[: max(0, int(config.max_scaffolds))]
-    result = DesignResult(config=config, design_hash=compute_design_hash({"config": config, "scaffolds": scaffold_list}))
+    design_payload = {"config": config, "scaffolds": scaffold_list}
+    result = DesignResult(config=config, design_hash=compute_design_hash(design_payload), design_payload=design_payload)
     if not scaffold_list:
         result.prediction_block_reason = "没有可用于分子设计的有效骨架"
         result.stage_counts = {"scaffolds": 0, "template_products": 0, "valid_products": 0, "scored_products": 0}

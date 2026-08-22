@@ -82,6 +82,32 @@ def test_beam_search_is_seed_stable_and_uses_model_score():
     assert first[0].model_score >= first[-1].model_score
 
 
+def test_design_result_round_trip_preserves_trace_and_failures():
+    from core.molecule_design import MoleculeDesignResult, design_molecules
+
+    result = design_molecules(
+        [Scaffold("C1CO1", "resin", "train", 0)],
+        DesignConfig(enabled_templates=["ether_chain_scan"], random_state=5),
+        scorer=lambda items: [2.0 for _ in items],
+    )
+    result.failures = [{"template": "test", "reason": "none"}]
+    restored = MoleculeDesignResult.from_dict(result.to_dict())
+    assert restored.design_hash == result.design_hash
+    assert restored.to_frame().equals(result.to_frame())
+    assert restored.failures == result.failures
+
+
+def test_all_failed_scaffolds_block_prediction_without_fabricated_features():
+    from core.molecule_design import design_molecules
+
+    result = design_molecules(
+        [],
+        DesignConfig(enabled_templates=["aryl_methyl_substitution"], random_state=5),
+    )
+    assert result.can_predict is False
+    assert result.prediction_block_reason
+
+
 def test_scaffold_miner_keeps_valid_training_scaffolds_in_order():
     frame = pd.DataFrame({"smiles": ["C1CO1", "invalid", "C1CO1", "NCCN"]})
 

@@ -21549,6 +21549,7 @@ def _render_molecule_design_engine():
         DesignConfig,
         ReactionTemplateRegistry,
         ScaffoldMiner,
+        compute_design_hash,
         design_molecules,
     )
 
@@ -21645,7 +21646,14 @@ def _render_molecule_design_engine():
         beam_width=int(beam_width),
         exploration_ratio=float(exploration_ratio),
     )
-    st.session_state["vs_design_config"] = dataclasses.asdict(config)
+    config_payload = dataclasses.asdict(config)
+    config_hash = compute_design_hash(config_payload)
+    if st.session_state.get("vs_design_config_hash") not in (None, config_hash):
+        st.session_state.pop("vs_design_result_df", None)
+        st.session_state.pop("vs_design_trace", None)
+        st.session_state.pop("vs_design_preview", None)
+    st.session_state["vs_design_config"] = config_payload
+    st.session_state["vs_design_config_hash"] = config_hash
 
     artifact = st.session_state.get("imported_model_artifact") or {}
     artifact_extra = artifact.get("extra") if isinstance(artifact, dict) else {}
