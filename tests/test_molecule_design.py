@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 from core.molecule_design import (
     DesignConfig,
     DesignProduct,
@@ -12,6 +14,57 @@ from core.molecule_design import (
     SearchConfig,
     compute_design_hash,
 )
+
+
+@pytest.mark.parametrize("template_id, scaffold", [
+    ("aryl_methyl_substitution", "c1ccccc1"),
+    ("hydroxyl_glycidyl_ether", "Oc1ccccc1"),
+    ("amine_alkylation", "NCCN"),
+    ("ether_chain_scan", "CCOCC1CO1"),
+])
+def test_templates_create_single_connected_valid_products(template_id, scaffold):
+    from core.molecule_design import apply_design_template, validate_product
+
+    role = "hardener" if template_id == "amine_alkylation" else "resin"
+    products = apply_design_template(scaffold, template_id, role=role)
+    assert products
+    for product in products:
+        assert "." not in product.product_smiles
+        assert product.chemical_validity is True
+        assert validate_product(product.product_smiles, role=role).ok
+
+
+def test_template_rejects_a_second_substitution_on_saturated_site():
+    from core.molecule_design import apply_design_template
+
+    assert apply_design_template("C", "aryl_methyl_substitution", role="resin") == []
+
+
+def test_resin_template_cannot_apply_hardener_only_edit():
+    from core.molecule_design import apply_design_template
+
+    assert apply_design_template("NCCN", "hydroxyl_glycidyl_ether", role="hardener") == []
+
+
+def test_generated_resin_and_hardener_keep_role_specific_functionality():
+    from core.molecule_design import (
+        DesignConfig,
+        Scaffold,
+        generate_rule_based_variants,
+        validate_product,
+    )
+
+    resin = generate_rule_based_variants(
+        [Scaffold("C1CO1", "resin", "train", 0)],
+        DesignConfig(enabled_templates=["ether_chain_scan"], keep_parents=True),
+    )
+    hardener = generate_rule_based_variants(
+        [Scaffold("NCCN", "hardener", "train", 1)],
+        DesignConfig(enabled_templates=["amine_alkylation"], keep_parents=True),
+    )
+    assert resin and hardener
+    assert all(validate_product(x.product_smiles, "resin").role_valid for x in resin)
+    assert all(validate_product(x.product_smiles, "hardener").role_valid for x in hardener)
 
 
 def test_scaffold_miner_keeps_valid_training_scaffolds_in_order():

@@ -18,6 +18,18 @@ import pandas as pd
 
 from .smiles_utils import normalize_chemical_string
 
+try:
+    from rdkit import Chem
+    from rdkit.Chem import rdChemReactions
+    RDKIT_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    Chem = None
+    rdChemReactions = None
+    RDKIT_AVAILABLE = False
+
+
+ALLOWED_ELEMENTS = {1, 6, 7, 8, 9, 14, 15, 16, 17, 35, 53}
+
 
 @dataclass
 class DesignConfig:
@@ -98,6 +110,275 @@ class DesignResult:
     prediction_block_reason: str | None = None
     can_predict: bool = False
     stage_counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ReactionTemplate:
+    template_id: str
+    version: int
+    roles: tuple[str, ...]
+    reaction_smarts: str
+    required_site: str
+    risk_level: str = "low"
+    max_products: int = 32
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    ok: bool
+    role_valid: bool
+    canonical_smiles: str | None = None
+    reasons: tuple[str, ...] = ()
+
+
+class ReactionTemplateRegistry:
+    """Small, versioned registry for the built-in molecule edit templates."""
+
+    _templates = {
+        "aryl_methyl_substitution": ReactionTemplate(
+            "aryl_methyl_substitution", 1, ("resin", "hardener"),
+            "[cH:1]>>[c:1]-[CH3]", "aromatic_hydrogen",
+        ),
+        "hydroxyl_glycidyl_ether": ReactionTemplate(
+            "hydroxyl_glycidyl_ether", 1, ("resin",),
+            "[O;H1:1]>>[O:1]CC1CO1", "hydroxyl",
+        ),
+        "amine_alkylation": ReactionTemplate(
+            "amine_alkylation", 1, ("hardener",),
+            "[N;H1,H2:1]>>[N:1]C", "amine_hydrogen",
+        ),
+        "ether_chain_scan": ReactionTemplate(
+            "ether_chain_scan", 1, ("resin", "hardener"),
+            "[CH3;!R:1]>>[CH2:1]C", "chain_terminal",
+        ),
+    }
+
+    @classmethod
+    def get(cls, template_id: str) -> ReactionTemplate | None:
+        return cls._templates.get(str(template_id))
+
+    @classmethod
+    def all(cls) -> tuple[ReactionTemplate, ...]:
+        return tuple(cls._templates.values())
+
+
+def _load_mol(smiles: str):
+    if not RDKIT_AVAILABLE or not smiles:
+        return None
+    try:
+        mol = Chem.MolFromSmiles(str(smiles))
+        if mol is None:
+            return None
+        Chem.SanitizeMol(mol)
+        return mol
+    except Exception:
+        return None
+
+
+def validate_product(smiles: str, role: str = "neutral") -> ValidationReport:
+    """Validate a generated product before feature extraction/model scoring."""
+    if not RDKIT_AVAILABLE:
+        return ValidationReport(False, False, reasons=("rdkit_unavailable",))
+    mol = _load_mol(smiles)
+    if mol is None:
+        return ValidationReport(False, False, reasons=("invalid_smiles",))
+    reasons: list[str] = []
+    if "." in str(smiles):
+        reasons.append("disconnected_product")
+    if any(atom.GetAtomicNum() not in ALLOWED_ELEMENTS for atom in mol.GetAtoms()):
+        reasons.append("element_not_allowed")
+    try:
+        canonical = Chem.MolToSmiles(mol, canonical=True)
+    except Exception:
+        canonical = None
+        reasons.append("canonicalization_failed")
+    role_key = str(role or "neutral").lower()
+    role_valid = role_key in {"neutral", "any", "resin", "hardener"}
+    if not role_valid:
+        reasons.append("unknown_role")
+    return ValidationReport(
+        ok=not reasons and role_valid,
+        role_valid=role_valid,
+        canonical_smiles=canonical,
+        reasons=tuple(reasons),
+    )
+
+
+def _append_atom(mol, atomic_num: int = 6) -> int:
+    atom = Chem.Atom(int(atomic_num))
+    return mol.AddAtom(atom)
+
+
+def _connect_single(mol, atom_idx: int, atomic_num: int = 6) -> int:
+    new_idx = _append_atom(mol, atomic_num)
+    mol.AddBond(int(atom_idx), int(new_idx), Chem.BondType.SINGLE)
+    return new_idx
+
+
+def _product_from_rw(mol, parent: str, role: str, template: ReactionTemplate, trace: dict[str, Any]):
+    try:
+        product_mol = mol.GetMol()
+        Chem.SanitizeMol(product_mol)
+        product_smiles = Chem.MolToSmiles(product_mol, canonical=True)
+    except Exception:
+        return None
+    report = validate_product(product_smiles, role=role)
+    if not report.ok or not report.canonical_smiles:
+        return None
+    return DesignProduct(
+        parent_smiles=parent,
+        product_smiles=report.canonical_smiles,
+        role=role,
+        design_method="reaction_template",
+        template_id=template.template_id,
+        edit_trace=[trace],
+        design_depth=1,
+        chemical_validity=True,
+    )
+
+
+def apply_design_template(smiles: str, template_id: str, *, role: str) -> list[DesignProduct]:
+    """Apply one built-in template using explicit RDKit atom/bond edits."""
+    template = ReactionTemplateRegistry.get(template_id)
+    if template is None or str(role) not in template.roles:
+        return []
+    parent = _load_mol(smiles)
+    if parent is None:
+        return []
+    parent_canonical = Chem.MolToSmiles(parent, canonical=True)
+    products: list[DesignProduct] = []
+    if template_id == "aryl_methyl_substitution":
+        site_indices = [
+            atom.GetIdx() for atom in parent.GetAtoms()
+            if atom.GetIsAromatic() and atom.GetTotalNumHs() > 0
+        ]
+        for site_idx in site_indices[: template.max_products]:
+            rw = Chem.RWMol(parent)
+            new_idx = _connect_single(rw, site_idx, 6)
+            product = _product_from_rw(
+                rw, parent_canonical, role, template,
+                {"site_atom": int(site_idx), "new_atom": int(new_idx), "bond": "SINGLE"},
+            )
+            if product is not None:
+                products.append(product)
+    elif template_id == "hydroxyl_glycidyl_ether":
+        site_indices = [
+            atom.GetIdx() for atom in parent.GetAtoms()
+            if atom.GetAtomicNum() == 8 and atom.GetTotalNumHs() > 0
+        ]
+        for site_idx in site_indices[: template.max_products]:
+            rw = Chem.RWMol(parent)
+            first = _connect_single(rw, site_idx, 6)
+            carbon2 = _connect_single(rw, first, 6)
+            oxygen = _append_atom(rw, 8)
+            rw.AddBond(carbon2, oxygen, Chem.BondType.SINGLE)
+            rw.AddBond(oxygen, first, Chem.BondType.SINGLE)
+            product = _product_from_rw(
+                rw, parent_canonical, role, template,
+                {"site_atom": int(site_idx), "new_atoms": [int(first), int(carbon2), int(oxygen)], "bond": "SINGLE"},
+            )
+            if product is not None:
+                products.append(product)
+    elif template_id == "amine_alkylation":
+        site_indices = [
+            atom.GetIdx() for atom in parent.GetAtoms()
+            if atom.GetAtomicNum() == 7 and atom.GetTotalNumHs() > 0
+        ]
+        for site_idx in site_indices[: template.max_products]:
+            rw = Chem.RWMol(parent)
+            new_idx = _connect_single(rw, site_idx, 6)
+            product = _product_from_rw(
+                rw, parent_canonical, role, template,
+                {"site_atom": int(site_idx), "new_atom": int(new_idx), "bond": "SINGLE"},
+            )
+            if product is not None:
+                products.append(product)
+    elif template_id == "ether_chain_scan":
+        site_indices = [
+            atom.GetIdx() for atom in parent.GetAtoms()
+            if atom.GetAtomicNum() == 6 and not atom.IsInRing() and atom.GetDegree() == 1
+        ]
+        for site_idx in site_indices[: template.max_products]:
+            rw = Chem.RWMol(parent)
+            new_idx = _connect_single(rw, site_idx, 6)
+            product = _product_from_rw(
+                rw, parent_canonical, role, template,
+                {"site_atom": int(site_idx), "new_atom": int(new_idx), "bond": "SINGLE", "scan": "C1-C6"},
+            )
+            if product is not None:
+                products.append(product)
+    return products
+
+
+def _count_pattern(mol, smarts: str) -> int:
+    if mol is None:
+        return 0
+    try:
+        pattern = Chem.MolFromSmarts(smarts)
+        return len(mol.GetSubstructMatches(pattern)) if pattern is not None else 0
+    except Exception:
+        return 0
+
+
+def _role_specific_valid(smiles: str, role: str) -> bool:
+    """Apply conservative chemistry-role gates after a product is connected."""
+    mol = _load_mol(smiles)
+    role_key = str(role or "neutral").lower()
+    if mol is None:
+        return False
+    if role_key == "resin":
+        return _count_pattern(mol, "[O;r3]1[C;r3][C;r3]1") > 0
+    if role_key == "hardener":
+        active = sum(int(atom.GetAtomicNum() == 7 and atom.GetTotalNumHs() > 0) for atom in mol.GetAtoms())
+        active += _count_pattern(mol, "[SX2H]")
+        active += _count_pattern(mol, "[cX3][OX2H]")
+        active += _count_pattern(mol, "[CX3](=O)O[CX3](=O)")
+        active += _count_pattern(mol, "n1cc[nH]c1")
+        return active > 0
+    return True
+
+
+def generate_rule_based_variants(
+    scaffolds: Sequence[Scaffold],
+    config: DesignConfig,
+) -> list[DesignProduct]:
+    """Generate deterministic A/B variants under role and quota constraints."""
+    template_ids = list(config.enabled_templates)
+    if not template_ids:
+        template_ids = [template.template_id for template in ReactionTemplateRegistry.all()]
+    products: list[DesignProduct] = []
+    for scaffold in list(scaffolds)[: max(0, int(config.max_scaffolds))]:
+        parent_report = validate_product(scaffold.smiles, role=scaffold.role)
+        if not parent_report.ok or not _role_specific_valid(scaffold.smiles, scaffold.role):
+            continue
+        if config.keep_parents:
+            products.append(
+                DesignProduct(
+                    parent_smiles=parent_report.canonical_smiles or scaffold.smiles,
+                    product_smiles=parent_report.canonical_smiles or scaffold.smiles,
+                    role=scaffold.role,
+                    design_method="parent",
+                    template_id="",
+                    design_depth=0,
+                    chemical_validity=True,
+                )
+            )
+        generated = 0
+        seen_products = {products[-1].product_smiles} if products and products[-1].parent_smiles == scaffold.smiles else set()
+        for template_id in template_ids:
+            if generated >= int(config.max_variants_per_scaffold):
+                break
+            for product in apply_design_template(scaffold.smiles, template_id, role=scaffold.role):
+                if not _role_specific_valid(product.product_smiles, scaffold.role):
+                    continue
+                if product.product_smiles in seen_products:
+                    continue
+                seen_products.add(product.product_smiles)
+                products.append(product)
+                generated += 1
+                if generated >= int(config.max_variants_per_scaffold):
+                    break
+    return products
 
 
 def _json_safe(value: Any) -> Any:
@@ -219,4 +500,11 @@ __all__ = [
     "DesignResult",
     "ScaffoldMiner",
     "compute_design_hash",
+    "ALLOWED_ELEMENTS",
+    "ReactionTemplate",
+    "ReactionTemplateRegistry",
+    "ValidationReport",
+    "validate_product",
+    "apply_design_template",
+    "generate_rule_based_variants",
 ]
