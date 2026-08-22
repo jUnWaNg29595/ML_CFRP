@@ -1,4 +1,7 @@
 import pandas as pd
+import os
+import subprocess
+import sys
 
 from core.molecule_design import (
     DesignConfig,
@@ -48,3 +51,24 @@ def test_domain_types_have_json_safe_defaults_and_nested_hashing():
 
     assert SearchConfig().beam_width > 0
     assert compute_design_hash(result)
+
+
+def test_design_hash_is_stable_for_nested_sets_across_python_processes():
+    script = (
+        "from core.molecule_design import compute_design_hash; "
+        "print(compute_design_hash({'nested': {'alpha', 'beta', 'gamma', 'delta'}}))"
+    )
+    hashes = []
+    for seed in ("1", "2"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = seed
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        hashes.append(completed.stdout.strip())
+
+    assert hashes[0] == hashes[1]

@@ -111,8 +111,20 @@ def _json_safe(value: Any) -> Any:
         return value if math.isfinite(value) else None
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        normalized_items = [_json_safe(item) for item in value]
+        return sorted(
+            normalized_items,
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
 
     # numpy and pandas scalar objects expose ``item`` while remaining optional
     # dependencies of this lightweight contract.
