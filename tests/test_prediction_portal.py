@@ -6,6 +6,7 @@ import pytest
 from core.prediction_portal import (
     activate_publication,
     build_prediction_contract,
+    is_port_open,
     make_publication_entry,
     portal_health_label,
     rollback_publication,
@@ -201,6 +202,10 @@ def test_portal_health_and_active_release_selection():
     assert select_active_publication(
         [{"id": "v1", "enabled": False}, {"id": "v2", "enabled": True}]
     )["id"] == "v2"
+
+
+def test_portal_port_probe_returns_false_for_unused_local_port():
+    assert is_port_open("127.0.0.1", 1, timeout=0.05) is False
     assert select_active_publication([]) is None
 
 

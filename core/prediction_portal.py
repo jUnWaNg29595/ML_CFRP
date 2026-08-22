@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import socket
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -468,6 +469,15 @@ def rollback_publication(
 
 def portal_health_label(running: bool) -> str:
     return "可访问" if bool(running) else "未启动"
+
+
+def is_port_open(host: str = "127.0.0.1", port: int = 8555, *, timeout: float = 0.2) -> bool:
+    """Return whether a TCP service accepts connections without starting it."""
+    try:
+        with socket.create_connection((str(host), int(port)), timeout=float(timeout)):
+            return True
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def should_show_publication(contract_report: Mapping[str, Any]) -> bool:

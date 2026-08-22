@@ -1116,6 +1116,7 @@ from core.prediction_molecular_baseline import (
     validate_single_row_source_values,
     workflow_requires_manual_molecular_input,
 )
+from core.prediction_portal import is_port_open, portal_health_label
 from core.navigation import (
     NAVIGATION_PAGES,
     resolve_navigation_page,
@@ -3508,6 +3509,28 @@ def render_sidebar():
         )
         page = resolve_navigation_page(page)
         st.session_state["_last_active_page"] = page
+
+        st.markdown("---")
+        st.markdown("### 🌐 用户预测门户")
+        portal_enabled = st.checkbox(
+            "显示用户预测门户入口",
+            value=bool(st.session_state.get("user_prediction_portal_enabled", False)),
+            key="user_prediction_portal_enabled",
+            disabled=active_task_lock,
+            help="开启后显示独立运行在 8555 端口的外部用户预测页面。",
+        )
+        if portal_enabled:
+            portal_running = is_port_open("127.0.0.1", 8555)
+            if portal_running:
+                st.success(f"门户状态：{portal_health_label(True)}")
+                st.link_button(
+                    "打开用户预测门户",
+                    "http://localhost:8555",
+                    width="stretch",
+                )
+            else:
+                st.warning("门户状态：未启动。请运行“启动预测平台.bat”后刷新页面。")
+                st.caption("访问地址：http://localhost:8555")
 
         st.markdown("---")
         st.markdown("### 📊 数据状态")
