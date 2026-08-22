@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -41,6 +42,14 @@ from core.virtual_screening import (
     iter_pair_indices,
     sample_pair_indices,
 )
+
+
+def test_virtual_screening_page_exposes_design_engine_only():
+    source = Path(__file__).resolve().parents[1].joinpath("app.py").read_text(encoding="utf-8")
+    source = source[source.rfind("def page_virtual_screening") :]
+    assert "分子设计引擎" in source
+    assert "叠加 PubChem 候选" not in source
+    assert "虚拟完整分子上限" not in source
 
 
 def test_exact_replay_rejects_missing_required_feature_without_fingerprint_fill():

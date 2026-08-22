@@ -21542,6 +21542,222 @@ def page_virtual_screening():
         )
 
 
+def _render_molecule_design_engine():
+    """Design-only virtual screening page backed by validated scaffold edits."""
+    import dataclasses
+    from core.molecule_design import (
+        DesignConfig,
+        ReactionTemplateRegistry,
+        ScaffoldMiner,
+        design_molecules,
+    )
+
+    st.title("🧬 虚拟分子筛选 · 分子设计引擎")
+    st.caption("以训练/候选数据中的有效骨架为起点，按化学键规则生成变体，再用当前模型评分。")
+
+    model = get_current_model()
+    if model is None:
+        st.warning("请先训练或导入模型")
+        return
+    source_df = st.session_state.get("processed_data")
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+        source_df = st.session_state.get("data")
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+        st.warning("请先上传包含 SMILES/结构列的数据")
+        return
+
+    text_cols = [
+        str(column) for column in source_df.columns
+        if source_df[column].dtype == object or str(source_df[column].dtype).startswith("string")
+    ]
+    smiles_cols = [
+        column for column in text_cols
+        if any(token in column.lower() for token in ("smiles", "smi", "structure", "molecule", "分子"))
+    ] or text_cols
+    if not smiles_cols:
+        st.error("当前数据没有可用的 SMILES/结构列")
+        return
+
+    model_name = st.session_state.get("model_name") or type(model).__name__
+    feature_cols = [str(column) for column in (st.session_state.get("feature_cols") or [])]
+    st.info(f"当前模型：{model_name} · 输入特征：{len(feature_cols)} 列。所有候选必须通过模型特征契约后才会评分。")
+
+    def _role_default(tokens):
+        for column in smiles_cols:
+            low = column.lower()
+            if any(token in low for token in tokens):
+                return column
+        return smiles_cols[0]
+
+    with st.expander("1. 骨架来源与化学角色", expanded=True):
+        resin_col = st.selectbox(
+            "树脂/主体骨架列", smiles_cols,
+            index=smiles_cols.index(_role_default(("resin", "epoxy", "树脂", "环氧"))),
+            key="vs_design_resin_col",
+        )
+        include_hardener = st.checkbox("同时设计固化剂骨架", value=True, key="vs_design_include_hardener")
+        hardener_col = None
+        if include_hardener:
+            hardener_col = st.selectbox(
+                "固化剂骨架列", smiles_cols,
+                index=smiles_cols.index(_role_default(("hardener", "curing", "固化", "交联"))),
+                key="vs_design_hardener_col",
+            )
+        source_limit = st.slider("每个角色最多使用的训练骨架", 1, 256, 32, key="vs_design_scaffold_limit")
+        keep_parents = st.checkbox("保留原始骨架作为对照锚点", value=True, key="vs_design_keep_parents")
+
+    templates = list(ReactionTemplateRegistry.all())
+    with st.expander("2. A/B 化学设计规则", expanded=True):
+        enabled_template_ids = st.multiselect(
+            "启用的连接模板（A 骨架编辑 + B Reaction SMARTS）",
+            options=[template.template_id for template in templates],
+            default=[template.template_id for template in templates],
+            format_func=lambda value: {
+                "aryl_methyl_substitution": "芳环氢 → 甲基",
+                "hydroxyl_glycidyl_ether": "羟基 → 醚/环氧链",
+                "amine_alkylation": "胺基 → 烷基化",
+                "ether_chain_scan": "链端 C1-C6 扫描",
+            }.get(value, value),
+            key="vs_design_templates",
+        )
+        for template in templates:
+            if template.template_id in enabled_template_ids:
+                st.caption(
+                    f"`{template.template_id}` · SMARTS `{template.reaction_smarts}` · "
+                    f"位点 `{template.required_site}` · 风险：{template.risk_level}"
+                )
+        max_variants = st.slider("每个骨架最多保留的变体", 1, 64, 12, key="vs_design_max_variants")
+
+    with st.expander("3. C 模型引导图搜索", expanded=True):
+        search_depth = st.slider("搜索深度", 0, 3, 1, key="vs_design_search_depth")
+        beam_width = st.slider("Beam 宽度", 1, 32, 8, key="vs_design_beam_width")
+        exploration_ratio = st.slider("探索比例", 0.0, 0.5, 0.2, 0.05, key="vs_design_exploration_ratio")
+        design_seed = st.number_input("设计随机种子", 0, 10_000_000, 42, key="vs_design_random_state")
+        st.caption("搜索只扩展已通过 RDKit 连接、价态、元素和角色规则的产物；没有模型分数时不会返回随机排序结果。")
+
+    config = DesignConfig(
+        random_state=int(design_seed),
+        max_scaffolds=int(source_limit),
+        max_variants_per_scaffold=int(max_variants),
+        keep_parents=bool(keep_parents),
+        enabled_templates=list(enabled_template_ids),
+        search_depth=int(search_depth),
+        beam_width=int(beam_width),
+        exploration_ratio=float(exploration_ratio),
+    )
+    st.session_state["vs_design_config"] = dataclasses.asdict(config)
+
+    artifact = st.session_state.get("imported_model_artifact") or {}
+    artifact_extra = artifact.get("extra") if isinstance(artifact, dict) else {}
+    artifact_extra = artifact_extra if isinstance(artifact_extra, dict) else {}
+    workflow = artifact_extra.get("molecular_feature_workflow") or st.session_state.get("molecular_feature_workflow")
+    molecular_cfg = artifact_extra.get("molecular_feature_config") or st.session_state.get("molecular_feature_config")
+    pipeline = st.session_state.get("pipeline")
+    imputer = st.session_state.get("imputer")
+    scaler = st.session_state.get("scaler")
+
+    def _descriptor_frame(smiles_values):
+        from rdkit import Chem
+        from rdkit.Chem import Descriptors, Lipinski, rdMolDescriptors
+        rows = []
+        for smiles in smiles_values:
+            mol = Chem.MolFromSmiles(str(smiles))
+            if mol is None:
+                rows.append({})
+                continue
+            rows.append({
+                "MolWt": float(Descriptors.MolWt(mol)),
+                "molecular_weight": float(Descriptors.MolWt(mol)),
+                "LogP": float(Descriptors.MolLogP(mol)),
+                "logp": float(Descriptors.MolLogP(mol)),
+                "NumHDonors": float(Lipinski.NumHDonors(mol)),
+                "NumHAcceptors": float(Lipinski.NumHAcceptors(mol)),
+                "NumRings": float(rdMolDescriptors.CalcNumRings(mol)),
+                "HeavyAtomCount": float(mol.GetNumHeavyAtoms()),
+            })
+        return pd.DataFrame(rows)
+
+    def _score_items(items, role):
+        """Build model inputs from the saved workflow, never from fabricated zero columns."""
+        from core.virtual_screening import build_feature_matrix, predict_with_model
+        values = [item.product_smiles for item in items]
+        if workflow is not None:
+            from core.molecular_feature_workflow import execute_molecular_feature_workflow
+            frame = pd.concat([source_df.iloc[[0]].copy()] * len(values), ignore_index=True)
+            for column in frame.columns:
+                low = str(column).lower()
+                if role == "resin" and any(token in low for token in ("resin", "epoxy", "树脂", "环氧")):
+                    frame[column] = values
+                elif role == "hardener" and any(token in low for token in ("hardener", "curing", "固化", "交联")):
+                    frame[column] = values
+            try:
+                execution = execute_molecular_feature_workflow(frame, workflow, mode="screening")
+                missing = [column for column in feature_cols if column not in execution.features.columns]
+                if missing:
+                    raise ValueError("模型特征流程缺少：" + ", ".join(missing[:8]))
+                matrix = build_feature_matrix(feature_cols, execution.features, strict=True)
+                return np.asarray(predict_with_model(model, matrix, pipeline=pipeline, imputer=imputer, scaler=scaler), dtype=float)
+            except Exception as exc:
+                raise ValueError(f"分子特征 workflow 无法复现：{exc}") from exc
+        descriptors = _descriptor_frame(values)
+        missing = [column for column in feature_cols if column not in descriptors.columns]
+        if missing:
+            raise ValueError("没有保存可复现的分子特征 workflow，且模型需要未提供的特征：" + ", ".join(missing[:8]))
+        matrix = build_feature_matrix(feature_cols, descriptors, strict=True)
+        return np.asarray(predict_with_model(model, matrix, pipeline=pipeline, imputer=imputer, scaler=scaler), dtype=float)
+
+    with st.expander("4. 设计预览与正式筛选", expanded=True):
+        preview_limit = st.slider("预览骨架数", 1, min(8, int(source_limit)), min(3, int(source_limit)), key="vs_design_preview_limit")
+        preview_btn = st.button("🔬 预览设计", type="secondary", key="vs_design_preview_btn")
+        run_btn = st.button("🚀 运行模型驱动分子筛选", type="primary", key="vs_design_run_btn")
+
+    if preview_btn or run_btn:
+        limit = int(preview_limit if preview_btn else source_limit)
+        try:
+            resin_scaffolds = ScaffoldMiner.from_frame(source_df, "resin", [resin_col], limit, int(design_seed))
+            resin_result = design_molecules(
+                resin_scaffolds, config, model=model,
+                feature_cols=feature_cols,
+                scorer=lambda items: _score_items(items, "resin"),
+            )
+            frames = [pd.DataFrame([dataclasses.asdict(item) for item in resin_result.products])]
+            if include_hardener and hardener_col:
+                hard_scaffolds = ScaffoldMiner.from_frame(source_df, "hardener", [hardener_col], limit, int(design_seed) + 1)
+                hard_result = design_molecules(
+                    hard_scaffolds, config, model=model,
+                    feature_cols=feature_cols,
+                    scorer=lambda items: _score_items(items, "hardener"),
+                )
+                frames.append(pd.DataFrame([dataclasses.asdict(item) for item in hard_result.products]))
+            result_df = pd.concat([frame for frame in frames if not frame.empty], ignore_index=True) if any(not frame.empty for frame in frames) else pd.DataFrame()
+            if result_df.empty:
+                st.error("没有生成满足化学连接规则且能通过模型特征契约的候选")
+            else:
+                design_hash = resin_result.design_hash
+                st.session_state["vs_design_hash"] = design_hash
+                st.session_state["vs_design_preview"] = bool(preview_btn)
+                st.session_state["vs_design_result_df"] = result_df
+                st.session_state["vs_design_trace"] = result_df.to_dict(orient="records")
+                st.success(f"设计完成：生成 {len(result_df):,} 个可审计候选")
+                st.dataframe(result_df, width="stretch", height=420)
+                st.download_button(
+                    "⬇️ 下载分子设计结果（CSV）",
+                    data=result_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="model_guided_molecule_design.csv",
+                    mime="text/csv",
+                    key="vs_design_download",
+                )
+        except Exception as exc:
+            st.session_state.pop("vs_design_result_df", None)
+            st.session_state.pop("vs_design_trace", None)
+            st.error(f"设计/模型评分已停止：{exc}")
+
+
+def page_virtual_screening():
+    """虚拟分子筛选：仅保留模型驱动的分子设计引擎。"""
+    return _render_molecule_design_engine()
+
+
 def page_hyperparameter_optimization():
     """超参数优化页面：可靠基线默认使用外层独立测试集 + 内层固定交叉验证。"""
     st.title("⚙️ 超参数优化")

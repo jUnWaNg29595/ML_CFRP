@@ -41,6 +41,9 @@ class DesignConfig:
     max_products_per_template: int = 32
     keep_parents: bool = True
     enabled_templates: list[str] = field(default_factory=list)
+    search_depth: int = 1
+    beam_width: int = 8
+    exploration_ratio: float = 0.2
 
 
 @dataclass
@@ -482,10 +485,11 @@ def design_molecules(
         return result
     if int(config.max_variants_per_scaffold) > 0:
         search_config = SearchConfig(
-            depth=1,
-            beam_width=max(1, min(int(config.max_variants_per_scaffold), 32)),
+            depth=max(0, int(config.search_depth)),
+            beam_width=max(1, min(int(config.beam_width), int(config.max_variants_per_scaffold), 32)),
             max_products=max(1, int(config.max_variants_per_scaffold) * max(1, len(scaffold_list))),
             random_state=int(config.random_state),
+            exploration_ratio=float(config.exploration_ratio),
         )
         variants = search_design_space(variants, search_config, scorer=scorer)
     result.products = variants
