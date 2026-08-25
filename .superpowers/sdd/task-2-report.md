@@ -34,3 +34,10 @@
 
 - 未修改 `app.py`、`UserPrediction.py`、`prediction_config.json` 或其他无关文件。
 - 未纳入工作树中预先存在的其他 `.superpowers/sdd` 未跟踪文件。
+
+## 本次复审记录（2026-08-25）
+
+- 复审确认任务2修复已包含在当前提交 `496521a`，当前工作树未发现 `core/portal_ai_config.py` 或 `tests/test_portal_ai_config.py` 的额外未提交差异。
+- 按复审要求重新运行 `python -m pytest -q tests/test_portal_ai_config.py tests/test_prediction_portal.py tests/test_portal_ai_schema.py`：`78 passed`。
+- 重新运行 `git diff --check`：通过。
+- 本次仅更新本报告，不修改 `app.py`、`UserPrediction.py`、`prediction_config.json`，也不纳入其他预先存在的未跟踪文件。
