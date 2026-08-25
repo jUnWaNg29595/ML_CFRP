@@ -170,8 +170,12 @@ def _parse_suggestion(value: object, warnings: list[str]) -> AIFieldSuggestion:
     field_name = _as_text(value.get("field"), label="suggestion.field", max_length=MAX_FIELD_NAME_LENGTH)
     state = value.get("state", "suggested")
     source = value.get("source", "ai")
+    if not isinstance(state, str):
+        raise ValueError("suggestion.state must be a string")
     if state not in FIELD_STATES:
         raise ValueError(f"unsupported field state: {state}")
+    if not isinstance(source, str):
+        raise ValueError("suggestion.source must be a string")
     if source not in SOURCES:
         raise ValueError(f"unsupported source: {source}")
     confidence = _validate_confidence(value.get("confidence"), label="suggestion.confidence")

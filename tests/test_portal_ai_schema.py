@@ -177,3 +177,21 @@ def test_context_redacts_credentials_embedded_in_free_text():
     assert "synthetic-password" not in safe["user_text"]
     assert "synthetic-secret" not in safe["user_text"]
     assert "synthetic-token" not in safe["user_text"]
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed_value"),
+    [("state", []), ("source", {})],
+)
+def test_parse_suggestion_rejects_non_string_state_and_source(field, malformed_value):
+    with pytest.raises(ValueError, match=field):
+        parse_ai_response(
+            {
+                "suggestions": [
+                    {
+                        "field": "resin_smiles",
+                        field: malformed_value,
+                    }
+                ]
+            }
+        )
