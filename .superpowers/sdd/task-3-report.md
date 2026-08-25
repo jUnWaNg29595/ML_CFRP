@@ -1,63 +1,41 @@
-# Task 3 完成报告：数据探索页预览与图表快速导出
+# Task 3 完成报告：OpenAI 兼容门户 AI 客户端
+
+## 状态
+
+已完成任务 3，工作树为 `C:\Users\wangj\Desktop\CFRP系统-worktrees\portal-ai-ui`。
 
 ## 实现内容
 
-- 在数据探索页增加当前处理数据/原始数据预览源选择。
-- 增加支持搜索和多选的预览列选择，并在数据源切换后清理失效列。
-- 将预览行数限制为最多 5000 行；空列选择只提示“至少选择一列”，不回退显示全部列。
-- 增加 `_render_data_explore_preview(raw_df, processed_df)` 辅助函数。
-- 增加 `_render_figure_export_controls(figure, data_df, base_name, key_prefix)` 辅助函数。
-- 为相关性矩阵、Pearson 分析、分布图、箱线图和缺失值图增加当前图表数据 CSV/Excel 及 HTML/PNG/SVG 快速导出。
-- 图表导出数据默认来自当前处理数据；相关性和 Pearson 使用当前图表实际计算数据。
-- Excel、PNG、SVG 等单格式依赖错误单独提示，不阻断其他格式。
-- 所有图表导出按钮使用稳定的页面级 key 前缀。
+- 新增 `core/portal_ai.py`，提供 `PortalAIClient`、`parse_chat_completion()` 和 `parse_json_or_markdown_json()`。
+- 使用 `POST /chat/completions` 调用 OpenAI-compatible 服务；API Key 只进入 `Authorization: Bearer ...` 请求头。
+- 注入可测试的 `transport` seam，不在测试中联网。
+- 对 timeout、连接异常、408、409、425、429 和 5xx 执行一次重试，最多两次尝试。
+- 对 401、403、429、瞬时网络错误和 malformed JSON 分类，错误信息不包含 API Key、请求头或完整请求体。
+- 支持纯 JSON 与单个 Markdown fenced JSON；拒绝带解释性 prose 或多重代码围栏的响应。
+- AI 输出继续进入既有 `portal_ai_schema` 校验，不执行 Python、命令或其他代码。
+- 保留语义兼容异常别名，便于调用方区分认证、请求、限流和响应解析错误。
 
-## TDD 验证
+## 验证
 
-1. 先新增两个页面源代码回归测试。
-2. 首次运行回归测试：2 个新增测试按预期失败，原因是页面缺少预览和快速导出标签。
-3. 完成最小实现后运行：
-   - `tests/test_app_scope_regressions.py`
-   - `tests/test_data_explore_export.py`
-4. 最终结果：`26 passed`。
-5. 额外运行 `python -m py_compile app.py`，通过。
+- `python -m pytest -q tests/test_portal_ai.py`：7 passed。
+- `python -m pytest -q tests/test_portal_ai.py tests/test_portal_ai_config.py tests/test_portal_ai_schema.py tests/test_prediction_portal.py`：86 passed。
+- `python -m compileall -q .`：通过。
+- `git diff --check`：通过。
 
 ## 变更边界
 
-- Task 3 自己的修改：`app.py`、`tests/test_app_scope_regressions.py`、本报告。
-- `core/model_trainer.py` 保持未暂存、未提交。
-- `app.py` 中用户已有的 `StandardScaler/MinMaxScaler/RobustScaler` 无关修改保持未暂存、未提交。
-- 缓存、备份和其他未跟踪文件均未加入提交。
+本任务只提交 `core/portal_ai.py`、`tests/test_portal_ai.py` 和本报告；工作树中预先存在的其他 `.superpowers/sdd` 文件、缓存、模型、数据和备份不纳入提交。
 
-## Concerns
+## 安全边界
 
-- PNG/SVG 是否可用取决于 Plotly 的 `kaleido` 依赖；依赖缺失时页面会仅提示对应格式不可用，HTML 和数据导出仍可继续。
-- 未运行完整项目测试套件；本任务使用了 brief 指定的页面回归测试和导出核心测试。
+- AI 只能解析输入和解释结果，不能执行 Python、Shell、模块导入或模型操作。
+- API Key 不写入日志、错误文本、导出对象或配置请求体。
+- 实际特征工程、xTB、模型加载与预测仍由 Python 后端负责，AI 客户端不绕过确认门禁。
+## 独立审查后的修复
 
-## Task 3 审查修复报告
+- 清除 transport 任意异常的上下文链，避免底层异常文本或请求对象携带 API Key/headers。
+- 普通 4xx 错误保留 `PortalAIHTTPError` 类型和 `status_code`。
+- 确保最多两次重试，且只在实际重试前 sleep；transport 注入使用 `is None` 判断。
+- JSON 解析器拒绝数组、数字、字符串和 `null` 等非对象响应。
 
-### 修复内容
-
-- 将数据探索页的预览测试从纯源码字符串断言替换为真实辅助函数交互测试。
-- 覆盖预览数据源选择、显式空列选择、最多 5000 行、列选择在数据源切换时保留有效交集，以及图表导出按钮的实际 payload、文件名和稳定 key。
-- 修复数据源切换逻辑：保留仍存在的列；仅在切换后没有有效列选择时回退当前数据源前 8 列；显式空选择在同一数据源下仍保持空并隐藏表格。
-
-### TDD 验证
-
-1. RED：
-   - 命令：`C:\Users\wangj\anaconda3\envs\CFRP_env\python.exe -m pytest tests\test_app_scope_regressions.py tests\test_data_explore_export.py -q`
-   - 输出：`1 failed, 27 passed`
-   - 失败：数据源切换后预期保留 `shared`，实际回退为原始数据前 8 列。
-2. GREEN：
-   - 同一命令输出：`28 passed in 20.79s`
-3. 提交前新鲜验证：
-   - 同一聚焦测试命令输出：`28 passed in 20.68s`
-   - 命令：`C:\Users\wangj\anaconda3\envs\CFRP_env\python.exe -m py_compile app.py`
-   - 输出：无；退出码 `0`。
-
-### 边界与顾虑
-
-- 未运行完整项目测试套件；本次仅运行 Task 3 相关回归/导出测试和 `app.py` 编译检查。
-- Streamlit 可导入并支持行为级测试；未启动交互式 Streamlit 服务。
-- PNG/SVG 仍依赖 Plotly `kaleido`，依赖缺失时由现有逻辑逐格式提示，不影响 HTML、CSV、Excel 按钮。
-- `app.py` 中已有的其他未提交修改、缓存、备份和未跟踪文件未纳入本次修复提交。
+复审补测覆盖上述边界，任务 3 与既有门户回归共 `89 passed`。

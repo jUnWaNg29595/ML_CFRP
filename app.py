@@ -1131,6 +1131,15 @@ from core.prediction_portal import (
     start_prediction_portal,
     stop_prediction_portal,
 )
+from core.portal_ai import PortalAIClient, PortalAIError
+from core.portal_ai_config import (
+    AIServiceConfig,
+    exportable_ai_config,
+    load_ai_config,
+    redacted_ai_config,
+    save_ai_config,
+    validate_ai_config,
+)
 from core.navigation import (
     NAVIGATION_PAGES,
     resolve_navigation_page,
@@ -4062,6 +4071,87 @@ def _render_network_proxy_panel(active_task_lock: bool = False):
                 st.info(report.get('message', '代理未启用。'))
 
 
+
+def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
+    """Render safe AI service administration without exposing credentials."""
+    with st.expander('AI 服务管理', expanded=False):
+        config_root = Path(__file__).resolve().parent
+        try:
+            ai_config = load_ai_config(config_root)
+        except Exception as exc:
+            st.error(f'AI 配置读取失败：{exc}')
+            ai_config = {'services': []}
+        services = list(ai_config.get('services') or [])
+        service_options = [item.get('service_id') for item in services if item.get('service_id')]
+        service_options = service_options or ['deepseek']
+        selected_id = st.selectbox('服务', service_options, key='portal_ai_service_selector', disabled=active_task_lock)
+        current = next((item for item in services if item.get('service_id') == selected_id), {})
+        if not current:
+            current = {
+                'service_id': selected_id, 'label': 'DeepSeek', 'provider': 'openai-compatible',
+                'base_url': 'https://api.deepseek.com/v1', 'model': 'deepseek-chat',
+                'purpose': 'both', 'timeout_seconds': 30, 'max_tokens': 2048,
+                'temperature': 0.2, 'enabled': False,
+            }
+        col1, col2 = st.columns(2)
+        with col1:
+            service_id = st.text_input('服务 ID', value=str(current.get('service_id') or selected_id), key='portal_ai_service_id', disabled=active_task_lock)
+            label = st.text_input('显示名称', value=str(current.get('label') or service_id), key='portal_ai_label', disabled=active_task_lock)
+            provider = st.text_input('提供方', value=str(current.get('provider') or 'openai-compatible'), key='portal_ai_provider', disabled=active_task_lock)
+            base_url = st.text_input('兼容 API 地址', value=str(current.get('base_url') or ''), key='portal_ai_base_url', disabled=active_task_lock)
+            model = st.text_input('模型名称', value=str(current.get('model') or ''), key='portal_ai_model', disabled=active_task_lock)
+        with col2:
+            purpose = st.selectbox('用途', ['both', 'input_parsing', 'result_explanation'], index=['both', 'input_parsing', 'result_explanation'].index(current.get('purpose', 'both')) if current.get('purpose', 'both') in {'both', 'input_parsing', 'result_explanation'} else 0, format_func=lambda value: {'both': '输入助手 + 结果解释', 'input_parsing': '仅输入助手', 'result_explanation': '仅结果解释'}[value], key='portal_ai_purpose', disabled=active_task_lock)
+            timeout_seconds = st.number_input('超时（秒）', min_value=1, max_value=300, value=int(current.get('timeout_seconds', 30)), key='portal_ai_timeout', disabled=active_task_lock)
+            max_tokens = st.number_input('最大输出 token', min_value=1, max_value=200000, value=int(current.get('max_tokens', 2048)), key='portal_ai_max_tokens', disabled=active_task_lock)
+            temperature = st.number_input('Temperature', min_value=0.0, max_value=2.0, value=float(current.get('temperature', 0.2)), step=0.05, key='portal_ai_temperature', disabled=active_task_lock)
+            enabled = st.checkbox('启用该服务', value=bool(current.get('enabled', False)), key='portal_ai_enabled', disabled=active_task_lock)
+        key_hint = '••••••••（已保存；留空表示保持不变）' if current.get('api_key') else '尚未设置 API Key'
+        st.caption(key_hint)
+        api_key = st.text_input('API Key', value='', type='password', key='portal_ai_api_key', disabled=active_task_lock, help='不会在页面、日志或脱敏导出中显示。')
+        payload = {
+            'service_id': service_id.strip(), 'label': label.strip(), 'provider': provider.strip(),
+            'base_url': base_url.strip(), 'model': model.strip(), 'purpose': purpose,
+            'timeout_seconds': int(timeout_seconds), 'max_tokens': int(max_tokens),
+            'temperature': float(temperature), 'enabled': bool(enabled),
+        }
+        if api_key.strip():
+            payload['api_key'] = api_key.strip()
+        elif current.get('api_key'):
+            payload['api_key'] = current['api_key']
+        save_col, test_col = st.columns(2)
+        with save_col:
+            if st.button('保存 AI 配置', key='portal_ai_save', width='stretch', disabled=active_task_lock):
+                try:
+                    new_services = [item for item in services if item.get('service_id') != service_id.strip()]
+                    new_services.append(payload)
+                    normalized = save_ai_config(config_root, {'services': new_services})
+                    st.success(f'已安全保存 {len(normalized.get("services", []))} 个 AI 服务。')
+                except Exception as exc:
+                    st.error(f'AI 配置校验或保存失败：{exc}')
+        with test_col:
+            if st.button('测试连接', key='portal_ai_test', width='stretch', disabled=active_task_lock):
+                try:
+                    normalized = validate_ai_config({'services': [payload]})['services'][0]
+                    client = PortalAIClient(AIServiceConfig(**normalized))
+                    client.parse_input({'material_type': 'epoxy_resin', 'target': 'tg', 'text': '连接测试；不要生成预测值。'})
+                    st.success('AI 服务连接和 JSON 契约测试通过。')
+                except PortalAIError as exc:
+                    st.error(f'AI 服务测试失败：{exc}')
+                except Exception as exc:
+                    st.error(f'AI 服务配置不可用：{exc}')
+        st.markdown('**当前脱敏配置**')
+        st.json(redacted_ai_config(ai_config), expanded=False)
+        st.download_button(
+            '下载脱敏配置',
+            data=json.dumps(exportable_ai_config(ai_config), ensure_ascii=False, indent=2),
+            file_name='portal_ai_config.redacted.json',
+            mime='application/json',
+            key='portal_ai_export',
+            disabled=active_task_lock,
+        )
+        st.caption('AI 只辅助输入和解释；不会生成分子特征、修改模型输入或替代 Python 预测。')
+
 def render_sidebar():
     """渲染侧边栏导航"""
     with st.sidebar:
@@ -4171,6 +4261,7 @@ def render_sidebar():
             st.warning("门户状态：未启动。可点击“开启门户”，或勾选上方自动运行。")
             st.caption("访问地址：http://localhost:8555")
         _render_network_proxy_panel(active_task_lock)
+        _render_portal_ai_service_panel(active_task_lock)
 
         st.markdown("---")
         st.markdown("### 📊 数据状态")

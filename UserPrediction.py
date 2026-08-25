@@ -6,6 +6,7 @@ import base64
 import json
 import re
 from datetime import datetime
+from html import escape as html_escape
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -14,6 +15,11 @@ import pandas as pd
 import streamlit as st
 
 from core.model_io import load_model_artifact_bytes
+from core.portal_prediction import run_confirmed_prediction
+from core.portal_ai import PortalAIClient, PortalAIError
+from core.portal_ai_config import AIServiceConfig, load_ai_config, redacted_ai_config
+from core.portal_ui import inject_scientific_theme, render_material_card, render_stage_timeline, render_status_badge, svg_icon
+from core.portal_tasks import PortalTaskManager
 
 
 APP_NAME = "CFRP 预测应用平台"
@@ -28,6 +34,214 @@ ASSET_ROOT = PLATFORM_ROOT / "assets"
 DATA_UPLOAD_TYPES = ["csv", "xlsx", "xls"]
 SMILES_UPLOAD_TYPES = ["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "heif", "heic", "pdf"]
 PARAMETER_KINDS = ["number", "integer", "text", "select", "smiles"]
+
+
+def build_ai_confirmation_state(response: Any, confirmed_fields: set[str] | None = None) -> Dict[str, Any]:
+    """Normalize AI suggestions into a state that requires explicit user decisions."""
+    if isinstance(response, dict):
+        payload = response
+    else:
+        payload = {
+            "recognized_fields": getattr(response, "recognized_fields", {}),
+            "suggestions": getattr(response, "suggestions", []),
+            "warnings": getattr(response, "warnings", []),
+            "assumptions": getattr(response, "assumptions", []),
+        }
+    fields: Dict[str, Dict[str, Any]] = {}
+    recognized = payload.get("recognized_fields") if isinstance(payload.get("recognized_fields"), dict) else {}
+    for field, value in recognized.items():
+        if isinstance(field, str) and field.strip():
+            fields[field.strip()] = {"value": value, "state": "recognized", "confidence": None}
+    suggestions = payload.get("suggestions") or []
+    for item in suggestions:
+        if hasattr(item, "field"):
+            field, value, state, confidence = item.field, item.value, item.state, item.confidence
+        elif isinstance(item, dict):
+            field, value, state, confidence = item.get("field"), item.get("value"), item.get("state", "suggested"), item.get("confidence")
+        else:
+            continue
+        if isinstance(field, str) and field.strip():
+            fields[field.strip()] = {"value": value, "state": state or "suggested", "confidence": confidence}
+    confirmed = {str(field) for field in (confirmed_fields or set()) if str(field).strip()}
+    return {"fields": fields, "confirmed_fields": confirmed, "rejected_fields": set(), "warnings": list(payload.get("warnings") or []), "assumptions": list(payload.get("assumptions") or [])}
+
+
+def confirm_ai_field(state: Dict[str, Any], field: str, value: Any) -> Dict[str, Any]:
+    """Return a copied state after the user confirms or edits one AI field."""
+    updated = copy.deepcopy(state)
+    name = str(field).strip()
+    updated.setdefault("fields", {})[name] = {"value": value, "state": "confirmed", "confidence": 1.0}
+    updated.setdefault("confirmed_fields", set()).add(name)
+    updated.setdefault("rejected_fields", set()).discard(name)
+    return updated
+
+
+def reject_ai_field(state: Dict[str, Any], field: str) -> Dict[str, Any]:
+    updated = copy.deepcopy(state)
+    name = str(field).strip()
+    updated.setdefault("fields", {}).setdefault(name, {"value": None})["value"] = None
+    updated["fields"][name]["state"] = "rejected"
+    updated.setdefault("confirmed_fields", set()).discard(name)
+    updated.setdefault("rejected_fields", set()).add(name)
+    return updated
+
+
+def can_submit_ai_prediction(state: Dict[str, Any]) -> bool:
+    fields = set((state or {}).get("fields") or {})
+    resolved = set((state or {}).get("confirmed_fields") or set()) | set((state or {}).get("rejected_fields") or set())
+    return bool(fields) and fields <= resolved
+
+
+def fallback_input_mode(error: Any) -> str:
+    return "manual" if isinstance(error, (str, Exception)) else "manual"
+
+
+def render_task_snapshot(snapshot: Dict[str, Any]) -> str:
+    task_id = html_escape(str(snapshot.get("task_id") or ""))
+    stage = html_escape(str(snapshot.get("stage_label") or snapshot.get("stage") or ""))
+    progress = max(0, min(100, int(snapshot.get("progress") or 0)))
+    status = html_escape(str(snapshot.get("status") or "unknown"))
+    return (f'<section class="portal-status-panel" data-task-id="{task_id}">'
+            f'<div><strong>任务 {task_id}</strong> · {status}</div>'
+            f'<div class="portal-help">阶段：{stage} · {progress}%</div>'
+            f'<div class="portal-progress"><div style="width:{progress}%"></div></div></section>')
+
+
+def render_result(result: Dict[str, Any]) -> str:
+    prediction = html_escape(str(result.get("prediction", "")))
+    unit = html_escape(str(result.get("unit") or ""))
+    explanation = result.get("explanation") or {}
+    if isinstance(explanation, dict) and explanation.get("status") == "unavailable":
+        note = "AI 解释暂不可用"
+    elif isinstance(explanation, dict) and explanation.get("summary"):
+        note = html_escape(str(explanation.get("summary")))
+    else:
+        note = "Python 模型结果为权威值"
+    return f'<div class="portal-result"><strong>{prediction} {unit}</strong><span>{note}</span></div>'
+
+
+@st.cache_resource(show_spinner=False)
+def get_portal_task_manager(root: str) -> PortalTaskManager:
+    return PortalTaskManager(Path(root))
+
+
+def submit_prediction_task(config: Dict[str, Any], material_key: str, target_key: str, input_df: pd.DataFrame, *, explain: bool = False) -> str:
+    manager = get_portal_task_manager(str(PROJECT_ROOT))
+    inputs: Any = input_df.iloc[0].to_dict() if len(input_df) == 1 else input_df.to_dict(orient="records")
+    return manager.create_task({
+        "request": {
+            "material_type": material_key, "target": target_key, "inputs": inputs,
+            "confirmed_by_user": True,
+        },
+        "config": config, "explain": bool(explain),
+    })
+
+
+def _ai_service_dataclass(service: Dict[str, Any]) -> AIServiceConfig:
+    allowed = {field for field in AIServiceConfig.__dataclass_fields__}
+    return AIServiceConfig(**{key: value for key, value in service.items() if key in allowed})
+
+
+def render_ai_assistant_tab(config: Dict[str, Any], material_key: str, target_key: str, target_cfg: Dict[str, Any]) -> None:
+    st.markdown('### AI 辅助输入')
+    st.caption('AI 只提取和整理你提供的信息；每个字段必须确认、修改后确认或明确拒绝，不能自动生成 EEW、AHEW、PHR、分子特征或工艺参数。')
+    try:
+        ai_config = load_ai_config(PROJECT_ROOT)
+    except Exception as exc:
+        st.error(f'AI 配置读取失败：{exc}')
+        return
+    services = [item for item in ai_config.get('services', []) if item.get('enabled') and item.get('purpose') in {'both', 'input_parsing'}]
+    if not services:
+        st.info('暂无已启用的输入助手服务；请在主平台侧边栏配置，或继续使用手动/批量输入。')
+        return
+    service = st.selectbox('AI 服务', services, format_func=lambda item: item.get('label') or item.get('service_id'), key=f'ai_service_{material_key}_{target_key}')
+    text_key = f'ai_text_{material_key}_{target_key}'
+    user_text = st.text_area('描述材料、配方和工艺信息', key=text_key, height=150, placeholder='例如：树脂 SMILES 为 CCO；固化温度 80 °C。')
+    state_key = f'ai_state_{material_key}_{target_key}'
+    if st.button('解析输入', key=f'ai_parse_{material_key}_{target_key}', type='secondary'):
+        if not user_text.strip():
+            st.warning('请先输入待解析的文本。')
+        else:
+            try:
+                response = PortalAIClient(_ai_service_dataclass(service)).parse_input({
+                    'material_type': material_key, 'target': target_key,
+                    'field_descriptions': [
+                        {'name': item.get('name'), 'label': item.get('label'), 'kind': item.get('kind'), 'required': item.get('required', False)}
+                        for item in target_cfg.get('parameters', [])
+                    ], 'user_text': user_text,
+                })
+                st.session_state[state_key] = build_ai_confirmation_state(response)
+                st.success('解析完成，请逐项确认或拒绝。')
+            except PortalAIError as exc:
+                st.warning(f'AI 不可用：{exc}；已保留手动输入模式。')
+    state = st.session_state.get(state_key)
+    if not state:
+        st.info('解析结果会显示在这里。')
+        return
+    for warning in state.get('warnings', []):
+        st.warning(str(warning))
+    for field, detail in state.get('fields', {}).items():
+        current_value = '' if detail.get('value') is None else str(detail.get('value'))
+        edited = st.text_input(f'{field}（{detail.get("state", "suggested")}）', value=current_value, key=f'ai_field_{material_key}_{target_key}_{field}')
+        col_confirm, col_reject = st.columns(2)
+        with col_confirm:
+            if st.button('确认该字段', key=f'ai_confirm_{material_key}_{target_key}_{field}', width='stretch'):
+                st.session_state[state_key] = confirm_ai_field(state, field, edited)
+                st.rerun()
+        with col_reject:
+            if st.button('拒绝该字段', key=f'ai_reject_{material_key}_{target_key}_{field}', width='stretch'):
+                st.session_state[state_key] = reject_ai_field(state, field)
+                st.rerun()
+    if can_submit_ai_prediction(state):
+        if st.button('创建 AI 辅助预测任务', key=f'ai_submit_{material_key}_{target_key}', type='primary'):
+            confirmed_inputs = {
+                field: detail.get('value')
+                for field, detail in state.get('fields', {}).items()
+                if field not in set(state.get('rejected_fields') or set()) and detail.get('value') not in (None, '')
+            }
+            if confirmed_inputs:
+                task_key = f'portal_task_ai_{material_key}_{target_key}'
+                st.session_state[task_key] = submit_prediction_task(config, material_key, target_key, pd.DataFrame([confirmed_inputs]), explain=True)
+                st.rerun()
+            else:
+                st.warning('没有被确认的有效输入，无法创建任务。')
+    render_portal_task_panel(st.session_state.get(f'portal_task_ai_{material_key}_{target_key}'), session_key=f'ai_{material_key}_{target_key}')
+
+
+def render_portal_task_panel(task_id: str | None, *, session_key: str) -> None:
+    if not task_id:
+        return
+    manager = get_portal_task_manager(str(PROJECT_ROOT))
+    try:
+        snapshot = manager.get_task_snapshot(task_id)
+    except KeyError:
+        st.error("找不到预测任务快照，请重新提交。")
+        return
+    st.markdown(render_task_snapshot(snapshot), unsafe_allow_html=True)
+    st.markdown(render_stage_timeline(snapshot.get("stage", ""), snapshot.get("progress", 0)), unsafe_allow_html=True)
+    status = snapshot.get("status")
+    control_cols = st.columns(3)
+    with control_cols[0]:
+        if st.button("刷新任务", key=f"refresh_{session_key}_{task_id}", width="stretch"):
+            st.rerun()
+    with control_cols[1]:
+        if status in {"queued", "validating", "featuring", "predicting", "explaining", "pending", "running"} and st.button("取消任务", key=f"cancel_{session_key}_{task_id}", width="stretch"):
+            manager.cancel_task(task_id)
+            st.rerun()
+    with control_cols[2]:
+        if status in {"failed", "cancelled"} and st.button("重试任务", key=f"retry_{session_key}_{task_id}", width="stretch"):
+            st.session_state[session_key] = manager.retry_task(task_id)
+            st.rerun()
+    if status == "completed" and isinstance(snapshot.get("result"), dict):
+        st.markdown(render_result(snapshot["result"]), unsafe_allow_html=True)
+        result = snapshot["result"]
+        st.success(f'预测完成：{result.get("prediction")} {result.get("unit") or ""}')
+        if snapshot.get("explanation_error"):
+            st.info("AI 解释暂不可用，Python 预测结果不受影响。")
+    elif status == "failed":
+        st.error(f'任务失败：{snapshot.get("error") or "请检查发布模型和输入契约。"}')
+    elif status == "cancelled":
+        st.warning("任务已取消，可以修改输入后重新提交。")
 
 
 def now_iso() -> str:
@@ -429,94 +643,64 @@ def upsert_model_entry(
     return entry
 
 
-@st.cache_resource(show_spinner=False)
-def load_artifact_from_disk(path_str: str, mtime: float) -> Dict[str, Any]:
-    del mtime
-    return load_model_artifact_bytes(Path(path_str).read_bytes())
-
-
-def align_prediction_frame(df: pd.DataFrame, feature_cols: List[str]) -> Tuple[pd.DataFrame, List[str]]:
-    if not feature_cols:
-        return df.copy(), []
-
-    aligned = df.copy()
-    missing = [col for col in feature_cols if col not in aligned.columns]
-    for col in missing:
-        col_lower = col.lower()
-        if any(token in col_lower for token in ["morgan", "maccs", "fingerprint", "fp_", "_fp"]):
-            aligned[col] = 0
-        else:
-            aligned[col] = np.nan
-    return aligned[feature_cols], missing
-
-
-def run_prediction(model_entry: Dict[str, Any], input_df: pd.DataFrame) -> Dict[str, Any]:
-    artifact_path = resolve_model_path(model_entry)
-    if not artifact_path.exists():
-        raise FileNotFoundError(f"模型文件不存在: {artifact_path}")
-
-    artifact = load_artifact_from_disk(str(artifact_path), artifact_path.stat().st_mtime)
-    pipeline = artifact.get("pipeline")
-    model = artifact.get("model") or pipeline
-    if model is None:
-        raise RuntimeError("模型文件中未检测到可用模型对象")
-
-    feature_cols = list(model_entry.get("feature_cols") or artifact.get("feature_cols") or input_df.columns.tolist())
-    prepared_df, auto_filled = align_prediction_frame(input_df, feature_cols)
-
-    if pipeline is not None:
-        preds = pipeline.predict(prepared_df)
-    else:
-        values = prepared_df.values
-        imputer = artifact.get("imputer")
-        scaler = artifact.get("scaler")
-        if imputer is not None:
-            values = imputer.transform(values)
-        if scaler is not None:
-            values = scaler.transform(values)
-        preds = model.predict(values)
-
-    predictions = np.asarray(preds).reshape(-1)
-    return {
-        "predictions": predictions,
-        "feature_cols": feature_cols,
-        "auto_filled": auto_filled,
-        "artifact": artifact,
-    }
-
-
-def execute_predictions(selected_models: List[Dict[str, Any]], input_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str]]:
+def execute_predictions(
+    selected_models: List[Dict[str, Any]],
+    input_df: pd.DataFrame,
+    *,
+    config: Dict[str, Any],
+    material_key: str,
+    target_key: str,
+    confirmed_by_user: bool,
+) -> Tuple[pd.DataFrame, List[str], List[str]]:
     result_df = input_df.copy()
     infos: List[str] = []
     errors: List[str] = []
     prediction_cols: List[str] = []
 
-    for model_entry in selected_models:
-        label = model_entry.get("label") or model_entry.get("model_name") or "model"
-        try:
-            result = run_prediction(model_entry, input_df)
-            base_col = f"prediction__{label}"
-            pred_col = base_col
-            counter = 2
-            while pred_col in result_df.columns:
-                pred_col = f"{base_col}_{counter}"
-                counter += 1
+    if not confirmed_by_user:
+        return result_df, infos, ['请先勾选用户确认，确认输入结构和工艺参数后再执行预测。']
+    if len(selected_models) != 1:
+        return result_df, infos, ['可信门户每个材料/目标只能使用一个已发布模型，请先在管理端只启用一个发布版本。']
 
-            result_df[pred_col] = result["predictions"]
-            prediction_cols.append(pred_col)
-
-            info_text = f"{label}: 使用 {len(result['feature_cols'])} 个特征完成预测"
-            if result["auto_filled"]:
-                info_text += f"，自动补齐 {len(result['auto_filled'])} 个缺失列"
-            infos.append(info_text)
-        except Exception as exc:
-            errors.append(f"{label}: {exc}")
+    model_entry = selected_models[0]
+    label = model_entry.get('label') or model_entry.get('model_name') or 'model'
+    try:
+        summary = run_confirmed_prediction(
+            {
+                'material_type': material_key,
+                'target': target_key,
+                'inputs': input_df,
+                'confirmed_by_user': confirmed_by_user,
+            },
+            config=config,
+        )
+        predictions = summary.prediction
+        if not isinstance(predictions, (list, tuple, np.ndarray, pd.Series)):
+            predictions = [predictions]
+        predictions = list(predictions)
+        if len(predictions) != len(result_df):
+            raise ValueError(f'模型返回 {len(predictions)} 条结果，但输入有 {len(result_df)} 行。')
+        base_col = f'prediction__{label}'
+        pred_col = base_col
+        counter = 2
+        while pred_col in result_df.columns:
+            pred_col = f'{base_col}_{counter}'
+            counter += 1
+        result_df[pred_col] = predictions
+        prediction_cols.append(pred_col)
+        info_text = f'{label}: 已通过发布契约完成可信预测'
+        if summary.model_version:
+            info_text += f'，版本 {summary.model_version}'
+        if summary.feature_workflow_id:
+            info_text += f'，工作流 {summary.feature_workflow_id}'
+        infos.append(info_text)
+        infos.extend(f'{label}: {warning}' for warning in summary.warnings)
+    except Exception as exc:
+        errors.append(f'{label}: {exc}')
 
     if len(prediction_cols) > 1:
-        result_df["prediction_mean"] = result_df[prediction_cols].mean(axis=1)
-
+        result_df['prediction_mean'] = result_df[prediction_cols].mean(axis=1)
     return result_df, infos, errors
-
 
 def metric_text(metrics: Dict[str, Any]) -> str:
     if not metrics:
@@ -833,11 +1017,10 @@ def render_user_page(config: Dict[str, Any]) -> None:
     if not enabled_models:
         return
 
-    default_model_ids = [enabled_models[0]["id"]]
-    selected_model_ids = st.multiselect(
+    selected_model_id = st.selectbox(
         "选择用于预测的模型",
         options=[model["id"] for model in enabled_models],
-        default=default_model_ids,
+        index=0,
         format_func=lambda model_id: next(
             (
                 f"{model.get('label', '')} | {metric_text(model.get('metrics') or {})}"
@@ -847,15 +1030,18 @@ def render_user_page(config: Dict[str, Any]) -> None:
             model_id,
         ),
     )
-    selected_models = [model for model in enabled_models if model["id"] in selected_model_ids]
+    selected_models = [model for model in enabled_models if model["id"] == selected_model_id]
     if not selected_models:
         st.warning("请至少选择一个模型。")
         return
 
-    if any(model.get("has_feature_process") for model in selected_models):
-        st.warning("已检测到部分模型带有分子特征流程配置。当前版本先完成平台框架和 SMILES 录入/识别，尚未自动按训练流程生成分子特征。")
+    confirmed_by_user = st.checkbox(
+        "我确认已检查输入结构、配方/工艺参数，并同意调用已发布模型进行预测",
+        key=f"prediction_confirmation_{selected_material}_{selected_target}",
+    )
+    st.caption("门户预测不会自动补齐缺失特征；模型必须处于已启用、已发布且通过契约验证状态。")
 
-    tab_manual, tab_batch, tab_config = st.tabs(["手动输入", "批量上传", "当前配置"])
+    tab_manual, tab_batch, tab_ai, tab_config = st.tabs(["手动输入", "批量上传", "AI 辅助输入", "当前配置"])
 
     with tab_manual:
         st.markdown("### 手动输入参数")
@@ -867,8 +1053,10 @@ def render_user_page(config: Dict[str, Any]) -> None:
             if validation_errors:
                 st.error("请先补全必填项后再预测。")
             else:
-                result_df, infos, errors = execute_predictions(selected_models, manual_df)
-                render_prediction_results(result_df, infos, errors, f"{selected_target}_manual_predictions.csv")
+                task_key = f"portal_task_manual_{selected_material}_{selected_target}"
+                st.session_state[task_key] = submit_prediction_task(config, selected_material, selected_target, manual_df, explain=False)
+                st.rerun()
+        render_portal_task_panel(st.session_state.get(f"portal_task_manual_{selected_material}_{selected_target}"), session_key=f"manual_{selected_material}_{selected_target}")
 
     with tab_batch:
         st.markdown("### 上传待预测数据")
@@ -882,12 +1070,17 @@ def render_user_page(config: Dict[str, Any]) -> None:
                 batch_df = load_data_file(uploaded)
                 st.dataframe(batch_df.head(20), use_container_width=True)
                 if st.button("执行批量预测", type="primary", key=f"predict_batch_{selected_material}_{selected_target}"):
-                    result_df, infos, errors = execute_predictions(selected_models, batch_df)
-                    render_prediction_results(result_df, infos, errors, f"{selected_target}_batch_predictions.csv")
+                    task_key = f"portal_task_batch_{selected_material}_{selected_target}"
+                    st.session_state[task_key] = submit_prediction_task(config, selected_material, selected_target, batch_df, explain=False)
+                    st.rerun()
+                render_portal_task_panel(st.session_state.get(f"portal_task_batch_{selected_material}_{selected_target}"), session_key=f"batch_{selected_material}_{selected_target}")
             except Exception as exc:
                 st.error(f"读取文件失败: {exc}")
         else:
-            st.info("适合已经准备好批量输入表格的场景。若模型缺少部分特征列，系统会按规则自动补齐。")
+            st.info("适合已经准备好批量输入表格的场景。缺失特征不会被自动补齐，系统会按发布契约校验并提示具体问题。")
+
+    with tab_ai:
+        render_ai_assistant_tab(config, selected_material, selected_target, target_cfg)
 
     with tab_config:
         st.markdown("### 当前性能项参数")
@@ -1333,6 +1526,7 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    inject_scientific_theme()
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
     config = load_config()
