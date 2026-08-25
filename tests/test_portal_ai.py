@@ -132,4 +132,3 @@ def test_completion_and_json_parser_validate_shapes():
 
 
 
-
