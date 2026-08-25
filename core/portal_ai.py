@@ -82,6 +82,8 @@ def _safe_error(error_type: type[PortalAIError], *, status_code: int | None = No
         return PortalAIAccessError("AI service access was denied", status_code=status_code)
     if issubclass(error_type, PortalAITransientError):
         return PortalAITransientError("AI service is temporarily unavailable", status_code=status_code)
+    if issubclass(error_type, PortalAIHTTPError):
+        return PortalAIHTTPError("AI service request failed", status_code=status_code)
     if issubclass(error_type, PortalAIParseError):
         return PortalAIParseError("AI service returned an invalid JSON response")
     return PortalAIError("AI service request failed")
@@ -126,9 +128,12 @@ def parse_json_or_markdown_json(text: str) -> object:
     elif "```" in candidate:
         raise PortalAIParseError("AI service returned an invalid JSON response")
     try:
-        return json_module.loads(candidate)
+        parsed = json_module.loads(candidate)
     except (TypeError, json_module.JSONDecodeError) as exc:
         raise PortalAIParseError("AI service returned an invalid JSON response") from exc
+    if not isinstance(parsed, Mapping):
+        raise PortalAIParseError("AI service returned an invalid JSON response")
+    return parsed
 
 
 def _bounded_timeout(value: object) -> int:
@@ -254,7 +259,7 @@ class PortalAIClient:
         sleep: Callable[[float], object] = time.sleep,
     ):
         self.config = config
-        self.transport = transport or _http_transport
+        self.transport = _http_transport if transport is None else transport
         self.sleep = sleep
 
     def _request(self, messages: list[dict[str, str]]) -> object:
@@ -278,28 +283,35 @@ class PortalAIClient:
             "timeout": _bounded_timeout(self.config.timeout_seconds),
         }
         for attempt in range(3):
+            pending_error = None
+            retry = False
             try:
                 return _response_payload(self.transport(**kwargs))
             except PortalAIAuthError as exc:
-                raise _safe_error(PortalAIAuthError, status_code=exc.status_code) from None
+                pending_error = _safe_error(PortalAIAuthError, status_code=exc.status_code)
             except PortalAIAccessError as exc:
-                raise _safe_error(PortalAIAccessError, status_code=exc.status_code) from None
+                pending_error = _safe_error(PortalAIAccessError, status_code=exc.status_code)
             except PortalAITransientError as exc:
                 if attempt < 2:
-                    self.sleep(0.25)
-                    continue
-                raise _safe_error(PortalAITransientError, status_code=exc.status_code) from None
+                    retry = True
+                else:
+                    pending_error = _safe_error(PortalAITransientError, status_code=exc.status_code)
             except (TimeoutError, socket.timeout, ConnectionError, urllib.error.URLError):
                 if attempt < 2:
-                    self.sleep(0.25)
-                    continue
-                raise _safe_error(PortalAITransientError) from None
-            except PortalAIParseError as exc:
-                raise _safe_error(PortalAIParseError) from None
+                    retry = True
+                else:
+                    pending_error = _safe_error(PortalAITransientError)
+            except PortalAIParseError:
+                pending_error = _safe_error(PortalAIParseError)
             except PortalAIHTTPError as exc:
-                raise _safe_error(PortalAIHTTPError, status_code=exc.status_code) from None
+                pending_error = _safe_error(PortalAIHTTPError, status_code=exc.status_code)
             except Exception:
-                raise _safe_error(PortalAIError) from None
+                pending_error = _safe_error(PortalAIError)
+            if retry:
+                self.sleep(0.25)
+                continue
+            if pending_error is not None:
+                raise pending_error from None
         raise PortalAITransientError("AI service is temporarily unavailable")
 
     def _complete_json(self, instruction: str, content: object) -> object:
@@ -348,6 +360,3 @@ __all__ = [
     "parse_chat_completion",
     "parse_json_or_markdown_json",
 ]
-
-
-

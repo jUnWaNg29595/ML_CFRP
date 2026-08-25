@@ -1,6 +1,8 @@
 from core.portal_ai import (
     PortalAIAuthenticationError,
     PortalAIClient,
+    PortalAIError,
+    PortalAIHTTPError,
     PortalAIMalformedResponseError,
     PortalAITransientError,
     parse_chat_completion,
@@ -72,22 +74,65 @@ def test_authentication_errors_are_not_retried_or_leaked():
 
 def test_transient_status_is_retried_twice_then_fails():
     calls = []
+    sleeps = []
 
     def transport(**kwargs):
         calls.append(kwargs)
         return {"status_code": 503}
 
     try:
-        PortalAIClient(_config(), transport=transport, sleep=lambda _: None).parse_input({})
+        PortalAIClient(_config(), transport=transport, sleep=sleeps.append).parse_input({})
     except PortalAITransientError:
         pass
     else:
         raise AssertionError("transient error was not raised")
     assert len(calls) == 3
+    assert sleeps == [0.25, 0.25]
+
+
+def test_transport_exception_does_not_retain_secret_context():
+    def transport(**kwargs):
+        raise RuntimeError(f"request failed: {kwargs!r}")
+
+    try:
+        PortalAIClient(_config(), transport=transport).parse_input({})
+    except PortalAIError as exc:
+        assert "sk-secret" not in str(exc)
+        assert "Authorization" not in str(exc)
+        assert exc.__context__ is None
+    else:
+        raise AssertionError("transport error was not raised")
+
+
+def test_non_authentication_http_errors_keep_type_and_status_code():
+    def transport(**kwargs):
+        return {"status_code": 400, "body": "bad request"}
+
+    try:
+        PortalAIClient(_config(), transport=transport).parse_input({})
+    except PortalAIHTTPError as exc:
+        assert type(exc) is PortalAIHTTPError
+        assert exc.status_code == 400
+    else:
+        raise AssertionError("HTTP error was not raised")
+
+
+def test_falsey_transport_is_preserved_as_injected_seam():
+    class FalseyTransport:
+        def __bool__(self):
+            return False
+
+        def __call__(self, **kwargs):
+            return {"choices": [{"message": {"content": '{"recognized_fields": {}}'}}]}
+
+    transport = FalseyTransport()
+    client = PortalAIClient(_config(), transport=transport)
+
+    assert client.transport is transport
 
 
 def test_malformed_json_and_prose_are_rejected():
-    for value in ["here is the answer", "```json\n{bad}\n```"]:
+    for value in ["here is the answer", "```json\n{bad}\n```", "[]", "1", '"text"', "null"]:
         try:
             parse_json_or_markdown_json(value)
         except PortalAIMalformedResponseError:
@@ -128,7 +173,3 @@ def test_completion_and_json_parser_validate_shapes():
             pass
         else:
             raise AssertionError("invalid completion was accepted")
-
-
-
-

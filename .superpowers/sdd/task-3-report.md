@@ -31,3 +31,11 @@
 - AI 只能解析输入和解释结果，不能执行 Python、Shell、模块导入或模型操作。
 - API Key 不写入日志、错误文本、导出对象或配置请求体。
 - 实际特征工程、xTB、模型加载与预测仍由 Python 后端负责，AI 客户端不绕过确认门禁。
+## 独立审查后的修复
+
+- 清除 transport 任意异常的上下文链，避免底层异常文本或请求对象携带 API Key/headers。
+- 普通 4xx 错误保留 `PortalAIHTTPError` 类型和 `status_code`。
+- 确保最多两次重试，且只在实际重试前 sleep；transport 注入使用 `is None` 判断。
+- JSON 解析器拒绝数组、数字、字符串和 `null` 等非对象响应。
+
+复审补测覆盖上述边界，任务 3 与既有门户回归共 `89 passed`。
