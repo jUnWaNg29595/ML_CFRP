@@ -441,3 +441,12 @@ def test_ai_service_config_has_no_runtime_port_or_prediction_fields():
     }.issubset(field_names)
     assert "port" not in field_names
     assert "prediction_config" not in field_names
+from pathlib import Path
+from core.portal_ai_config import default_ai_config, exportable_ai_config
+import json
+
+
+def test_ai_export_has_no_key_and_runtime_port_is_separate():
+    config = {'services': [{'service_id': 'deepseek', 'api_key': 'sk-live-secret', 'model': 'deepseek-chat', 'base_url': 'https://api.deepseek.com/v1'}]}
+    assert 'sk-live-secret' not in json.dumps(exportable_ai_config(config))
+    assert 'port' not in default_ai_config()

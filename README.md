@@ -419,3 +419,22 @@ For questions or issues, please open an issue on GitHub.
 **⭐ If this project helps your research, please give it a star! ⭐**
 
 </div>
+
+### 用户预测门户（8555）
+
+主平台和独立门户分开运行，避免用户界面阻塞科研计算：
+
+```powershell
+streamlit run 'app.py' --server.port 8501
+streamlit run 'UserPrediction.py' --server.port 8555
+```
+
+主平台侧边栏的“用户预测门户”区域可以开启、关闭或自动启动 `8555` 端口，并提供入口状态检查。门户支持手动输入、批量上传和 AI 辅助输入三种模式。
+
+- **发布门禁**：门户只调用“已启用且已发布”的唯一模型版本，并严格复现发布 artifact 中的分子特征工作流。
+- **后台任务**：预测任务写入 `prediction_portal/tasks/<task_id>.json`，页面显示任务 ID、阶段、进度、取消和重试状态；刷新页面后可恢复任务快照。
+- **AI 安全边界**：AI 只能整理用户输入和解释 Python 预测结果，不能生成分子特征、补齐 EEW/AHEW/PHR、修改模型输入或覆盖预测值。每个 AI 字段必须确认、修改后确认或明确拒绝。
+- **AI 配置**：主平台侧边栏的“AI 服务管理”支持 OpenAI-compatible 服务、DeepSeek、超时、token 上限、temperature、启用状态、连接测试和脱敏导出。API Key 只保存在本地受保护配置中，不会进入脱敏导出或日志。
+- **无 AI 降级**：AI 服务不可用时，手动输入和批量上传仍可继续使用。
+
+发布模型前，请在主平台模型管理中完成特征契约和分子特征工作流验证，再设置为“已发布”。未发布、契约不完整或存在多个启用版本的模型会被门户拒绝。
