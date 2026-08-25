@@ -37,7 +37,6 @@
 
 ## 本次复审记录（2026-08-25）
 
-- 复审确认任务2修复已包含在当前提交 `496521a`，当前工作树未发现 `core/portal_ai_config.py` 或 `tests/test_portal_ai_config.py` 的额外未提交差异。
-- 按复审要求重新运行 `python -m pytest -q tests/test_portal_ai_config.py tests/test_prediction_portal.py tests/test_portal_ai_schema.py`：`78 passed`。
-- 重新运行 `git diff --check`：通过。
-- 本次仅更新本报告，不修改 `app.py`、`UserPrediction.py`、`prediction_config.json`，也不纳入其他预先存在的未跟踪文件。
+- 修复 P1：`_SECRET_KEY_PATTERN` 现在要求敏感字段完整匹配，并以非字母数字作为分隔边界，避免 `max_tokens` 因包含 `token` 被误判。
+- 回归测试确认 `max_tokens` 保留且等于 `2048`，`api_key` 在 exportable 结果中删除、在 redacted 结果中掩码。
+- 本次仅修改 `core/portal_ai_config.py`、`tests/test_portal_ai_config.py` 与本报告，不纳入其他预先存在的未跟踪文件。

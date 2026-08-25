@@ -101,6 +101,18 @@ def test_redacted_config_masks_keys_without_mutating_input():
     assert "token-secret" not in json.dumps(redacted)
 
 
+def test_redaction_and_export_keep_max_tokens_while_handling_api_key():
+    config = {"services": [_service(api_key="sk-secret", max_tokens=2048)]}
+
+    redacted = redacted_ai_config(config)
+    exported = exportable_ai_config(config)
+
+    assert redacted["services"][0]["max_tokens"] == 2048
+    assert redacted["services"][0]["api_key"] == "••••••••"
+    assert exported["services"][0]["max_tokens"] == 2048
+    assert "api_key" not in exported["services"][0]
+
+
 def test_redaction_and_export_support_dataclasses_and_nested_lists():
     service = AIServiceConfig(
         service_id="local",

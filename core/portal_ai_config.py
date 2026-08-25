@@ -32,8 +32,9 @@ MAX_TEXT_LENGTH = 200
 PRIVATE_FILE_MODE = 0o600
 
 _SECRET_KEY_PATTERN = re.compile(
-    r"(?:api[_-]?key|access[_-]?token|authorization|bearer|client[_-]?secret|"
-    r"credential|password|private[_-]?key|secret|token|key)",
+    r"(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?token|authorization|bearer|"
+    r"client[_-]?secret|credential|password|private[_-]?key|secret|token|key)"
+    r"(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _HOST_LABEL_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
@@ -328,7 +329,7 @@ def _copy_without_secrets(value: object, *, mask: bool, secret_values: set[str])
             if raw_key.lower() == "base_url" and isinstance(item, str):
                 result[raw_key] = _sanitize_url_for_output(item, secret_values=secret_values)
                 continue
-            if _SECRET_KEY_PATTERN.search(raw_key.replace(" ", "")):
+            if _SECRET_KEY_PATTERN.search(raw_key):
                 if mask:
                     result[raw_key] = "••••••••"
                 continue
@@ -352,7 +353,7 @@ def _secret_values(config: object) -> set[str]:
     def collect(value: object) -> None:
         if isinstance(value, Mapping):
             for raw_key, item in value.items():
-                if isinstance(raw_key, str) and _SECRET_KEY_PATTERN.search(raw_key.replace(" ", "")):
+                if isinstance(raw_key, str) and _SECRET_KEY_PATTERN.search(raw_key):
                     if isinstance(item, str) and item:
                         values.add(item)
                 collect(item)
@@ -456,4 +457,3 @@ __all__ = [
     "save_ai_config",
     "validate_ai_config",
 ]
-
