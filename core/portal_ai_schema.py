@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import types
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -38,6 +39,7 @@ FIELD_STATES = frozenset(
 EXPLANATION_STATUSES = frozenset({"available", "unavailable", "failed"})
 MAX_TEXT_LENGTH = 4000
 MAX_FIELD_NAME_LENGTH = 160
+MAX_IDENTIFIER_LENGTH = 200
 
 _UNCERTAIN_VALUES = frozenset(
     {"", "na", "n/a", "none", "null", "unknown", "uncertain", "未确定", "不确定", "未知"}
@@ -49,6 +51,12 @@ _SECRET_KEY_PATTERN = re.compile(
 )
 _SECRET_VALUE_PATTERN = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_-]{8,}|Bearer\s+[A-Za-z0-9._~+/=-]{8,})\b",
+    re.IGNORECASE,
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r"(?P<name>\b(?:api[_-]?key|key|password|secret|token|access[_-]?token|"
+    r"authorization|client[_-]?secret|private[_-]?key)\b)\s*=\s*"
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;&]+)",
     re.IGNORECASE,
 )
 _UNSAFE_TEXT_PATTERNS = (
@@ -231,7 +239,41 @@ def parse_ai_response(value: object) -> AIParseResponse:
 def _validate_optional_identifier(value: object, *, label: str) -> str | None:
     if value is None:
         return None
-    return _as_text(value, label=label, max_length=200)
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    identifier = value.strip()
+    if not identifier:
+        raise ValueError(f"{label} must not be empty")
+    if len(identifier) > MAX_IDENTIFIER_LENGTH:
+        raise ValueError(f"{label} must be at most {MAX_IDENTIFIER_LENGTH} characters")
+    return identifier
+
+
+def _validate_input_value(value: object, *, path: str) -> object:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (types.CodeType, types.ModuleType)):
+        raise ValueError(f"inputs{path} contains code-like object")
+    if callable(value):
+        raise ValueError(f"inputs{path} contains callable object")
+    if isinstance(value, Mapping):
+        normalized = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"inputs{path} contains a non-string key")
+            field_name = _as_text(key, label="input field", max_length=MAX_FIELD_NAME_LENGTH)
+            normalized[field_name] = _validate_input_value(
+                item, path=f"{path}.{field_name}"
+            )
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [
+            _validate_input_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise ValueError(
+        f"inputs{path} contains unsupported object type: {type(value).__name__}"
+    )
 
 
 def validate_confirmed_request(value: object) -> ConfirmedPredictionRequest:
@@ -265,12 +307,7 @@ def validate_confirmed_request(value: object) -> ConfirmedPredictionRequest:
         raise ValueError(f"unsupported target for {material_type}: {target}")
     if not isinstance(value["inputs"], Mapping):
         raise ValueError("inputs must be an object")
-    inputs = {}
-    for key, item in value["inputs"].items():
-        field_name = _as_text(key, label="input field", max_length=MAX_FIELD_NAME_LENGTH)
-        if callable(item):
-            raise ValueError(f"input {field_name} cannot be callable")
-        inputs[field_name] = item
+    inputs = _validate_input_value(value["inputs"], path="")
     if value["confirmed_by_user"] is not True:
         raise ValueError("confirmed_by_user must be True")
     source = _as_text(value["source"], label="source", max_length=40)
@@ -294,6 +331,9 @@ def validate_confirmed_request(value: object) -> ConfirmedPredictionRequest:
 def _sanitize_text(value: str) -> str:
     value = value[:MAX_TEXT_LENGTH]
     value = _SECRET_VALUE_PATTERN.sub("[redacted secret]", value)
+    value = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(
+        lambda match: f"{match.group('name')}=[redacted credential]", value
+    )
     for pattern in _UNSAFE_TEXT_PATTERNS:
         value = pattern.sub("[removed unsafe instruction]", value)
     return value

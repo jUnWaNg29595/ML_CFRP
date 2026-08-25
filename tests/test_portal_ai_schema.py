@@ -118,3 +118,62 @@ def test_context_text_is_capped_and_nested_secret_keys_are_removed():
 
     assert safe["nested"] == {"keep": "ok"}
     assert len(safe["user_text"]) <= 4000
+
+
+def test_confirmed_request_rejects_nested_callable_code_and_unsupported_values():
+    base_request = {
+        "material_type": "epoxy_resin",
+        "target": "tg",
+        "source": "manual",
+        "confirmed_by_user": True,
+    }
+
+    with pytest.raises(ValueError, match="inputs"):
+        validate_confirmed_request(
+            {
+                **base_request,
+                "inputs": {"nested": {"callback": lambda: None}},
+            }
+        )
+    with pytest.raises(ValueError, match="inputs"):
+        validate_confirmed_request(
+            {
+                **base_request,
+                "inputs": {"nested": [compile("x = 1", "<test>", "exec")]},
+            }
+        )
+    with pytest.raises(ValueError, match="inputs"):
+        validate_confirmed_request(
+            {
+                **base_request,
+                "inputs": {"nested": {"unsupported": object()}},
+            }
+        )
+
+
+@pytest.mark.parametrize("identifier", ["model_id", "feature_workflow_id"])
+def test_confirmed_request_rejects_overlong_identifiers(identifier):
+    request = {
+        "material_type": "epoxy_resin",
+        "target": "tg",
+        "inputs": {},
+        "source": "manual",
+        "confirmed_by_user": True,
+        identifier: "x" * 201,
+    }
+
+    with pytest.raises(ValueError, match=identifier):
+        validate_confirmed_request(request)
+
+
+def test_context_redacts_credentials_embedded_in_free_text():
+    safe = sanitize_ai_context(
+        {
+            "user_text": "key=synthetic-key password=synthetic-password secret=synthetic-secret token=synthetic-token"
+        }
+    )
+
+    assert "synthetic-key" not in safe["user_text"]
+    assert "synthetic-password" not in safe["user_text"]
+    assert "synthetic-secret" not in safe["user_text"]
+    assert "synthetic-token" not in safe["user_text"]
