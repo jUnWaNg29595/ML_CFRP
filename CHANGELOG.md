@@ -5,6 +5,21 @@
 本文档格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/),
 并且本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.5.2] - 2026-08-25
+
+### 修复
+- 修复代理连接测试把 HTTP 代理端口误报为 SOCKS5 握手失败的问题
+- 增加 SOCKS5、HTTP 代理协议自动诊断，并识别代理认证/外部访问拒绝
+- 代理协议不匹配时停止继续向 PubChem 和 Hugging Face 发起误导性请求
+- 更新代理设置界面，显示实际端口类型和 CCProxy 外部访问提示
+
+### 文档
+- 新增网络代理配置说明，覆盖 SOCKS5、HTTP、认证代理和 CCProxy 端口排查
+
+### 测试
+- 增加 HTTP 端口误配和外部访问拒绝的代理探测回归测试
+
+---
 ## [Unreleased]
 
 后续变更将在此处记录。

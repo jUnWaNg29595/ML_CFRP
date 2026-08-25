@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
 import socket
+import subprocess
+import sys
+from pathlib import Path
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -479,6 +484,236 @@ def is_port_open(host: str = "127.0.0.1", port: int = 8555, *, timeout: float = 
     except (OSError, TypeError, ValueError):
         return False
 
+
+
+PORTAL_DEFAULT_PORT = 8555
+PORTAL_SCRIPT_NAME = "UserPrediction.py"
+
+
+def _portal_project_root(project_root: str | os.PathLike[str] | None = None) -> Path:
+    if project_root is None:
+        return Path(__file__).resolve().parents[1]
+    return Path(project_root).resolve()
+
+
+def portal_runtime_file(project_root: str | os.PathLike[str] | None = None) -> Path:
+    return _portal_project_root(project_root) / "prediction_portal" / "portal_runtime.json"
+
+
+def _read_portal_runtime_state(project_root: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    path = portal_runtime_file(project_root)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _write_portal_runtime_state(
+    state: Mapping[str, Any], project_root: str | os.PathLike[str] | None = None
+) -> None:
+    path = portal_runtime_file(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def _clear_portal_runtime_state(project_root: str | os.PathLike[str] | None = None) -> None:
+    try:
+        portal_runtime_file(project_root).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return
+
+
+def _is_process_running(pid: Any) -> bool:
+    try:
+        process_id = int(pid)
+        if process_id <= 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    if sys.platform.startswith("win"):
+        try:
+            import psutil
+
+            process = psutil.Process(process_id)
+            return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+        except ImportError:
+            try:
+                completed = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {process_id}"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                return str(process_id) in (completed.stdout or "")
+            except (OSError, subprocess.SubprocessError):
+                return False
+        except (OSError, psutil.Error):
+            return False
+
+    try:
+        os.kill(process_id, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+def _is_managed_portal_process(pid: Any, port: int = PORTAL_DEFAULT_PORT) -> bool:
+    """Confirm the tracked PID still belongs to UserPrediction.py."""
+    try:
+        import psutil
+
+        command_line = " ".join(psutil.Process(int(pid)).cmdline()).lower()
+        script_matches = PORTAL_SCRIPT_NAME.lower() in command_line
+        port_matches = f"--server.port {int(port)}" in command_line or f"--server.port={int(port)}" in command_line
+        return script_matches and port_matches
+    except Exception:
+        return False
+
+
+def _portal_command(
+    project_root: str | os.PathLike[str],
+    python_executable: str | None = None,
+    port: int = PORTAL_DEFAULT_PORT,
+) -> list[str]:
+    root = _portal_project_root(project_root)
+    return [
+        str(python_executable or sys.executable),
+        "-m",
+        "streamlit",
+        "run",
+        str(root / PORTAL_SCRIPT_NAME),
+        "--server.port",
+        str(int(port)),
+        "--server.headless",
+        "true",
+        "--browser.gatherUsageStats",
+        "false",
+    ]
+
+
+def portal_process_status(
+    project_root: str | os.PathLike[str] | None = None,
+    *,
+    port: int = PORTAL_DEFAULT_PORT,
+) -> dict[str, Any]:
+    state = _read_portal_runtime_state(project_root)
+    pid = state.get("pid")
+    if pid is not None and _is_process_running(pid):
+        return {
+            "status": "running" if is_port_open("127.0.0.1", port) else "starting",
+            "managed": True,
+            "pid": int(pid),
+            "port": int(port),
+        }
+    if pid is not None:
+        _clear_portal_runtime_state(project_root)
+    if is_port_open("127.0.0.1", port):
+        return {"status": "running", "managed": False, "pid": None, "port": int(port)}
+    return {"status": "stopped", "managed": False, "pid": None, "port": int(port)}
+
+
+def start_prediction_portal(
+    project_root: str | os.PathLike[str] | None = None,
+    *,
+    python_executable: str | None = None,
+    port: int = PORTAL_DEFAULT_PORT,
+) -> dict[str, Any]:
+    root = _portal_project_root(project_root)
+    current = portal_process_status(root, port=port)
+    if current["status"] in {"running", "starting"}:
+        return {**current, "started": False}
+
+    script_path = root / PORTAL_SCRIPT_NAME
+    if not script_path.is_file():
+        return {
+            "status": "error",
+            "started": False,
+            "error": f"未找到门户脚本：{script_path}",
+            "port": int(port),
+        }
+
+    log_path = root / "prediction_portal" / "portal_runtime.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    creation_flags = 0
+    if sys.platform.startswith("win"):
+        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+            subprocess, "CREATE_NO_WINDOW", 0
+        )
+    command = _portal_command(root, python_executable, port)
+    try:
+        with log_path.open("ab") as log_file:
+            process = subprocess.Popen(
+                command,
+                cwd=str(root),
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=creation_flags,
+            )
+    except (OSError, ValueError) as exc:
+        return {"status": "error", "started": False, "error": str(exc), "port": int(port)}
+
+    _write_portal_runtime_state(
+        {
+            "pid": int(process.pid),
+            "port": int(port),
+            "script": str(script_path),
+            "command": command,
+        },
+        root,
+    )
+    return {"status": "starting", "started": True, "managed": True, "pid": int(process.pid), "port": int(port)}
+
+
+def stop_prediction_portal(
+    project_root: str | os.PathLike[str] | None = None,
+    *,
+    port: int = PORTAL_DEFAULT_PORT,
+) -> dict[str, Any]:
+    root = _portal_project_root(project_root)
+    state = _read_portal_runtime_state(root)
+    pid = state.get("pid")
+    if pid is None:
+        current = portal_process_status(root, port=port)
+        if current.get("status") == "running" and not current.get("managed"):
+            return {**current, "stopped": False, "error": "当前端口由外部进程占用，未执行强制停止。"}
+        return {"status": "stopped", "stopped": False, "pid": None, "port": int(port)}
+
+    if not _is_process_running(pid):
+        _clear_portal_runtime_state(root)
+        return {"status": "stopped", "stopped": False, "pid": int(pid), "port": int(port)}
+    if not _is_managed_portal_process(pid, port):
+        return {
+            "status": "error",
+            "stopped": False,
+            "pid": int(pid),
+            "port": int(port),
+            "error": "记录的 PID 不再匹配 UserPrediction.py，未执行强制停止。",
+        }
+
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.run(
+                ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            os.killpg(int(pid), 15)
+    except (OSError, ValueError) as exc:
+        return {"status": "error", "stopped": False, "pid": int(pid), "port": int(port), "error": str(exc)}
+
+    _clear_portal_runtime_state(root)
+    return {"status": "stopped", "stopped": True, "pid": int(pid), "port": int(port)}
 
 def should_show_publication(contract_report: Mapping[str, Any]) -> bool:
     return bool(

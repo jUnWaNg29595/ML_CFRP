@@ -1,4 +1,6 @@
 import copy
+import os
+import json
 
 import pandas as pd
 import pytest
@@ -6,7 +8,11 @@ import pytest
 from core.prediction_portal import (
     activate_publication,
     build_prediction_contract,
+    _is_process_running,
     is_port_open,
+    portal_process_status,
+    start_prediction_portal,
+    stop_prediction_portal,
     make_publication_entry,
     portal_health_label,
     rollback_publication,
@@ -497,3 +503,72 @@ def test_rollback_rejects_duplicate_requested_versions_without_mutation():
         rollback_publication(config, material_key="epoxy_resin", target_key="tg", version="v2")
 
     assert config == before
+
+
+def test_start_prediction_portal_launches_user_prediction_and_persists_pid(tmp_path, monkeypatch):
+    (tmp_path / "UserPrediction.py").write_text("# test portal", encoding="utf-8")
+    calls = []
+
+    class _Process:
+        pid = 4321
+
+    def fake_popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Process()
+
+    monkeypatch.setattr("core.prediction_portal.is_port_open", lambda *args, **kwargs: False)
+    monkeypatch.setattr("core.prediction_portal.subprocess.Popen", fake_popen)
+
+    result = start_prediction_portal(
+        project_root=tmp_path,
+        python_executable="python-test",
+        port=8555,
+    )
+
+    assert result["status"] == "starting"
+    assert result["pid"] == 4321
+    assert calls[0][0][:5] == [
+        "python-test",
+        "-m",
+        "streamlit",
+        "run",
+        str(tmp_path / "UserPrediction.py"),
+    ]
+    runtime_file = tmp_path / "prediction_portal" / "portal_runtime.json"
+    assert json.loads(runtime_file.read_text(encoding="utf-8"))["pid"] == 4321
+
+
+def test_stop_prediction_portal_only_stops_the_managed_process(tmp_path, monkeypatch):
+    runtime_dir = tmp_path / "prediction_portal"
+    runtime_dir.mkdir()
+    runtime_file = runtime_dir / "portal_runtime.json"
+    runtime_file.write_text(
+        json.dumps({"pid": 4321, "port": 8555}),
+        encoding="utf-8",
+    )
+    commands = []
+
+    monkeypatch.setattr("core.prediction_portal._is_process_running", lambda pid: pid == 4321)
+    monkeypatch.setattr("core.prediction_portal._is_managed_portal_process", lambda pid, port: True)
+    monkeypatch.setattr(
+        "core.prediction_portal.subprocess.run",
+        lambda command, **kwargs: commands.append((command, kwargs)),
+    )
+
+    result = stop_prediction_portal(project_root=tmp_path, port=8555)
+
+    assert result["status"] == "stopped"
+    assert commands[0][0] == ["taskkill", "/PID", "4321", "/T", "/F"]
+    assert not runtime_file.exists()
+
+
+def test_portal_process_status_reports_unmanaged_open_port(tmp_path, monkeypatch):
+    monkeypatch.setattr("core.prediction_portal.is_port_open", lambda *args, **kwargs: True)
+
+    result = portal_process_status(project_root=tmp_path, port=8555)
+
+    assert result["status"] == "running"
+    assert result["managed"] is False
+
+def test_is_process_running_accepts_current_windows_process():
+    assert _is_process_running(os.getpid()) is True

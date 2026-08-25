@@ -5,6 +5,10 @@
 # 重要：必须在导入任何库之前设置环境变量！
 # ============================================
 import os
+from .network_config import configure_network_proxy
+
+configure_network_proxy()
+
 # 禁用 TensorFlow，避免与 transformers 冲突
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
 os.environ.setdefault('USE_TF', '0')
@@ -56,6 +60,45 @@ def _safe_console_print(*args, **kwargs):
 
 
 print = _safe_console_print
+
+def resolve_transformer_trust_remote_code(model_name, resolved_model_path=None, requested=False):
+    """Resolve whether a Transformer repository needs its trusted custom code.
+
+    MolFormer publishes its configuration and model implementation through
+    ``auto_map``.  Older workflow records may still contain
+    ``trust_remote_code=False``; local configuration inspection upgrades that
+    value only for MolFormer, while ordinary models keep the original default.
+    """
+    if bool(requested):
+        return True
+
+    names = [str(value).lower() for value in (model_name, resolved_model_path) if value]
+    is_molformer_name = any('molformer' in value for value in names)
+
+    config_candidates = []
+    for value in (resolved_model_path, model_name):
+        if not value:
+            continue
+        candidate = os.fspath(value)
+        if os.path.isdir(candidate):
+            config_candidates.append(os.path.join(candidate, 'config.json'))
+        elif os.path.isfile(candidate) and os.path.basename(candidate).lower() == 'config.json':
+            config_candidates.append(candidate)
+
+    for config_path in config_candidates:
+        try:
+            import json
+            with open(config_path, 'r', encoding='utf-8') as config_file:
+                config = json.load(config_file)
+        except (OSError, ValueError, TypeError):
+            continue
+        if str(config.get('model_type', '')).lower() == 'molformer':
+            return True
+        auto_map = config.get('auto_map')
+        if is_molformer_name and isinstance(auto_map, dict) and auto_map:
+            return True
+
+    return is_molformer_name
 
 # PyTorch 是可选依赖 (用于 ANI2x 力场计算)
 try:
@@ -1576,15 +1619,20 @@ class SmilesTransformerEmbeddingExtractor:
         device=None,
         trust_remote_code: bool = False
     ):
-        # 禁用 huggingface_hub 的在线元数据检查
+        # 默认允许联网下载；如用户显式设置离线模式则保持离线。
+        # 这样本地缓存优先，但缓存不完整时可以通过统一代理自动补齐。
         import os
-        os.environ['HF_HUB_OFFLINE'] = '1'
-        os.environ['TRANSFORMERS_OFFLINE'] = '1'
+        os.environ.setdefault('HF_HUB_OFFLINE', '0')
+        os.environ.setdefault('TRANSFORMERS_OFFLINE', '0')
 
         self.model_name = model_name
         self.pooling = (pooling or "cls").lower()
         self.max_length = int(max_length)
-        self.trust_remote_code = bool(trust_remote_code)
+        self.trust_remote_code = resolve_transformer_trust_remote_code(
+            self.model_name,
+            self.model_name,
+            requested=trust_remote_code,
+        )
 
         try:
             import torch
@@ -1659,6 +1707,37 @@ class SmilesTransformerEmbeddingExtractor:
             # 某些 tokenizer 可能没有 pad_token，做个兜底
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.cls_token
+
+            def _ensure_molformer_transformers_compatibility():
+                """兼容 MoLFormer 远程代码与新版 transformers 的 mask API。"""
+                try:
+                    import transformers.masking_utils as masking_utils
+                    if hasattr(masking_utils, 'create_bidirectional_mask'):
+                        return
+                    import torch
+
+                    def create_bidirectional_mask(config, inputs_embeds, attention_mask=None):
+                        batch_size, seq_length = inputs_embeds.shape[:2]
+                        if attention_mask is None:
+                            attention_mask = torch.ones(
+                                (batch_size, seq_length),
+                                dtype=torch.bool,
+                                device=inputs_embeds.device,
+                            )
+                        else:
+                            attention_mask = attention_mask.to(device=inputs_embeds.device)
+                            if attention_mask.ndim == 4:
+                                return attention_mask.to(dtype=inputs_embeds.dtype)
+                            attention_mask = attention_mask.reshape(batch_size, seq_length).bool()
+                        zeros = torch.zeros((), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+                        neg_inf = torch.full((), float('-inf'), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+                        return torch.where(attention_mask[:, None, None, :], zeros, neg_inf)
+
+                    masking_utils.create_bidirectional_mask = create_bidirectional_mask
+                except Exception as exc:
+                    raise RuntimeError(f'MoLFormer transformers 兼容层初始化失败: {exc}') from exc
+
+            _ensure_molformer_transformers_compatibility()
 
             def _load_model(
                 low_cpu_mem_usage=None,
@@ -1859,6 +1938,14 @@ class SmilesTransformerEmbeddingExtractor:
                 max_length=self.max_length
             )
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            # 不同 SMILES Transformer 的 tokenizer 输出字段不同；
+            # MoLFormer 不接受 token_type_ids，按 forward 签名严格过滤。
+            try:
+                import inspect
+                accepted_inputs = set(inspect.signature(self.model.forward).parameters)
+                inputs = {k: v for k, v in inputs.items() if k in accepted_inputs}
+            except Exception:
+                inputs.pop('token_type_ids', None)
 
             with self.torch.no_grad():
                 outputs = self.model(**inputs)

@@ -1308,3 +1308,34 @@ def test_explicit_component_role_overrides_column_name_inference():
         "neutral",
         inferred_role="hardener",
     ) == "neutral"
+
+
+def test_molformer_local_config_requires_remote_code(tmp_path):
+    model_dir = tmp_path / 'molformer'
+    model_dir.mkdir()
+    (model_dir / 'config.json').write_text(
+        '{"model_type": "molformer", "auto_map": '
+        '{"AutoConfig": "configuration_molformer.MolformerConfig"}}',
+        encoding='utf-8',
+    )
+
+    assert molecular_features.resolve_transformer_trust_remote_code(
+        str(model_dir),
+        str(model_dir),
+        requested=False,
+    ) is True
+
+
+def test_standard_local_config_keeps_remote_code_disabled(tmp_path):
+    model_dir = tmp_path / 'chemberta'
+    model_dir.mkdir()
+    (model_dir / 'config.json').write_text(
+        '{"model_type": "roberta"}',
+        encoding='utf-8',
+    )
+
+    assert molecular_features.resolve_transformer_trust_remote_code(
+        str(model_dir),
+        str(model_dir),
+        requested=False,
+    ) is False

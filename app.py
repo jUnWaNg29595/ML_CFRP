@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 碳纤维复合材料智能预测平台 v1.5.1
 更新内容：
@@ -28,6 +28,7 @@ import hashlib
 import functools
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 
 def _configure_safe_console_output():
@@ -58,6 +59,13 @@ os.environ['USE_TORCH'] = '1'
 
 # [关键] 设置 Hugging Face 镜像源（必须在导入 transformers 之前）
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+# [关键] 统一配置网络代理，供 Hugging Face、PubChem 等在线请求使用
+try:
+    from core.network_config import configure_network_proxy
+    _CFRP_PROXY_URL = configure_network_proxy()
+except Exception:
+    _CFRP_PROXY_URL = None
 
 # [关键] 设置 PyTorch CUDA 内存分配器
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
@@ -1116,7 +1124,13 @@ from core.prediction_molecular_baseline import (
     validate_single_row_source_values,
     workflow_requires_manual_molecular_input,
 )
-from core.prediction_portal import is_port_open, portal_health_label
+from core.prediction_portal import (
+    is_port_open,
+    portal_health_label,
+    portal_process_status,
+    start_prediction_portal,
+    stop_prediction_portal,
+)
 from core.navigation import (
     NAVIGATION_PAGES,
     resolve_navigation_page,
@@ -3004,6 +3018,37 @@ def _current_molecular_feature_artifact_extra():
     return extra
 
 
+def _current_melting_point_artifact_extra(target_col=None):
+    """Return auditable metadata for an explicitly handed-off MP training set."""
+    target = str(target_col or st.session_state.get("target_col") or "").strip()
+    dataset = st.session_state.get("melting_point_training_dataset")
+    if target != "mp_c" or not isinstance(dataset, pd.DataFrame) or dataset.empty:
+        return {}
+    try:
+        from core.melting_point_screening import build_melting_point_artifact_extra
+
+        workflow = st.session_state.get("molecular_feature_workflow")
+        if isinstance(workflow, dict):
+            workflow_hash = workflow.get("workflow_hash")
+        else:
+            workflow_hash = getattr(workflow, "workflow_hash", None)
+        extra = build_melting_point_artifact_extra(
+            dataset,
+            workflow_hash=workflow_hash,
+        )
+        split_metrics = st.session_state.get("melting_point_metrics")
+        if isinstance(split_metrics, dict):
+            extra["split_metrics"] = split_metrics
+            extra["train_positions"] = list(
+                (split_metrics.get("train") or {}).get("positions") or []
+            )
+            extra["test_positions"] = list(
+                (split_metrics.get("test") or {}).get("positions") or []
+            )
+        return extra
+    except Exception:
+        return {}
+
 def _is_recent_snapshot(meta: dict, max_hours: int = 72) -> bool:
     if not meta or not meta.get("saved_at"):
         return False
@@ -3038,6 +3083,428 @@ def _maybe_autosave_session():
     if (now_ts - last_ts) < max(10, interval):
         return
     _save_session_snapshot("latest")
+
+
+def render_melting_point_dataset_panel() -> Optional[pd.DataFrame]:
+    """Render the cached PubChem melting-point collection and training handoff UI."""
+    from core.melting_point_data import (
+        load_persisted_melting_point_dataset,
+        persist_melting_point_dataset,
+        prepare_melting_point_dataset,
+        summarize_melting_point_dataset,
+        normalize_melting_point_units,
+    )
+    from core.pubchem_client import (
+        fetch_cids_by_smarts,
+        fetch_melting_point_records_by_smarts,
+    )
+
+    if (
+        not isinstance(st.session_state.get("melting_point_raw_records"), pd.DataFrame)
+        and not isinstance(st.session_state.get("melting_point_dataset"), pd.DataFrame)
+    ):
+        try:
+            persisted_raw, persisted_cleaned, persisted_summary = load_persisted_melting_point_dataset()
+            if isinstance(persisted_raw, pd.DataFrame) and not persisted_raw.empty:
+                st.session_state["melting_point_raw_records"] = normalize_melting_point_units(persisted_raw)
+            if isinstance(persisted_cleaned, pd.DataFrame) and not persisted_cleaned.empty:
+                st.session_state["melting_point_dataset"] = normalize_melting_point_units(persisted_cleaned)
+            if persisted_summary:
+                st.session_state["melting_point_dataset_summary"] = persisted_summary
+        except Exception:
+            pass
+
+    with st.expander("🧪 熔点数据集采集", expanded=False):
+        st.caption("按树脂与固化剂角色独立采集 PubChem 熔点记录；所有数值统一换算为摄氏度（°C），原始单位保留在 mp_unit_raw。")
+        default_resin_smarts = "C1OC1"
+        default_hardener_smarts = "[N,O,S]"
+        hardener_query_map = {
+            "胺": "[NX3;H1,H2;!$(N-C=O)]",
+            "酸酐": "C(=O)OC(=O)",
+            "酚": "[c][OX2H]",
+            "硫醇": "[SX2H]",
+            "咪唑": "[nH]1ccnc1",
+            "其他": default_hardener_smarts,
+        }
+        resin_smarts = st.text_input(
+            "树脂 SMARTS",
+            value=st.session_state.get("melting_point_resin_smarts", default_resin_smarts),
+            key="melting_point_resin_smarts",
+            help="默认 C1OC1 查询含氧杂环/环氧结构；留空则跳过树脂采集。可替换为自己的可复现 SMARTS。",
+        )
+        hardener_smarts = st.text_input(
+            "固化剂通用 SMARTS（可覆盖类别默认值）",
+            value=st.session_state.get("melting_point_hardener_smarts", default_hardener_smarts),
+            key="melting_point_hardener_smarts",
+            help="保持默认 [N,O,S] 时，系统按所选类别使用独立 SMARTS；输入其他 SMARTS 后，各类别共用该自定义查询。",
+        )
+        hardener_classes = st.multiselect(
+            "固化剂类别",
+            options=["胺", "酸酐", "酚", "硫醇", "咪唑", "其他"],
+            default=st.session_state.get(
+                "melting_point_hardener_classes",
+                ["胺", "酸酐", "酚", "硫醇", "咪唑"],
+            ),
+            key="melting_point_hardener_classes",
+        )
+        limit_col, sample_col = st.columns(2)
+        with limit_col:
+            resin_cid_limit = st.number_input(
+                "树脂 CID 上限",
+                min_value=1,
+                max_value=200000,
+                value=5000,
+                step=500,
+                key="melting_point_resin_cid_limit",
+            )
+            hardener_cid_limit = st.number_input(
+                "固化剂 CID 上限",
+                min_value=1,
+                max_value=200000,
+                value=3000,
+                step=500,
+                key="melting_point_hardener_cid_limit",
+            )
+        with sample_col:
+            per_class_limit = st.number_input(
+                "每个固化剂类别样本上限",
+                min_value=1,
+                max_value=100000,
+                value=3000,
+                step=500,
+                key="melting_point_per_class_limit",
+            )
+            collection_seed = st.number_input(
+                "采集随机种子",
+                min_value=0,
+                max_value=2**31 - 1,
+                value=42,
+                step=1,
+                key="melting_point_collection_seed",
+            )
+            property_workers = st.number_input(
+                "PubChem 并发请求数",
+                min_value=1,
+                max_value=6,
+                value=4,
+                step=1,
+                key="melting_point_property_workers",
+                help="仅限制 PubChem 网络请求并发；过高可能触发服务端限流。",
+            )
+        include_low_quality = st.checkbox(
+            "清洗集纳入低质量记录（训练页仍默认关闭）",
+            value=False,
+            key="melting_point_include_low_quality",
+        )
+        minimum_samples = st.number_input(
+            "每个角色/类别最低样本数提示",
+            min_value=1,
+            max_value=1000,
+            value=5,
+            step=1,
+            key="melting_point_minimum_samples",
+        )
+
+        if st.button("🔎 采集/续采熔点数据", type="primary", key="melting_point_collect"):
+            queries = []
+            if str(resin_smarts).strip():
+                queries.append(("resin", "", str(resin_smarts).strip(), int(resin_cid_limit)))
+            if str(hardener_smarts).strip():
+                for hardener_class in hardener_classes:
+                    entered_hardener_smarts = str(hardener_smarts).strip()
+                    query_smarts = (
+                        hardener_query_map.get(hardener_class, default_hardener_smarts)
+                        if entered_hardener_smarts == default_hardener_smarts
+                        else entered_hardener_smarts
+                    )
+                    queries.append(("hardener", hardener_class, query_smarts, int(hardener_cid_limit)))
+
+            if not queries:
+                st.warning("请至少填写树脂 SMARTS 或选择一个固化剂类别。")
+            else:
+                progress_bar = st.progress(0, text="准备采集熔点记录…")
+                progress_state = {
+                    "total": len(queries),
+                    "completed": 0,
+                    "successful": [],
+                    "failed": [],
+                    "failed_cids": {},
+                    "cid_total": 0,
+                    "cid_completed": 0,
+                    "cid_cache_hits": 0,
+                    "cid_fetched": 0,
+                    "cid_failed": 0,
+                    "current_query": "",
+                    "current_phase": "准备中",
+                }
+                st.session_state["melting_point_collection_progress"] = progress_state
+                collected_frames = []
+                previous_raw = st.session_state.get("melting_point_raw_records")
+
+                def _persist_partial_melting_point_records() -> None:
+                    existing_frames = [
+                        previous_raw
+                    ] if isinstance(previous_raw, pd.DataFrame) and not previous_raw.empty else []
+                    if not (existing_frames or collected_frames):
+                        return
+                    partial_raw = pd.concat(existing_frames + collected_frames, ignore_index=True)
+                    dedup_columns = [
+                        column for column in ("cid", "mp_raw", "component_role", "hardener_class")
+                        if column in partial_raw.columns
+                    ]
+                    if dedup_columns:
+                        partial_raw = partial_raw.drop_duplicates(dedup_columns, keep="last")
+                    partial_cleaned = prepare_melting_point_dataset(
+                        partial_raw,
+                        include_low_quality=bool(include_low_quality),
+                    )
+                    partial_summary = summarize_melting_point_dataset(partial_cleaned)
+                    st.session_state["melting_point_raw_records"] = partial_raw
+                    st.session_state["melting_point_dataset"] = partial_cleaned
+                    st.session_state["melting_point_dataset_summary"] = partial_summary
+                    try:
+                        st.session_state["melting_point_dataset_paths"] = persist_melting_point_dataset(
+                            partial_raw,
+                            partial_cleaned,
+                            partial_summary,
+                        )
+                    except Exception as persist_error:
+                        progress_state.setdefault("persist_errors", []).append(str(persist_error))
+
+                def _filter_default_hardener_class(records: pd.DataFrame, requested_class: str, query: str) -> pd.DataFrame:
+                    if records.empty or str(requested_class).strip() == "" or str(query).strip() != "[N,O,S]":
+                        return records
+                    if _Chem is None:
+                        return records
+                    patterns = {
+                        "胺": "[NX3;H1,H2;!$(N-C=O)]",
+                        "酸酐": "C(=O)OC(=O)",
+                        "酚": "[c][OX2H]",
+                        "硫醇": "[SX2H]",
+                        "咪唑": "[nH]1ccnc1",
+                    }
+                    compiled = {
+                        label: _Chem.MolFromSmarts(smarts)
+                        for label, smarts in patterns.items()
+                    }
+
+                    def is_requested(smiles: object) -> bool:
+                        molecule = _Chem.MolFromSmiles(str(smiles or ""))
+                        if molecule is None:
+                            return False
+                        matched = [
+                            label for label, pattern in compiled.items()
+                            if pattern is not None and molecule.HasSubstructMatch(pattern)
+                        ]
+                        if requested_class == "其他":
+                            return not matched or len(matched) > 1
+                        return len(matched) == 1 and matched[0] == requested_class
+
+                    mask = records["smiles"].map(is_requested) if "smiles" in records.columns else pd.Series(False, index=records.index)
+                    filtered = records[mask].copy()
+                    filtered.attrs.update(records.attrs)
+                    filtered.attrs["class_filter_removed"] = int(len(records) - len(filtered))
+                    return filtered
+
+                for component_role, hardener_class, query_smarts, max_cids in queries:
+                    label = hardener_class or "树脂"
+                    progress_state["current_query"] = label
+                    progress_state["current_phase"] = "获取 CID"
+                    progress_state["cid_total"] = 0
+                    progress_state["cid_completed"] = 0
+                    progress_state["cid_cache_hits"] = 0
+                    progress_state["cid_fetched"] = 0
+                    progress_state["cid_failed"] = 0
+                    try:
+                        cids = fetch_cids_by_smarts(query_smarts, max_cids=max_cids)
+                        progress_state["cid_total"] = len(cids)
+                        progress_state["current_phase"] = "读取结构与熔点注释"
+                        st.session_state["melting_point_collection_progress"] = progress_state
+                        if not cids:
+                            st.warning(f"{label}：未找到 CID，已保留其他成功类别。")
+                        else:
+                            def _query_progress(event: dict) -> None:
+                                progress_state["current_phase"] = str(event.get("phase") or "查询中")
+                                progress_state["cid_total"] = int(event.get("total_cids") or len(cids))
+                                progress_state["cid_completed"] = int(event.get("completed_cids") or 0)
+                                progress_state["cid_cache_hits"] = int(event.get("cache_hits") or 0)
+                                progress_state["cid_fetched"] = int(event.get("fetched_cids") or 0)
+                                progress_state["cid_failed"] = int(event.get("failed_cids") or 0)
+                                st.session_state["melting_point_collection_progress"] = progress_state
+                                query_fraction = min(
+                                    1.0,
+                                    progress_state["cid_completed"] / max(1, progress_state["cid_total"]),
+                                )
+                                overall_fraction = (
+                                    progress_state["completed"] + query_fraction
+                                ) / max(1, progress_state["total"])
+                                progress_bar.progress(
+                                    min(1.0, overall_fraction),
+                                    text=(
+                                        f"{label}：{progress_state['cid_completed']}/"
+                                        f"{progress_state['cid_total']} CID；"
+                                        f"缓存 {progress_state['cid_cache_hits']}，"
+                                        f"成功 {progress_state['cid_fetched']}，"
+                                        f"失败 {progress_state['cid_failed']}"
+                                    ),
+                                )
+
+                            records = fetch_melting_point_records_by_smarts(
+                                query_smarts,
+                                component_role=component_role,
+                                hardener_class=hardener_class,
+                                max_cids=max_cids,
+                                property_workers=int(property_workers),
+                                cids=cids,
+                                progress_callback=_query_progress,
+                            )
+                            progress_state["cid_total"] = int(records.attrs.get("cids_requested") or len(cids))
+                            progress_state["cid_cache_hits"] = int(records.attrs.get("cache_hits") or 0)
+                            progress_state["cid_fetched"] = int(records.attrs.get("fetched_cids") or 0)
+                            failed_cids = records.attrs.get("failed_cids") or []
+                            progress_state["cid_failed"] = len(failed_cids) if isinstance(failed_cids, (list, tuple, set)) else int(bool(failed_cids))
+                            progress_state["cid_completed"] = min(
+                                progress_state["cid_total"],
+                                progress_state["cid_cache_hits"]
+                                + progress_state["cid_fetched"]
+                                + progress_state["cid_failed"],
+                            )
+                            if component_role == "hardener":
+                                records = _filter_default_hardener_class(
+                                    records,
+                                    hardener_class,
+                                    query_smarts,
+                                )
+                            failed_cids = records.attrs.get("failed_cids") or {}
+                            if failed_cids:
+                                progress_state["failed_cids"][label] = failed_cids
+                            if records.empty:
+                                st.warning(f"{label}：找到 {len(cids)} 个 CID，但没有熔点注释。")
+                            else:
+                                if component_role == "hardener" and "cid" in records.columns:
+                                    unique_cids = records["cid"].dropna().drop_duplicates()
+                                    if len(unique_cids) > int(per_class_limit):
+                                        selected_cids = unique_cids.sample(
+                                            n=int(per_class_limit),
+                                            random_state=int(collection_seed),
+                                        )
+                                        records = records[records["cid"].isin(selected_cids)].copy()
+                                collected_frames.append(records)
+                                _persist_partial_melting_point_records()
+                                progress_state["successful"].append(label)
+                    except Exception as exc:
+                        progress_state["failed"].append(label)
+                        st.error(f"{label}：网络或 PubChem 采集失败：{exc}")
+                    progress_state["completed"] += 1
+                    progress_state["current_phase"] = "查询完成"
+                    st.session_state["melting_point_collection_progress"] = progress_state
+                    progress_bar.progress(
+                        progress_state["completed"] / progress_state["total"],
+                        text=f"已完成 {progress_state['completed']}/{progress_state['total']} 个查询",
+                    )
+
+                previous_raw = st.session_state.get("melting_point_raw_records")
+                existing_frames = [previous_raw] if isinstance(previous_raw, pd.DataFrame) and not previous_raw.empty else []
+                if collected_frames or existing_frames:
+                    raw_records = pd.concat(existing_frames + collected_frames, ignore_index=True)
+                    dedup_columns = [
+                        column for column in ("cid", "mp_raw", "component_role", "hardener_class")
+                        if column in raw_records.columns
+                    ]
+                    if dedup_columns:
+                        raw_records = raw_records.drop_duplicates(dedup_columns, keep="last")
+                    cleaned_dataset = prepare_melting_point_dataset(
+                        raw_records,
+                        include_low_quality=bool(include_low_quality),
+                    )
+                    summary = summarize_melting_point_dataset(cleaned_dataset)
+                    st.session_state["melting_point_raw_records"] = raw_records
+                    st.session_state["melting_point_dataset"] = cleaned_dataset
+                    st.session_state["melting_point_dataset_summary"] = summary
+                    try:
+                        persisted_paths = persist_melting_point_dataset(
+                            raw_records,
+                            cleaned_dataset,
+                            summary,
+                        )
+                        st.session_state["melting_point_dataset_paths"] = persisted_paths
+                    except Exception as persist_error:
+                        st.warning(f"熔点数据已载入当前会话，但落盘保存失败：{persist_error}")
+                    st.success(f"熔点采集完成：原始 {len(raw_records):,} 条，清洗后 {len(cleaned_dataset):,} 条。")
+                    if cleaned_dataset.empty:
+                        st.warning("当前没有高质量可训练熔点记录；可检查 SMILES、注释质量或开启低质量记录。")
+                    role_counts = raw_records.get("component_role", pd.Series(dtype=object)).value_counts()
+                    for role in ("resin", "hardener"):
+                        if role in role_counts and int(role_counts[role]) < int(minimum_samples):
+                            st.warning(f"{role} 角色样本数 {int(role_counts[role])} 少于提示阈值 {int(minimum_samples)}。")
+                    class_counts = raw_records.get("hardener_class", pd.Series(dtype=object)).value_counts()
+                    for hardener_class in hardener_classes:
+                        if hardener_class in class_counts and int(class_counts[hardener_class]) < int(minimum_samples):
+                            st.warning(
+                                f"固化剂类别「{hardener_class}」样本数 {int(class_counts[hardener_class])} 少于提示阈值 {int(minimum_samples)}。"
+                            )
+                elif not progress_state["successful"]:
+                    st.warning("本次采集没有新增成功记录，已保留原有缓存数据。")
+
+        raw_records = st.session_state.get("melting_point_raw_records")
+        cleaned_dataset = st.session_state.get("melting_point_dataset")
+        summary = st.session_state.get("melting_point_dataset_summary") or {}
+        progress_state = st.session_state.get("melting_point_collection_progress") or {}
+        if progress_state:
+            st.caption(
+                f"缓存进度：{progress_state.get('completed', 0)}/{progress_state.get('total', 0)}；"
+                f"成功 {len(progress_state.get('successful') or [])} 类，失败 {len(progress_state.get('failed') or [])} 类。"
+            )
+            cid_total = int(progress_state.get("cid_total") or 0)
+            cid_completed = int(progress_state.get("cid_completed") or 0)
+            if cid_total:
+                st.caption(
+                    f"当前查询：{progress_state.get('current_query') or '—'}；"
+                    f"阶段：{progress_state.get('current_phase') or '—'}；"
+                    f"CID {cid_completed}/{cid_total}；"
+                    f"缓存命中 {int(progress_state.get('cid_cache_hits') or 0)}，"
+                    f"在线成功 {int(progress_state.get('cid_fetched') or 0)}，"
+                    f"失败 {int(progress_state.get('cid_failed') or 0)}。"
+                )
+            if progress_state.get("failed_cids"):
+                st.caption(
+                    "部分 CID 请求失败；再次点击“采集/续采熔点数据”时只会重试未完成 CID。"
+                )
+        if isinstance(raw_records, pd.DataFrame) and not raw_records.empty:
+            st.caption(f"原始记录 {len(raw_records):,} 条；清洗数据 {len(cleaned_dataset) if isinstance(cleaned_dataset, pd.DataFrame) else 0:,} 条。目标列：mp_c（°C）；原始单位见 mp_unit_raw。")
+            st.download_button(
+                "⬇️ 下载原始熔点记录",
+                data=raw_records.to_csv(index=False).encode("utf-8-sig"),
+                file_name="melting_point_raw_records.csv",
+                mime="text/csv",
+                key="melting_point_download_raw",
+            )
+        if isinstance(cleaned_dataset, pd.DataFrame) and not cleaned_dataset.empty:
+            st.dataframe(cleaned_dataset.head(100), width="stretch", hide_index=True)
+            st.download_button(
+                "⬇️ 下载熔点训练数据",
+                data=cleaned_dataset.to_csv(index=False).encode("utf-8-sig"),
+                file_name="melting_point_training_dataset.csv",
+                mime="text/csv",
+                key="melting_point_download_cleaned",
+            )
+            st.caption(
+                f"质量分布：{summary.get('quality_counts', {})}；"
+                f"角色分布：{summary.get('role_counts', {})}。"
+            )
+            persisted_paths = st.session_state.get("melting_point_dataset_paths") or {}
+            if persisted_paths:
+                st.caption(f"已落盘保存：{persisted_paths.get('cleaned_path', '')}")
+            if st.button("📚 载入模型训练", key="melting_point_load_training"):
+                st.session_state["melting_point_training_dataset"] = normalize_melting_point_units(cleaned_dataset)
+                st.session_state["melting_point_training_handoff"] = {
+                    "target_col": "mp_c",
+                    "row_count": int(len(cleaned_dataset)),
+                    "loaded_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                st.session_state["target_col"] = "mp_c"
+                st.success("熔点训练数据已载入模型训练页，目标变量已设为 mp_c。")
+        return cleaned_dataset if isinstance(cleaned_dataset, pd.DataFrame) else None
 
 
 # ============================================================
@@ -3092,6 +3559,20 @@ def init_session_state():
         'last_export_model_bytes': None,
         'last_export_feature_process_bytes': None,
         'last_export_status': None,
+
+        # --- 熔点数据采集与训练交接 ---
+        'melting_point_raw_records': pd.DataFrame(),
+        'melting_point_dataset': pd.DataFrame(),
+        'melting_point_dataset_summary': {},
+        'melting_point_collection_progress': {},
+        'melting_point_training_dataset': pd.DataFrame(),
+        'melting_point_training_handoff': None,
+        'melting_point_model_artifact': None,
+        'melting_point_model': None,
+        'melting_point_model_pipeline': None,
+        'melting_point_model_feature_cols': [],
+        'melting_point_model_scaler': None,
+        'melting_point_model_imputer': None,
 
         # --- [新增] Active Learning ---
         'al_pool_data': None,
@@ -3462,6 +3943,125 @@ def log_fe_step(operation: str, description: str, params=None, input_df=None, ou
 # ============================================================
 # 侧边栏渲染
 # ============================================================
+def _render_network_proxy_panel(active_task_lock: bool = False):
+    """渲染统一网络代理设置，供 PubChem 与 Hugging Face 共用。"""
+    try:
+        from core.network_config import (
+            get_network_settings,
+            save_network_settings,
+            test_network_connections,
+        )
+    except Exception as exc:
+        st.error(f"代理配置模块加载失败：{exc}")
+        return
+
+    settings = get_network_settings()
+    widget_defaults = {
+        'network_proxy_enabled_widget': bool(settings.get('enabled', True)),
+        'network_proxy_type_widget': str(settings.get('proxy_type') or 'SOCKS5'),
+        'network_proxy_url_widget': str(settings.get('proxy_url') or 'socks5://127.0.0.1:10808'),
+    }
+    for key, value in widget_defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+    with st.expander('🌐 网络与代理', expanded=False):
+        st.caption('统一用于 PubChem 查询、Hugging Face 模型下载和其他在线数据请求。')
+        enabled = st.checkbox(
+            '启用代理',
+            key='network_proxy_enabled_widget',
+            disabled=active_task_lock,
+            help='关闭后恢复直连；本地缓存和已下载模型不会被删除。',
+        )
+        proxy_type = st.selectbox(
+            '代理类型',
+            ['SOCKS5', 'HTTP', 'HTTPS'],
+            key='network_proxy_type_widget',
+            disabled=active_task_lock,
+            help='10808 若返回 HTTP 响应，请改选 HTTP；若仍提示禁止外部用户，请在 CCProxy 中启用外部访问/认证，或填写实际可用端口。',
+        )
+        proxy_url = st.text_input(
+            '代理地址',
+            key='network_proxy_url_widget',
+            disabled=active_task_lock,
+            placeholder='127.0.0.1:10808 或 socks5://127.0.0.1:10808',
+            help='可填写 host:port，也可填写带协议的完整地址。',
+        )
+        st.caption(f"当前配置来源：{settings.get('source', 'default')}；保存位置：{settings.get('config_path', '-')}")
+        form_signature = (bool(enabled), str(proxy_type), str(proxy_url).strip())
+        if st.session_state.get('_network_proxy_test_signature') not in (None, form_signature):
+            st.session_state.pop('_network_proxy_test_report', None)
+        st.session_state['_network_proxy_test_signature'] = form_signature
+
+        test_col, save_col = st.columns(2)
+        with test_col:
+            test_clicked = st.button(
+                '🔌 测试连接',
+                key='network_proxy_test_btn',
+                width='stretch',
+                disabled=active_task_lock,
+            )
+        with save_col:
+            save_clicked = st.button(
+                '💾 保存并应用',
+                key='network_proxy_save_btn',
+                width='stretch',
+                disabled=active_task_lock,
+            )
+
+        if save_clicked:
+            try:
+                saved = save_network_settings(enabled, proxy_url, proxy_type)
+                st.success(f"代理设置已保存并应用：{saved.get('proxy_url', proxy_url)}")
+                settings = saved
+            except Exception as exc:
+                st.error(f"代理设置保存失败：{exc}")
+
+        if test_clicked:
+            try:
+                with st.spinner('正在测试代理协议及在线服务连接...'):
+                    st.session_state['_network_proxy_test_report'] = test_network_connections(
+                        timeout=10,
+                        settings={
+                            'enabled': enabled,
+                            'proxy_type': proxy_type,
+                            'proxy_url': proxy_url,
+                        },
+                    )
+            except Exception as exc:
+                st.session_state['_network_proxy_test_report'] = {
+                    'status': 'failed',
+                    'message': f'连接测试异常：{exc}',
+                }
+
+        report = st.session_state.get('_network_proxy_test_report')
+        if isinstance(report, dict):
+            protocol_report = report.get('protocol') or {}
+            if protocol_report.get('status') == 'protocol_mismatch':
+                st.error(f"❌ 协议不匹配：{protocol_report.get('message')}")
+                http_probe = protocol_report.get('http_probe') or {}
+                if http_probe.get('status') == 'access_denied':
+                    st.error(
+                        f"❌ HTTP 代理诊断：{http_probe.get('message')}"
+                        ' 当前端口可能属于 CCProxy 的受限服务，需在代理软件中启用外部访问或改用可用端口。'
+                    )
+                elif http_probe.get('status') == 'auth_required':
+                    st.warning(f"⚠️ HTTP 代理诊断：{http_probe.get('message')}")
+            elif protocol_report.get('status') == 'ok':
+                st.success(f"✅ {protocol_report.get('message')}")
+            elif protocol_report.get('message'):
+                st.warning(f"⚠️ {protocol_report.get('message')}")
+
+            for service_name, label in (('pubchem', 'PubChem'), ('huggingface', 'Hugging Face')):
+                service_report = report.get(service_name) or {}
+                if service_report.get('status') == 'ok':
+                    st.success(f"✅ {label}：连接成功")
+                elif service_report:
+                    st.warning(f"⚠️ {label}：{service_report.get('message', '连接失败')}")
+            if report.get('status') == 'disabled':
+                st.info(report.get('message', '代理未启用。'))
+
+
 def render_sidebar():
     """渲染侧边栏导航"""
     with st.sidebar:
@@ -3512,25 +4112,65 @@ def render_sidebar():
 
         st.markdown("---")
         st.markdown("### 🌐 用户预测门户")
+        if "user_prediction_portal_enabled" not in st.session_state:
+            st.session_state["user_prediction_portal_enabled"] = False
         portal_enabled = st.checkbox(
-            "显示用户预测门户入口",
-            value=bool(st.session_state.get("user_prediction_portal_enabled", False)),
+            "自动运行并显示用户预测门户入口",
             key="user_prediction_portal_enabled",
-            disabled=active_task_lock,
-            help="开启后显示独立运行在 8555 端口的外部用户预测页面。",
+            help="勾选后，主平台会自动启动 8555 端口的独立用户预测页面；取消勾选不会强制关闭已运行的门户。",
         )
+
+        portal_start_col, portal_stop_col = st.columns(2)
+        with portal_start_col:
+            if st.button("开启门户", key="portal_start_button", width="stretch"):
+                start_result = start_prediction_portal(port=8555)
+                if start_result.get("status") == "error":
+                    st.error(f"门户启动失败：{start_result.get('error', '未知错误')}")
+                else:
+                    st.session_state["_portal_notice"] = "已发送门户启动请求，正在等待 8555 端口就绪。"
+                    st.rerun()
+        with portal_stop_col:
+            if st.button("关闭门户", key="portal_stop_button", width="stretch"):
+                stop_result = stop_prediction_portal(port=8555)
+                if stop_result.get("status") == "error":
+                    st.error(f"门户关闭失败：{stop_result.get('error', '未知错误')}")
+                elif stop_result.get("error"):
+                    st.warning(stop_result["error"])
+                else:
+                    st.session_state["_portal_notice"] = "门户已关闭。"
+                    st.rerun()
+
+        portal_notice = st.session_state.pop("_portal_notice", None)
+        if portal_notice:
+            st.info(portal_notice)
+
         if portal_enabled:
-            portal_running = is_port_open("127.0.0.1", 8555)
-            if portal_running:
-                st.success(f"门户状态：{portal_health_label(True)}")
-                st.link_button(
-                    "打开用户预测门户",
-                    "http://localhost:8555",
-                    width="stretch",
-                )
+            portal_status = portal_process_status(port=8555)
+            if portal_status.get("status") == "stopped":
+                auto_start_result = start_prediction_portal(port=8555)
+                if auto_start_result.get("status") == "error":
+                    st.error(f"门户自动启动失败：{auto_start_result.get('error', '未知错误')}")
+                else:
+                    portal_status = portal_process_status(port=8555)
+
+        portal_status = portal_process_status(port=8555)
+        if portal_status.get("status") == "running":
+            if portal_status.get("managed"):
+                st.success(f"门户状态：{portal_health_label(True)}（由主平台管理，PID {portal_status.get('pid')}）")
             else:
-                st.warning("门户状态：未启动。请运行“启动预测平台.bat”后刷新页面。")
-                st.caption("访问地址：http://localhost:8555")
+                st.success("门户状态：可访问（由其他进程启动）")
+            st.link_button(
+                "打开用户预测门户",
+                "http://localhost:8555",
+                width="stretch",
+            )
+        elif portal_status.get("status") == "starting":
+            st.info(f"门户状态：正在启动（PID {portal_status.get('pid')}），稍后刷新即可访问。")
+            st.caption("访问地址：http://localhost:8555")
+        else:
+            st.warning("门户状态：未启动。可点击“开启门户”，或勾选上方自动运行。")
+            st.caption("访问地址：http://localhost:8555")
+        _render_network_proxy_panel(active_task_lock)
 
         st.markdown("---")
         st.markdown("### 📊 数据状态")
@@ -8018,7 +8658,7 @@ def page_molecular_features():
             "pooling": "cls",
             "max_length": 256,
             "batch_size": 16,
-            "trust_remote_code": False,
+            "trust_remote_code": True,
         }),
         ("TOML-BERT", {
             "model_name": None,
@@ -12246,7 +12886,10 @@ def _render_binary_classification_results(
             imputer=res.get("imputer"),
             feature_cols=effective_feature_cols,
             target_col=target_col,
-            extra=_current_molecular_feature_artifact_extra(),
+            extra={
+                **_current_molecular_feature_artifact_extra(),
+                **_current_melting_point_artifact_extra(target_col),
+            },
         )
         st.session_state.last_training_run_id = summary.run_id
         st.caption(f"已保存训练记录：{summary.run_id}")
@@ -12258,17 +12901,151 @@ def page_model_training():
     """模型训练页面（稳健版：支持分层/分组划分 + Repeated KFold CV）"""
     st.title("🤖 模型训练")
 
-    if st.session_state.data is None:
+    melting_point_training_dataset = st.session_state.get("melting_point_training_dataset")
+    has_melting_point_handoff = (
+        isinstance(melting_point_training_dataset, pd.DataFrame)
+        and not melting_point_training_dataset.empty
+    )
+    if has_melting_point_handoff:
+        handoff = st.session_state.get("melting_point_training_handoff") or {}
+        st.success(
+            f"熔点训练数据已载入模型训练页：{len(melting_point_training_dataset):,} 条，"
+            f"目标变量为 `{handoff.get('target_col', 'mp_c')}`（°C）。"
+        )
+        st.caption("当前训练集来自熔点采集面板；原始数据与当前处理数据不会被删除。")
+        include_low_quality = st.checkbox(
+            "训练时纳入低质量熔点记录",
+            value=False,
+            key="melting_point_train_include_low_quality",
+            help="默认仅使用有限 mp_c 且 mp_quality=high 的记录。",
+        )
+        st.session_state["target_col"] = "mp_c"
+
+    if st.session_state.data is None and not has_melting_point_handoff:
         st.warning("⚠️ 请先上传数据")
         return
 
-    if not st.session_state.feature_cols:
+    if not st.session_state.feature_cols and not has_melting_point_handoff:
         st.warning("⚠️ 请先在特征选择页面选择特征")
         return
 
     # 数据源
-    df_all = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
-    df = df_all.copy()
+    if has_melting_point_handoff:
+        df = melting_point_training_dataset.copy()
+        mp_values = pd.to_numeric(df.get("mp_c"), errors="coerce")
+        finite_mp_mask = np.isfinite(mp_values.to_numpy(dtype=float))
+        if not include_low_quality:
+            finite_mp_mask &= df.get("mp_quality", pd.Series("high", index=df.index)).eq("high").to_numpy()
+        df = df.loc[finite_mp_mask].copy()
+        if df.empty:
+            st.warning("熔点训练交接数据没有可用的有限 mp_c 记录。")
+            return
+        st.info(
+            f"本次训练使用 {len(df):,} 条有限 mp_c（°C）记录"
+            + ("（已纳入低质量记录）" if include_low_quality else "（默认仅高质量记录）")
+        )
+    else:
+        df_all = st.session_state.processed_data if st.session_state.processed_data is not None else st.session_state.data
+        df = df_all.copy()
+
+    # 熔点数据只有一个分子源列，必须显式按已锁定 workflow 复现特征，
+    # 不能把当前 CFRP 会话中的旧 feature_cols 直接套到 PubChem 表上。
+    if has_melting_point_handoff:
+        from core.melting_point_training import prepare_melting_point_source_frame
+        from core.molecular_feature_workflow import execute_molecular_feature_workflow
+        from core.virtual_screening import resolve_molecular_feature_workflow
+
+        workflow_payload = st.session_state.get('molecular_feature_workflow')
+        workflow = resolve_molecular_feature_workflow(
+            {
+                'molecular_feature_workflow': workflow_payload,
+                'molecular_feature_config': st.session_state.get('molecular_feature_config') or {},
+            },
+            model_feature_cols=None,
+        )
+        if workflow is None:
+            st.warning('熔点训练需要先在【分子特征工程复现】页导入并锁定单一组分 workflow。')
+            st.info('建议：使用一个 SMILES/BigSMILES 源列完成特征提取，再回到这里载入熔点数据。')
+            return
+
+        workflow_hash = str(getattr(workflow, 'workflow_hash', '') or '')
+        cache_frame = st.session_state.get('melting_point_training_feature_frame')
+        cache_key = st.session_state.get('melting_point_training_feature_cache_key')
+        key_source = df[['smiles', 'mp_c']].copy()
+        if 'mp_quality' in df.columns:
+            key_source['mp_quality'] = df['mp_quality'].astype(str)
+        try:
+            import hashlib
+            frame_hash = hashlib.sha256(
+                pd.util.hash_pandas_object(key_source.reset_index(drop=True), index=False).values.tobytes()
+            ).hexdigest()
+        except Exception:
+            frame_hash = f'{len(df)}:{tuple(key_source.get("smiles", []).astype(str).head(5))}'
+        expected_cache_key = f'{workflow_hash}:{include_low_quality}:{frame_hash}'
+
+        if cache_key == expected_cache_key and isinstance(cache_frame, pd.DataFrame):
+            prepared_features = cache_frame.copy()
+            if len(prepared_features) == len(df):
+                df = pd.concat(
+                    [df.reset_index(drop=True), prepared_features.reset_index(drop=True)],
+                    axis=1,
+                )
+                st.session_state['feature_cols'] = list(prepared_features.columns)
+                st.caption(f'已复用熔点分子特征缓存：{len(prepared_features.columns)} 个特征。')
+            else:
+                st.session_state.pop('melting_point_training_feature_frame', None)
+                st.session_state.pop('melting_point_training_feature_cache_key', None)
+
+        if not isinstance(st.session_state.get('melting_point_training_feature_frame'), pd.DataFrame) or st.session_state.get('melting_point_training_feature_cache_key') != expected_cache_key:
+            st.info('当前熔点训练集尚未生成与 workflow 对应的分子特征；请显式执行一次，结果会缓存在本次会话。')
+            if not st.button('🧬 准备熔点训练分子特征', type='primary', key='melting_point_prepare_training_features'):
+                return
+            try:
+                source_frame, source_report = prepare_melting_point_source_frame(df, workflow)
+                progress = st.empty()
+                progress.info(
+                    f"正在按 workflow 提取熔点特征：{source_report.get('row_count', len(source_frame)):,} 行，"
+                    f"源列角色={source_report.get('source_role', 'neutral')}。"
+                )
+                execution = execute_molecular_feature_workflow(
+                    source_frame,
+                    workflow,
+                    device=st.session_state.get('compute_device'),
+                    mode='melting_point_training',
+                    progress_callback=lambda trace: progress.info(
+                        f"已完成 {trace.get('step_id')}："
+                        f"有效行 {trace.get('valid_count', 0):,}/{trace.get('input_count', 0):,}，"
+                        f"输出特征 {len(trace.get('output_columns') or []):,}"
+                    ),
+                )
+                prepared_features = execution.features.reset_index(drop=True)
+                if len(prepared_features) != len(df):
+                    raise ValueError(
+                        f'workflow 输出行数不匹配：{len(prepared_features)} != {len(df)}。'
+                    )
+                st.session_state['melting_point_training_feature_frame'] = prepared_features.copy()
+                st.session_state['melting_point_training_feature_cache_key'] = expected_cache_key
+                st.session_state['melting_point_training_feature_meta'] = {
+                    'workflow_hash': workflow_hash,
+                    'source_report': source_report,
+                    'step_trace': execution.step_trace,
+                    'warnings': execution.warnings,
+                }
+                st.session_state['feature_cols'] = list(prepared_features.columns)
+                df = pd.concat(
+                    [df.reset_index(drop=True), prepared_features],
+                    axis=1,
+                )
+                progress.success(
+                    f'熔点分子特征准备完成：{len(prepared_features):,} 行 × '
+                    f'{len(prepared_features.columns):,} 列。'
+                )
+                if execution.warnings:
+                    st.warning('；'.join(execution.warnings[:8]))
+            except Exception as exc:
+                st.error(f'熔点分子特征准备失败：{exc}')
+                st.info('请回到【分子特征工程复现】页，选择单一树脂或单一固化剂源列后重新锁定 workflow。')
+                return
 
     # --- [P0-2] Tg 口径过滤：建议分方法建模 ---
     target_col = st.session_state.target_col
@@ -12333,7 +13110,10 @@ def page_model_training():
 
     # 构造 X / y
     try:
-        X = df[st.session_state.feature_cols]
+        training_feature_cols = list(st.session_state.get('feature_cols') or [])
+        if not training_feature_cols:
+            raise ValueError('没有可用于训练的特征列；请先准备分子特征。')
+        X = df[training_feature_cols]
         y = df[target_col]
     except Exception as e:
         st.error(f"❌ 构造训练数据失败：{e}")
@@ -13708,6 +14488,65 @@ def page_model_training():
                     train_metrics = _compute_metrics(res.get('y_train', []), res.get('y_pred_train', []))
                     test_metrics = _compute_metrics(res.get('y_test', []), y_pred_test)
 
+                    melting_point_metrics = None
+                    if str(target_col or '').strip() == 'mp_c':
+                        try:
+                            from core.melting_point_training import build_melting_point_split_metrics
+
+                            melting_point_metrics = build_melting_point_split_metrics(
+                                df,
+                                train_indices=res.get('train_indices'),
+                                test_indices=res.get('test_indices'),
+                                y_train=res.get('y_train', []),
+                                y_pred_train=res.get('y_pred_train', []),
+                                y_test=res.get('y_test', []),
+                                y_pred_test=y_pred_test,
+                            )
+                            st.session_state["melting_point_metrics"] = melting_point_metrics
+                            extra_tables['melting_point_split_metrics'] = pd.DataFrame(
+                                [
+                                    {
+                                        'split': split_name,
+                                        'subset': 'overall',
+                                        **(split_payload.get('metrics') or {}),
+                                    }
+                                    for split_name, split_payload in melting_point_metrics.items()
+                                    if isinstance(split_payload, dict) and 'metrics' in split_payload
+                                ]
+                            )
+                            st.markdown('### 🌡️ 熔点分层指标（°C）')
+                            metric_rows = []
+                            for split_name in ('train', 'test'):
+                                split_payload = melting_point_metrics.get(split_name) or {}
+                                overall = split_payload.get('metrics') or {}
+                                metric_rows.append({
+                                    '数据集': '训练集' if split_name == 'train' else '测试集',
+                                    '有效样本数': overall.get('n', 0),
+                                    'MAE': overall.get('mae'),
+                                    'RMSE': overall.get('rmse'),
+                                    'R²': overall.get('r2'),
+                                })
+                                for role, values in (split_payload.get('roles') or {}).items():
+                                    metric_rows.append({
+                                        '数据集': f"{'训练集' if split_name == 'train' else '测试集'} / 角色:{role}",
+                                        '有效样本数': values.get('n', 0),
+                                        'MAE': values.get('mae'),
+                                        'RMSE': values.get('rmse'),
+                                        'R²': values.get('r2'),
+                                    })
+                                for hardener_class, values in (split_payload.get('hardener_classes') or {}).items():
+                                    metric_rows.append({
+                                        '数据集': f"{'训练集' if split_name == 'train' else '测试集'} / 固化剂:{hardener_class}",
+                                        '有效样本数': values.get('n', 0),
+                                        'MAE': values.get('mae'),
+                                        'RMSE': values.get('rmse'),
+                                        'R²': values.get('r2'),
+                                    })
+                            if metric_rows:
+                                st.dataframe(pd.DataFrame(metric_rows), width='stretch', hide_index=True)
+                        except Exception as melting_point_metric_error:
+                            st.warning(f'熔点分层指标生成失败，已保留总体指标：{melting_point_metric_error}')
+
                     try:
                         pred_test_df = pd.DataFrame({
                             "y_true": res.get('y_test', []),
@@ -13865,6 +14704,38 @@ def page_model_training():
                             "best_iteration": res.get("best_iteration"),
                             "best_score": best_score,
                         }
+                        if melting_point_metrics is not None:
+                            meta['melting_point_metrics'] = melting_point_metrics
+                            meta['melting_point_train_indices'] = list(
+                                (melting_point_metrics.get('train') or {}).get('positions') or []
+                            )
+                            meta['melting_point_test_indices'] = list(
+                                (melting_point_metrics.get('test') or {}).get('positions') or []
+                            )
+                            try:
+                                from core.melting_point_screening import build_melting_point_artifact_extra
+
+                                mp_quality_policy = (
+                                    'high_quality_and_optional_low_quality'
+                                    if has_melting_point_handoff and include_low_quality
+                                    else 'high_quality_only'
+                                )
+                                workflow_value = st.session_state.get('molecular_feature_workflow')
+                                workflow_hash = (
+                                    workflow_value.get('workflow_hash')
+                                    if isinstance(workflow_value, dict)
+                                    else getattr(workflow_value, 'workflow_hash', None)
+                                )
+                                meta['melting_point_source'] = build_melting_point_artifact_extra(
+                                    df,
+                                    workflow_hash=workflow_hash,
+                                    quality_policy=mp_quality_policy,
+                                )
+                            except Exception:
+                                meta['melting_point_source'] = {
+                                    'dataset_row_count': int(len(df)),
+                                    'quality_policy': mp_quality_policy,
+                                }
                         if cv_res is not None:
                             meta.update(
                                 {
@@ -13899,7 +14770,7 @@ def page_model_training():
                             imputer=res.get('imputer'),
                             feature_cols=effective_feature_cols,
                             target_col=target_col,
-                            extra=_current_molecular_feature_artifact_extra(),
+                            extra={**_current_molecular_feature_artifact_extra(), **_current_melting_point_artifact_extra(target_col)},
                         )
                         st.session_state.last_training_run_id = summary.run_id
                         st.caption(f"🗂️ 已保存训练记录: {summary.run_id}（可在【📈 训练记录】查看）")
@@ -13961,6 +14832,7 @@ def page_model_training():
                                 except Exception:
                                     _extra['feature_engineering_log'] = _tracker.export_log()
                             _extra['effective_feature_cols'] = effective_feature_cols
+                            _extra.update(_current_melting_point_artifact_extra(target_col))
                             _tr = st.session_state.get("train_result") or {}
                             _processed_ref = st.session_state.get("processed_data")
                             if _processed_ref is None:
@@ -14018,6 +14890,7 @@ def page_model_training():
                                     else None
                                 ),
                             }
+                            process_payload.update(_current_melting_point_artifact_extra(target_col))
                             process_payload.update(
                                 workflow_to_artifact_extra(
                                     st.session_state.get('molecular_feature_workflow')
@@ -14327,6 +15200,7 @@ def page_model_training():
                                     st.session_state.get("molecular_feature_workflow")
                                 )
                             )
+                            extra_export.update(_current_melting_point_artifact_extra(st.session_state.get('target_col')))
                             extra_export.update(
                                 process_pls_to_artifact_extra(
                                     st.session_state.get("process_pls_workflow")
@@ -17344,7 +18218,7 @@ def _virtual_screening_task_guard(page_func):
 
 
 @_virtual_screening_task_guard
-def page_virtual_screening():
+def _page_virtual_screening_formula():
     """虚拟分子生成与高通量筛选"""
     st.title("🧪 虚拟分子筛选")
     st.caption("基于当前模型与分子特征流程，批量生成候选并进行高通量预测筛选。")
@@ -17393,6 +18267,101 @@ def page_virtual_screening():
             key="vs_saved_formula_result_download",
         )
 
+    with st.expander('🌡️ 独立熔点模型（可选）', expanded=False):
+        melting_point_upload = st.file_uploader(
+            '上传独立熔点模型（.joblib/.pkl）',
+            type=['joblib', 'pkl'],
+            key='melting_point_model_uploader_vs',
+            help='熔点模型必须是本系统导出的、带 task_kind=melting_point 和 target_unit=C 元数据的模型。',
+        )
+        if melting_point_upload is not None:
+            try:
+                import hashlib
+                melting_point_bytes = melting_point_upload.getvalue()
+                melting_point_hash = hashlib.sha256(melting_point_bytes).hexdigest()
+                same_melting_point_model = (
+                    st.session_state.get('_last_melting_point_model_import_hash') == melting_point_hash
+                    and st.session_state.get('melting_point_model_artifact') is not None
+                    and st.session_state.get('melting_point_model') is not None
+                )
+                if same_melting_point_model:
+                    st.info('熔点模型已加载（检测到相同文件），已跳过重复导入。')
+                else:
+                    from core.model_io import load_model_artifact_bytes
+                    from core.melting_point_screening import (
+                        validate_melting_point_artifact,
+                        validate_melting_point_artifact_for_screening,
+                    )
+
+                    with st.spinner('正在加载独立熔点模型…'):
+                        melting_point_artifact = load_model_artifact_bytes(melting_point_bytes)
+                    melting_point_validation = validate_melting_point_artifact(melting_point_artifact)
+                    if not melting_point_validation.get('ok', False):
+                        error_codes = '、'.join(melting_point_validation.get('error_codes') or [])
+                        st.error(
+                            '❌ 熔点模型元数据不完整，未导入。'
+                            f'缺失或不匹配字段：{error_codes or "未知"}。'
+                            '请使用熔点训练页导出的模型，而不是普通Tg/力学模型。'
+                        )
+                    else:
+                        melting_point_model_obj = melting_point_artifact.get('model')
+                        melting_point_pipeline_obj = melting_point_artifact.get('pipeline')
+                        if melting_point_model_obj is None and melting_point_pipeline_obj is not None:
+                            melting_point_model_obj = melting_point_pipeline_obj
+                            melting_point_pipeline_obj = None
+                        if melting_point_model_obj is None:
+                            raise ValueError('熔点模型文件中没有可预测的 model 或 pipeline。')
+                        melting_point_feature_cols = _resolve_effective_feature_cols(
+                            selected_feature_cols=melting_point_artifact.get('feature_cols') or [],
+                            model=melting_point_model_obj,
+                            pipeline=melting_point_pipeline_obj,
+                            imported_artifact=melting_point_artifact,
+                        )[0]
+                        melting_point_feature_cols = sanitize_feature_columns(
+                            melting_point_feature_cols or melting_point_artifact.get('feature_cols') or []
+                        )
+                        if not melting_point_feature_cols:
+                            raise ValueError('熔点模型没有可用的特征列记录。')
+                        strict_validation = validate_melting_point_artifact_for_screening(
+                            melting_point_artifact,
+                            model_feature_cols=melting_point_feature_cols,
+                        )
+                        if not strict_validation.get('ok', False):
+                            error_codes = '、'.join(strict_validation.get('error_codes') or [])
+                            workflow_report = strict_validation.get('workflow_report') or {}
+                            details = []
+                            if workflow_report.get('missing_features'):
+                                details.append('缺少特征：' + '、'.join(workflow_report['missing_features'][:8]))
+                            if workflow_report.get('order_mismatch'):
+                                details.append('最终特征顺序与模型不一致')
+                            st.error(
+                                '❌ 熔点模型 workflow 与模型特征不兼容，未导入。'
+                                f'错误码：{error_codes or "未知"}。'
+                                + ((' ' + '；'.join(details)) if details else '')
+                                + ' 请从同一熔点训练流程重新导出模型。'
+                            )
+                        else:
+                            st.session_state['melting_point_model_artifact'] = melting_point_artifact
+                            st.session_state['melting_point_model'] = melting_point_model_obj
+                            st.session_state['melting_point_model_pipeline'] = melting_point_pipeline_obj
+                            st.session_state['melting_point_model_feature_cols'] = melting_point_feature_cols
+                            st.session_state['melting_point_model_scaler'] = melting_point_artifact.get('scaler')
+                            st.session_state['melting_point_model_imputer'] = melting_point_artifact.get('imputer')
+                            st.session_state['_last_melting_point_model_import_hash'] = melting_point_hash
+                            st.success(
+                                '✅ 独立熔点模型导入成功：'
+                                f'{len(melting_point_feature_cols)} 个特征，目标单位 °C。'
+                            )
+            except Exception as melting_point_import_error:
+                st.error(f'❌ 熔点模型导入失败：{melting_point_import_error}')
+        if st.session_state.get('melting_point_model_artifact') is not None:
+            melting_point_artifact_info = st.session_state.get('melting_point_model_artifact') or {}
+            melting_point_extra_info = melting_point_artifact_info.get('extra') or {}
+            st.caption(
+                '当前已加载独立熔点模型：'
+                f'{len(st.session_state.get("melting_point_model_feature_cols") or [])} 个特征；'
+                f'训练样本 {melting_point_extra_info.get("dataset_row_count", "未知")} 条。'
+            )
     # [关键修复] 检查模型是否存在
     current_model = get_current_model()
     # 允许在此页面直接导入模型，避免位置不清晰
@@ -19019,6 +19988,72 @@ def page_virtual_screening():
         )
         formula_top_k = st.slider("返回候选数", 1, 1000, 100, key="vs_formula_top_k_v2")
         formula_batch_size = st.slider("每类实验建议数量", 3, 100, 15, key="vs_formula_batch_size_v2")
+        st.markdown('#### 熔点模型筛选（可选）')
+        melting_point_filter_requested = st.checkbox(
+            '启用独立熔点模型筛选',
+            value=False,
+            key='vs_melting_point_filter_enabled_v1',
+            help='熔点模型与当前性能模型完全分离；没有独立熔点模型时不会使用经验公式代替预测。',
+        )
+        melting_point_filter_mode = 'annotate'
+        melting_point_resin_limit = 130.0
+        melting_point_hardener_limit = 130.0
+        melting_point_max_std = 35.0
+        melting_point_min_ad = 0.0
+        melting_point_filter_enabled = bool(
+            melting_point_filter_requested
+            and st.session_state.get('melting_point_model') is not None
+        )
+        if melting_point_filter_requested and not melting_point_filter_enabled:
+            st.warning('已勾选熔点筛选，但当前没有可用的独立熔点模型；本次筛选不会伪造熔点预测。')
+        if melting_point_filter_enabled:
+            mp_ui_col1, mp_ui_col2 = st.columns(2)
+            with mp_ui_col1:
+                melting_point_resin_limit = st.number_input(
+                    '树脂熔点上限（°C）',
+                    min_value=-100.0,
+                    max_value=500.0,
+                    value=130.0,
+                    step=5.0,
+                    key='vs_melting_point_resin_limit_v1',
+                )
+                melting_point_hardener_limit = st.number_input(
+                    '固化剂熔点上限（°C）',
+                    min_value=-100.0,
+                    max_value=500.0,
+                    value=130.0,
+                    step=5.0,
+                    key='vs_melting_point_hardener_limit_v1',
+                )
+            with mp_ui_col2:
+                melting_point_filter_mode = st.selectbox(
+                    '熔点规则模式',
+                    options=['annotate', 'strict'],
+                    index=0,
+                    key='vs_melting_point_filter_mode_v1',
+                    format_func=lambda value: {
+                        'annotate': '标记模式（保留候选，推荐）',
+                        'strict': '严格剔除（只保留通过项）',
+                    }[value],
+                )
+                melting_point_max_std = st.number_input(
+                    '允许的最大预测标准差（°C）',
+                    min_value=0.0,
+                    max_value=500.0,
+                    value=35.0,
+                    step=5.0,
+                    key='vs_melting_point_max_std_v1',
+                )
+            melting_point_min_ad = st.slider(
+                '熔点模型最低适用域分数',
+                min_value=0.0,
+                max_value=100.0,
+                value=0.0,
+                step=5.0,
+                key='vs_melting_point_min_ad_v1',
+                help='适用域分数范围为0-100；设为0表示不按分数额外剔除。域外候选仍会标记为未知。',
+            )
+            st.caption('树脂与固化剂阈值独立控制。默认先标记，不直接删除候选，便于检查模型覆盖范围和异常结构。')
         screening_expensive_unique_cap = 20000
         screening_xtb_n_jobs = max(1, int((mf_cfg.get("params") or {}).get("xtb_n_jobs", 1)))
         if screening_uses_expensive_features:
@@ -19142,6 +20177,215 @@ def page_virtual_screening():
                 )
             return execution.features, None
 
+        def _predict_melting_point_role(candidate_frame, role):
+            mp_artifact = st.session_state.get('melting_point_model_artifact') or {}
+            mp_model = st.session_state.get('melting_point_model')
+            if not isinstance(candidate_frame, pd.DataFrame) or candidate_frame.empty:
+                return None, '没有可用于熔点预测的候选。'
+            if not isinstance(mp_artifact, dict) or mp_model is None:
+                return None, '未加载独立熔点模型。'
+            role_column = 'resin_smiles' if role == 'resin' else 'hardener_smiles'
+            if role_column not in candidate_frame.columns:
+                return None, f'候选表缺少{("树脂" if role == "resin" else "固化剂")} SMILES 列。'
+            selected_smiles = candidate_frame[role_column].fillna('').astype(str)
+            if selected_smiles.str.strip().eq('').all():
+                return None, f'没有有效的{"树脂" if role == "resin" else "固化剂"} SMILES。'
+
+            # 熔点是分子级属性。同一个候选分子可能被多个配方/工艺网格重复引用，
+            # 不能按配方行重复执行昂贵的分子特征 workflow；先按 canonical SMILES
+            # 去重，预测完成后再按原始配方顺序映射回去。
+            try:
+                from core.melting_point_data import canonicalize_smiles
+            except Exception:
+                canonicalize_smiles = None
+
+            def _molecule_key(value):
+                text = str(value or '').strip()
+                if not text:
+                    return ''
+                if canonicalize_smiles is not None:
+                    try:
+                        canonical = canonicalize_smiles(text)
+                        if canonical:
+                            return str(canonical)
+                    except Exception:
+                        pass
+                return text
+
+            selected_keys = selected_smiles.map(_molecule_key)
+            unique_positions = (
+                pd.DataFrame({'_molecule_key': selected_keys, '_smiles': selected_smiles})
+                .drop_duplicates('_molecule_key', keep='first')
+            )
+            unique_keys = unique_positions['_molecule_key'].tolist()
+            unique_smiles = unique_positions['_smiles'].tolist()
+
+            mp_extra = mp_artifact.get('extra') if isinstance(mp_artifact.get('extra'), dict) else {}
+            mp_cfg = dict(mp_extra.get('molecular_feature_config') or {})
+            mp_workflow_payload = mp_extra.get('molecular_feature_workflow')
+            mp_feature_cols = sanitize_feature_columns(
+                st.session_state.get('melting_point_model_feature_cols')
+                or mp_artifact.get('feature_cols')
+                or []
+            )
+            if not mp_feature_cols:
+                return None, '熔点模型没有可用特征列。'
+            if not mp_workflow_payload and isinstance(mp_artifact.get('molecular_feature_workflow'), dict):
+                mp_workflow_payload = mp_artifact.get('molecular_feature_workflow')
+            if not mp_workflow_payload and isinstance(mp_artifact.get('molecular_feature_config'), dict):
+                mp_cfg = dict(mp_artifact.get('molecular_feature_config') or {})
+            mp_workflow = resolve_molecular_feature_workflow(
+                {
+                    'molecular_feature_workflow': mp_workflow_payload,
+                    'molecular_feature_config': mp_cfg,
+                },
+                model_feature_cols=mp_feature_cols,
+            )
+            if mp_workflow is None:
+                return None, '熔点模型未保存可执行的分子特征 workflow。'
+            if not isinstance(mp_workflow, MolecularFeatureWorkflow):
+                mp_workflow = MolecularFeatureWorkflow.from_dict(mp_workflow)
+            mp_resin_sources, mp_hardener_sources = resolve_workflow_source_columns_by_role(
+                mp_workflow,
+                mp_cfg,
+            )
+            mp_input = pd.DataFrame(index=range(len(unique_smiles)))
+            mp_input['smiles'] = np.asarray(unique_smiles, dtype=object)
+            mp_input['bigsmiles'] = np.asarray(unique_smiles, dtype=object)
+            mp_input['resin_smiles'] = (
+                np.asarray(unique_smiles, dtype=object) if role == 'resin'
+                else np.full(len(unique_smiles), None, dtype=object)
+            )
+            mp_input['hardener_smiles'] = (
+                np.asarray(unique_smiles, dtype=object) if role == 'hardener'
+                else np.full(len(unique_smiles), None, dtype=object)
+            )
+            mp_input = materialize_workflow_source_columns(
+                mp_input,
+                resin_columns=mp_resin_sources,
+                hardener_columns=mp_hardener_sources,
+            )
+            declared_sources = []
+            for step in getattr(mp_workflow, 'steps', []) or []:
+                if isinstance(step, dict):
+                    source_values = step.get('source_columns') or []
+                    if isinstance(source_values, str):
+                        source_values = [source_values]
+                    declared_sources.extend(source_values)
+            input_contract = getattr(mp_workflow, 'input_contract', {}) or {}
+            if isinstance(input_contract, dict):
+                for source_key in ('resin_component_cols', 'hardener_component_cols', 'smiles_col', 'hardener_col'):
+                    source_value = input_contract.get(source_key)
+                    if isinstance(source_value, str):
+                        declared_sources.append(source_value)
+                    elif isinstance(source_value, (list, tuple)):
+                        declared_sources.extend(source_value)
+            declared_sources = list(dict.fromkeys(
+                str(value).strip() for value in declared_sources if str(value).strip()
+            ))
+            missing_sources = [
+                source_column for source_column in declared_sources
+                if source_column not in mp_input.columns
+            ]
+            if missing_sources:
+                return None, (
+                    '熔点 workflow 声明的源列缺失，未执行预测：'
+                    + '、'.join(missing_sources[:12])
+                )
+            try:
+                mp_execution = execute_molecular_feature_workflow(
+                    mp_input,
+                    mp_workflow,
+                    device=torch_device,
+                    mode='screening',
+                )
+                mp_features = mp_execution.features
+                if not isinstance(mp_features, pd.DataFrame) or mp_features.empty:
+                    return None, '熔点 workflow 没有生成有效特征。'
+                mp_workflow_feature_cols = sanitize_feature_columns(
+                    getattr(mp_workflow, 'final_feature_names', [])
+                )
+                if mp_workflow_feature_cols != list(mp_feature_cols):
+                    return None, '熔点 workflow 最终特征顺序与模型特征列不一致，未执行预测。'
+                mp_molecular_cols = list(mp_feature_cols)
+                mp_reference = mp_extra.get('screening_reference_X')
+                if not isinstance(mp_reference, pd.DataFrame) or mp_reference.empty:
+                    mp_reference = mp_artifact.get('X_train_raw')
+                mp_reference = mp_reference.copy() if isinstance(mp_reference, pd.DataFrame) else None
+                mp_base_row = None
+                if isinstance(mp_reference, pd.DataFrame) and not mp_reference.empty:
+                    common_reference_cols = [column for column in mp_feature_cols if column in mp_reference.columns]
+                    if common_reference_cols:
+                        mp_base_row = mp_reference[common_reference_cols].apply(
+                            pd.to_numeric,
+                            errors='coerce',
+                        ).median(numeric_only=True)
+                mp_X = build_feature_matrix(
+                    feature_cols=mp_feature_cols,
+                    mol_features=mp_features,
+                    base_row=mp_base_row,
+                    fill_missing_fp=False,
+                    strict=True,
+                    strict_feature_cols=mp_molecular_cols,
+                )
+                mp_pipeline = st.session_state.get('melting_point_model_pipeline')
+                mp_imputer = st.session_state.get('melting_point_model_imputer')
+                mp_scaler = st.session_state.get('melting_point_model_scaler')
+                mp_preds, mp_std, _ = predict_with_uncertainty_info(
+                    mp_model,
+                    mp_X,
+                    pipeline=mp_pipeline,
+                    imputer=mp_imputer,
+                    scaler=mp_scaler,
+                    mc_samples=int(formula_mc_samples),
+                )
+                mp_ad = np.full(len(mp_X), np.nan, dtype=float)
+                mp_ad_in_domain = np.full(len(mp_X), np.nan, dtype=object)
+                if isinstance(mp_reference, pd.DataFrame) and not mp_reference.empty:
+                    common_reference_cols = [column for column in mp_feature_cols if column in mp_reference.columns]
+                    if len(common_reference_cols) == len(mp_feature_cols):
+                        mp_ad_frame = estimate_applicability_scores(
+                            mp_X[mp_feature_cols],
+                            mp_reference[mp_feature_cols],
+                            feature_cols=mp_feature_cols,
+                            reference_max_samples=3000,
+                            random_state=int(formula_random_state),
+                        )
+                        if isinstance(mp_ad_frame, pd.DataFrame) and 'ad_score' in mp_ad_frame.columns:
+                            mp_ad = pd.to_numeric(mp_ad_frame['ad_score'], errors='coerce').to_numpy(dtype=float)
+                        if isinstance(mp_ad_frame, pd.DataFrame) and 'ad_in_domain' in mp_ad_frame.columns:
+                            mp_ad_in_domain = mp_ad_frame['ad_in_domain'].to_numpy(dtype=object)
+
+                def _expand_unique_values(values):
+                    values_array = np.asarray(values, dtype=float).reshape(-1)
+                    value_map = dict(zip(unique_keys, values_array.tolist()))
+                    return np.asarray(
+                        [value_map.get(key, np.nan) for key in selected_keys.tolist()],
+                        dtype=float,
+                    )
+
+                def _expand_unique_domain_values(values):
+                    values_array = np.asarray(values, dtype=object).reshape(-1)
+                    value_map = dict(zip(unique_keys, values_array.tolist()))
+                    return np.asarray(
+                        [value_map.get(key, np.nan) for key in selected_keys.tolist()],
+                        dtype=object,
+                    )
+
+                return {
+                    'prediction': _expand_unique_values(mp_preds),
+                    'std': (
+                        _expand_unique_values(mp_std)
+                        if mp_std is not None
+                        else np.full(len(candidate_frame), np.nan, dtype=float)
+                    ),
+                    'ad': _expand_unique_values(mp_ad),
+                    'ad_in_domain': _expand_unique_domain_values(mp_ad_in_domain),
+                    'unique_count': int(len(unique_smiles)),
+                    'input_count': int(len(candidate_frame)),
+                }, None
+            except Exception as melting_point_prediction_error:
+                return None, str(melting_point_prediction_error)
         st.markdown("### 5) 联合评分")
         formula_synth_min = st.slider(
             "最低可合成性分数（0=只排序不淘汰）",
@@ -20185,6 +21429,126 @@ def page_virtual_screening():
                             proxy_uncertainty_df["uncertainty_multiplier"], errors="coerce"
                         ).reindex(out_df.index).to_numpy(dtype=float)
 
+            if melting_point_filter_enabled:
+                formula_progress.progress(74)
+                formula_status.info('正在按独立熔点模型评估树脂/固化剂…')
+                def _observed_melting_point_values(candidate_frame, role):
+                    prefix = 'resin' if role == 'resin' else 'hardener'
+                    role_column = 'resin_smiles' if role == 'resin' else 'hardener_smiles'
+                    observed = pd.Series(np.nan, index=candidate_frame.index, dtype=float)
+                    for direct_column in (f'{prefix}_mp_observed', f'{prefix}_mp_c_observed'):
+                        if direct_column in candidate_frame.columns:
+                            observed = pd.to_numeric(candidate_frame[direct_column], errors='coerce')
+                            break
+                    training_frame = st.session_state.get('melting_point_training_dataset')
+                    if not isinstance(training_frame, pd.DataFrame) or training_frame.empty or role_column not in candidate_frame.columns:
+                        return observed.to_numpy(dtype=float)
+                    try:
+                        from core.melting_point_data import canonicalize_smiles
+                        training_smiles = training_frame.get('canonical_smiles')
+                        if training_smiles is None:
+                            training_smiles = training_frame.get('smiles', pd.Series(index=training_frame.index))
+                            training_smiles = training_smiles.map(canonicalize_smiles)
+                        else:
+                            training_smiles = training_smiles.map(lambda value: str(value).strip() if pd.notna(value) else '')
+                        training_role = training_frame.get('component_role', pd.Series('', index=training_frame.index)).fillna('').astype(str).str.lower()
+                        role_tokens = {'resin': {'resin', '树脂'}, 'hardener': {'hardener', 'curing_agent', '固化剂'}}[role]
+                        role_mask = training_role.isin(role_tokens)
+                        if role_mask.any():
+                            training_frame = training_frame.loc[role_mask].copy()
+                            training_smiles = training_smiles.loc[role_mask]
+                        target_values = pd.to_numeric(training_frame.get('mp_c'), errors='coerce')
+                        valid = training_smiles.notna() & target_values.notna()
+                        if not valid.any():
+                            return observed.to_numpy(dtype=float)
+                        lookup = pd.DataFrame({'_key': training_smiles.loc[valid], '_mp': target_values.loc[valid]})
+                        lookup = lookup.groupby('_key', sort=False)['_mp'].median()
+                        candidate_keys = candidate_frame[role_column].fillna('').astype(str).map(canonicalize_smiles)
+                        mapped = pd.to_numeric(candidate_keys.map(lookup), errors='coerce')
+                        observed = observed.where(observed.notna(), mapped)
+                    except Exception:
+                        pass
+                    return observed.to_numpy(dtype=float)
+
+                melting_point_errors = []
+                melting_point_unique_counts = {}
+                for melting_point_role in ('resin', 'hardener'):
+                    if melting_point_role == 'hardener' and not hardener_formula_enabled:
+                        continue
+                    role_result, role_error = _predict_melting_point_role(out_df, melting_point_role)
+                    role_prefix = 'resin' if melting_point_role == 'resin' else 'hardener'
+                    out_df[f'{role_prefix}_mp_observed'] = _observed_melting_point_values(out_df, melting_point_role)
+                    if role_result is None:
+                        melting_point_errors.append(
+                            f'{("树脂" if melting_point_role == "resin" else "固化剂")}：{role_error}'
+                        )
+                        out_df[f'{role_prefix}_mp_predicted_c'] = np.nan
+                        out_df[f'{role_prefix}_mp_std_c'] = np.nan
+                        out_df[f'{role_prefix}_mp_ad_score'] = np.nan
+                        out_df[f'{role_prefix}_mp_ad_in_domain'] = np.nan
+                    else:
+                        out_df[f'{role_prefix}_mp_predicted_c'] = role_result['prediction']
+                        out_df[f'{role_prefix}_mp_std_c'] = role_result['std']
+                        out_df[f'{role_prefix}_mp_ad_score'] = role_result['ad']
+                        out_df[f'{role_prefix}_mp_ad_in_domain'] = role_result.get('ad_in_domain', np.nan)
+                        melting_point_unique_counts[role_prefix] = int(role_result.get('unique_count', len(out_df)))
+                mp_artifact = st.session_state.get('melting_point_model_artifact') or {}
+                mp_extra = mp_artifact.get('extra') if isinstance(mp_artifact, dict) else {}
+                mp_extra = mp_extra if isinstance(mp_extra, dict) else {}
+                mp_dataset_fingerprint = str(mp_extra.get('dataset_fingerprint') or '')
+                mp_workflow_hash = str(mp_extra.get('workflow_hash') or '')
+                if not mp_workflow_hash and isinstance(mp_extra.get('molecular_feature_workflow'), dict):
+                    mp_workflow_hash = str(mp_extra['molecular_feature_workflow'].get('workflow_hash') or '')
+                mp_model_id = str(
+                    (mp_artifact.get('model_id') if isinstance(mp_artifact, dict) else None)
+                    or mp_extra.get('model_id')
+                    or mp_artifact.get('model_name') if isinstance(mp_artifact, dict) else ''
+                ).strip()
+                if not mp_model_id:
+                    import hashlib
+                    mp_identity = '|'.join([
+                        str(mp_artifact.get('created_at', '')) if isinstance(mp_artifact, dict) else '',
+                        str(mp_artifact.get('target_col', '')) if isinstance(mp_artifact, dict) else '',
+                        mp_dataset_fingerprint,
+                        mp_workflow_hash,
+                    ])
+                    mp_model_id = f'melting_point:{hashlib.sha256(mp_identity.encode("utf-8")).hexdigest()[:16]}'
+                melting_point_mode_applied = melting_point_filter_mode
+                if melting_point_errors:
+                    melting_point_mode_applied = 'annotate'
+                    for melting_point_error in melting_point_errors:
+                        st.warning(f'熔点模型未能完成：{melting_point_error}；已自动降级为标记模式，保留候选。')
+                out_df['mp_model_id'] = mp_model_id
+                out_df['mp_model_dataset_fingerprint'] = mp_dataset_fingerprint or np.nan
+                out_df['mp_model_workflow_hash'] = mp_workflow_hash or np.nan
+                out_df['mp_filter_mode_requested'] = str(melting_point_filter_mode)
+                out_df['mp_filter_mode_applied'] = str(melting_point_mode_applied)
+                out_df['mp_resin_threshold_c'] = float(melting_point_resin_limit)
+                out_df['mp_hardener_threshold_c'] = float(melting_point_hardener_limit)
+                out_df['mp_max_std_c'] = float(melting_point_max_std)
+                out_df['mp_min_ad_score'] = float(melting_point_min_ad)
+                out_df['mp_evaluated_at'] = datetime.now().isoformat(timespec='seconds')
+                try:
+                    from core.melting_point_screening import apply_melting_point_gate
+                    out_df = apply_melting_point_gate(
+                        out_df,
+                        resin_limit_c=float(melting_point_resin_limit),
+                        hardener_limit_c=float(melting_point_hardener_limit),
+                        max_std_c=float(melting_point_max_std),
+                        min_ad_score=float(melting_point_min_ad),
+                        mode=melting_point_mode_applied,
+                    )
+                except Exception as melting_point_gate_error:
+                    st.error(f'❌ 熔点筛选门控失败：{melting_point_gate_error}')
+                    return
+                _append_formula_filter_trace(
+                    'after_melting_point_filter',
+                    out_df,
+                    melting_point_mode=melting_point_filter_mode,
+                )
+                if out_df.empty:
+                    st.warning('熔点严格筛选后没有候选留下；请切换到标记模式或放宽树脂/固化剂阈值。')
+                    return
             unconstrained_rank_df = out_df.copy()
             if int(formula_synth_min) > 0:
                 out_df = out_df[out_df["synth_score"] >= float(formula_synth_min)]
@@ -20573,7 +21937,15 @@ def page_virtual_screening():
                     "uncertainty_base_error", "uncertainty_multiplier", "total_score",
                     "synth_score", "feasibility_score", "reaction_score", "processability_score",
                     "availability_score", "ad_score", "novelty_score", "feature_score",
-                    "chemistry_label", "candidate_origin"
+                    "chemistry_label", "candidate_origin",
+                    "resin_mp_observed", "resin_mp_predicted_c", "resin_mp_std_c", "resin_mp_ad_score",
+                    "resin_mp_filter_status", "resin_mp_filter_reason",
+                    "hardener_mp_observed", "hardener_mp_predicted_c", "hardener_mp_std_c", "hardener_mp_ad_score",
+                    "hardener_mp_filter_status", "hardener_mp_filter_reason",
+                    "mp_filter_reason", "mp_model_id", "mp_model_dataset_fingerprint",
+                    "mp_model_workflow_hash", "mp_filter_mode_requested", "mp_filter_mode_applied",
+                    "mp_resin_threshold_c", "mp_hardener_threshold_c", "mp_max_std_c",
+                    "mp_min_ad_score", "mp_evaluated_at"
                 ] + role_formula_cols + selected_design_cols
                 if c in final_df.columns
             ]
@@ -20624,6 +21996,29 @@ def page_virtual_screening():
                 "target_error": "目标误差",
                 "target_error_prefilter": "预筛目标误差",
                 "prediction_prefilter": "预筛预测值",
+                "resin_mp_observed": "树脂实测熔点（°C）",
+                "resin_mp_predicted_c": "树脂预测熔点（°C）",
+                "resin_mp_std_c": "树脂熔点预测标准差（°C）",
+                "resin_mp_ad_score": "树脂熔点适用域评分",
+                "resin_mp_filter_status": "树脂熔点筛选状态",
+                "resin_mp_filter_reason": "树脂熔点筛选原因",
+                "hardener_mp_observed": "固化剂实测熔点（°C）",
+                "hardener_mp_predicted_c": "固化剂预测熔点（°C）",
+                "hardener_mp_std_c": "固化剂熔点预测标准差（°C）",
+                "hardener_mp_ad_score": "固化剂熔点适用域评分",
+                "hardener_mp_filter_status": "固化剂熔点筛选状态",
+                "hardener_mp_filter_reason": "固化剂熔点筛选原因",
+                "mp_filter_reason": "熔点综合筛选原因",
+                "mp_model_id": "熔点模型ID",
+                "mp_model_dataset_fingerprint": "熔点模型数据指纹",
+                "mp_model_workflow_hash": "熔点特征流程哈希",
+                "mp_filter_mode_requested": "熔点请求模式",
+                "mp_filter_mode_applied": "熔点实际模式",
+                "mp_resin_threshold_c": "树脂熔点阈值（°C）",
+                "mp_hardener_threshold_c": "固化剂熔点阈值（°C）",
+                "mp_max_std_c": "熔点最大标准差（°C）",
+                "mp_min_ad_score": "熔点最小适用域评分",
+                "mp_evaluated_at": "熔点评估时间",
             }
             if show_cols:
                 display_df = final_df[show_cols].rename(columns=_cn_cols)
@@ -21762,8 +23157,19 @@ def _render_molecule_design_engine():
 
 
 def page_virtual_screening():
-    """虚拟分子筛选：仅保留模型驱动的分子设计引擎。"""
-    return _render_molecule_design_engine()
+    """虚拟筛选总入口：保留配方级筛选，并提供分子设计引擎。"""
+    render_melting_point_dataset_panel()
+    screening_mode = st.radio(
+        "虚拟筛选模式",
+        options=["配方级高通量筛选", "分子设计引擎"],
+        index=0,
+        horizontal=True,
+        key="vs_screening_mode_v2",
+        help="配方级高通量筛选支持树脂/固化剂配方、模型工作流和熔点门控；分子设计引擎用于骨架变体设计。",
+    )
+    if screening_mode == "分子设计引擎":
+        return _render_molecule_design_engine()
+    return _page_virtual_screening_formula()
 
 
 def page_hyperparameter_optimization():
