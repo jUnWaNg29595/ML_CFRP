@@ -114,15 +114,31 @@ def _sensitive_parameter_name(value: str) -> bool:
     )
 
 
-def _clean_url_component(component: str, *, reject_sensitive: bool) -> str:
+def _contains_secret_value(value: str, secret_values: set[str]) -> bool:
+    decoded = unquote(value)
+    if any(secret and secret in decoded for secret in secret_values):
+        return True
+    return bool(re.search(r"(?i)(?:sk-[A-Za-z0-9_-]{4,}|bearer\s+[A-Za-z0-9._-]{8,})", decoded))
+
+
+def _clean_url_component(
+    component: str,
+    *,
+    reject_sensitive: bool,
+    secret_values: set[str] | None = None,
+) -> str:
     if not component:
         return component
     safe_parts = []
+    secret_values = secret_values or set()
     for part in component.split("&"):
         parameter_name = part.split("=", 1)[0]
+        decoded_part = unquote(part)
         if _sensitive_parameter_name(parameter_name):
             if reject_sensitive:
                 raise ValueError("base_url contains sensitive query or fragment credentials")
+            continue
+        if _contains_secret_value(decoded_part, secret_values):
             continue
         safe_parts.append(part)
     return "&".join(safe_parts)
@@ -275,14 +291,32 @@ def validate_ai_config(config: object) -> dict[str, Any]:
     return normalized
 
 
-def _sanitize_url_for_output(value: str) -> str:
+def _sanitize_url_for_output(value: str, *, secret_values: set[str]) -> str:
     try:
         parsed = urlsplit(value)
-        query = _clean_url_component(parsed.query, reject_sensitive=False)
-        fragment = _clean_url_component(parsed.fragment, reject_sensitive=False)
+        hostname = parsed.hostname
+        if not hostname:
+            return "[redacted URL]"
+        port = parsed.port
     except ValueError:
         return "[redacted URL]"
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), query, fragment))
+
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    safe_netloc = hostname
+    if port is not None:
+        safe_netloc = f"{safe_netloc}:{port}"
+    query = _clean_url_component(
+        parsed.query,
+        reject_sensitive=False,
+        secret_values=secret_values,
+    )
+    fragment = _clean_url_component(
+        parsed.fragment,
+        reject_sensitive=False,
+        secret_values=secret_values,
+    )
+    return urlunsplit((parsed.scheme, safe_netloc, parsed.path.rstrip("/"), query, fragment))
 
 
 def _copy_without_secrets(value: object, *, mask: bool, secret_values: set[str]) -> object:
@@ -292,7 +326,7 @@ def _copy_without_secrets(value: object, *, mask: bool, secret_values: set[str])
             if not isinstance(raw_key, str):
                 continue
             if raw_key.lower() == "base_url" and isinstance(item, str):
-                result[raw_key] = _sanitize_url_for_output(item)
+                result[raw_key] = _sanitize_url_for_output(item, secret_values=secret_values)
                 continue
             if _SECRET_KEY_PATTERN.search(raw_key.replace(" ", "")):
                 if mask:

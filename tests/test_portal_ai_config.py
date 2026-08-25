@@ -236,6 +236,26 @@ def test_exportable_and_redacted_remove_sensitive_url_parameters():
     assert "region=cn" in redacted["services"][0]["base_url"]
 
 
+def test_exportable_url_removes_secret_values_and_userinfo():
+    config = {
+        "services": [
+            _service(
+                base_url="https://user:password@example.com/v1?region=cn&foo=sk-secret#view=full%26bar=sk-secret"
+            )
+        ]
+    }
+
+    exported = exportable_ai_config(config)
+    redacted = redacted_ai_config(config)
+
+    for payload in (exported, redacted):
+        text = json.dumps(payload)
+        assert "password" not in text
+        assert "sk-secret" not in text
+        assert "user@" not in text
+    assert exported["services"][0]["base_url"] == "https://example.com/v1?region=cn"
+
+
 @pytest.mark.parametrize(
     "base_url",
     [
@@ -332,6 +352,65 @@ def test_atomic_write_failure_preserves_original_and_cleans_temp_file(tmp_path, 
     assert path.read_bytes() == original
     assert not list(path.parent.glob(".ai_config.*.tmp"))
 
+
+def test_normalize_url_has_no_stale_provider_reference():
+    assert portal_ai_config._normalize_url(
+        "https://api.example.com/v1///?region=cn#view=full/",
+        reject_sensitive=True,
+    ) == "https://api.example.com/v1?region=cn#view=full/"
+
+
+def test_export_removes_known_secret_values_from_arbitrary_encoded_parameters():
+    config = {
+        "services": [
+            _service(
+                api_key="sk-secret",
+                base_url=(
+                    "https://api.example.com/v1?region=cn&custom=sk%2Dsecret"
+                    "#state=sk%2Dsecret"
+                ),
+            )
+        ]
+    }
+
+    exported = exportable_ai_config(config)
+    redacted = redacted_ai_config(config)
+
+    for result in [exported, redacted]:
+        url = result["services"][0]["base_url"]
+        assert "region=cn" in url
+        assert "sk%2Dsecret" not in url
+        assert "sk-secret" not in url
+
+
+def test_export_strips_url_userinfo_without_losing_host():
+    config = {
+        "services": [
+            _service(base_url="https://alice:password@example.com/v1?region=cn")
+        ]
+    }
+
+    exported = exportable_ai_config(config)
+    redacted = redacted_ai_config(config)
+
+    for result in [exported, redacted]:
+        url = result["services"][0]["base_url"]
+        assert url == "https://example.com/v1?region=cn"
+        assert "alice" not in json.dumps(result)
+        assert "password" not in json.dumps(result)
+
+
+def test_windows_chmod_failure_does_not_abort_save(tmp_path, monkeypatch):
+    monkeypatch.setattr(portal_ai_config.os, "name", "nt")
+
+    def fail_chmod(*args):
+        raise OSError("simulated Windows chmod limitation")
+
+    monkeypatch.setattr(portal_ai_config.os, "chmod", fail_chmod)
+
+    save_ai_config(tmp_path, {"services": [_service(api_key="sk-secret")]})
+
+    assert load_ai_config(tmp_path)["services"][0]["api_key"] == "sk-secret"
 
 def test_ai_service_config_has_no_runtime_port_or_prediction_fields():
     field_names = {field.name for field in AIServiceConfig.__dataclass_fields__.values()}
