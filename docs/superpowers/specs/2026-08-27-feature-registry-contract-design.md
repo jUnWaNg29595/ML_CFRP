@@ -61,6 +61,8 @@ draft → approved → deprecated
 
 只有 approved snapshot 可以进入可发布训练。变更摘要、审核人、审核时间、批准 hash 和意见必须保留。未批准的 draft 不得被训练或发布流程悄悄采用。
 
+历史 artifact 中只能确认列存在但尚未完成语义复核的定义使用 `legacy_observed` 状态；它们可用于审计和生成待审核映射，但不能进入可发布模型 profile。`legacy_observed` 不是 approved 的别名。
+
 AI 只作为特征管理助手，职责限定为：原始数据列与 `feature_id` 的候选映射、中文语义解释、单位/编码冲突提示、来源规则检查和变更摘要。AI 建议不能直接修改 registry、批准映射、发布模型或生成模型输入值；最终批准仍由本地单人显式完成。AI 审核记录与 canonical registry hash 分离保存，只有人工采纳后的映射和规则进入正式 snapshot。
 
 ### 2.2 特征身份
@@ -152,6 +154,8 @@ AI 只作为特征管理助手，职责限定为：原始数据列与 `feature_i
 - `feature_id`、`name` 在同一 registry snapshot 内都必须唯一；
 - 一个特征不能同时属于 workflow 和 manual_input；
 - `target` 与 model profile 的 target_col 必须一致。
+
+feature definition 的 `status` 至少支持 `draft`、`approved`、`legacy_observed`、`deprecated` 和 `blocked`。`blocked` 必须带阻断原因；`legacy_observed` 必须带来源 artifact 或数据集标识。
 
 `model_profiles` 按材料和目标保存有序 feature identity：
 
