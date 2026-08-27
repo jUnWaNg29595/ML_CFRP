@@ -45,6 +45,14 @@ prediction_portal/feature_registry.json
 core/feature_registry.py
 ```
 
+AI 特征审核编排位于独立模块：
+
+```text
+core/feature_mapping_review.py
+```
+
+该模块只调用现有受控 AI 服务层生成结构化特征建议，不把 AI 请求逻辑耦合到 `UserPrediction.py`，也不让 AI 直接写入 registry 或训练数据。
+
 采用本地单人显式批准：
 
 ```text
@@ -52,6 +60,8 @@ draft → approved → deprecated
 ```
 
 只有 approved snapshot 可以进入可发布训练。变更摘要、审核人、审核时间、批准 hash 和意见必须保留。未批准的 draft 不得被训练或发布流程悄悄采用。
+
+AI 只作为特征管理助手，职责限定为：原始数据列与 `feature_id` 的候选映射、中文语义解释、单位/编码冲突提示、来源规则检查和变更摘要。AI 建议不能直接修改 registry、批准映射、发布模型或生成模型输入值；最终批准仍由本地单人显式完成。AI 审核记录与 canonical registry hash 分离保存，只有人工采纳后的映射和规则进入正式 snapshot。
 
 ### 2.2 特征身份
 
@@ -75,6 +85,8 @@ draft → approved → deprecated
 组件计数规则已经确定：树脂结构为空或非法时阻断；固化剂为空时允许并由系统明确计算 `curing_agent_smiles_n_components = 0`；固化剂非空但非法时阻断。空值导致的结构性 0 必须由 registry 的规则明确声明，不能与缺失补齐混淆。
 
 `tg_method` 和 `tg_standard` 当前训练参考数据为整数编码。registry 必须保存枚举的显示值、编码值和未知值策略；编码未确认前，依赖这两个字段的模型不能发布。
+
+上述 28 个字段来自当前 Tg 初始数据集的观察，不是所有未来数据集或所有模型的固定要求。它们首先作为历史 profile 的候选语义登记；未来数据集可以使用不同原始列名，也可以只提供其中一部分特征，但必须通过显式 dataset manifest 映射并由人工批准。真正固定的是 feature 的语义、单位、转换和来源规则，不是某个数据集的列名或特征子集。
 
 ## 3. 登记库数据模型
 
@@ -162,6 +174,57 @@ draft → approved → deprecated
 
 初始 Tg profile 必须保留现有模型的 532 个有序列身份，包括 28 个缺口；不能为了让旧模型看起来可运行而删除 `stoichiometric_ratio_r` 或其他缺口。该 profile 的状态为 blocked，直到所有来源和计算语义获得批准。
 
+这个历史 profile 只用于审计当前 artifact，不作为未来训练的全局模板。每个新的 dataset/model profile 都可以选择不同的 approved feature_id 子集；若原始列名不同，则在 dataset manifest 中显式绑定到同一 feature_id，并把单位换算、枚举编码和文本解析写入该 manifest 的 hash。
+
+## 3.1 数据集映射 manifest
+
+登记库定义稳定语义，dataset manifest 定义某一批原始数据如何落到这些语义上。manifest 是每次训练的输入边界，不能由模型特征名反推：
+
+```json
+{
+  "schema_version": 1,
+  "dataset_id": "future_dataset_001",
+  "model_profile_id": "epoxy_resin.tg.v2",
+  "bindings": [
+    {
+      "raw_column": "cure_schedule_text",
+      "feature_id": "cfrp.tg.cure_stage_count",
+      "canonical_name": "cure_stage_count",
+      "source_role": "workflow_source",
+      "unit_conversion": null,
+      "value_mapping": null,
+      "parse_rule_version": "core.process_features:1"
+    },
+    {
+      "raw_column": "degree_of_cure",
+      "feature_id": "cfrp.tg.degree_of_cure_pct",
+      "canonical_name": "degree_of_cure_pct",
+      "source_role": "manual_input",
+      "unit_conversion": {"from": "%", "to": "%", "factor": 1},
+      "value_mapping": null,
+      "parse_rule_version": "scalar-float:1"
+    }
+  ],
+  "status": "approved",
+  "approved_by": "local-user",
+  "approved_at": "2026-08-27T00:00:00+08:00",
+  "manifest_hash": "sha256-of-normalized-dataset-manifest"
+}
+```
+
+manifest 校验要求：
+
+- 每个 raw column 只能绑定一个 feature_id；
+- 每个 required feature_id 必须有且只有一个有效绑定；
+- 同语义不同列名可通过人工批准的 binding 表达；
+- 单位换算、枚举编码、文本解析和空值规则必须显式记录；
+- aliases 只生成候选 binding，不能自动落地；
+- manifest 的 approved hash 必须进入 contract 和 artifact；
+- 数据集缺少某个 feature_id 时，若该模型 profile 不需要它可以正常训练，若 profile 需要它则训练前阻断；
+- 不允许通过把不同语义的列映射到同一 feature_id 来凑齐特征数量。
+
+AI 生成的候选映射先保存为 `pending_review`，人工采纳后才变为 approved binding。这样未来数据可以使用不同名称和不同特征子集，同时保持每次训练的输入可追溯。
+
 ## 4. `prediction_contract` v2
 
 contract 是某一次训练 artifact 对 registry snapshot 的不可变引用，至少包含：
@@ -173,6 +236,8 @@ contract 是某一次训练 artifact 对 registry snapshot 的不可变引用，
   "target": "tg",
   "target_col": "tg_c",
   "model_profile_id": "epoxy_resin.tg",
+  "dataset_id": "future_dataset_001",
+  "dataset_manifest_hash": "sha256-of-normalized-dataset-manifest",
   "feature_cols": [],
   "feature_definitions": [],
   "workflow_feature_cols": [],
@@ -201,6 +266,7 @@ contract 是某一次训练 artifact 对 registry snapshot 的不可变引用，
 - `manual_input_feature_cols` 是模型直接读取的实验/工艺输入列。
 - `workflow_source_fields` 是生成 workflow 特征所需的原始输入，不等同于模型列。例如 SMILES 和固化温度/时间序列属于 source fields。
 - `feature_definitions` 是训练时 registry snapshot 中对应定义的完整深拷贝，不引用运行时最新文件。
+- `dataset_id` 和 `dataset_manifest_hash` 记录原始数据列到语义 feature_id 的显式绑定；不同数据集可以有不同列名和不同特征子集。
 - `training_missing_policy` 只描述训练数据内部的显式 Pipeline 行为；`missing_value_policy` 固定约束门户预测。
 
 发布不变量为：
@@ -219,14 +285,20 @@ workflow_feature_cols == molecular_workflow_feature_cols + derived_feature_cols
 
 ```text
 load approved registry
+  → build or load dataset manifest
+  → deterministic schema checks
+  → AI feature mapping suggestions (optional)
+  → local single-person approval
   → resolve model profile
-  → validate source fields and feature profile
+  → validate approved bindings and feature profile
   → freeze registry snapshot/version/hash
-  → build contract draft
+  → freeze dataset manifest/hash and build contract draft
   → pass the same snapshot to normal training, CV and optimization
 ```
 
 所有训练路径必须复用同一 snapshot，包括普通训练、交叉验证和超参搜索。训练代码不再通过 `n_features_in_`、feature mask 或列数量倒推业务输入含义；这些信息只能用于一致性校验。
+
+dataset manifest 先经过确定性列存在性、类型、单位和枚举检查；AI 只在确定性检查通过或已明确标记为待人工处理时提供候选映射。未批准的 binding 不得进入 `X`、workflow 或模型输入。
 
 现有训练 Pipeline 的训练集缺失值处理可以保留，但必须记录：
 
@@ -315,6 +387,26 @@ enabled = false
 
 所有 manual input 控件初始为空，不存在数值默认值。空值、非法值、越界值、枚举未映射值均阻断。系统不得使用 0、均值、中位数、训练均值或 imputer 伪造门户字段。AI 只能解析用户已经提供的文本；AI 建议必须逐项人工确认后才能进入同一校验流程。
 
+### 8.1 AI 特征管理建议
+
+AI 管理入口独立于普通预测页面，只处理当前数据集和当前模型 profile 相关的特征，不展示无关的预测结果、模型指标、全部历史数据或通用聊天内容。默认列表只保留：
+
+- 原始列名；
+- 候选 `feature_id` / canonical name；
+- 建议来源类型；
+- 单位或编码转换建议；
+- 一句话中文依据；
+- 冲突/不确定标记；
+- `采纳`、`修改后采纳`、`拒绝` 三个动作。
+
+原始样本、缺失率、分布统计、历史版本、完整 calculation rule 和 AI 原文放在按需展开的详情中。系统根据当前 dataset manifest 和 model profile 自动过滤不相关特征；用户可切换“仅显示待审核”“仅显示冲突”“显示已批准”三种视图。
+
+AI 必须返回结构化结果：候选特征、匹配理由、所依据的列样本/单位/编码证据、冲突项和置信等级。不确定或缺少证据时返回 `unknown`，不能猜公式、单位、编码或数值。高置信度只影响排序和提示颜色，不改变人工批准要求。
+
+每次 AI 审核保存独立的 review record：数据集 ID、目标 profile、AI 服务/模型、输入摘要 hash、结构化建议、中文解释、时间和人工动作。AI 的提示词、输出全文和置信度不直接进入 registry hash；人工批准后的 dataset mapping manifest 才会进入训练 contract 和 artifact。
+
+AI 特征管理不负责：用户预测输入解析、预测结果解释、自动实验设计、任意代码执行、模型参数修改、registry 自动发布或缺失特征生成。普通门户仍只使用已批准的 contract 和确定性校验。
+
 预测请求仍采用单一可信入口：
 
 ```text
@@ -335,6 +427,8 @@ enabled = false
 - 模型、artifact、contract、workflow 顺序或数量不一致。
 
 训练 run、artifact、发布条目和门户任务快照至少记录 registry version/hash、contract hash、workflow hash、model fingerprint、canonical/effective feature count 和阻断原因。日志不得记录 API key、完整敏感输入或任意 AI 生成的未确认数值。
+
+特征管理 review record 另外记录 AI 服务/模型、输入摘要 hash、结构化建议、中文依据、置信等级和人工动作；这些记录用于追溯和复盘，但不替代人工批准，也不改变未采纳建议的 registry 内容。
 
 ## 10. 迁移与兼容边界
 
@@ -373,6 +467,15 @@ enabled = false
 - 不允许 0、均值或 imputer 伪造门户字段；
 - AI 未确认字段不能进入预测。
 
+### AI 特征管理
+
+- 默认审核列表只显示当前数据集/profile 相关的待审核、冲突和已批准特征；
+- 详情展开后可查看样本、统计、单位、编码和完整规则；
+- AI 建议必须带中文依据和证据摘要；
+- AI 的高置信度不能绕过人工批准；
+- 拒绝或修改建议后，只有人工采纳结果进入 dataset manifest 和 contract；
+- AI 不得修改 registry、生成特征值或发布模型。
+
 ### 当前 Tg
 
 - 缺少 contract、workflow 少于模型特征、存在 blocked 特征时发布门禁失败；
@@ -387,4 +490,5 @@ enabled = false
 - 不用页面配置覆盖训练契约；
 - 不把所有 532 个特征直接变成用户输入框；
 - 不让 AI 生成缺失特征或执行代码；
+- 不把 AI 扩展成与特征审核无关的通用管理或预测助手；
 - 不在契约闭合前执行真实 Tg 预测。
