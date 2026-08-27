@@ -185,19 +185,25 @@ AI 只作为特征管理助手，职责限定为：原始数据列与 `feature_i
   "schema_version": 1,
   "dataset_id": "future_dataset_001",
   "model_profile_id": "epoxy_resin.tg.v2",
-  "bindings": [
+  "source_bindings": [
     {
       "raw_column": "cure_schedule_text",
-      "feature_id": "cfrp.tg.cure_stage_count",
-      "canonical_name": "cure_stage_count",
-      "source_role": "workflow_source",
+      "source_field": "cure_schedule",
       "unit_conversion": null,
       "value_mapping": null,
       "parse_rule_version": "core.process_features:1"
+    }
+  ],
+  "feature_bindings": [
+    {
+      "feature_id": "cfrp.tg.cure_stage_count",
+      "raw_columns": ["cure_schedule_text"],
+      "canonical_name": "cure_stage_count",
+      "source_role": "derived_workflow"
     },
     {
-      "raw_column": "degree_of_cure",
       "feature_id": "cfrp.tg.degree_of_cure_pct",
+      "raw_columns": ["degree_of_cure"],
       "canonical_name": "degree_of_cure_pct",
       "source_role": "manual_input",
       "unit_conversion": {"from": "%", "to": "%", "factor": 1},
@@ -214,7 +220,8 @@ AI 只作为特征管理助手，职责限定为：原始数据列与 `feature_i
 
 manifest 校验要求：
 
-- 每个 raw column 只能绑定一个 feature_id；
+- 每个 `source_bindings.raw_column` 只能声明一个规范化 `source_field`；同一 source field 可以被多个 derived feature 使用；
+- 每个 `feature_bindings.feature_id` 必须有且只有一个有效绑定；
 - 每个 required feature_id 必须有且只有一个有效绑定；
 - 同语义不同列名可通过人工批准的 binding 表达；
 - 单位换算、枚举编码、文本解析和空值规则必须显式记录；
