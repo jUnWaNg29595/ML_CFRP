@@ -26,6 +26,7 @@ import time
 import copy
 import hashlib
 import functools
+from pathlib import Path
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -1118,6 +1119,7 @@ from core.post_feature_mapping import (
     validate_mapping_for_prediction,
 )
 from core.prediction_contract import resolve_prediction_feature_contract
+from core.training_contract import lock_training_contract, assert_training_context, audit_training_result
 from core.prediction_molecular_baseline import (
     build_single_row_source_frame,
     collect_workflow_source_columns,
@@ -12988,6 +12990,46 @@ def _render_binary_classification_results(
         st.warning(f"训练记录保存失败：{save_exc}")
 
 
+def _lock_current_training_contract(frame, feature_cols, target_col, workflow=None):
+    """Resolve and freeze the approved registry/manifest for one training session."""
+    columns = [str(column) for column in (feature_cols or [])]
+    existing = st.session_state.get("training_feature_contract_context")
+    if isinstance(existing, dict):
+        if list(existing.get("canonical_feature_cols") or []) != columns:
+            raise ValueError("当前训练 context 的 canonical feature order 与所选特征不一致，请重新锁定")
+        frame_columns = getattr(frame, "columns", ())
+        assert_training_context(existing, [] if frame_columns is None else list(frame_columns))
+        return existing
+
+    registry_path = (
+        st.session_state.get("training_feature_registry_path")
+        or st.session_state.get("feature_registry_path")
+        or (Path(__file__).resolve().parent / "prediction_portal" / "feature_registry.json")
+    )
+    manifest = (
+        st.session_state.get("training_dataset_manifest")
+        or st.session_state.get("dataset_manifest")
+        or st.session_state.get("feature_dataset_manifest")
+    )
+    if isinstance(manifest, (str, Path)):
+        manifest = json.loads(Path(manifest).read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("未提供 approved dataset manifest，训练前无法锁定 feature contract")
+
+    context = lock_training_contract(
+        registry_path,
+        manifest,
+        material_type=str(manifest.get("material_type") or "unknown"),
+        target=str(manifest.get("target") or target_col),
+        target_col=str(target_col),
+        feature_cols=columns,
+        frame=frame,
+        workflow=workflow,
+    )
+    st.session_state["training_feature_contract_context"] = context
+    return context
+
+
 def page_model_training():
     """模型训练页面（稳健版：支持分层/分组划分 + Repeated KFold CV）"""
     st.title("🤖 模型训练")
@@ -13208,6 +13250,18 @@ def page_model_training():
         y = df[target_col]
     except Exception as e:
         st.error(f"❌ 构造训练数据失败：{e}")
+        return
+
+    try:
+        training_feature_contract_context = _lock_current_training_contract(
+            X,
+            training_feature_cols,
+            target_col,
+            workflow=st.session_state.get("molecular_feature_workflow")
+            or st.session_state.get("process_pls_workflow"),
+        )
+    except Exception as e:
+        st.error(f"❌ 训练前 feature contract 锁定失败：{e}")
         return
 
     target_task_info = _infer_binary_target_info(y)
@@ -14266,6 +14320,7 @@ def page_model_training():
                             balance_max_weight=float(balance_max_weight),
                             process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
                             use_process_pls=use_process_pls_for_training,
+                            feature_contract_context=training_feature_contract_context,
                             **params
                         )
                     finally:
@@ -14278,6 +14333,12 @@ def page_model_training():
                     print(f"[DEBUG APP] Result type: {type(res)}")
                     print(f"[DEBUG APP] Result keys: {list(res.keys()) if isinstance(res, dict) else 'NOT A DICT'}")
                     sys.stdout.flush()
+
+                    if isinstance(res, dict):
+                        res["feature_audit"] = audit_training_result(
+                            training_feature_contract_context,
+                            res,
+                        )
 
                     # [关键修复] 立即清理XGBoost临时文件并加载数据
                     if '_xgb_temp_model_path' in res and res['_xgb_temp_model_path']:
@@ -14343,6 +14404,7 @@ def page_model_training():
                             balance_max_weight=float(balance_max_weight),
                             process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
                             use_process_pls=use_process_pls_for_training,
+                            feature_contract_context=training_feature_contract_context,
                             **params
                         )
 
@@ -23282,6 +23344,18 @@ def page_hyperparameter_optimization():
     X = df[feature_cols].copy()
     y = df[target_col]
 
+    try:
+        training_feature_contract_context = _lock_current_training_contract(
+            X,
+            feature_cols,
+            target_col,
+            workflow=st.session_state.get("molecular_feature_workflow")
+            or st.session_state.get("process_pls_workflow"),
+        )
+    except Exception as e:
+        st.error(f"❌ 优化前 feature contract 锁定失败：{e}")
+        return
+
     process_pls_workflow = st.session_state.get("process_pls_workflow")
     use_process_pls = bool(
         isinstance(process_pls_workflow, dict)
@@ -23477,6 +23551,7 @@ def page_hyperparameter_optimization():
                         random_state=int(random_state),
                         process_pls_config=process_pls_workflow,
                         use_process_pls=True,
+                        feature_contract_context=training_feature_contract_context,
                     )
                 except Exception as exc:
                     pipeline_error = str(exc)
@@ -23492,6 +23567,7 @@ def page_hyperparameter_optimization():
                     random_state=int(random_state),
                     process_pls_config=(process_pls_workflow if use_process_pls else None),
                     use_process_pls=bool(use_process_pls),
+                    feature_contract_context=training_feature_contract_context,
                 )
             except Exception as exc:
                 pipeline_error = str(exc)
@@ -23578,6 +23654,7 @@ def page_hyperparameter_optimization():
                     timeout=(int(timeout_seconds) if int(timeout_seconds) > 0 else None),
                     optimization_method=opt_method,
                     evaluation_config=config,
+                    feature_contract_context=training_feature_contract_context,
                 )
 
             progress_bar.progress(1.0)
@@ -23795,8 +23872,14 @@ def page_hyperparameter_optimization():
                 model_name=train_model_name,
                 process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
                 use_process_pls=use_process_pls_for_training,
+                feature_contract_context=training_feature_contract_context,
                 **result.best_params,
             )
+            if isinstance(train_result, dict):
+                train_result["feature_audit"] = audit_training_result(
+                    training_feature_contract_context,
+                    train_result,
+                )
 
             model_obj = train_result["model"]
             is_xgboost = train_model_name == "XGBoost" or str(type(model_obj).__name__).lower().startswith("xgb")

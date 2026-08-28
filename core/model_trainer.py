@@ -3525,8 +3525,12 @@ class EnhancedModelTrainer:
         random_state=42,
         process_pls_config=None,
         use_process_pls=False,
+        feature_contract_context=None,
         **params,
     ):
+        if feature_contract_context is not None:
+            from .training_contract import assert_training_context
+            assert_training_context(feature_contract_context, getattr(feature_columns, "columns", feature_columns))
         if str(model_name) in RAW_FRAME_MODEL_NAMES:
             raise ValueError("当前模型不支持通用回归优化 pipeline，请在训练页使用专用训练流程")
         if _is_classification_model(model_name):
@@ -3571,9 +3575,13 @@ class EnhancedModelTrainer:
         balance_max_weight=3.0,
         process_pls_config=None,
         use_process_pls=False,
+        feature_contract_context=None,
         **params
     ):
         """训练单个模型（支持随机/分层/分组划分）"""
+        if feature_contract_context is not None:
+            from .training_contract import assert_training_context
+            assert_training_context(feature_contract_context, getattr(X, "columns", []))
         # Epoxy PINN 专用分支：允许原始字符串列，由模型内部解析（用于 Tg / 力学等物理约束）
         if str(model_name) == "Epoxy PINN (Physics-Informed)":
             return self._train_pinn_special(
@@ -5264,6 +5272,7 @@ class EnhancedModelTrainer:
         balance_max_weight=3.0,
         process_pls_config=None,
         use_process_pls=False,
+        feature_contract_context=None,
         **params
     ):
         """交叉验证（输出每折分数 + OOF 预测）
@@ -5273,6 +5282,9 @@ class EnhancedModelTrainer:
             - stratified_kfold: 对 y 分箱后用 StratifiedKFold
             - group_kfold: GroupKFold（需要 groups）
         """
+        if feature_contract_context is not None:
+            from .training_contract import assert_training_context
+            assert_training_context(feature_contract_context, getattr(X, "columns", []))
         # Epoxy PINN 专用分支：允许原始字符串列，由模型内部解析（用于 Tg / 力学等物理约束）
         if str(model_name) == "Epoxy PINN (Physics-Informed)":
             return self._cross_validate_pinn_special(

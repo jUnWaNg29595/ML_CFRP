@@ -642,6 +642,7 @@ class HyperparameterOptimizer:
         use_pruner,
         timeout,
         optimization_method,
+        feature_contract_context=None,
     ):
         y_name = getattr(y, "name", None)
         y_target = y.iloc[:, 0] if isinstance(y, pd.DataFrame) else y
@@ -703,6 +704,7 @@ class HyperparameterOptimizer:
                         random_state=int(config.random_state),
                         process_pls_config=config.process_pls_config,
                         use_process_pls=bool(config.use_process_pls),
+                        feature_contract_context=feature_contract_context,
                         **params,
                     )
                     pipeline.fit(X_train.iloc[train_idx], y_train.iloc[train_idx])
@@ -848,6 +850,7 @@ class HyperparameterOptimizer:
                 random_state=int(config.random_state),
                 process_pls_config=config.process_pls_config,
                 use_process_pls=bool(config.use_process_pls),
+                feature_contract_context=feature_contract_context,
                 **best_params,
             )
             final_pipeline.fit(X_train, y_train)
@@ -915,6 +918,7 @@ class HyperparameterOptimizer:
         use_pruner,
         timeout,
         optimization_method,
+        feature_contract_context=None,
     ):
         y_name = getattr(y, "name", None)
         if isinstance(y, pd.DataFrame):
@@ -984,6 +988,7 @@ class HyperparameterOptimizer:
                     random_state=int(config.random_state),
                     process_pls_config=config.process_pls_config,
                     use_process_pls=True,
+                    feature_contract_context=feature_contract_context,
                     **params,
                 )
             base_model = self.trainer._get_model(
@@ -1186,7 +1191,12 @@ class HyperparameterOptimizer:
         timeout: int | None = None,
         optimization_method: str = "tpe",
         evaluation_config: OptimizationEvaluationConfig | dict[str, Any] | None = None,
+        feature_contract_context=None,
     ):
+        if feature_contract_context is not None:
+            from .training_contract import assert_training_context
+            columns = getattr(X, "columns", None)
+            assert_training_context(feature_contract_context, [] if columns is None else list(columns))
         config = _coerce_evaluation_config(
             evaluation_config,
             cv=cv,
@@ -1209,6 +1219,7 @@ class HyperparameterOptimizer:
                 use_pruner=use_pruner,
                 timeout=timeout,
                 optimization_method=optimization_method,
+                feature_contract_context=feature_contract_context,
             )
         return self._optimize_reliable(
             model_name,
@@ -1221,6 +1232,7 @@ class HyperparameterOptimizer:
             use_pruner=use_pruner,
             timeout=timeout,
             optimization_method=optimization_method,
+            feature_contract_context=feature_contract_context,
         )
 
 

@@ -447,3 +447,33 @@ def test_exploratory_optimization_with_pls_uses_fold_local_pipeline(monkeypatch)
     assert calls
     assert all(call["use_process_pls"] is True for call in calls)
     assert all(call["process_pls_config"] == process_pls_config for call in calls)
+
+
+def test_optimizer_reuses_training_contract_context_for_trials_and_final_pipeline(monkeypatch):
+    X, y = _reliable_frame(rows=30)
+    optimizer = HyperparameterOptimizer()
+    context = {
+        "canonical_feature_cols": list(X.columns),
+        "feature_registry_hash": "r1",
+        "dataset_manifest_hash": "m1",
+    }
+    calls = []
+    original_builder = optimizer.trainer.build_regression_cv_pipeline
+
+    def recording_builder(*args, **kwargs):
+        calls.append(kwargs.get("feature_contract_context"))
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(optimizer.trainer, "build_regression_cv_pipeline", recording_builder)
+    result = optimizer.optimize(
+        "线性回归",
+        X,
+        y,
+        n_trials=1,
+        cv=2,
+        use_pruner=False,
+        feature_contract_context=context,
+    )
+
+    assert result.status == "completed"
+    assert calls and all(item is context for item in calls)
