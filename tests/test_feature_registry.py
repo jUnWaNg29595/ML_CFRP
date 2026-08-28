@@ -225,10 +225,9 @@ def test_known_gap_id_is_explicit_and_survives_model_column_rename():
     from scripts.bootstrap_feature_registry import GAP_FEATURE_IDS, _gap_definition
 
     original = _gap_definition("cure_total_time_h")
-    renamed = _gap_definition("cure_total_time_h")
     assert original["feature_id"] == GAP_FEATURE_IDS["cure_total_time_h"]
-    assert renamed["feature_id"] == "cfrp.tg.cure_total_time_h"
-    assert renamed["feature_id"] != "cfrp.tg.cure_total_time_hours"
+    renamed_column_mapping = {"cure_total_time_hours": original["feature_id"]}
+    assert renamed_column_mapping["cure_total_time_hours"] == "cfrp.tg.cure_total_time_h"
 
 
 def test_real_model_column_rename_requires_explicit_mapping_and_preserves_gap_id():
@@ -246,6 +245,30 @@ def test_real_model_column_rename_requires_explicit_mapping_and_preserves_gap_id
         payload = build_registry(renamed_path, {"renamed_pressure": "cfrp.tg.curing_pressure_mpa"})
         pressure = next(item for item in payload["features"] if item["feature_id"] == "cfrp.tg.curing_pressure_mpa")
         assert pressure["name"] == "curing_pressure_mpa"
+    finally:
+        renamed_path.unlink(missing_ok=True)
+
+
+def test_model_column_mapping_rejects_duplicate_gap_semantics():
+    from scripts.bootstrap_feature_registry import build_registry
+    import joblib
+
+    artifact = joblib.load(ARTIFACT)
+    renamed = dict(artifact)
+    renamed["feature_cols"] = list(artifact["feature_cols"])
+    renamed["feature_cols"][renamed["feature_cols"].index("curing_pressure_mpa")] = "renamed_pressure"
+    renamed["feature_cols"][renamed["feature_cols"].index("eew_g_eq")] = "renamed_pressure_2"
+    renamed_path = ROOT / "prediction_portal" / "duplicate_mapping_test_artifact.joblib"
+    try:
+        joblib.dump(renamed, renamed_path)
+        with pytest.raises(ValueError, match="same gap"):
+            build_registry(
+                renamed_path,
+                {
+                    "renamed_pressure": "cfrp.tg.curing_pressure_mpa",
+                    "renamed_pressure_2": "cfrp.tg.curing_pressure_mpa",
+                },
+            )
     finally:
         renamed_path.unlink(missing_ok=True)
 
@@ -278,12 +301,14 @@ def test_bootstrap_source_counts_and_artifact_bytes_unchanged():
     hash_before = hashlib.sha256(before).hexdigest()
     hash_before_2 = hashlib.sha256(before_2).hexdigest()
     payload = build_registry(ARTIFACT)
+    payload_2 = build_registry(ARTIFACT_2)
     after = ARTIFACT.read_bytes()
     after_2 = ARTIFACT_2.read_bytes()
     assert before == after
     assert before_2 == after_2
     assert hashlib.sha256(after).hexdigest() == hash_before
     assert hashlib.sha256(after_2).hexdigest() == hash_before_2
+    assert len(payload_2["features"]) == 532
     counts = {}
     for item in payload["features"]:
         counts[item["source_type"]] = counts.get(item["source_type"], 0) + 1

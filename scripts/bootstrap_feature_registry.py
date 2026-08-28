@@ -193,11 +193,24 @@ def build_registry(artifact_path: Path, column_mapping: dict[str, str] | None = 
     unknown_mappings = {key: value for key, value in column_mapping.items() if key not in model_features}
     if unknown_mappings:
         raise ValueError("column_mapping contains unknown model columns pending review: " + ", ".join(sorted(unknown_mappings)))
+    invalid_mapping_values = {
+        key: value for key, value in column_mapping.items()
+        if not isinstance(value, str) or not value.strip()
+    }
+    if invalid_mapping_values:
+        raise ValueError("column_mapping values must be non-empty strings: " + ", ".join(sorted(invalid_mapping_values)))
     id_to_gap = {feature_id: name for name, feature_id in GAP_FEATURE_IDS.items()}
     semantic_by_column = {
         column: id_to_gap.get(column_mapping.get(column, column), column_mapping.get(column, column))
         for column in model_features
     }
+    mapped_gap_names = [
+        semantic for column, semantic in semantic_by_column.items()
+        if column not in workflow_set and semantic in GAPS
+    ]
+    if len(mapped_gap_names) != len(set(mapped_gap_names)):
+        duplicates = sorted({name for name in mapped_gap_names if mapped_gap_names.count(name) > 1})
+        raise ValueError("column_mapping maps multiple model columns to the same gap: " + ", ".join(duplicates))
     legacy_ordinals = {
         name: index for index, name in enumerate(sorted(workflow_set), start=1)
     }
