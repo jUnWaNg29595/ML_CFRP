@@ -545,6 +545,9 @@ def build_output_rows(headers: list[str], rows: list[dict[str, str]]) -> tuple[l
     if not process_frame.empty and any(column in process_frame.columns for column in {"cure_schedule", "post_cure_schedule"}):
         bindings = [{"raw_column": field, "source_field": field} for field in ("cure_schedule", "post_cure_schedule") if field in process_frame.columns]
         result = compute_process_features(process_frame, process_definitions, {"source_bindings": bindings})
+        if result.errors:
+            first_error = result.errors[0]
+            raise ValueError("共享工艺特征派生失败: " + str(first_error.get("message", first_error)))
         for row_number, target in enumerate(output_rows):
             for name in process_names:
                 if name in result.features.columns:

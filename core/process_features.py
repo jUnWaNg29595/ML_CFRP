@@ -16,6 +16,7 @@ _IMPLEMENTATIONS = {
     "core.process_features:derive_cure_stage_count",
     "core.process_features:derive_cure_total_time_h",
 }
+_IMPLEMENTATION_VERSIONS = {name: {"1"} for name in _IMPLEMENTATIONS}
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,9 @@ def _dispatch_declared_rule(frame: pd.DataFrame, definition: dict, raw_columns: 
     implementation = str(rule.get("implementation") or "").strip()
     if implementation not in _IMPLEMENTATIONS:
         raise ValueError(f"未允许的派生实现: {implementation}")
+    version = str(rule.get("version") or "1").strip()
+    if version not in _IMPLEMENTATION_VERSIONS[implementation]:
+        raise ValueError(f"未允许的派生实现版本: {implementation}:{version or '<missing>'}")
     if implementation.endswith(":derive_cure_stage_count"):
         return derive_cure_stage_count(frame[raw_columns[0]])
     if implementation.endswith(":derive_cure_total_time_h"):
@@ -99,6 +103,11 @@ def compute_process_features(frame: pd.DataFrame, feature_definitions: list[dict
         if missing:
             errors.append({"code": "missing_source_column", "feature": definition.get("name"), "source": "derived_workflow", "rule": rule.get("implementation"), "message": "缺少声明的原始输入", "columns": missing})
             continue
+        if str(rule.get("null_policy") or "").strip().lower() == "reject":
+            null_rows = [int(index) for index, row in frame.loc[:, inputs].iterrows() if any(pd.isna(value) or not str(value).strip() for value in row)]
+            if null_rows:
+                errors.append({"code": "null_source_value", "feature": definition.get("name"), "source": inputs, "rule": rule.get("implementation"), "message": "声明为 reject 的工艺输入存在空值", "rows": null_rows})
+                continue
         try:
             output[str(definition["name"])] = _dispatch_declared_rule(frame, definition, inputs)
         except Exception as exc:

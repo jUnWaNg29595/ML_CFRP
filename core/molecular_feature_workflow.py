@@ -1126,7 +1126,8 @@ def prepare_step_inputs(
         raise TypeError("data must be a pandas DataFrame")
 
     source_columns = list(step.get("source_columns") or [])
-    missing_columns = [column for column in source_columns if column not in data.columns]
+    optional_columns = set(step.get("optional_source_columns") or [])
+    missing_columns = [column for column in source_columns if column not in data.columns and column not in optional_columns]
     if missing_columns:
         raise KeyError(
             "workflow step requires missing source columns: "
@@ -1140,17 +1141,18 @@ def prepare_step_inputs(
 
     params = _step_parameters(step)
     prepared: list[str | None] = []
-    source_values = {column: [] for column in source_columns}
+    present_columns = [column for column in source_columns if column in data.columns]
+    source_values = {column: [] for column in present_columns}
     component_values: list[list[str]] = []
     source_components: list[dict[Any, list[str]]] = []
     valid_indices: list[int] = []
 
     for row_index, row in enumerate(
-        data.loc[:, source_columns].itertuples(index=False, name=None)
+        data.reindex(columns=present_columns).itertuples(index=False, name=None)
     ):
         components: list[str] = []
         row_source_components: dict[Any, list[str]] = {}
-        for column, value in zip(source_columns, row):
+        for column, value in zip(present_columns, row):
             fragments = [] if _is_missing_cell(value) else split_smiles_cell(value)
             retained_fragments = _filter_step_components(fragments, params)
             row_source_components[column] = retained_fragments
@@ -1174,12 +1176,12 @@ def prepare_step_inputs(
     role = str(step.get("role") or "").lower()
     resin_columns = [
         column
-        for column in source_columns
+        for column in present_columns
         if any(token in str(column).lower() for token in ("resin", "epoxy"))
     ]
     hardener_columns = [
         column
-        for column in source_columns
+        for column in present_columns
         if any(
             token in str(column).lower()
             for token in ("hardener", "curing", "curer")
@@ -1459,6 +1461,7 @@ def execute_molecular_feature_workflow(
         declared_method = str(step.get("method") or "").strip().lower()
         if declared_method == "derived_workflow":
             features, valid_indices, step_warnings = execute_derived_feature_step(data, step)
+            input_count = len(data)
         else:
             smiles, prepared_indices, metadata = prepare_step_inputs(data, step)
             dispatch_step = dict(step)
@@ -1468,6 +1471,7 @@ def execute_molecular_feature_workflow(
                 dispatch_step,
                 device=device,
             )
+            input_count = len(smiles)
         valid_indices = [int(index) for index in valid_indices]
         prefixed = _apply_workflow_prefix(features, step.get("prefix"))
         duplicate_columns = prefixed.columns[prefixed.columns.duplicated()].tolist()
@@ -1490,7 +1494,7 @@ def execute_molecular_feature_workflow(
         trace = {
             "step_id": step_id,
             "mode": mode,
-            "input_count": len(smiles),
+            "input_count": input_count,
             "valid_count": len(valid_indices),
             "output_columns": list(restored.columns),
             "elapsed_time": time.perf_counter() - started,
