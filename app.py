@@ -15,6 +15,7 @@
 import os
 import sys
 import locale
+import binascii
 import multiprocessing
 import logging
 import base64
@@ -1146,6 +1147,7 @@ from core.navigation import (
     NAVIGATION_PAGES,
     resolve_navigation_page,
 )
+from core.feature_registry_ui import render_feature_registry_page
 from core.applicability_domain import ApplicabilityDomainAnalyzer, TanimotoADAnalyzer
 from core.ui_config import (
     MANUAL_TUNING_PARAMS,
@@ -7722,6 +7724,23 @@ def page_data_enhancement():
 # ============================================================
 # 页面：分子特征提取（完整5种方法）
 # ============================================================
+def page_feature_registry():
+    """Render the feature-only AI review and local approval workflow."""
+    registry = {}
+    registry_path = Path(__file__).resolve().parent / "prediction_portal" / "feature_registry.json"
+    try:
+        if registry_path.is_file():
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        st.warning(f"特征登记库读取失败：{exc}")
+    frame = st.session_state.get("processed_data")
+    if frame is None:
+        frame = st.session_state.get("data")
+    profile_id = st.session_state.get("model_profile_id") or st.session_state.get("training_model_profile_id")
+    manifest = st.session_state.get("feature_mapping_manifest") or {"status": "draft", "feature_bindings": []}
+    render_feature_registry_page(frame=frame, registry=registry, profile_id=profile_id, manifest=manifest)
+
+
 def page_molecular_features():
     """分子特征提取页面 - 完整还原5种方法 + 分子指纹 (适配双组分)"""
     from core.molecular_feature_workflow import (
@@ -7731,6 +7750,7 @@ def page_molecular_features():
     )
 
     st.title("🧬 分子特征提取")
+    _render_molecular_feature_clear_restore_control()
 
     if st.session_state.data is None:
         st.warning("⚠️ 请先上传数据")
@@ -12471,9 +12491,69 @@ def page_molecular_feature_reproduction():
 # ============================================================
 # 页面：特征选择（完整版）
 # ============================================================
+def _collect_molecular_feature_columns(columns, state=None):
+    """Collect extracted molecular columns from session metadata in stable order."""
+    state = state if state is not None else st.session_state
+    available = set(columns or [])
+    found = []
+
+    def add(values):
+        for value in values or []:
+            value = str(value)
+            if value in available and value not in found:
+                found.append(value)
+
+    add(state.get("molecular_feature_names", []))
+    workflow = state.get("molecular_feature_workflow") or {}
+    if isinstance(workflow, dict):
+        add(workflow.get("final_feature_names", []))
+        for step in workflow.get("steps", []) or []:
+            if isinstance(step, dict):
+                add(step.get("feature_names", []))
+    config = state.get("molecular_feature_config") or {}
+    if isinstance(config, dict):
+        add(config.get("feature_names", []))
+    prefixes = ("fp_", "morgan_", "maccs_", "rdkit_", "mordred_", "coulomb_", "ani_", "tda_", "gnn_", "chembert_", "transformer_", "embed_", "desc_", "3d_", "fgd_", "epoxy_", "reaction_")
+    add([c for c in columns or [] if str(c).startswith(prefixes)])
+    return found
+
+
+def _clear_molecular_features_from_session():
+    state = st.session_state
+    frame = state.get("processed_data")
+    columns = list(frame.columns) if isinstance(frame, pd.DataFrame) else []
+    removed = _collect_molecular_feature_columns(columns, state)
+    if not removed:
+        state["molecular_feature_clear_backup_tag"] = None
+        return []
+    tag = f"before_molecular_feature_clear_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    _save_session_snapshot(tag)
+    if isinstance(frame, pd.DataFrame):
+        state["processed_data"] = frame.drop(columns=removed, errors="ignore")
+    for key in ("molecular_features", "molecular_feature_names", "molecular_feature_config", "molecular_feature_workflow", "molecular_feature_trace"):
+        state[key] = None if key != "molecular_feature_names" and key != "molecular_feature_trace" else ([] if key == "molecular_feature_names" or key == "molecular_feature_trace" else None)
+    for key in ("feature_cols", "multiselect_features"):
+        if isinstance(state.get(key), list):
+            state[key] = [c for c in state[key] if c not in removed]
+    state["molecular_feature_clear_backup_tag"] = tag
+    return removed
+
+
+def _render_molecular_feature_clear_restore_control():
+    """Render clear/restore controls for extracted molecular features."""
+    if st.button("清除已提取分子特征", key="clear_molecular_features"):
+        _clear_molecular_features_from_session()
+    backup_tag = st.session_state.get("molecular_feature_clear_backup_tag")
+    if backup_tag:
+        st.caption(f"已保存快照：{backup_tag}")
+        st.button("恢复清除前分子特征", key="restore_molecular_features")
+
+
 def page_feature_selection():
     """特征选择页面 - 含 K-Means 聚类特征构造 + 完整特征选择"""
     st.title("🎯 特征选择")
+    # 清除已提取分子特征（保留原始 data，仅处理 processed_data）；入口：_clear_molecular_features_from_session
+    _render_molecular_feature_clear_restore_control()
 
     # ── K-Means 智能聚类（特征构造）──────────────────────────
     df = st.session_state.processed_data if st.session_state.get('processed_data') is not None else st.session_state.get('data')
@@ -24346,6 +24426,8 @@ def _reconstruct_split_from_current_data(meta, feature_cols=None, target_col=Non
 
 def page_training_records():
     st.title("📈 训练记录")
+    st.subheader("全部训练 / 优化记录")
+    st.caption("记录类型 · 模型筛选 · Optuna 优化详情（optimization_trials.csv）")
     st.caption("自动保存每次训练的指标、参数、训练曲线（loss/迭代指标或学习曲线）。")
 
     manager = TrainingRunManager()
@@ -24779,6 +24861,80 @@ def render_export_section():
 # ============================================================
 # 页面：图像/文件转SMILES（DECIMER）
 # ============================================================
+_IMAGE_CLIPBOARD_COMPONENT_PATH = (
+    Path(__file__).resolve().parent / "components" / "image_clipboard"
+)
+_IMAGE_CLIPBOARD_COMPONENT = components.declare_component(
+    "image_clipboard", path=str(_IMAGE_CLIPBOARD_COMPONENT_PATH)
+)
+
+
+def _image_clipboard_component(
+    *, key: str, max_bytes: int = 8 * 1024 * 1024, max_width: int = 1600
+):
+    """Render the local clipboard widget and return its JSON payload."""
+    return _IMAGE_CLIPBOARD_COMPONENT(
+        maxBytes=int(max_bytes),
+        maxWidth=int(max_width),
+        default=None,
+        key=key,
+    )
+
+
+def _decode_clipboard_image_payload(
+    payload: object, *, max_bytes: int = 8 * 1024 * 1024
+) -> dict:
+    """Validate and decode the base64 image returned by the clipboard widget."""
+    if not isinstance(payload, dict):
+        raise ValueError("剪贴板图片数据无效")
+
+    error = str(payload.get("error") or "").strip()
+    if error:
+        raise ValueError(error)
+
+    mime = str(payload.get("mime") or "").strip().lower()
+    if not mime.startswith("image/"):
+        raise ValueError("剪贴板内容不是图片")
+
+    data_b64 = payload.get("data_b64")
+    if not isinstance(data_b64, str) or not data_b64:
+        raise ValueError("剪贴板图片数据为空")
+
+    try:
+        decoded = base64.b64decode(data_b64, validate=True)
+    except (ValueError, TypeError, binascii.Error) as exc:
+        raise ValueError("剪贴板图片编码无效") from exc
+
+    if not decoded:
+        raise ValueError("剪贴板图片数据为空")
+    if len(decoded) > int(max_bytes):
+        raise ValueError(
+            f"剪贴板图片过大（{len(decoded) / 1024 / 1024:.1f} MB），请先裁剪或压缩"
+        )
+
+    name = str(payload.get("name") or "pasted-image.png").strip()
+    return {"name": name or "pasted-image.png", "mime": mime, "data": decoded}
+
+
+def _build_image_preview(
+    data: bytes, *, max_width: int = 640, max_height: int = 480
+) -> bytes:
+    """Create a bounded preview while leaving the bytes sent to DECIMER untouched."""
+    from PIL import Image
+
+    with Image.open(io.BytesIO(data)) as image:
+        image.load()
+        image.thumbnail(
+            (max(1, int(max_width)), max(1, int(max_height))),
+            resample=getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS),
+        )
+        if image.mode not in ("RGB", "RGBA"):
+            image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+        output = io.BytesIO()
+        image.save(output, format="PNG", optimize=True)
+        return output.getvalue()
+
+
 def page_image_to_smiles():
     """使用 DECIMER 从结构图片/文件中识别 SMILES"""
     st.title("🖼️ 图像/文件转 SMILES")
@@ -24814,70 +24970,126 @@ def page_image_to_smiles():
         )
         return
 
-    col1, col2 = st.columns(2)
-    with col1:
+    setting_col1, setting_col2 = st.columns(2)
+    with setting_col1:
         hand_drawn = st.checkbox("手绘结构模式（Hand-Drawn）", value=False)
-    with col2:
+    with setting_col2:
         with_conf = st.checkbox("返回置信度（Top-1）", value=False)
 
-    uploaded_files = st.file_uploader(
-        "上传结构图片或 PDF（可多选）",
-        type=["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "heif", "heic", "pdf"],
-        accept_multiple_files=True,
-    )
+    input_col, paste_col = st.columns([1, 1], gap="large")
+    with input_col:
+        st.markdown("#### 上传文件")
+        uploaded_files = st.file_uploader(
+            "上传结构图片或 PDF（可多选）",
+            type=[
+                "png",
+                "jpg",
+                "jpeg",
+                "bmp",
+                "tif",
+                "tiff",
+                "webp",
+                "heif",
+                "heic",
+                "pdf",
+            ],
+            accept_multiple_files=True,
+            key="image_smiles_file_uploader",
+        )
+        st.caption("支持多文件上传；识别使用原始文件内容。")
+    with paste_col:
+        st.markdown("#### 粘贴图片")
+        pasted_payload = _image_clipboard_component(
+            key="image_smiles_clipboard",
+            max_bytes=8 * 1024 * 1024,
+            max_width=1600,
+        )
+        pasted_image = None
+        if pasted_payload:
+            try:
+                pasted_image = _decode_clipboard_image_payload(pasted_payload)
+                st.caption(f"已接收：{pasted_image['name']}")
+            except ValueError as exc:
+                st.error(str(exc))
 
-    if not uploaded_files:
-        st.info("请上传图片或 PDF 后开始识别。")
+    input_items = []
+    if pasted_image:
+        input_items.append(pasted_image)
+    for uploaded_file in uploaded_files or []:
+        input_items.append(
+            {
+                "name": uploaded_file.name,
+                "mime": uploaded_file.type or "",
+                "data": uploaded_file.getvalue(),
+            }
+        )
+
+    if not input_items:
+        st.info("请上传文件，或点击右侧区域后按 Ctrl+V 粘贴结构图片。")
         return
 
+    st.caption(f"待识别输入：{len(input_items)} 个")
     results = []
-    for uf in uploaded_files:
+    for item in input_items:
         st.markdown("---")
-        st.subheader(f"📄 {uf.name}")
+        preview_col, result_col = st.columns([1, 1], gap="large")
+        with preview_col:
+            st.subheader(f"📄 {item['name']}")
+            if item["mime"].startswith("image/"):
+                try:
+                    preview_data = _build_image_preview(
+                        item["data"], max_width=640, max_height=480
+                    )
+                    st.image(
+                        preview_data,
+                        caption="预览（已限制最大尺寸）",
+                    )
+                except Exception:
+                    st.warning("图片预览失败，但仍会尝试识别原始文件。")
+            else:
+                st.caption("PDF 文件不在页面内展开预览，将直接提交识别。")
 
-        data = uf.getvalue()
-
-        # Preview image (skip pdf)
-        if uf.type and uf.type.startswith("image/"):
+        with result_col:
+            st.subheader("识别结果")
             try:
-                st.image(data, caption=uf.name, width="stretch")
-            except Exception:
-                pass
+                preds = smiles_from_bytes(
+                    item["data"],
+                    item["name"],
+                    confidence=with_conf,
+                    hand_drawn=hand_drawn,
+                )
+                for prediction in preds:
+                    page_tag = ""
+                    if prediction.page_index is not None:
+                        page_tag = f" (Page {prediction.page_index + 1})"
 
-        try:
-            preds = smiles_from_bytes(
-                data, uf.name, confidence=with_conf, hand_drawn=hand_drawn
-            )
-            for p in preds:
-                page_tag = ""
-                if p.page_index is not None:
-                    page_tag = f" (Page {p.page_index + 1})"
+                    st.success(f"SMILES{page_tag}: {prediction.smiles}")
+                    if prediction.confidence is not None:
+                        st.caption(f"Confidence (Top-1): {prediction.confidence:.4f}")
 
-                st.success(f"SMILES{page_tag}: {p.smiles}")
-                if p.confidence is not None:
-                    st.caption(f"Confidence (Top-1): {p.confidence:.4f}")
-
+                    results.append(
+                        {
+                            "filename": prediction.filename,
+                            "page": None
+                            if prediction.page_index is None
+                            else int(prediction.page_index + 1),
+                            "smiles": prediction.smiles,
+                            "confidence": prediction.confidence,
+                            "engine": prediction.engine,
+                        }
+                    )
+            except Exception as exc:
+                st.error(f"识别失败：{exc}")
                 results.append(
                     {
-                        "filename": p.filename,
-                        "page": None if p.page_index is None else int(p.page_index + 1),
-                        "smiles": p.smiles,
-                        "confidence": p.confidence,
-                        "engine": p.engine,
+                        "filename": item["name"],
+                        "page": None,
+                        "smiles": "",
+                        "confidence": None,
+                        "engine": "DECIMER",
+                        "error": str(exc),
                     }
                 )
-        except Exception as e:
-            st.error(f"识别失败：{e}")
-            results.append(
-                {
-                    "filename": uf.name,
-                    "page": None,
-                    "smiles": "",
-                    "confidence": None,
-                    "engine": "DECIMER",
-                    "error": str(e),
-                }
-            )
 
     if results:
         st.markdown("---")
@@ -24896,6 +25108,399 @@ def page_image_to_smiles():
         # Save for later pages
         st.session_state["smiles_results"] = df_res
         st.info("结果已保存到会话变量：st.session_state['smiles_results']。")
+
+
+# ============================================================
+# 页面：SMILES / BigSMILES 结构图像工具
+# ============================================================
+def _load_structure_visualization_apis():
+    """Load the vendored renderer lazily so the main app keeps its optional dependencies optional."""
+    try:
+        from bigsmiles_ui.bigsmiles_ui.batch_io import (
+            list_structure_columns,
+            process_table,
+            read_uploaded_table,
+            write_table,
+        )
+        from bigsmiles_ui.bigsmiles_ui.renderer import (
+            RenderOptions,
+            RenderResult,
+            render_structure,
+        )
+        return (
+            RenderOptions,
+            RenderResult,
+            render_structure,
+            list_structure_columns,
+            process_table,
+            read_uploaded_table,
+            write_table,
+        )
+    except ImportError:
+        # Support running from a packaged checkout where the outer namespace package
+        # is not already present on sys.path.
+        vendor_root = Path(__file__).resolve().parent / "bigsmiles_ui"
+        if str(vendor_root) not in sys.path:
+            sys.path.insert(0, str(vendor_root))
+        from bigsmiles_ui.batch_io import (
+            list_structure_columns,
+            process_table,
+            read_uploaded_table,
+            write_table,
+        )
+        from bigsmiles_ui.renderer import RenderOptions, RenderResult, render_structure
+
+        return (
+            RenderOptions,
+            RenderResult,
+            render_structure,
+            list_structure_columns,
+            process_table,
+            read_uploaded_table,
+            write_table,
+        )
+
+
+def _structure_visualization_output_root() -> Path:
+    root = Path(__file__).resolve().parent / "outputs" / "generated" / "structure_visualization"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _safe_structure_image_path(output_dir: Path, relative_path: str) -> Path | None:
+    """Resolve a renderer path while keeping it inside the selected output directory."""
+    if not relative_path:
+        return None
+    root = Path(output_dir).resolve()
+    candidate = (root / str(relative_path)).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _structure_result_text(result) -> str:
+    return "\n".join(
+        [
+            f"原始结构：{result.raw_string}",
+            f"识别类型：{result.detected_type}",
+            f"解析状态：{result.parse_status}",
+            f"规范化结构：{result.normalized_structure}",
+            f"绘图状态：{result.draw_status}",
+            f"错误信息：{result.error_message}",
+            f"警告信息：{result.warning_message}",
+            f"渲染器：{result.renderer}",
+        ]
+    )
+
+
+def _render_structure_result(result, output_dir: Path, *, key_prefix: str) -> None:
+    """Render common status, normalized text, previews, and downloads for one result."""
+    if result.parse_status == "valid" and result.draw_status == "rendered":
+        st.success(
+            f"解析成功；类型：{result.detected_type}；绘图器：{result.renderer or '未解析'}"
+        )
+    elif result.parse_status == "valid":
+        st.warning(
+            f"结构可解析，但绘图未完全成功；类型：{result.detected_type}；"
+            f"绘图状态：{result.draw_status}"
+        )
+    elif result.parse_status == "empty":
+        st.info("尚未输入结构")
+    else:
+        st.error(f"结构解析失败：{result.error_message or '语法无效'}")
+
+    if result.normalized_structure:
+        st.markdown("**规范化结构**")
+        st.code(result.normalized_structure, language="text")
+    if result.error_message and result.parse_status == "valid":
+        st.error(result.error_message)
+    if result.warning_message:
+        st.warning(result.warning_message)
+
+    image_items = (
+        ("主图", result.main_image_path, "主结构图"),
+        ("代表性采样图", result.sample_image_path, "代表性采样链段示意图"),
+    )
+    for label, relative_path, caption in image_items:
+        image_path = _safe_structure_image_path(output_dir, relative_path)
+        if image_path is None:
+            continue
+        st.image(str(image_path), caption=caption, width=640)
+        st.download_button(
+            f"下载{label}",
+            data=image_path.read_bytes(),
+            file_name=image_path.name,
+            mime="image/png",
+            key=f"{key_prefix}_{label}",
+        )
+
+    st.download_button(
+        "下载结构检查文本",
+        data=_structure_result_text(result).encode("utf-8"),
+        file_name="结构检查结果.txt",
+        mime="text/plain",
+        key=f"{key_prefix}_text",
+    )
+
+
+def _page_smiles_to_structure_image() -> None:
+    """Render one SMILES or BigSMILES expression with the vendored renderer."""
+    st.subheader("单条结构渲染")
+    st.caption("普通 SMILES 使用 RDKit 绘图；BigSMILES 保留重复单元和连接端语义。")
+    raw = st.text_area(
+        "输入 SMILES 或 BigSMILES",
+        height=140,
+        placeholder="例如：CCO，或 CC{[>][<]CC(C)[>][<]}CC(C)=C",
+        key="structure_visualization_input",
+    )
+    requested_type_label = st.selectbox(
+        "结构类型",
+        ["自动识别", "SMILES", "BigSMILES"],
+        key="structure_visualization_type",
+    )
+    type_map = {"自动识别": "auto", "SMILES": "smiles", "BigSMILES": "bigsmiles"}
+
+    size_col1, size_col2 = st.columns(2)
+    with size_col1:
+        image_width = st.number_input(
+            "图片宽度",
+            min_value=200,
+            max_value=3000,
+            value=1000,
+            step=50,
+            key="structure_visualization_width",
+        )
+    with size_col2:
+        image_height = st.number_input(
+            "图片高度",
+            min_value=200,
+            max_value=3000,
+            value=700,
+            step=50,
+            key="structure_visualization_height",
+        )
+
+    sample = st.checkbox(
+        "生成代表性采样链段示意图（整体复制重复单元，仅用于拓扑检查）",
+        value=False,
+        key="structure_visualization_sample",
+    )
+    repeat_units = 5
+    random_seed = 42
+    if sample:
+        option_col1, option_col2 = st.columns(2)
+        with option_col1:
+            repeat_units = st.number_input(
+                "重复单元数",
+                min_value=1,
+                max_value=50,
+                value=5,
+                step=1,
+                key="structure_visualization_repeat_units",
+            )
+        with option_col2:
+            random_seed = st.number_input(
+                "随机种子",
+                min_value=0,
+                max_value=2_147_483_647,
+                value=42,
+                step=1,
+                key="structure_visualization_random_seed",
+            )
+
+    if st.button("生成结构图", type="primary", key="structure_visualization_render"):
+        try:
+            RenderOptions, _RenderResult, render_structure, *_ = _load_structure_visualization_apis()
+            options = RenderOptions(
+                requested_type=type_map[requested_type_label],
+                render_sample_chain=sample,
+                repeat_units=int(repeat_units),
+                random_seed=int(random_seed),
+                image_width=int(image_width),
+                image_height=int(image_height),
+            )
+            output_dir = _structure_visualization_output_root() / "single"
+            result = render_structure(raw, output_dir, options)
+            st.session_state["structure_visualization_single_result"] = result
+            st.session_state["structure_visualization_single_output_dir"] = str(output_dir)
+        except Exception as exc:
+            st.session_state.pop("structure_visualization_single_result", None)
+            st.error(f"结构图生成失败：{exc}")
+
+    result = st.session_state.get("structure_visualization_single_result")
+    output_dir_text = st.session_state.get("structure_visualization_single_output_dir")
+    if result is not None and output_dir_text:
+        _render_structure_result(result, Path(output_dir_text), key_prefix="structure_visualization_single")
+    else:
+        st.info("输入结构后点击“生成结构图”。")
+
+
+def _page_batch_structure_check() -> None:
+    """Validate and render a structure column from an uploaded CSV/XLSX table."""
+    st.subheader("批量结构检查")
+    st.caption("原始列不会覆盖；结果表会追加解析状态、规范化结构和图片路径。")
+    uploaded = st.file_uploader(
+        "上传 CSV、XLSX 或 XLSM 文件",
+        type=["csv", "xlsx", "xlsm"],
+        key="structure_visualization_batch_upload",
+    )
+    if uploaded is None:
+        st.info("请上传包含 SMILES 或 BigSMILES 结构列的表格。")
+        return
+
+    try:
+        (
+            _RenderOptions,
+            _RenderResult,
+            _render_structure,
+            list_structure_columns,
+            process_table,
+            read_uploaded_table,
+            write_table,
+        ) = _load_structure_visualization_apis()
+        frame = read_uploaded_table(uploaded.name, uploaded.getvalue())
+        columns = list_structure_columns(frame)
+    except Exception as exc:
+        st.error(f"读取表格失败：{exc}")
+        return
+    if not columns:
+        st.error("表格没有可用列")
+        return
+
+    structure_column = st.selectbox(
+        "选择结构列",
+        columns,
+        key="structure_visualization_batch_column",
+    )
+    requested_type_label = st.selectbox(
+        "结构类型",
+        ["自动识别", "SMILES", "BigSMILES"],
+        key="structure_visualization_batch_type",
+    )
+    type_map = {"自动识别": "auto", "SMILES": "smiles", "BigSMILES": "bigsmiles"}
+    sample = st.checkbox(
+        "生成代表性采样链段示意图",
+        value=False,
+        key="structure_visualization_batch_sample",
+    )
+    repeat_units = 5
+    random_seed = 42
+    if sample:
+        repeat_units = st.number_input(
+            "批量重复单元数",
+            min_value=1,
+            max_value=50,
+            value=5,
+            step=1,
+            key="structure_visualization_batch_repeat_units",
+        )
+        random_seed = st.number_input(
+            "批量随机种子",
+            min_value=0,
+            max_value=2_147_483_647,
+            value=42,
+            step=1,
+            key="structure_visualization_batch_random_seed",
+        )
+    output_format = st.selectbox(
+        "输出格式",
+        ["CSV", "XLSX"],
+        key="structure_visualization_batch_format",
+    )
+    default_suffix = ".csv" if output_format == "CSV" else ".xlsx"
+    output_name = st.text_input(
+        "结果文件名",
+        value=f"结构检查结果{default_suffix}",
+        key="structure_visualization_batch_name",
+    ).strip()
+    if not output_name.lower().endswith((".csv", ".xlsx")):
+        output_name += default_suffix
+    output_name = Path(output_name).name
+
+    if not st.button("开始批量检查", type="primary", key="structure_visualization_batch_run"):
+        st.caption(f"已读取 {len(frame)} 行；点击按钮后开始处理。")
+        return
+
+    output_dir = _structure_visualization_output_root() / "batch" / datetime.now().strftime(
+        "%Y%m%d_%H%M%S_%f"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    options = _RenderOptions(
+        requested_type=type_map[requested_type_label],
+        render_sample_chain=sample,
+        repeat_units=int(repeat_units),
+        random_seed=int(random_seed),
+    )
+    progress = st.progress(0, text="准备开始")
+    status = st.empty()
+    counts = {"valid": 0, "invalid": 0, "empty": 0, "valid_but_not_renderable": 0}
+
+    def update(current: int, total: int, result) -> None:
+        counts[result.parse_status] = counts.get(result.parse_status, 0) + 1
+        if result.draw_status == "valid_but_not_renderable":
+            counts["valid_but_not_renderable"] += 1
+        progress.progress(
+            current / max(total, 1),
+            text=f"正在处理：第 {current} / {total} 行",
+        )
+        status.info(
+            f"进度 {current}/{total}；有效 {counts['valid']}；无效 {counts['invalid']}；"
+            f"空值 {counts['empty']}；可解析但不可绘图 {counts['valid_but_not_renderable']}"
+        )
+
+    try:
+        result_frame = process_table(frame, structure_column, output_dir, options, update)
+        output_path = write_table(result_frame, output_dir / output_name)
+    except Exception as exc:
+        progress.empty()
+        status.empty()
+        st.error(f"批量处理失败：{exc}")
+        return
+
+    progress.progress(1.0, text="批量检查完成")
+    status.success(
+        f"完成：共 {len(result_frame)} 行；有效 {counts['valid']}；"
+        f"无效 {counts['invalid']}；空值 {counts['empty']}。"
+    )
+    st.dataframe(result_frame.head(100), width="stretch")
+    st.download_button(
+        "下载结果表",
+        data=output_path.read_bytes(),
+        file_name=output_path.name,
+        mime=(
+            "text/csv"
+            if output_path.suffix.lower() == ".csv"
+            else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        key="structure_visualization_batch_download",
+    )
+    st.caption(f"图片位于结果目录：{output_dir / 'images'}；移动结果表时请保留 images 文件夹。")
+
+
+def page_smiles_structure_tools() -> None:
+    """Combine image recognition, structure rendering, and batch checks in one page.
+
+    This integrated entrypoint intentionally exposes render_structure, SMILES,
+    BigSMILES, page_image_to_smiles, process_table and batch workflows.
+    """
+    st.title("🧪 SMILES / BigSMILES 结构图像工具")
+    st.caption("在同一页面完成图像转 SMILES、SMILES/BigSMILES 转图片和批量结构检查。")
+    image_tab, render_tab, batch_tab = st.tabs(
+        ["图像转 SMILES", "SMILES / BigSMILES 转图片", "批量结构检查"]
+    )
+    with image_tab:
+        page_image_to_smiles()
+    with render_tab:
+        _page_smiles_to_structure_image()
+    with batch_tab:
+        _page_batch_structure_check()
+
+
+def page_structure_recognition() -> None:
+    """Legacy name for the merged SMILES / BigSMILES structure tools page."""
+    return page_smiles_structure_tools()
 
 # ============================================================
 # 主程序入口（保持原有结构）
@@ -24938,9 +25543,11 @@ elif page == "🧬 分子特征":
     page_molecular_features()
 elif page == "🧬 分子特征复现":
     page_molecular_feature_reproduction()
+elif page == "🧩 特征管理":
+    page_feature_registry()
 
-elif page == "🖼️ 图像转SMILES":
-    page_image_to_smiles()
+elif page == "🧪 SMILES / BigSMILES 结构图像工具":
+    page_smiles_structure_tools()
 elif page == "🎯 特征选择":
     page_feature_selection()
 elif page == "🤖 模型训练":
