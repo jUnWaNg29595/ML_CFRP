@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 for _name, _value in {
     "long": np.int64,
@@ -82,7 +83,7 @@ def test_cancelled_task_does_not_publish_later_prediction(tmp_path, monkeypatch)
     assert snapshot.get("result") is None
 
 
-def test_retry_creates_new_task_and_reuses_persisted_request(tmp_path, monkeypatch):
+def test_retry_creates_new_task_with_explicit_request(tmp_path, monkeypatch):
     calls = []
 
     def predict(request, config, progress):
@@ -95,13 +96,27 @@ def test_retry_creates_new_task_and_reuses_persisted_request(tmp_path, monkeypat
     manager = PortalTaskManager(tmp_path)
     first_id = manager.create_task(_request(tmp_path))
     first = manager.wait_for_task(first_id, timeout=2)
-    retry_id = manager.retry_task(first_id)
+    retry_id = manager.retry_task(first_id, request=_request(tmp_path))
     second = manager.wait_for_task(retry_id, timeout=2)
 
     assert first["status"] == "failed"
     assert retry_id != first_id
     assert second["status"] == "completed"
     assert calls[1]["material_type"] == "epoxy_resin"
+
+
+def test_retry_without_explicit_request_is_blocked_even_with_runtime_copy(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "core.portal_tasks.run_confirmed_prediction",
+        lambda request, config, progress: (_ for _ in ()).throw(RuntimeError("temporary failure")),
+    )
+    manager = PortalTaskManager(tmp_path)
+    first_id = manager.create_task(_request(tmp_path))
+    first = manager.wait_for_task(first_id, timeout=2)
+
+    assert first["status"] == "failed"
+    with pytest.raises(ValueError, match="重新提交|原始输入"):
+        manager.retry_task(first_id)
 
 
 def test_restart_marks_active_snapshot_failed(tmp_path):

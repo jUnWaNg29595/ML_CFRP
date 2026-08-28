@@ -508,8 +508,11 @@ AI 特征管理不负责：用户预测输入解析、预测结果解释、自�
 
 以下为当前仓库中已核实的聚焦验收结果；未将全量测试声明为通过：
 
+- 历史分组记录：
 - `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_contract_v2.py tests/test_prediction_portal.py tests/test_prediction_feature_contract.py -q`：15 passed。
 - `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_process_features.py tests/test_molecular_feature_workflow.py -q`：55 passed。
 - `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_training_contract.py tests/test_training_runs.py -q`：20 passed。
 - `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_portal_tasks.py -q`：7 passed。
+- 聚焦验收测试合计 65 项，其中 62 passed、3 failed（62/65 passed）；因此聚焦测试集尚未全部通过。
 - `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_feature_registry_end_to_end.py -q`：1 passed（1.54s）。
+- `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests -q`：555 passed、5 failed；全量测试当前未通过，不得声明为全量通过。

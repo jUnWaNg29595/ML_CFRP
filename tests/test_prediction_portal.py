@@ -105,6 +105,27 @@ def test_publication_contract_records_numeric_ranges_and_workflow_sources():
     assert contract["workflow_schema_version"] == 3
 
 
+def test_v2_contract_rejects_recomputed_registry_hash_or_semantic_definition_drift():
+    artifact = {"model": _NamedModel(), "pipeline": None, "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"], "target_col": "Tg", "extra": {}}
+    registry = {"registry_version": "v1", "registry_hash": "stale", "features": [
+        {"name": "resin_xtb_gap", "feature_id": "r", "source_type": "molecular_workflow", "status": "approved", "unit": "eV"},
+        {"name": "curing_agent_xtb_gap", "feature_id": "h", "source_type": "molecular_workflow", "status": "approved", "unit": "eV"},
+    ]}
+    manifest = {"manifest_hash": "m1"}
+    contract = {
+        "schema_version": 2, "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+        "canonical_feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"], "effective_feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"], "removed_feature_cols": [],
+        "workflow_feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"], "molecular_workflow_feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"], "derived_feature_cols": [], "manual_input_feature_cols": [],
+        "feature_definitions": [dict(item) for item in registry["features"]], "feature_registry_version": "v1", "feature_registry_hash": "stale", "dataset_manifest_hash": "m1", "target_col": "Tg",
+        "workflow_source_fields": [], "source_columns": [], "workflow_source_columns": [], "workflow_present": False, "molecular_features_indicated": False, "pipeline_present": False, "imputer_present": False, "scaler_present": False, "numeric_ranges": {}, "contract_hash": "",
+    }
+    from core.prediction_portal import compute_contract_hash
+    contract["contract_hash"] = compute_contract_hash(contract)
+    report = validate_publication_artifact(artifact, contract, registry_snapshot=registry, dataset_manifest=manifest)
+    assert report["ok"] is False
+    assert any("hash" in error.lower() for error in report["errors"])
+
+
 def test_publication_rejects_missing_molecular_workflow_for_molecular_sources():
     artifact = {
         "model": _NamedModel(),
@@ -123,6 +144,33 @@ def test_publication_rejects_missing_molecular_workflow_for_molecular_sources():
 
     assert report["ok"] is False
     assert any("workflow" in error.lower() for error in report["errors"])
+
+
+def test_publication_rejects_workflow_feature_gap_before_activation():
+    artifact = {
+        "model": _NamedModel(),
+        "pipeline": None,
+        "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+        "target_col": "Tg",
+        "extra": {
+            "molecular_feature_workflow": {
+                "schema_version": 3,
+                "workflow_hash": "workflow-123",
+                "steps": [],
+                "merge_order": [],
+                "final_feature_names": ["resin_xtb_gap"],
+            }
+        },
+    }
+    contract = _molecular_contract(
+        feature_cols=["resin_xtb_gap", "curing_agent_xtb_gap"],
+    )
+
+    report = validate_publication_artifact(artifact, contract)
+
+    assert report["ok"] is False
+    assert any("final_feature_names" in error for error in report["errors"])
+    assert any("curing_agent_xtb_gap" in error for error in report["errors"])
 
 
 def test_legacy_artifact_needs_validation_and_is_not_publishable():
@@ -158,10 +206,18 @@ def test_publication_rejects_missing_model_target_and_exact_contract():
     assert any("feature" in error.lower() for error in report["errors"])
 
 
-def test_activate_and_rollback_keep_one_active_version():
+def test_activate_and_rollback_keep_one_active_version(tmp_path, monkeypatch):
     config = {"materials": {"epoxy_resin": {"targets": {"tg": {"models": []}}}}}
-    first = {"id": "tg-v1", "version": "v1", "enabled": True}
-    second = {"id": "tg-v2", "version": "v2", "enabled": True}
+    gate_report = {"ok": True, "status": "valid", "errors": []}
+    artifact_path = tmp_path / "model.joblib"
+    artifact_path.write_bytes(b"fixture")
+    contract = {"schema_version": 2, "feature_cols": ["x"], "target_col": "Tg"}
+    def release(version):
+        return {"id": f"tg-{version}", "version": version, "enabled": True, "publication_status": "published", "gate_report": gate_report,
+                "artifact_path": str(artifact_path), "artifact_hash": __import__('hashlib').sha256(b"fixture").hexdigest(),
+                "contract": contract, "_artifact": {"model": object(), "feature_cols": ["x"], "target_col": "Tg", "extra": {}}}
+    monkeypatch.setattr("core.prediction_portal.validate_publication_artifact", lambda *args, **kwargs: {"ok": True, "status": "valid", "errors": []})
+    first, second = release("v1"), release("v2")
 
     activate_publication(config, material_key="epoxy_resin", target_key="tg", entry=first)
     activate_publication(config, material_key="epoxy_resin", target_key="tg", entry=second)
@@ -185,14 +241,14 @@ def test_activation_creates_missing_config_path_and_copies_entries():
         metrics={"r2": 0.9},
         version="v1",
         published_at="2026-08-19T00:00:00Z",
+        publication_status="published",
+        enabled=True,
+        gate_report={"ok": True, "status": "valid", "errors": []},
     )
 
-    updated = activate_publication(config, material_key="epoxy_resin", target_key="tg", entry=entry)
-
-    assert updated is config
-    assert updated["materials"]["epoxy_resin"]["targets"]["tg"]["models"] == [entry]
-    assert entry["enabled"] is True
-    assert entry["publication_status"] == "published"
+    with pytest.raises(ValueError, match="artifact|contract"):
+        activate_publication(config, material_key="epoxy_resin", target_key="tg", entry=entry)
+    assert config == {}
 
 
 def test_rollback_rejects_unknown_version():
@@ -206,7 +262,7 @@ def test_portal_health_and_active_release_selection():
     assert portal_health_label(True) == "可访问"
     assert portal_health_label(False) == "未启动"
     assert select_active_publication(
-        [{"id": "v1", "enabled": False}, {"id": "v2", "enabled": True}]
+            [{"id": "v1", "enabled": False, "publication_status": "published", "gate_report": {"ok": True, "status": "valid"}}, {"id": "v2", "enabled": True, "publication_status": "published", "gate_report": {"ok": True, "status": "valid"}}]
     )["id"] == "v2"
 
 
@@ -216,9 +272,15 @@ def test_portal_port_probe_returns_false_for_unused_local_port():
 
 
 def test_publication_gate_accepts_only_valid_contract_report():
-    assert should_show_publication({"ok": True}) is True
+    assert should_show_publication({"ok": True}) is False
+    assert should_show_publication({"ok": True, "status": "valid"}) is True
     assert should_show_publication({"ok": False}) is False
     assert should_show_publication({"ok": True, "status": "needs_validation"}) is False
+
+
+def test_active_publication_requires_valid_gate_report():
+    assert select_active_publication([{"id": "v1", "enabled": True, "publication_status": "published"}]) is None
+    assert select_active_publication([{"id": "v1", "enabled": True, "publication_status": "published", "gate_report": {"ok": True, "status": "valid"}}])["id"] == "v1"
 
 
 def _molecular_contract(**overrides):
@@ -477,7 +539,7 @@ def test_rollback_unknown_version_does_not_change_active_release():
 def test_multiple_enabled_releases_are_rejected_instead_of_first_match():
     with pytest.raises(ValueError, match="multiple|多个"):
         select_active_publication(
-            [{"id": "v1", "enabled": True}, {"id": "v2", "enabled": True}]
+            [{"id": "v1", "enabled": True, "publication_status": "published", "gate_report": {"ok": True, "status": "valid"}}, {"id": "v2", "enabled": True, "publication_status": "published", "gate_report": {"ok": True, "status": "valid"}}]
         )
 
 

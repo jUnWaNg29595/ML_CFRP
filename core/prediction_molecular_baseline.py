@@ -8,6 +8,22 @@ from typing import Any
 import pandas as pd
 
 
+def _is_missing_scalar(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(missing, bool):
+        return missing
+    if type(missing).__name__ == "bool_":
+        return bool(missing)
+    return False
+
+
 def _ordered_step_ids(workflow: Mapping[str, Any]) -> list[str]:
     steps = workflow.get("steps") or []
     by_id = {
@@ -127,11 +143,9 @@ def validate_single_row_source_values(
             missing_columns.append(column)
             continue
         value = source_frame.iloc[0][column]
-        if value is None or (isinstance(value, float) and pd.isna(value)):
+        if _is_missing_scalar(value):
             empty_columns.append(column)
             continue
-        if isinstance(value, str) and not value.strip():
-            empty_columns.append(column)
 
     return {
         "ok": not missing_columns and not empty_columns,

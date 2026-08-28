@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import threading
@@ -124,6 +125,7 @@ class PortalTaskManager:
         self._cancel_events: dict[str, threading.Event] = {}
         self._futures: dict[str, Future[Any]] = {}
         self._snapshots: dict[str, dict[str, Any]] = {}
+        self._runtime_requests: dict[str, Mapping[str, Any]] = {}
         self._owns_executor = executor is None
         self._executor = executor or ThreadPoolExecutor(max_workers=2, thread_name_prefix="portal-task")
         self._load_snapshots()
@@ -212,12 +214,16 @@ class PortalTaskManager:
         if not isinstance(request, Mapping):
             raise ValueError("task request must be an object")
         task_id = uuid.uuid4().hex
+        request_payload = _jsonable(request)
+        request_hash = hashlib.sha256(json.dumps(request_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        request_summary = request_payload if isinstance(request_payload, Mapping) else {}
         snapshot = {
             "task_id": task_id,
             "status": "queued",
             "progress": 0,
             "stage": "queued",
-            "request": _jsonable(request),
+            "request_summary_hash": request_hash,
+            "request_fields": sorted(str(key) for key in request_summary.keys()),
             "result": None,
             "explanation": None,
             "explanation_error": "",
@@ -227,6 +233,7 @@ class PortalTaskManager:
         }
         with self._lock:
             self._snapshots[task_id] = snapshot
+            self._runtime_requests[task_id] = dict(request)
             self._cancel_events[task_id] = threading.Event()
             self._condition(task_id)
             self._persist(snapshot)
@@ -256,7 +263,9 @@ class PortalTaskManager:
         try:
             self._publish(task_id, status="validating", stage="validation", progress=5)
             self._check_cancelled(task_id)
-            envelope = self._snapshots[task_id]["request"]
+            envelope = self._runtime_requests.get(task_id)
+            if not isinstance(envelope, Mapping):
+                raise ValueError("任务快照不包含可重放的原始请求，请由用户重新提交输入。")
             prediction_request, config = self._split_request(envelope)
             result = run_confirmed_prediction(
                 prediction_request,
@@ -321,11 +330,13 @@ class PortalTaskManager:
                 )
             return snapshot
 
-    def retry_task(self, task_id: str) -> str:
+    def retry_task(self, task_id: str, request: Mapping[str, Any] | None = None) -> str:
         snapshot = self.get_task_snapshot(task_id)
         if snapshot.get("status") not in {"failed", "cancelled"}:
             raise ValueError("只有失败或取消的任务可以重试。")
-        return self.create_task(snapshot["request"])
+        if not isinstance(request, Mapping):
+            raise ValueError("重试任务必须由用户重新提交原始输入。")
+        return self.create_task(request)
 
     def wait_for_task(self, task_id: str, timeout: float | None = None) -> dict[str, Any]:
         with self._lock:

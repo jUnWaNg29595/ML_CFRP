@@ -50,6 +50,9 @@ def render_feature_registry_page(
     for binding in manifest.get("feature_bindings", []) if isinstance(manifest.get("feature_bindings"), list) else []:
         if not isinstance(binding, Mapping):
             continue
+        binding_status = str(binding.get("review_status") or "pending_review")
+        if binding_status != status_filter:
+            continue
         rows.append({
             "原始列": ", ".join(map(str, binding.get("raw_columns") or [])),
             "feature_id": binding.get("feature_id", ""),
@@ -76,6 +79,13 @@ def render_feature_registry_page(
             with action_cols[2]:
                 reject = st.button("拒绝", key=f"feature_review_reject_{index}", disabled=not bool(reviewer))
             action = "accept" if accept else "edit_accept" if edit_accept else "reject" if reject else None
+            edited = None
+            if edit_accept:
+                edited = {
+                    "raw_columns": st.text_input("编辑原始列", value=", ".join(map(str, suggestion.get("raw_columns") or [])), key=f"feature_review_raw_{index}"),
+                    "source_role": st.selectbox("编辑来源", ["manual_input", "molecular_workflow", "derived_workflow"], index=(["manual_input", "molecular_workflow", "derived_workflow"].index(str(suggestion.get("source_role") or "manual_input")) if str(suggestion.get("source_role") or "manual_input") in {"manual_input", "molecular_workflow", "derived_workflow"} else 0), key=f"feature_review_role_{index}"),
+                    "unit": st.text_input("编辑单位", value=str(suggestion.get("unit") or ""), key=f"feature_review_unit_{index}"),
+                }
             if action:
                 event = {
                     "event": "local_decision",
@@ -85,7 +95,7 @@ def render_feature_registry_page(
                     "suggestion": dict(suggestion),
                 }
                 try:
-                    updated = apply_feature_review_decision(manifest, suggestion, action, reviewer)
+                    updated = apply_feature_review_decision(manifest, suggestion, action, reviewer, registry=registry, edited=edited, profile_id=profile_id)
                     st.session_state["feature_mapping_manifest"] = updated
                     event["status"] = "applied"
                     st.success("已记录本地审核动作；AI 建议不会自动写入登记库。")

@@ -16,6 +16,7 @@ from .portal_ai_schema import (
     AIParseResponse,
     parse_ai_response,
     sanitize_ai_context,
+    parse_feature_mapping_response,
 )
 
 
@@ -66,6 +67,8 @@ _SYSTEM_PROMPT = (
 )
 _INPUT_PROMPT = (
     "Extract only material and prediction inputs from the supplied context. "
+    "Never invent numeric values or workflow features; only echo values explicitly present in user_text, "
+    "and leave absent/uncertain fields null. "
     "Use null for uncertain values and include recognized_fields, suggestions, missing_fields, "
     "warnings, assumptions, and confidence when useful."
 )
@@ -73,20 +76,32 @@ _EXPLANATION_PROMPT = (
     "Explain the supplied prediction result for a technical user. Return an object with "
     "summary, experiment_suggestions, and warnings. Do not invent unavailable measurements."
 )
+_FEATURE_REVIEW_PROMPT = (
+    "Review only raw-column to semantic-feature mappings. Return JSON with suggestions, conflicts, "
+    "rationale_zh, and confidence. Do not generate feature values, approve anything, or infer "
+    "missing measurements. Keep uncertain mappings pending_review."
+)
 
 
 def _safe_error(error_type: type[PortalAIError], *, status_code: int | None = None) -> PortalAIError:
+    suffix = f"（HTTP {status_code}）" if status_code is not None else ""
     if issubclass(error_type, PortalAIAuthError):
-        return PortalAIAuthError("AI service authentication failed", status_code=status_code)
+        return PortalAIAuthError(f"AI 服务认证失败{suffix}，请检查 API Key。", status_code=status_code)
     if issubclass(error_type, PortalAIAccessError):
-        return PortalAIAccessError("AI service access was denied", status_code=status_code)
+        return PortalAIAccessError(f"AI 服务拒绝访问{suffix}，请检查账号权限或模型权限。", status_code=status_code)
     if issubclass(error_type, PortalAITransientError):
-        return PortalAITransientError("AI service is temporarily unavailable", status_code=status_code)
+        if status_code is not None and status_code >= 500:
+            message = f"AI 上游网关暂时不可用{suffix}，模型列表正常但聊天接口失败，请联系 API 服务商。"
+        elif status_code == 429:
+            message = f"AI 服务请求过于频繁{suffix}，请稍后重试。"
+        else:
+            message = f"AI 服务暂时不可用{suffix}，请检查网络或服务状态。"
+        return PortalAITransientError(message, status_code=status_code)
     if issubclass(error_type, PortalAIHTTPError):
-        return PortalAIHTTPError("AI service request failed", status_code=status_code)
+        return PortalAIHTTPError(f"AI 服务请求失败{suffix}。", status_code=status_code)
     if issubclass(error_type, PortalAIParseError):
-        return PortalAIParseError("AI service returned an invalid JSON response")
-    return PortalAIError("AI service request failed")
+        return PortalAIParseError("AI 服务返回了无效 JSON。")
+    return PortalAIError("AI 服务请求失败。")
 
 
 def parse_chat_completion(payload: object) -> str:
@@ -157,6 +172,46 @@ def _bounded_temperature(value: object) -> float:
         return 0.2
 
 
+def list_models(config: AIServiceConfig, *, timeout: int | None = None) -> list[dict[str, object]]:
+    """Fetch selectable models from an OpenAI-compatible endpoint without using a proxy."""
+    api_key = config.api_key
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise PortalAIAuthError("AI service authentication failed")
+    request = urllib.request.Request(
+        config.base_url.rstrip("/") + "/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with _direct_opener().open(request, timeout=timeout or _bounded_timeout(config.timeout_seconds)) as response:
+            payload = json_module.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise PortalAIAuthError(status_code=exc.code) from exc
+        if exc.code == 403:
+            raise PortalAIAccessError(status_code=exc.code) from exc
+        if exc.code in _TRANSIENT_STATUS_CODES or exc.code >= 500:
+            raise PortalAITransientError(status_code=exc.code) from exc
+        raise PortalAIHTTPError(status_code=exc.code) from exc
+    except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError) as exc:
+        raise PortalAITransientError() from exc
+    except (UnicodeError, json_module.JSONDecodeError) as exc:
+        raise PortalAIParseError("AI service returned an invalid models response") from exc
+
+    raw_models = payload.get("data") if isinstance(payload, Mapping) else None
+    if not isinstance(raw_models, list):
+        raise PortalAIParseError("AI service returned an invalid models response")
+    models = []
+    for item in raw_models:
+        if not isinstance(item, Mapping) or not isinstance(item.get("id"), str) or not item["id"].strip():
+            continue
+        models.append({"id": item["id"].strip(), "owned_by": str(item.get("owned_by") or "")[:120]})
+    return sorted(models, key=lambda item: str(item["id"]).lower())
+
+
 def _string_list(value: object) -> list[str]:
     if value is None:
         return []
@@ -215,6 +270,11 @@ def _response_payload(value: object) -> object:
     return value
 
 
+def _direct_opener() -> urllib.request.OpenerDirector:
+    """Open AI endpoints directly, independently of the shared data proxy."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _http_transport(
     *,
     method: str = "POST",
@@ -230,7 +290,7 @@ def _http_transport(
         method=method,
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _direct_opener().open(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         status_code = exc.code
@@ -344,6 +404,16 @@ class PortalAIClient:
         except ValueError as exc:
             raise PortalAIParseError("AI service returned an invalid JSON response") from exc
 
+    def review_feature_mapping(self, context: object) -> dict[str, object]:
+        """Return bounded mapping suggestions; this method never approves or writes a registry."""
+        try:
+            payload = self._complete_json(_FEATURE_REVIEW_PROMPT, sanitize_ai_context(context))
+            return parse_feature_mapping_response(payload)
+        except PortalAIError:
+            raise
+        except ValueError as exc:
+            raise PortalAIParseError("AI 服务返回了无效特征审核 JSON。") from exc
+
 
 __all__ = [
     "PortalAIError",
@@ -357,6 +427,7 @@ __all__ = [
     "PortalAIRequestError",
     "PortalAIRateLimitError",
     "PortalAIClient",
+    "list_models",
     "parse_chat_completion",
     "parse_json_or_markdown_json",
 ]

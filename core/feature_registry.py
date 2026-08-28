@@ -213,4 +213,11 @@ def build_registry_snapshot(registry: Mapping[str, Any], profile_id: str) -> dic
         if definitions[feature_id].get("status") != "approved":
             raise ValueError(f"model profile references non-approved feature: {feature_id}")
         selected.append(copy.deepcopy(dict(definitions[feature_id])))
-    return {"schema_version": registry.get("schema_version"), "registry_version": registry.get("registry_version"), "registry_hash": compute_registry_hash(registry), "profile_id": profile_id, "model_profile": profile, "features": selected}
+    # Keep the complete semantic registry alongside the selected compact view.
+    # The parent hash is independently verifiable by consumers without access
+    # to the source registry, so changing the hash and contract together cannot
+    # turn an altered definition into a valid publication.
+    snapshot = {"schema_version": registry.get("schema_version"), "registry_version": registry.get("registry_version"), "registry_hash": compute_registry_hash(registry), "registry_payload": copy.deepcopy(dict(registry)), "profile_id": profile_id, "model_profile": profile, "features": selected}
+    selected_payload = {"profile_id": profile_id, "model_profile": profile, "features": selected}
+    snapshot["selected_features_hash"] = hashlib.sha256(json.dumps(selected_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return snapshot

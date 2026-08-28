@@ -17,7 +17,8 @@ NAVIGATION_GROUPS = (
         (
             "🧬 分子特征",
             "🧬 分子特征复现",
-            "🖼️ 图像转SMILES",
+            "🧩 特征管理",
+            "🧪 SMILES / BigSMILES 结构图像工具",
             "🎯 特征选择",
         ),
     ),
@@ -62,7 +63,9 @@ NAVIGATION_ALIASES.update(
     {
         "首页": "🏠 首页",
         "分子特征复现": "🧬 分子特征复现",
-        "图像转SMILES": "🖼️ 图像转SMILES",
+        "特征管理": "🧩 特征管理",
+        "图像转SMILES": "🧪 SMILES / BigSMILES 结构图像工具",
+        "🖼️ 图像转SMILES": "🧪 SMILES / BigSMILES 结构图像工具",
         "超参优化": "⚙️ 超参优化",
         "主动学习": "🧠 主动学习",
         "预测应用": "🔮 预测应用",

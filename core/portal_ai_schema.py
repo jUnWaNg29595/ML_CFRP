@@ -372,3 +372,64 @@ def sanitize_ai_context(value: object) -> dict[str, object]:
         return {}
     sanitized = _sanitize_value(value)
     return sanitized if isinstance(sanitized, dict) else {}
+
+
+def parse_feature_mapping_response(value: object) -> dict[str, object]:
+    """Validate the narrow AI response used by feature mapping review."""
+    if not isinstance(value, Mapping):
+        raise ValueError("feature review response must be an object")
+    suggestions = value.get("suggestions", [])
+    conflicts = value.get("conflicts", [])
+    if not isinstance(suggestions, list) or not isinstance(conflicts, list):
+        raise ValueError("feature review suggestions/conflicts must be lists")
+    allowed_roles = {"molecular_workflow", "derived_workflow", "manual_input", "target", "metadata", "unknown"}
+    allowed_statuses = {"pending_review", "conflict", "unknown"}
+    normalized: list[dict[str, object]] = []
+    for item in suggestions:
+        if not isinstance(item, Mapping):
+            raise ValueError("feature review suggestions must contain objects")
+        feature_id = item.get("feature_id")
+        raw_columns = item.get("raw_columns", [])
+        source_role = item.get("source_role", "")
+        if not isinstance(feature_id, str) or not feature_id.strip():
+            raise ValueError("feature review feature_id is required")
+        if not isinstance(raw_columns, list) or any(not isinstance(column, str) or not column.strip() for column in raw_columns):
+            raise ValueError("feature review raw_columns must be a list of strings")
+        if not isinstance(source_role, str) or source_role.strip() not in allowed_roles:
+            raise ValueError("feature review source_role is invalid")
+        confidence = _validate_confidence(item.get("confidence"), label="feature review confidence")
+        rationale = item.get("rationale_zh", "")
+        if not isinstance(rationale, str):
+            raise ValueError("feature review rationale_zh must be a string")
+        status = item.get("status", "pending_review")
+        if not isinstance(status, str) or status.strip() not in allowed_statuses:
+            raise ValueError("feature review status is invalid")
+        unit = item.get("unit")
+        if unit is not None and (not isinstance(unit, str) or not unit.strip()):
+            raise ValueError("feature review unit must be a non-empty string or null")
+        if not rationale.strip() and status.strip() not in {"pending_review", "unknown", "conflict"}:
+            raise ValueError("feature review suggestion requires evidence or explicit pending/unknown semantics")
+        if not raw_columns and status.strip() not in {"pending_review", "unknown", "conflict"}:
+            raise ValueError("feature review suggestion requires raw-column evidence")
+        normalized.append({
+            "feature_id": feature_id.strip(),
+            "raw_columns": [column.strip() for column in raw_columns],
+            "source_role": source_role.strip(),
+            "confidence": confidence,
+            "rationale_zh": rationale[:MAX_TEXT_LENGTH],
+            "unit": unit.strip()[:120] if isinstance(unit, str) else None,
+            "status": status.strip(),
+        })
+    if any(not isinstance(item, str) or not item.strip() for item in conflicts):
+        raise ValueError("feature review conflicts must contain non-empty strings")
+    normalized_conflicts = [str(item).strip() for item in conflicts]
+    rationale = value.get("rationale_zh", "")
+    if rationale is not None and not isinstance(rationale, str):
+        raise ValueError("feature review rationale_zh must be a string")
+    confidence = _validate_confidence(value.get("confidence"), label="feature review confidence")
+    return {
+        "suggestions": normalized,
+        "conflicts": normalized_conflicts,
+        "rationale_zh": (rationale or "")[:MAX_TEXT_LENGTH],
+        "confidence": confidence,
+    }

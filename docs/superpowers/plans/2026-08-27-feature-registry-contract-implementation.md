@@ -857,6 +857,8 @@ Expected: FAIL，直到 registry、manifest、contract 和 artifact 互相引用
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests -q`
 Expected: PASS；若环境中存在可选依赖缺失，必须单独记录失败测试和原因，不得把未运行说成通过。另运行 `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m compileall core scripts UserPrediction.py app.py`，Expected: 无语法错误。
 
+当前核实结果：聚焦验收测试 62/65 passed，端到端验收 1 passed；全量 `pytest tests -q` 为 555 passed、5 failed。因全量测试仍有失败，Step 4 保持未完成并阻断最终验收，不能勾选为已完成。
+
 - [x] **Step 5: 最终提交和交付审查**
 
 ```powershell
