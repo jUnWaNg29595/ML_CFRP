@@ -1073,7 +1073,13 @@ from core.data_explore_export import (
     resolve_data_source,
     sanitize_preview_columns,
 )
-from core.model_trainer import EnhancedModelTrainer, AutoGluonWrapper, GRAPH_MODEL_NAMES, CLASSIFICATION_MODEL_NAMES  # 确保引入 Wrapper
+from core.model_trainer import (
+    EnhancedModelTrainer,
+    AutoGluonWrapper,
+    GRAPH_MODEL_NAMES,
+    RAW_FRAME_MODEL_NAMES,
+    CLASSIFICATION_MODEL_NAMES,
+)  # 确保引入 Wrapper
 # 延迟导入 model_interpreter 以避免 SHAP 兼容性问题
 try:
     from core.model_interpreter import (
@@ -1120,7 +1126,12 @@ from core.post_feature_mapping import (
     validate_mapping_for_prediction,
 )
 from core.prediction_contract import resolve_prediction_feature_contract
-from core.training_contract import lock_training_contract, assert_training_context, audit_training_result
+from core.training_contract import (
+    lock_training_contract,
+    assert_training_context,
+    audit_training_result,
+    select_training_context_for_model,
+)
 from core.prediction_molecular_baseline import (
     build_single_row_source_frame,
     collect_workflow_source_columns,
@@ -13372,7 +13383,7 @@ def page_model_training():
     col1, col2 = st.columns([1, 2])
     smiles_col = None
     smiles_aware_models = set(GRAPH_MODEL_NAMES) | {"GNN + Transformer Fusion"}
-    raw_frame_models = {"Epoxy PINN (Physics-Informed)", "Transformer + PINN", "GNN + Transformer Fusion"}
+    raw_frame_models = set(RAW_FRAME_MODEL_NAMES) | {"Epoxy PINN (Physics-Informed)"}
     pinn_like_models = {"Epoxy PINN (Physics-Informed)", "Transformer + PINN"}
 
     with col1:
@@ -14374,6 +14385,14 @@ def page_model_training():
                             return
                         X_model = df[raw_cols].copy()
 
+                    model_training_context = select_training_context_for_model(
+                        training_feature_contract_context,
+                        model_name,
+                        getattr(X_model, "columns", []),
+                        graph_model_names=GRAPH_MODEL_NAMES,
+                        raw_frame_model_names=raw_frame_models,
+                    )
+
                     # 训练（支持 split_strategy / n_bins / groups）
                     print(f"[DEBUG APP] About to call trainer.train_model...")
                     import sys
@@ -14403,7 +14422,7 @@ def page_model_training():
                             balance_max_weight=float(balance_max_weight),
                             process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
                             use_process_pls=use_process_pls_for_training,
-                            feature_contract_context=training_feature_contract_context,
+                            feature_contract_context=model_training_context,
                             **params
                         )
                     finally:
@@ -14487,7 +14506,7 @@ def page_model_training():
                             balance_max_weight=float(balance_max_weight),
                             process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
                             use_process_pls=use_process_pls_for_training,
-                            feature_contract_context=training_feature_contract_context,
+                            feature_contract_context=model_training_context,
                             **params
                         )
 
