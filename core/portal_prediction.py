@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Mapping, Sequence
@@ -18,6 +19,7 @@ from .prediction_molecular_baseline import (
     collect_workflow_source_columns,
     validate_single_row_source_values,
 )
+from .molecular_feature_workflow import materialize_workflow_source_columns
 from .prediction_portal import validate_publication_artifact
 
 _CONFIRMATION_KEYS = ('confirmed_by_user', 'user_confirmed', 'confirmed')
@@ -74,7 +76,11 @@ def _contract(entry: Mapping[str, Any], artifact: Mapping[str, Any] | None = Non
 
 
 def _source_columns(contract: Mapping[str, Any], workflow: Mapping[str, Any] | None) -> list[dict[str, Any]]:
-    declared = contract.get('source_columns') or contract.get('workflow_source_columns')
+    declared = (
+        contract.get('workflow_source_fields')
+        or contract.get('source_columns')
+        or contract.get('workflow_source_columns')
+    )
     if isinstance(declared, list) and all(isinstance(item, Mapping) for item in declared):
         return [dict(item) for item in declared if _text(item.get('column'))]
     return collect_workflow_source_columns(workflow)
@@ -110,6 +116,21 @@ def _load_artifact(entry: Mapping[str, Any], config: Mapping[str, Any] | None = 
     return dict(artifact)
 
 
+def _verify_artifact_file_hash(entry: Mapping[str, Any], config: Mapping[str, Any]) -> Path | None:
+    """Require and verify the immutable artifact path/hash for published releases."""
+    path_value = _text(entry.get('artifact_path'))
+    expected = _text(entry.get('artifact_hash')).lower()
+    if not path_value or not expected:
+        raise ValueError('已发布模型缺少 artifact_path 或 artifact_hash。')
+    path = _artifact_path(entry, config)
+    if not path.is_file():
+        raise ValueError(f'已发布模型文件不存在：{path}')
+    digest = hashlib.sha256(path.read_bytes()).hexdigest().lower()
+    if digest != expected:
+        raise ValueError('已发布模型 artifact_hash 校验失败，文件可能已被替换。')
+    return path
+
+
 def _validate_contract_shape(contract: Mapping[str, Any], artifact: Mapping[str, Any], entry: Mapping[str, Any]) -> list[str]:
     errors: list[str] = []
     features = contract.get('feature_cols')
@@ -143,10 +164,18 @@ def load_published_portal_model(config: Mapping[str, Any], material_type: str, t
     entry = enabled[0]
     if _text(entry.get('publication_status')).lower() != 'published':
         raise ValueError('当前模型不是已发布版本，不能用于门户预测。')
+    gate_report = entry.get('gate_report')
+    if (
+        not isinstance(gate_report, Mapping)
+        or gate_report.get('ok') is not True
+        or _text(gate_report.get('status')).lower() != 'valid'
+    ):
+        raise ValueError('当前模型缺少成功的发布门禁报告，需要验证后才能用于门户预测。')
     if entry.get('needs_validation') is True or _text(entry.get('status')).lower() in {'needs_validation', 'ambiguous', 'disabled'}:
         raise ValueError('当前模型仍需验证，不能用于门户预测。')
     load_entry = dict(entry)
     load_entry['_portal_config'] = config
+    _verify_artifact_file_hash(load_entry, config)
     try:
         artifact = _load_artifact(load_entry)
     except TypeError as exc:
@@ -228,13 +257,33 @@ def _structure_error(value: Any) -> str | None:
     return None
 
 
+def _is_missing_scalar(value: Any) -> bool:
+    """Return missingness for scalar values without ambiguous array truth tests."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(missing, (bool, np.bool_)) and bool(missing)
+
+
+def _source_is_required(item: Mapping[str, Any]) -> bool:
+    return bool(item.get("required", not bool(item.get("nullable", False)))) and not bool(item.get("nullable", False))
+
+
 def _validate_structure_columns(frame: pd.DataFrame, source_columns: list[dict[str, Any]]) -> list[str]:
     errors: list[str] = []
     for item in source_columns:
         column = _text(item.get('column'))
         if not column or column not in frame.columns:
             continue
+        optional = not _source_is_required(item)
         for index, value in frame[column].items():
+            if optional and _is_missing_scalar(value):
+                continue
             error = _structure_error(value)
             if error:
                 errors.append(f'{column}[{index}] {error}')
@@ -243,7 +292,18 @@ def _validate_structure_columns(frame: pd.DataFrame, source_columns: list[dict[s
 
 def _unknown_input_columns(frame: pd.DataFrame, contract: Mapping[str, Any], workflow: Mapping[str, Any] | None) -> list[str]:
     allowed = set(_text(item) for item in contract.get('feature_cols') or [])
-    allowed.update(item['column'] for item in _source_columns(contract, workflow) if _text(item.get('column')))
+    source_names = [
+        str(item['column'])
+        for item in _source_columns(contract, workflow)
+        if _text(item.get('column'))
+    ]
+    allowed.update(source_names)
+    for item in _source_columns(contract, workflow):
+        aliases = item.get('aliases') or item.get('accepted_aliases') or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        if isinstance(aliases, Sequence):
+            allowed.update(str(alias).strip() for alias in aliases if _text(alias))
     return [str(column) for column in frame.columns if str(column) not in allowed]
 
 
@@ -266,6 +326,123 @@ def _validate_numeric_frame(frame: pd.DataFrame, columns: Sequence[str], ranges:
                 continue
             if ((values < minimum) | (values > maximum)).any():
                 errors.append(f'模型特征列 {column} 超出发布训练范围 [{minimum}, {maximum}]。')
+    return errors
+
+
+def _workflow_feature_names(workflow: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(workflow, Mapping):
+        return []
+    return [
+        str(name)
+        for name in workflow.get('final_feature_names') or []
+        if _text(name)
+    ]
+
+
+def _explicit_model_feature_names(
+    contract: Mapping[str, Any],
+    workflow: Mapping[str, Any] | None,
+) -> list[str]:
+    declared_manual = [
+        str(name) for name in contract.get('manual_input_feature_cols') or []
+        if _text(name)
+    ]
+    if declared_manual:
+        return declared_manual
+    workflow_names = set(_workflow_feature_names(workflow))
+    return [
+        str(name)
+        for name in contract.get('feature_cols') or []
+        if _text(name) and str(name) not in workflow_names
+    ]
+
+
+def _merge_explicit_model_features(
+    generated: pd.DataFrame,
+    inputs: pd.DataFrame,
+    contract: Mapping[str, Any],
+    workflow: Mapping[str, Any] | None,
+) -> pd.DataFrame:
+    """Merge user-declared non-workflow features without manufacturing values."""
+    explicit_names = _explicit_model_feature_names(contract, workflow)
+    if not explicit_names:
+        return generated
+    missing = [name for name in explicit_names if name not in inputs.columns]
+    if missing:
+        raise ValueError(
+            '模型需要显式工艺/实验特征，当前输入缺少：' + ', '.join(missing)
+            + '。请填写这些字段，或重新训练并发布包含完整特征工作流的模型。'
+        )
+    explicit = inputs.loc[:, explicit_names].reset_index(drop=True)
+    merged = generated.reset_index(drop=True).copy()
+    for name in explicit_names:
+        if name in merged.columns:
+            raise ValueError(f'模型特征列 {name} 同时由 workflow 和输入提供，来源存在歧义。')
+        merged[name] = explicit[name].to_numpy()
+    return merged
+
+
+def _manual_feature_definitions(contract: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    definitions: dict[str, Mapping[str, Any]] = {}
+    for item in contract.get('feature_definitions') or []:
+        if isinstance(item, Mapping) and _text(item.get('name')):
+            definitions[str(item['name'])] = item
+    return definitions
+
+
+def _validate_manual_inputs(frame: pd.DataFrame, contract: Mapping[str, Any]) -> list[str]:
+    """Validate only user-editable contract fields; never manufacture defaults."""
+    names = [str(name) for name in contract.get('manual_input_feature_cols') or [] if _text(name)]
+    if not names:
+        return []
+    definitions = _manual_feature_definitions(contract)
+    ranges = contract.get('numeric_ranges') or {}
+    enums = contract.get('enum_values') or contract.get('categorical_values') or {}
+    errors: list[str] = []
+    for name in names:
+        definition = definitions.get(name, {})
+        if definition.get('source_type') != 'manual_input':
+            errors.append(f'手工特征 {name} 的 source_type 必须是 manual_input。')
+        if definition.get('status') != 'approved':
+            errors.append(f'手工特征 {name} 尚未获得 approved registry 状态。')
+        if definition.get('default_policy') != 'explicit_only':
+            errors.append(f'手工特征 {name} 的 default_policy 必须是 explicit_only。')
+        required = bool(definition.get('required_for_prediction', True))
+        nullable = bool(definition.get('nullable', False))
+        if name not in frame.columns:
+            if required and not nullable:
+                errors.append(f'缺少必填手工特征：{name}')
+            continue
+        series = frame[name]
+        missing = series.isna() | series.map(lambda value: isinstance(value, str) and not value.strip())
+        if missing.any() and required and not nullable:
+            errors.append(f'手工特征 {name} 不能为空。')
+            continue
+        data_type = str(definition.get('data_type') or '').lower()
+        if data_type in {'float', 'number', 'integer', 'int'}:
+            values = pd.to_numeric(series, errors='coerce')
+            valid = ~missing
+            if valid.any() and values.loc[valid].isna().any():
+                errors.append(f'手工特征 {name} 必须是有限数值。')
+                continue
+            if valid.any() and not np.isfinite(values.loc[valid].to_numpy(dtype=float)).all():
+                errors.append(f'手工特征 {name} 必须是有限数值。')
+                continue
+            bounds = ranges.get(name) if isinstance(ranges, Mapping) else definition.get('valid_range')
+            if isinstance(bounds, Mapping) and valid.any():
+                try:
+                    lower, upper = float(bounds['min']), float(bounds['max'])
+                except (KeyError, TypeError, ValueError):
+                    errors.append(f'手工特征 {name} 的数值范围契约无效。')
+                else:
+                    if ((values.loc[valid] < lower) | (values.loc[valid] > upper)).any():
+                        errors.append(f'手工特征 {name} 超出允许范围 [{lower}, {upper}]。')
+        allowed = enums.get(name) if isinstance(enums, Mapping) else definition.get('enum_values')
+        if allowed and name in frame.columns:
+            allowed_set = {str(value) for value in allowed}
+            invalid = [str(value) for value in series[~missing].tolist() if str(value) not in allowed_set]
+            if invalid:
+                errors.append(f'手工特征 {name} 包含未映射枚举值：{invalid[0]}')
     return errors
 
 
@@ -297,30 +474,58 @@ def validate_prediction_request(request: Mapping[str, Any], config: Mapping[str,
     try:
         frame = _as_frame(_input_payload(request))
     except Exception as exc:
+        payload = _input_payload(request)
+        manual_names = [str(name) for name in contract.get('manual_input_feature_cols') or [] if _text(name)]
+        if isinstance(payload, Mapping) and not payload and manual_names:
+            return errors + [f'缺少必填手工特征：{", ".join(manual_names)}']
         return errors + [str(exc)]
+    errors.extend(_validate_manual_inputs(frame, contract))
     unknown_columns = _unknown_input_columns(frame, contract, workflow)
     if unknown_columns:
         errors.append('inputs 包含未知列：' + ', '.join(unknown_columns))
     sources = _source_columns(contract, workflow)
     if sources:
         source_names = [str(item.get('column')) for item in sources if _text(item.get('column'))]
+        resin_columns = [column for column in source_names if column.lower().startswith(('resin_smiles_', 'resin_smiles'))]
+        hardener_columns = [column for column in source_names if column.lower().startswith(('curing_agent_smiles_', 'curing_agent_smiles', 'hardener_smiles_'))]
+        frame = materialize_workflow_source_columns(
+            frame,
+            resin_columns=resin_columns,
+            hardener_columns=hardener_columns,
+        )
         missing_columns = [column for column in source_names if column not in frame.columns]
-        if missing_columns:
-            errors.append('缺少分子源列：' + ', '.join(missing_columns))
+        required_missing = [column for column in missing_columns
+                            if next((_source_is_required(item) for item in sources if str(item.get('column')) == column), True)]
+        if required_missing:
+            errors.append('缺少分子源列：' + ', '.join(required_missing))
         source_report = validate_single_row_source_values(frame.iloc[[0]], sources)
         if len(frame) > 1:
             source_report['empty_columns'] = [
                 column
                 for column in source_names
                 if column in frame.columns and frame[column].map(
-                    lambda value: value is None
-                    or (isinstance(value, float) and pd.isna(value))
-                    or (isinstance(value, str) and not value.strip())
+                    _is_missing_scalar
                 ).any()
             ]
-        if source_report['empty_columns']:
-            errors.append('分子源列不能为空：' + ', '.join(source_report['empty_columns']))
+        required_empty = [column for column in source_report['empty_columns']
+                          if next((_source_is_required(item) for item in sources if str(item.get('column')) == column), True)]
+        if required_empty:
+            errors.append('分子源列不能为空：' + ', '.join(required_empty))
         errors.extend(_validate_structure_columns(frame, sources))
+        explicit_names = _explicit_model_feature_names(contract, workflow)
+        missing_explicit = [name for name in explicit_names if name not in frame.columns]
+        if missing_explicit:
+            errors.append(
+                '缺少模型要求的显式工艺/实验特征：' + ', '.join(missing_explicit)
+            )
+        else:
+            errors.extend(
+                _validate_numeric_frame(
+                    frame,
+                    explicit_names,
+                    contract.get('numeric_ranges') or {},
+                )
+            )
     else:
         errors.extend(_validate_numeric_frame(frame, contract.get('feature_cols') or [], contract.get('numeric_ranges') or {}))
     return errors
@@ -362,10 +567,23 @@ def run_confirmed_prediction(
     material, target = _material_target(request)
     bundle = load_published_portal_model(config, material, target)
     entry, artifact, contract = bundle['entry'], bundle['artifact'], bundle['contract']
-    frame = _as_frame(_input_payload(request))
     extra = _mapping(artifact.get('extra'))
     workflow = _mapping(extra.get('molecular_feature_workflow'))
+    frame = _as_frame(_input_payload(request))
+    sources = _source_columns(contract, workflow)
+    if sources:
+        source_names = [str(item.get('column')) for item in sources if _text(item.get('column'))]
+        resin_columns = [column for column in source_names if column.lower().startswith(('resin_smiles_', 'resin_smiles'))]
+        hardener_columns = [column for column in source_names if column.lower().startswith(('curing_agent_smiles_', 'curing_agent_smiles', 'hardener_smiles_'))]
+        frame = materialize_workflow_source_columns(
+            frame,
+            resin_columns=resin_columns,
+            hardener_columns=hardener_columns,
+            )
     warnings: list[str] = []
+    manual_errors = _validate_manual_inputs(frame, contract)
+    if manual_errors:
+        raise ValueError('预测请求中的手工特征未通过校验：' + '；'.join(manual_errors))
     _progress(progress, 'validated', rows=len(frame), model_version=_text(entry.get('version')))
 
     if workflow:
@@ -376,13 +594,20 @@ def run_confirmed_prediction(
             mode='portal',
             progress_callback=lambda trace: _progress(progress, 'workflow_step', **trace),
         )
-        features = workflow_result.features.reindex(columns=list(contract['feature_cols']))
+        generated_features = workflow_result.features
         warnings.extend(str(item) for item in workflow_result.warnings)
         workflow_id = _text(entry.get('feature_workflow_id') or workflow.get('workflow_hash'))
+        features = _merge_explicit_model_features(
+            generated_features,
+            frame,
+            contract,
+            workflow,
+        )
     else:
-        features = frame.reindex(columns=list(contract['feature_cols']))
+        features = frame.copy()
         workflow_id = _text(entry.get('feature_workflow_id') or contract.get('workflow_hash'))
 
+    features = features.reindex(columns=list(contract['feature_cols']))
     feature_errors = _validate_numeric_frame(
         features,
         contract['feature_cols'],
