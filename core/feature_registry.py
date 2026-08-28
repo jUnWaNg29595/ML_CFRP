@@ -95,7 +95,9 @@ def validate_registry(payload: Mapping[str, Any], require_approved: bool = False
             else:
                 if not isinstance(rule.get("input_fields"), list) or not rule.get("input_fields"):
                     errors.append(f"{prefix}.calculation_rule.input_fields is required")
-                if not isinstance(rule.get("implementation"), str) or not rule.get("implementation"):
+                elif any(not isinstance(field, str) or not field.strip() for field in rule["input_fields"]):
+                    errors.append(f"{prefix}.calculation_rule.input_fields must contain non-empty strings")
+                if not isinstance(rule.get("implementation"), str) or not rule.get("implementation").strip():
                     errors.append(f"{prefix}.calculation_rule.implementation is required")
                 for policy_name in ("null_policy", "invalid_policy"):
                     if not isinstance(rule.get(policy_name), str) or not rule.get(policy_name).strip():
@@ -127,6 +129,9 @@ def validate_registry(payload: Mapping[str, Any], require_approved: bool = False
             refs = []
         seen_refs: set[str] = set()
         for feature_id in refs:
+            if not isinstance(feature_id, str) or not feature_id.strip():
+                errors.append(f"model profile {profile_id}.feature_ids entries must be non-empty strings")
+                continue
             if feature_id not in definitions:
                 errors.append(f"model profile {profile_id} references unknown feature_id: {feature_id}")
             if feature_id in seen_refs:
@@ -140,6 +145,8 @@ def validate_registry(payload: Mapping[str, Any], require_approved: bool = False
             errors.append(f"model profile {profile_id}.target_col is required")
         if profile_status == "approved":
             for feature_id in refs:
+                if not isinstance(feature_id, str):
+                    continue
                 definition = definitions.get(feature_id)
                 if definition is not None and definition.get("status") != "approved":
                     errors.append(f"model profile {profile_id} approved profile requires approved feature: {feature_id}")
@@ -148,9 +155,14 @@ def validate_registry(payload: Mapping[str, Any], require_approved: bool = False
             errors.append(f"model profile {profile_id}.blocked_feature_ids must be a list")
             blocked = []
         if isinstance(blocked, list):
-            blocked_set = set(blocked)
+            if any(not isinstance(feature_id, str) or not feature_id.strip() for feature_id in blocked):
+                errors.append(f"model profile {profile_id}.blocked_feature_ids entries must be non-empty strings")
+            if len(blocked) != len(set(item for item in blocked if isinstance(item, str))):
+                errors.append(f"model profile {profile_id}.blocked_feature_ids contains duplicate entries")
+            blocked_set = {item for item in blocked if isinstance(item, str)}
             actual_blocked = {
                 feature_id for feature_id in refs
+                if isinstance(feature_id, str)
                 if definitions.get(feature_id, {}).get("status") == "blocked"
             }
             for feature_id in blocked:

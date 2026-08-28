@@ -11,6 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = Path(r"C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe")
 ARTIFACT = ROOT / "prediction_portal/managed_models/epoxy_resin/tg/20260825_200526_model_XGBoost_6.joblib"
+ARTIFACT_2 = ROOT / "prediction_portal/managed_models/epoxy_resin/tg/20260825_200532_model_XGBoost_6.joblib"
 
 
 def _feature(**overrides):
@@ -131,6 +132,24 @@ def test_workflow_requires_unit_and_null_invalid_policies():
     assert any("invalid_policy" in error for error in report["errors"])
 
 
+def test_workflow_rejects_blank_or_non_string_input_fields():
+    from core.feature_registry import validate_registry
+
+    feature = _feature(
+        source_type="derived_workflow",
+        default_policy="workflow_only",
+        calculation_rule={
+            "input_fields": ["schedule", "  ", 3],
+            "implementation": " impl ",
+            "null_policy": " reject ",
+            "invalid_policy": " reject ",
+        },
+    )
+    report = validate_registry(_registry([feature]))
+    assert report["ok"] is False
+    assert any("input_fields" in error for error in report["errors"])
+
+
 def test_profile_status_target_and_blocked_list_are_bidirectionally_validated():
     from core.feature_registry import validate_registry
 
@@ -148,6 +167,16 @@ def test_profile_status_target_and_blocked_list_are_bidirectionally_validated():
     report = validate_registry(missing_blocked)
     assert report["ok"] is False
     assert any("blocked" in error for error in report["errors"])
+
+    duplicate_blocked = _registry([blocked, approved], {"p": {**base_profile, "blocked_feature_ids": ["blocked", "blocked"]}})
+    report = validate_registry(duplicate_blocked)
+    assert report["ok"] is False
+    assert any("duplicate" in error for error in report["errors"])
+
+    malformed_refs = _registry([blocked, approved], {"p": {**base_profile, "feature_ids": [["blocked"]], "blocked_feature_ids": []}})
+    report = validate_registry(malformed_refs)
+    assert report["ok"] is False
+    assert any("non-empty strings" in error for error in report["errors"])
 
     wrong_blocked = _registry([blocked, approved], {"p": {**base_profile, "blocked_feature_ids": ["approved"]}})
     report = validate_registry(wrong_blocked)
@@ -202,13 +231,59 @@ def test_known_gap_id_is_explicit_and_survives_model_column_rename():
     assert renamed["feature_id"] != "cfrp.tg.cure_total_time_hours"
 
 
+def test_real_model_column_rename_requires_explicit_mapping_and_preserves_gap_id():
+    from scripts.bootstrap_feature_registry import build_registry
+    import joblib
+
+    artifact = joblib.load(ARTIFACT)
+    renamed = dict(artifact)
+    renamed["feature_cols"] = ["renamed_pressure" if name == "curing_pressure_mpa" else name for name in artifact["feature_cols"]]
+    renamed_path = ROOT / "prediction_portal" / "renamed_test_artifact.joblib"
+    try:
+        joblib.dump(renamed, renamed_path)
+        with pytest.raises(ValueError, match="explicit column_mapping|required"):
+            build_registry(renamed_path)
+        payload = build_registry(renamed_path, {"renamed_pressure": "cfrp.tg.curing_pressure_mpa"})
+        pressure = next(item for item in payload["features"] if item["feature_id"] == "cfrp.tg.curing_pressure_mpa")
+        assert pressure["name"] == "curing_pressure_mpa"
+    finally:
+        renamed_path.unlink(missing_ok=True)
+
+
+def test_legacy_audit_ids_are_stable_when_artifact_columns_reordered():
+    from scripts.bootstrap_feature_registry import build_registry
+    import joblib
+
+    artifact = joblib.load(ARTIFACT)
+    reordered = dict(artifact)
+    reordered["feature_cols"] = list(reversed(artifact["feature_cols"]))
+    reordered_path = ROOT / "prediction_portal" / "reordered_test_artifact.joblib"
+    try:
+        joblib.dump(reordered, reordered_path)
+        first = build_registry(ARTIFACT)
+        second = build_registry(reordered_path)
+        left = {item["legacy_name"]: item["feature_id"] for item in first["features"] if item["status"] == "legacy_observed"}
+        right = {item["legacy_name"]: item["feature_id"] for item in second["features"] if item["status"] == "legacy_observed"}
+        assert left == right
+    finally:
+        reordered_path.unlink(missing_ok=True)
+
+
 def test_bootstrap_source_counts_and_artifact_bytes_unchanged():
     from scripts.bootstrap_feature_registry import GAPS, build_registry
+    import hashlib
 
     before = ARTIFACT.read_bytes()
+    before_2 = ARTIFACT_2.read_bytes()
+    hash_before = hashlib.sha256(before).hexdigest()
+    hash_before_2 = hashlib.sha256(before_2).hexdigest()
     payload = build_registry(ARTIFACT)
     after = ARTIFACT.read_bytes()
+    after_2 = ARTIFACT_2.read_bytes()
     assert before == after
+    assert before_2 == after_2
+    assert hashlib.sha256(after).hexdigest() == hash_before
+    assert hashlib.sha256(after_2).hexdigest() == hash_before_2
     counts = {}
     for item in payload["features"]:
         counts[item["source_type"]] = counts.get(item["source_type"], 0) + 1

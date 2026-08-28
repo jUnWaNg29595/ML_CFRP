@@ -52,7 +52,34 @@ GAPS: dict[str, tuple[str, str | None]] = {
 # These IDs are semantic commitments, kept explicit so source/model column
 # spelling changes cannot silently create a new feature identity.
 GAP_FEATURE_IDS = {
-    name: f"cfrp.tg.{name}" for name in GAPS
+    "cure_stage_count": "cfrp.tg.cure_stage_count",
+    "cure_total_time_h": "cfrp.tg.cure_total_time_h",
+    "cure_max_temperature_c": "cfrp.tg.cure_max_temperature_c",
+    "cure_final_temperature_c": "cfrp.tg.cure_final_temperature_c",
+    "cure_temp_time_integral_c_h": "cfrp.tg.cure_temp_time_integral_c_h",
+    "cure_time_weighted_avg_temperature_c": "cfrp.tg.cure_time_weighted_avg_temperature_c",
+    "post_cure_stage_count": "cfrp.tg.post_cure_stage_count",
+    "post_cure_total_time_h": "cfrp.tg.post_cure_total_time_h",
+    "post_cure_max_temperature_c": "cfrp.tg.post_cure_max_temperature_c",
+    "post_cure_final_temperature_c": "cfrp.tg.post_cure_final_temperature_c",
+    "post_cure_temp_time_integral_c_h": "cfrp.tg.post_cure_temp_time_integral_c_h",
+    "post_cure_time_weighted_avg_temperature_c": "cfrp.tg.post_cure_time_weighted_avg_temperature_c",
+    "post_cure_temperature_c": "cfrp.tg.post_cure_temperature_c",
+    "has_post_cure": "cfrp.tg.has_post_cure",
+    "total_cure_stage_count": "cfrp.tg.total_cure_stage_count",
+    "total_heat_treatment_time_h": "cfrp.tg.total_heat_treatment_time_h",
+    "overall_max_cure_temperature_c": "cfrp.tg.overall_max_cure_temperature_c",
+    "overall_temp_time_integral_c_h": "cfrp.tg.overall_temp_time_integral_c_h",
+    "degree_of_cure_pct": "cfrp.tg.degree_of_cure_pct",
+    "gel_time_min": "cfrp.tg.gel_time_min",
+    "curing_pressure_mpa": "cfrp.tg.curing_pressure_mpa",
+    "eew_g_eq": "cfrp.tg.eew_g_eq",
+    "ahew_g_eq": "cfrp.tg.ahew_g_eq",
+    "tg_method": "cfrp.tg.tg_method",
+    "tg_standard": "cfrp.tg.tg_standard",
+    "stoichiometric_ratio_r": "cfrp.tg.stoichiometric_ratio_r",
+    "resin_smiles_n_components": "cfrp.tg.resin_smiles_n_components",
+    "curing_agent_smiles_n_components": "cfrp.tg.curing_agent_smiles_n_components",
 }
 
 GAP_UNITS = {
@@ -146,7 +173,7 @@ def _gap_definition(name: str) -> dict[str, Any]:
     return definition
 
 
-def build_registry(artifact_path: Path) -> dict[str, Any]:
+def build_registry(artifact_path: Path, column_mapping: dict[str, str] | None = None) -> dict[str, Any]:
     artifact = joblib.load(artifact_path)
     if not isinstance(artifact, dict):
         raise ValueError("artifact must contain a dictionary payload")
@@ -162,16 +189,33 @@ def build_registry(artifact_path: Path) -> dict[str, Any]:
     # identify which of those ordered columns were produced by the old
     # workflow.
     workflow_set = set(workflow_features)
+    column_mapping = dict(column_mapping or {})
+    unknown_mappings = {key: value for key, value in column_mapping.items() if key not in model_features}
+    if unknown_mappings:
+        raise ValueError("column_mapping contains unknown model columns pending review: " + ", ".join(sorted(unknown_mappings)))
+    id_to_gap = {feature_id: name for name, feature_id in GAP_FEATURE_IDS.items()}
+    semantic_by_column = {
+        column: id_to_gap.get(column_mapping.get(column, column), column_mapping.get(column, column))
+        for column in model_features
+    }
+    legacy_ordinals = {
+        name: index for index, name in enumerate(sorted(workflow_set), start=1)
+    }
     definitions = []
-    legacy_ordinal = 1
     for name in model_features:
         if name in workflow_set:
-            definitions.append(_legacy_definition(name, legacy_ordinal, str(artifact_path)))
-            legacy_ordinal += 1
+            definitions.append(_legacy_definition(name, legacy_ordinals[name], str(artifact_path)))
         else:
-            definitions.append(_gap_definition(name))
+            semantic_name = semantic_by_column[name]
+            if semantic_name in GAPS:
+                definitions.append(_gap_definition(semantic_name))
+            else:
+                raise ValueError(
+                    f"unmapped model column '{name}' is not a known gap; explicit column_mapping required (pending review)"
+                )
     # Ensure every historical gap is represented, even if a future artifact changes order.
-    missing_gaps = [name for name in GAPS if name not in model_features]
+    mapped_semantics = set(semantic_by_column.values())
+    missing_gaps = [name for name in GAPS if name not in mapped_semantics]
     if missing_gaps:
         raise ValueError("artifact is missing historical gaps: " + ", ".join(missing_gaps))
     profile_ids = [item["feature_id"] for item in definitions]
