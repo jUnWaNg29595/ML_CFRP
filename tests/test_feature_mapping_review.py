@@ -61,10 +61,30 @@ def test_review_client_response_is_structured(monkeypatch):
 
     class Client:
         def review_feature_mapping(self, context):
-            return {"suggestions": [{"feature_id": "pressure", "raw_columns": ["p_raw"], "source_role": "manual_input", "confidence": 0.9, "rationale_zh": "单位一致"}], "conflicts": [], "rationale_zh": "仅供审核", "confidence": 0.9}
+            return {"suggestions": [{"feature_id": "pressure", "raw_columns": ["p_raw"], "source_role": "manual_input", "status": "pending_review", "confidence": 0.9, "rationale_zh": "单位一致"}], "conflicts": [], "rationale_zh": "仅供审核", "confidence": 0.9}
 
     result = request_feature_mapping_review(Client(), {"raw_columns": ["p_raw"]})
     assert result["suggestions"][0]["feature_id"] == "pressure"
+
+
+def test_review_client_rejects_suggestion_without_explicit_status():
+    from core.feature_mapping_review import request_feature_mapping_review
+
+    class Client:
+        def review_feature_mapping(self, context):
+            return {
+                "suggestions": [
+                    {
+                        "feature_id": "pressure",
+                        "raw_columns": ["p_raw"],
+                        "source_role": "manual_input",
+                    }
+                ],
+                "conflicts": [],
+            }
+
+    with pytest.raises(ValueError, match="status"):
+        request_feature_mapping_review(Client(), {"raw_columns": ["p_raw"]})
 
 
 def test_feature_review_rejects_unbounded_source_role_and_missing_evidence():

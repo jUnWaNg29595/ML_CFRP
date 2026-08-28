@@ -7,9 +7,45 @@ from core.portal_ai_schema import (
     ConfirmedPredictionRequest,
     PredictionResultSummary,
     parse_ai_response,
+    parse_feature_mapping_response,
     sanitize_ai_context,
     validate_confirmed_request,
 )
+
+
+def test_feature_mapping_parser_requires_explicit_status():
+    with pytest.raises(ValueError, match="status"):
+        parse_feature_mapping_response(
+            {
+                "suggestions": [
+                    {
+                        "feature_id": "pressure",
+                        "raw_columns": ["p_raw"],
+                        "source_role": "manual_input",
+                    }
+                ],
+                "conflicts": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("status", ["pending_review", "conflict", "unknown"])
+def test_feature_mapping_parser_preserves_explicit_status(status):
+    response = parse_feature_mapping_response(
+        {
+            "suggestions": [
+                {
+                    "feature_id": "pressure",
+                    "raw_columns": ["p_raw"],
+                    "source_role": "manual_input",
+                    "status": status,
+                }
+            ],
+            "conflicts": [],
+        }
+    )
+
+    assert response["suggestions"][0]["status"] == status
 
 
 def test_confirmation_is_required_and_secrets_are_removed():

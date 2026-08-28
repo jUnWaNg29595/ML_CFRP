@@ -401,7 +401,9 @@ def parse_feature_mapping_response(value: object) -> dict[str, object]:
         rationale = item.get("rationale_zh", "")
         if not isinstance(rationale, str):
             raise ValueError("feature review rationale_zh must be a string")
-        status = item.get("status", "pending_review")
+        if "status" not in item:
+            raise ValueError("feature review suggestion status is required")
+        status = item["status"]
         if not isinstance(status, str) or status.strip() not in allowed_statuses:
             raise ValueError("feature review status is invalid")
         unit = item.get("unit")
