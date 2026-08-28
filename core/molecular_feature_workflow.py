@@ -1283,6 +1283,28 @@ def execute_feature_step(
     return features, valid_indices, warnings
 
 
+def execute_derived_feature_step(
+    data: pd.DataFrame,
+    step: Mapping[str, Any],
+) -> tuple[pd.DataFrame, list[int], list[str]]:
+    """Execute a registry-declared process derivation step."""
+    from .process_features import compute_process_features
+
+    definitions = list(step.get("feature_definitions") or step.get("derived_feature_definitions") or [])
+    if not definitions:
+        raise ValueError("derived workflow step requires feature_definitions")
+    manifest = step.get("manifest") or {
+        "source_bindings": [
+            {"raw_column": column, "source_field": column}
+            for column in list(step.get("source_columns") or [])
+        ]
+    }
+    result = compute_process_features(data, definitions, manifest)
+    if result.errors:
+        raise ValueError("; ".join(item.get("message", "派生特征计算失败") for item in result.errors))
+    return result.features, list(range(len(data))), []
+
+
 def _apply_workflow_prefix(
     features: pd.DataFrame,
     prefix: Any,
@@ -1434,14 +1456,18 @@ def execute_molecular_feature_workflow(
     for step_id in ordered_ids:
         step = step_by_id[step_id]
         started = time.perf_counter()
-        smiles, prepared_indices, metadata = prepare_step_inputs(data, step)
-        dispatch_step = dict(step)
-        dispatch_step["_prepared_inputs"] = metadata
-        features, valid_indices, step_warnings = execute_feature_step(
-            smiles,
-            dispatch_step,
-            device=device,
-        )
+        declared_method = str(step.get("method") or "").strip().lower()
+        if declared_method == "derived_workflow":
+            features, valid_indices, step_warnings = execute_derived_feature_step(data, step)
+        else:
+            smiles, prepared_indices, metadata = prepare_step_inputs(data, step)
+            dispatch_step = dict(step)
+            dispatch_step["_prepared_inputs"] = metadata
+            features, valid_indices, step_warnings = execute_feature_step(
+                smiles,
+                dispatch_step,
+                device=device,
+            )
         valid_indices = [int(index) for index in valid_indices]
         prefixed = _apply_workflow_prefix(features, step.get("prefix"))
         duplicate_columns = prefixed.columns[prefixed.columns.duplicated()].tolist()

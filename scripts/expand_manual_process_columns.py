@@ -21,7 +21,10 @@ import os
 import re
 from pathlib import Path
 
+import pandas as pd
 import xlrd
+
+from core.process_features import compute_process_features
 
 
 DEFAULT_NAME_KEYWORD = "\u624b\u5de5\u6570\u636e"
@@ -510,7 +513,47 @@ def build_output_rows(headers: list[str], rows: list[dict[str, str]]) -> tuple[l
             row.update(_expand_sequence_column(source_row, source_col, limit))
         output_rows.append(row)
 
-    return output_headers, output_rows
+    # Canonical process features are computed by the shared registry-aware
+    # module so offline expansion and portal/workflow execution stay aligned.
+    process_names = [
+        "cure_stage_count", "cure_total_time_h", "cure_max_temperature_c",
+        "cure_final_temperature_c", "cure_temp_time_integral_c_h",
+        "cure_time_weighted_avg_temperature_c", "post_cure_stage_count",
+        "post_cure_total_time_h", "post_cure_max_temperature_c",
+        "post_cure_final_temperature_c", "post_cure_temp_time_integral_c_h",
+        "post_cure_time_weighted_avg_temperature_c", "post_cure_temperature_c",
+        "has_post_cure", "total_cure_stage_count", "total_heat_treatment_time_h",
+        "overall_max_cure_temperature_c", "overall_temp_time_integral_c_h",
+    ]
+    process_definitions = []
+    for name in process_names:
+        fields = ["post_cure_schedule" if name.startswith("post_cure") else "cure_schedule"]
+        if name.startswith("total_") or name.startswith("overall_"):
+            fields = ["cure_schedule", "post_cure_schedule"]
+        process_definitions.append({
+            "name": name,
+            "source_type": "derived_workflow",
+            "calculation_rule": {
+                "implementation": "core.process_features:derive_declared_feature",
+                "version": "1",
+                "input_fields": fields,
+                "null_policy": "reject",
+                "invalid_policy": "reject",
+            },
+        })
+    process_frame = pd.DataFrame(rows)
+    if not process_frame.empty and any(column in process_frame.columns for column in {"cure_schedule", "post_cure_schedule"}):
+        bindings = [{"raw_column": field, "source_field": field} for field in ("cure_schedule", "post_cure_schedule") if field in process_frame.columns]
+        result = compute_process_features(process_frame, process_definitions, {"source_bindings": bindings})
+        for row_number, target in enumerate(output_rows):
+            for name in process_names:
+                if name in result.features.columns:
+                    value = result.features.iloc[row_number][name]
+                    target[name] = "" if value != value else format(float(value), "g")
+        helper_columns.extend(process_names)
+
+    output_headers = headers + helper_columns
+    return _dedupe_keep_order(output_headers), output_rows
 
 
 def _dedupe_keep_order(values: list[str]) -> list[str]:
