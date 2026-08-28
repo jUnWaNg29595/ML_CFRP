@@ -3956,6 +3956,7 @@ def log_fe_step(operation: str, description: str, params=None, input_df=None, ou
 # ============================================================
 def _render_network_proxy_panel(active_task_lock: bool = False):
     """渲染统一网络代理设置，供 PubChem 与 Hugging Face 共用。"""
+    active_task_lock = bool(get_task_manager().get_active_tasks())
     try:
         from core.network_config import (
             get_network_settings,
