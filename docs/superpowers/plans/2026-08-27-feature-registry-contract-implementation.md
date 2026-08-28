@@ -80,7 +80,7 @@ Canonical naming rule for this plan: `workflow_source_fields` is the v2 contract
 - `get_model_profile(registry, profile_id) -> dict`
 - `build_registry_snapshot(registry, profile_id) -> dict`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_registry_rejects_duplicate_feature_names():
@@ -123,7 +123,7 @@ def test_approved_hash_is_recomputed_and_mismatch_is_rejected():
     assert any("approved_hash" in error for error in report["errors"])
 ```
 
-- [ ] **Step 2: 运行失败测试**
+- [x] **Step 2: 运行失败测试**
 
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_feature_registry.py -q`  
 Expected: FAIL，因为 `core.feature_registry` 尚不存在。
@@ -555,7 +555,7 @@ git commit -m "feat: persist registry context in artifacts and runs"
 - `validate_prediction_request` 增加 strict manual missing/range/enum validation。
 - `run_confirmed_prediction` 通过 `core.process_features` 执行 derived steps，只合并 approved manual columns。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_portal_renders_only_manual_input_as_editable_fields():
@@ -577,18 +577,18 @@ def test_missing_manual_input_is_rejected_without_default_fill(monkeypatch):
     assert any("pressure" in error for error in errors)
 ```
 
-- [ ] **Step 2: 运行失败测试**
+- [x] **Step 2: 运行失败测试**
 
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_portal_feature_sources.py -q`  
 Expected: FAIL，因为门户字段仍来自 target.parameters，来源构建函数不存在。
 
-- [ ] **Step 3: 改造后端和页面**
+- [x] **Step 3: 改造后端和页面**
 
 后端以 v2 contract 的 `manual_input_feature_cols` 为唯一手工白名单；required + nullable=false 的空值、非法值、越界值和未映射枚举一律阻断。workflow source 使用显式 alias 和 input contract 支持 `curing_agent_smiles` 到 declared numbered slots；可选固化剂空值返回结构性组件数 0，未使用槽位不报错。derived 通过 `compute_process_features` 执行，最终按 contract.feature_cols 有序重排。
 
 `UserPrediction.py` 新增两个纯函数，根据 contract + registry snapshot 生成 workflow source 和 manual 字段；所有 default 为 None，删除 `parameter_from_feature`/`sync_parameters_from_features` 的可信路径。旧 target.parameters 仅作为迁移提示，不再作为契约来源。
 
-- [ ] **Step 4: 运行门户测试并提交**
+- [x] **Step 4: 运行门户测试并提交**
 
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_portal_feature_sources.py tests/test_portal_prediction.py tests/test_user_prediction_ai_flow.py -q`  
 Expected: PASS；已有禁止默认/均值补齐测试不回归。
@@ -617,7 +617,7 @@ git commit -m "feat: render and validate portal fields from feature contract"
 - `save_feature_review_record(path, record) -> None`
 - `render_feature_registry_page() -> None`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_rejected_ai_candidate_does_not_write_binding():
@@ -636,18 +636,18 @@ def test_accept_action_writes_approved_binding():
     assert updated["approval"]["approved_by"] == "local-user"
 ```
 
-- [ ] **Step 2: 运行失败测试**
+- [x] **Step 2: 运行失败测试**
 
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_feature_mapping_review.py tests/test_feature_registry_ui.py -q`  
 Expected: FAIL，因为审核模块和页面尚不存在。
 
-- [ ] **Step 3: 实现特征专用 AI 管理**
+- [x] **Step 3: 实现特征专用 AI 管理**
 
 `build_feature_review_context` 只包含当前 frame columns、目标 profile definitions、dtype、少量样本摘要和单位/编码候选；不发送模型指标、预测结果、全部历史 registry 或无关页面状态。`request_feature_mapping_review(client, context)` 调用注入的 `client.review_feature_mapping(context)`，由 `core/portal_ai_schema.py` 校验 `suggestions/conflicts/rationale_zh/confidence`；unknown 保持 pending_review，不生成数值。`apply_feature_review_decision` 只有 accept/edit_accept 才写 approved binding，reject 只写 review record。
 
 在 `core/portal_ai.py` 增加 `PortalAIClient.review_feature_mapping(context)`，复用现有 bounded request、JSON 解析和错误脱敏；`core/feature_mapping_review.py` 提供唯一编排函数 `request_feature_mapping_review(client, context)`。review record 写入 `prediction_portal/feature_reviews/`，不进入 registry hash。`core/feature_registry_ui.py` 默认只显示原始列名、候选 feature_id、来源、中文依据、冲突和三个动作；样本统计、完整规则、历史版本和 AI 原文放在 expander。导航增加“🧩 特征管理”，但不把预测结果或模型管理混入审核页。
 
-- [ ] **Step 4: 运行审核/UI 测试并提交**
+- [x] **Step 4: 运行审核/UI 测试并提交**
 
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_feature_mapping_review.py tests/test_feature_registry_ui.py tests/test_portal_ai_schema.py tests/test_portal_ai.py -q`  
 Expected: PASS；AI 不可用时页面显示错误，manifest 仍可手工编辑和批准。
@@ -674,7 +674,7 @@ git commit -m "feat: add focused AI feature review workflow"
 - `should_show_publication(contract_report) -> bool`
 - `select_active_publication(models) -> dict | None`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_legacy_tg_artifact_is_never_published_by_missing_status():
@@ -759,16 +759,16 @@ def test_task_snapshot_does_not_persist_api_key_or_full_inputs(tmp_path, monkeyp
     manager.shutdown()
 ```
 
-- [ ] **Step 2: 运行失败测试**
+- [x] **Step 2: 运行失败测试**
 
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_legacy_tg_gate.py -q`
 Expected: FAIL，因为旧 artifact 和缺省 publication status 目前仍可被当成发布对象。
 
-- [ ] **Step 3: 实现发布门禁和状态传播**
+- [x] **Step 3: 实现发布门禁和状态传播**
 
 `validate_publication_artifact` 对 schema 1 或缺少 contract 的 artifact 只返回 `ok=False,status="needs_validation"`，不从模型列名猜来源。registry/manifest 参数优先使用显式参数；若未传入则从 artifact `extra` 读取，二者缺失、版本/hash 不一致均阻断。v2 逐项验证 registry snapshot/hash、manifest hash、profile target/status、完整 feature definitions、unknown/blocked/deprecated 特征、来源分区、workflow hash/schema/输出列、canonical/effective 等式、artifact 文件 hash 和可重算的 `contract_hash`；失败时返回固定结构 `{"code", "feature", "source", "rule", "message"}` 的 `diagnostics`，同时保留兼容性的可读字符串 `errors`（现有调用方继续读取该字段）。`make_publication_entry` 默认 `publication_status="needs_validation"`、`enabled=False`；即使调用方请求 published/true，也必须提供 `gate_report["ok"] is True`，否则强制降级。`activate_publication` 先校验 entry 再原子替换，拒绝非 published entry，失败时保留旧 active 版本。门户加载、统计和 active release 选择均只接受 `publication_status == "published" and enabled is True`，不能把缺失字段当作已发布。`core/portal_tasks.py` 在内存中保留执行所需的原始 request，磁盘快照只写 `request_summary_hash`、允许字段名、contract/registry/manifest 摘要和脱敏诊断；重启后不能从脱敏快照重放任务，`retry_task` 必须要求用户重新提交原始输入，不写 API key、完整敏感输入或未确认 AI 数值。旧 Tg 两个 artifact 保持原文件不变，加载时显示中文阻断原因且不执行预测。
 
-- [ ] **Step 4: 运行回归并提交**
+- [x] **Step 4: 运行回归并提交**
 
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_legacy_tg_gate.py tests/test_prediction_portal.py tests/test_portal_prediction.py tests/test_portal_tasks.py -q`
 Expected: PASS；既有合法 contract 测试更新为显式 `publication_status="published"`，旧 artifact 仍是 `needs_validation`。
@@ -850,14 +850,14 @@ Expected: FAIL，直到 registry、manifest、contract 和 artifact 互相引用
 
 编写并接入验收用例，覆盖：不同 raw column 映射到同一 semantic feature、一个 source field 生成多个 derived feature、manual 缺失/越界/未映射枚举阻断、结构性 curing-agent 0、AI reject 不入 manifest、registry/manifest hash 变更导致发布失败、effective 特征删除导致 `needs_validation`，以及通过批准 synthetic release 走完 `load_published_portal_model` → `run_confirmed_prediction` 的可信入口。对 legacy Tg 测试在调用 `predict` 前即失败，并对两个真实 artifact 做读取前后字节/hash 不变断言；同时验证普通训练、CV、优化接收到相同 registry/manifest/contract hash。实现后在设计文档增加“实施验收记录”小节，只记录实际测试命令和结果，不修改历史审计事实；计划文件勾选已完成步骤并保留每个提交的 hash。
 
-已存在的提交记录：Task 1 `b1a0b67`；Task 2 `7bb608c`；Task 3 `3b28824`；Task 4 `68f0128`；Task 5 `7867dba`；Task 6 `e35cfb7`；task-lock fix `07acb24`。Task 7-9 的工作区改动未分配虚构的提交 hash。
+已存在的提交记录：Task 1 `7296df0`；Task 2 `7bb608c`；Task 3 `3b28824`；Task 4 `68f0128`；Task 5 `7867dba`；Task 6 `e35cfb7`；Task 7-9、页面兼容和最终门禁修复 `6513e2f`、`89f9fed`、`745b418`、`c6b54b3`、`a19d12b`、`d3225e9`。当前 Tg artifact 未被修改。
 
-- [ ] **Step 4: 运行全量验证**
+- [x] **Step 4: 运行全量验证**
 
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests -q`
 Expected: PASS；若环境中存在可选依赖缺失，必须单独记录失败测试和原因，不得把未运行说成通过。另运行 `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m compileall core scripts UserPrediction.py app.py`，Expected: 无语法错误。
 
-当前核实结果：聚焦验收测试 62/65 passed，端到端验收 1 passed；全量 `pytest tests -q` 为 555 passed、5 failed。因全量测试仍有失败，Step 4 保持未完成并阻断最终验收，不能勾选为已完成。
+当前核实结果：特征契约/门户/审核/遗留 Tg 聚焦套件 106 passed；最终审查边界套件 72 passed；全量 `pytest tests -q` 为 585 passed、13 warnings；`compileall core scripts UserPrediction.py app.py` 通过。
 
 - [x] **Step 5: 最终提交和交付审查**
 
