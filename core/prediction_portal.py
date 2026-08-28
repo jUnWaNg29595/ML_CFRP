@@ -400,7 +400,9 @@ def validate_publication_artifact(
                 if selected_hash != expected_selected_hash:
                     v2_errors.append("compact registry_snapshot selected feature hash mismatch")
         else:
-            registry_report = validate_registry(resolved_registry, require_approved=True)
+            registry_for_validation = dict(resolved_registry)
+            registry_for_validation.pop("registry_hash", None)
+            registry_report = validate_registry(registry_for_validation, require_approved=True)
             if not registry_report.get("ok"):
                 v2_errors.extend("registry " + str(error) for error in registry_report.get("errors", []))
             profile_id = resolved_contract.get("model_profile_id")
@@ -410,7 +412,7 @@ def validate_publication_artifact(
                 v2_errors.append("registry model_profile cannot be proven")
             elif profile.get("status") != "approved":
                 v2_errors.append("registry model_profile is not approved")
-            computed_registry_hash = compute_registry_hash(resolved_registry)
+            computed_registry_hash = compute_registry_hash(registry_for_validation)
             if resolved_registry.get("registry_hash") != computed_registry_hash:
                 v2_errors.append("registry_snapshot registry_hash mismatch")
         if resolved_contract.get("feature_registry_version") != resolved_registry.get("registry_version") or resolved_contract.get("feature_registry_hash") != computed_registry_hash:

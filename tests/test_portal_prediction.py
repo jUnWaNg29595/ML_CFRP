@@ -1,9 +1,20 @@
 import numpy as np
 import pandas as pd
 import pytest
+import hashlib
+from pathlib import Path
+import tempfile
 
 import core.portal_prediction as portal_prediction
-from core.molecular_feature_workflow import WorkflowExecutionResult
+from core.molecular_feature_workflow import (
+    WorkflowExecutionResult,
+    materialize_workflow_source_columns,
+)
+from core.dataset_manifest import compute_dataset_manifest_hash
+from core.prediction_portal import compute_contract_hash
+from core.feature_registry import compute_registry_hash
+import json
+from core.prediction_molecular_baseline import collect_workflow_source_columns
 
 
 class FakeModel:
@@ -37,24 +48,117 @@ def _workflow():
     }
 
 
-def _artifact(model=None):
-    model = model or FakePipeline()
-    workflow = _workflow()
-    contract = {
-        'schema_version': 1,
-        'feature_cols': ['x'],
+def _v2_context(workflow, feature_cols, feature_definitions):
+    """Build the smallest complete v2 publication context for portal tests."""
+    feature_definitions = [
+        {
+            **dict(item),
+            'data_type': item.get('data_type', 'float'),
+            'unit': item.get('unit', 'unknown'),
+            'default_policy': item.get(
+                'default_policy',
+                'workflow_only' if item.get('source_type') in {'molecular_workflow', 'derived_workflow'} else 'explicit_only',
+            ),
+            'required_for_prediction': item.get('required_for_prediction', True),
+            'nullable': item.get('nullable', False),
+            **({'calculation_rule': item.get('calculation_rule') or {
+                'input_fields': ['resin_smiles'],
+                'implementation': 'fixture.workflow:derive',
+                'null_policy': 'reject',
+                'invalid_policy': 'reject',
+            }} if item.get('source_type') in {'molecular_workflow', 'derived_workflow'} else {}),
+        }
+        for item in feature_definitions
+    ]
+    source_columns = collect_workflow_source_columns(workflow)
+    profile = {
+        'profile_id': 'fixture-profile',
+        'status': 'approved',
+        'feature_ids': [item.get('feature_id') for item in feature_definitions],
         'target_col': 'Tg',
-        'workflow_hash': 'workflow-1',
-        'workflow_schema_version': 3,
-        'source_columns': [{'column': 'resin_smiles', 'roles': ['resin']}],
-        'workflow_source_columns': [{'column': 'resin_smiles', 'roles': ['resin']}],
+    }
+    registry_payload = {
+        'schema_version': 1,
+        'registry_version': 'fixture-v1',
+        'features': feature_definitions,
+        'model_profiles': {'fixture-profile': profile},
+        'approval': {'status': 'approved'},
+    }
+    registry_payload['approval']['approved_hash'] = compute_registry_hash(registry_payload)
+    registry_snapshot = {
+        'schema_version': 1,
+        'registry_version': 'fixture-v1',
+        'registry_hash': registry_payload['approval']['approved_hash'],
+        'profile_id': 'fixture-profile',
+        'model_profile': profile,
+        'features': feature_definitions,
+        'registry_payload': registry_payload,
+    }
+    selected_payload = {'profile_id': registry_snapshot['profile_id'], 'model_profile': registry_snapshot['model_profile'], 'features': feature_definitions}
+    registry_snapshot['selected_features_hash'] = hashlib.sha256(json.dumps(selected_payload, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+    dataset_manifest = {
+        'schema_version': 1,
+        'dataset_id': 'portal-fixture',
+        'model_profile_id': 'fixture-profile',
+        'source_bindings': [],
+        'feature_bindings': [],
+        'status': 'approved',
+    }
+    dataset_manifest['manifest_hash'] = compute_dataset_manifest_hash(dataset_manifest)
+    contract = {
+        'schema_version': 2,
+        'feature_cols': list(feature_cols),
+        'canonical_feature_cols': list(feature_cols),
+        'effective_feature_cols': list(feature_cols),
+        'removed_feature_cols': [],
+        'removed_feature_reasons': {},
+        'feature_registry_version': registry_snapshot['registry_version'],
+        'feature_registry_hash': registry_snapshot['registry_hash'],
+        'dataset_manifest_hash': dataset_manifest['manifest_hash'],
+        'model_profile_id': registry_snapshot['profile_id'],
+        'workflow_feature_cols': [
+            item['name'] for item in feature_definitions
+            if item.get('source_type') in {'molecular_workflow', 'derived_workflow'}
+        ],
+        'molecular_workflow_feature_cols': [
+            item['name'] for item in feature_definitions
+            if item.get('source_type') == 'molecular_workflow'
+        ],
+        'derived_feature_cols': [
+            item['name'] for item in feature_definitions
+            if item.get('source_type') == 'derived_workflow'
+        ],
+        'manual_input_feature_cols': [
+            item['name'] for item in feature_definitions
+            if item.get('source_type') == 'manual_input'
+        ],
+        'feature_definitions': [dict(item) for item in feature_definitions],
+        'target_col': 'Tg',
+        'workflow_hash': workflow.get('workflow_hash'),
+        'workflow_schema_version': workflow.get('schema_version'),
+        'source_columns': source_columns,
+        'workflow_source_columns': [dict(item) for item in source_columns],
+        'workflow_source_fields': [dict(item) for item in source_columns],
         'workflow_present': True,
         'molecular_features_indicated': True,
         'pipeline_present': True,
         'imputer_present': False,
         'scaler_present': False,
         'numeric_ranges': {},
+        'contract_hash': '',
     }
+    contract['contract_hash'] = compute_contract_hash(contract)
+    return contract, registry_snapshot, dataset_manifest
+
+
+def _artifact(model=None):
+    model = model or FakePipeline()
+    workflow = _workflow()
+    contract, registry_snapshot, dataset_manifest = _v2_context(
+        workflow,
+        ['x'],
+        [{'feature_id': 'x', 'name': 'x', 'source_type': 'molecular_workflow', 'status': 'approved'}],
+    )
     return {
         'model': model,
         'pipeline': model,
@@ -63,11 +167,16 @@ def _artifact(model=None):
         'extra': {
             'prediction_contract': contract,
             'molecular_feature_workflow': workflow,
+            'registry_snapshot': registry_snapshot,
+            'dataset_manifest': dataset_manifest,
         },
     }
 
 
 def _config(artifact=None, *, enabled=True, status='published'):
+    artifact = artifact or _artifact()
+    fixture_path = Path(tempfile.gettempdir()) / 'cfrp_portal_fixture.joblib'
+    fixture_path.write_bytes(b'portal-fixture-artifact')
     entry = {
         'id': 'tg-v1',
         'version': 'v1',
@@ -76,8 +185,11 @@ def _config(artifact=None, *, enabled=True, status='published'):
         'publication_status': status,
         'unit': '°C',
         'target_col': 'Tg',
-        'contract': _artifact(artifact)['extra']['prediction_contract'],
-        '_artifact': artifact or _artifact(),
+        'contract': artifact['extra']['prediction_contract'],
+        '_artifact': artifact,
+        'artifact_path': str(fixture_path),
+        'artifact_hash': hashlib.sha256(fixture_path.read_bytes()).hexdigest(),
+        'gate_report': {'ok': True, 'status': 'valid', 'errors': []},
     }
     return {'materials': {'epoxy_resin': {'targets': {'tg': {'models': [entry]}}}}}
 
@@ -161,3 +273,65 @@ def test_missing_and_malformed_molecular_sources_are_rejected():
         _request(inputs={'other': 1}), config
     )
     assert any('缺少分子源列' in error for error in errors)
+
+
+def test_canonical_smiles_are_expanded_to_declared_numbered_sources():
+    frame = materialize_workflow_source_columns(
+        pd.DataFrame({
+            'resin_smiles': ['CCO.CCN'],
+            'hardener_smiles': ['NCCN'],
+        }),
+        resin_columns=['resin_smiles_1', 'resin_smiles_2', 'resin_smiles_3'],
+        hardener_columns=['curing_agent_smiles_1', 'curing_agent_smiles_2'],
+    )
+    assert frame.loc[0, 'resin_smiles_1'] == 'CCO'
+    assert frame.loc[0, 'resin_smiles_2'] == 'CCN'
+    assert pd.isna(frame.loc[0, 'resin_smiles_3'])
+    assert frame.loc[0, 'curing_agent_smiles_1'] == 'NCCN'
+    assert pd.isna(frame.loc[0, 'curing_agent_smiles_2'])
+
+
+def test_realistic_feature_gap_is_blocked_without_derived_workflow(monkeypatch):
+    artifact = _artifact()
+    artifact['feature_cols'] = ['x', 'degree_of_cure_pct']
+    artifact['model'].n_features_in_ = 2
+    artifact['model'].feature_names_in_ = np.asarray(['x', 'degree_of_cure_pct'])
+    artifact['pipeline'] = artifact['model']
+    workflow = artifact['extra']['molecular_feature_workflow']
+    workflow['final_feature_names'] = ['x', 'degree_of_cure_pct']
+    workflow['feature_source_map'] = {'x': 'resin', 'degree_of_cure_pct': 'resin'}
+    contract, registry_snapshot, dataset_manifest = _v2_context(
+        workflow,
+        ['x', 'degree_of_cure_pct'],
+        [
+            {'feature_id': 'x', 'name': 'x', 'source_type': 'molecular_workflow', 'status': 'approved'},
+            {'feature_id': 'degree', 'name': 'degree_of_cure_pct', 'source_type': 'derived_workflow', 'status': 'approved'},
+        ],
+    )
+    artifact['extra']['prediction_contract'] = contract
+    artifact['extra']['registry_snapshot'] = registry_snapshot
+    artifact['extra']['dataset_manifest'] = dataset_manifest
+    config = _config(artifact)
+    config['materials']['epoxy_resin']['targets']['tg']['models'][0]['contract'] = contract
+    monkeypatch.setattr(
+        'core.portal_prediction.execute_molecular_feature_workflow',
+        lambda *args, **kwargs: WorkflowExecutionResult(
+            features=pd.DataFrame({'x': [3.0]}),
+            step_trace=[], warnings=[], workflow_hash='workflow-1', valid_row_indices={'resin': [0]}
+        ),
+    )
+    with pytest.raises(ValueError, match='degree_of_cure_pct'):
+        portal_prediction.run_confirmed_prediction(_request(), config=config)
+
+
+def test_explicit_non_workflow_features_must_be_supplied():
+    contract = {
+        'feature_cols': ['x', 'degree_of_cure_pct'],
+    }
+    with pytest.raises(ValueError, match='显式工艺/实验特征'):
+        portal_prediction._merge_explicit_model_features(
+            pd.DataFrame({'x': [3.0]}),
+            pd.DataFrame({'resin_smiles': ['C1CC1']}),
+            contract,
+            {'final_feature_names': ['x']},
+        )
