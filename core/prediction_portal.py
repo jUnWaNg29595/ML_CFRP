@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import socket
@@ -18,7 +19,7 @@ from .prediction_contract import resolve_prediction_feature_contract
 from .prediction_molecular_baseline import collect_workflow_source_columns
 
 
-CONTRACT_SCHEMA_VERSION = 1
+CONTRACT_SCHEMA_VERSION = 2
 _CONTRACT_FIELDS = {
     "schema_version",
     "feature_cols",
@@ -182,6 +183,13 @@ def _numeric_ranges(frame: Any, feature_cols: list[str]) -> dict[str, dict[str, 
     return ranges
 
 
+def compute_contract_hash(contract: Mapping[str, Any]) -> str:
+    payload = copy.deepcopy(dict(contract))
+    payload.pop("contract_hash", None)
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def build_prediction_contract(
     *,
     artifact: Mapping[str, Any],
@@ -190,6 +198,13 @@ def build_prediction_contract(
     workflow: Any = None,
     training_frame: Any = None,
     source_frame: Any = None,
+    registry_snapshot: Mapping[str, Any] | None = None,
+    dataset_manifest: Mapping[str, Any] | None = None,
+    model_profile_id: str | None = None,
+    canonical_feature_cols: Sequence[str] | None = None,
+    effective_feature_cols: Sequence[str] | None = None,
+    removed_feature_cols: Sequence[str] | None = None,
+    removed_feature_reasons: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the exact, serializable contract used for portal publication."""
 
@@ -221,8 +236,8 @@ def build_prediction_contract(
     workflow_payload = _as_workflow_mapping(workflow)
     source_columns = collect_workflow_source_columns(workflow_payload)
     numeric_frame = training_frame if training_frame is not None else source_frame
-    return {
-        "schema_version": CONTRACT_SCHEMA_VERSION,
+    base = {
+        "schema_version": 1 if registry_snapshot is None and dataset_manifest is None else 2,
         "feature_cols": resolved_features,
         "target_col": target,
         "workflow_hash": workflow_payload.get("workflow_hash"),
@@ -238,6 +253,34 @@ def build_prediction_contract(
         "scaler_present": _has_usable_preprocessor(artifact, "scaler"),
         "numeric_ranges": _numeric_ranges(numeric_frame, resolved_features),
     }
+    if base["schema_version"] == 2:
+        canonical = _normalized_columns(canonical_feature_cols or resolved_features)
+        effective = _normalized_columns(effective_feature_cols or resolved_features)
+        removed = _normalized_columns(removed_feature_cols or [])
+        definitions = list((_as_mapping(registry_snapshot).get("features") or []))
+        workflow_cols = [str(item.get("name")) for item in definitions if isinstance(item, Mapping) and item.get("source_type") in {"molecular_workflow", "derived_workflow"} and item.get("name") in canonical]
+        molecular_cols = [str(item.get("name")) for item in definitions if isinstance(item, Mapping) and item.get("source_type") == "molecular_workflow" and item.get("name") in canonical]
+        manual_cols = [str(item.get("name")) for item in definitions if isinstance(item, Mapping) and item.get("source_type") == "manual_input" and item.get("name") in canonical]
+        derived_cols = [str(item.get("name")) for item in definitions if isinstance(item, Mapping) and item.get("source_type") == "derived_workflow" and item.get("name") in canonical]
+        base.update({
+            "canonical_feature_cols": canonical,
+            "effective_feature_cols": effective,
+            "removed_feature_cols": removed,
+            "removed_feature_reasons": copy.deepcopy(dict(removed_feature_reasons or {})),
+            "feature_registry_version": _as_mapping(registry_snapshot).get("registry_version"),
+            "feature_registry_hash": _as_mapping(registry_snapshot).get("registry_hash"),
+            "dataset_manifest_hash": _as_mapping(dataset_manifest).get("manifest_hash"),
+            "model_profile_id": model_profile_id,
+            "workflow_feature_cols": workflow_cols,
+            "molecular_workflow_feature_cols": molecular_cols,
+            "derived_feature_cols": derived_cols,
+            "manual_input_feature_cols": manual_cols,
+            "feature_definitions": copy.deepcopy(definitions),
+            "workflow_source_fields": [],
+            "contract_hash": "",
+        })
+        base["contract_hash"] = compute_contract_hash(base)
+    return base
 
 
 def _contract_from_artifact(artifact: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -251,7 +294,9 @@ def _contracts_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
 
 
 def validate_publication_artifact(
-    artifact: Mapping[str, Any], contract: Mapping[str, Any] | None = None
+    artifact: Mapping[str, Any], contract: Mapping[str, Any] | None = None,
+    registry_snapshot: Mapping[str, Any] | None = None,
+    dataset_manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a publication diagnostic without mutating the artifact."""
 
@@ -270,12 +315,46 @@ def validate_publication_artifact(
         }
     resolved_contract = _as_mapping(resolved_contract)
 
-    missing_contract_fields = sorted(_CONTRACT_FIELDS - set(resolved_contract))
+    schema_version = resolved_contract.get("schema_version")
+    legacy_contract = schema_version in {None, 1}
+    if schema_version not in {None, 1, 2}:
+        return {"ok": False, "status": "needs_validation", "errors": ["prediction_contract schema_version is unsupported."]}
+    v2_errors: list[str] = []
+    if not legacy_contract and resolved_contract.get("contract_hash") != compute_contract_hash(resolved_contract):
+        v2_errors.append("prediction_contract contract_hash mismatch")
+    if not legacy_contract and registry_snapshot is not None:
+        if resolved_contract.get("feature_registry_version") != registry_snapshot.get("registry_version") or resolved_contract.get("feature_registry_hash") != registry_snapshot.get("registry_hash"):
+            v2_errors.append("feature registry version/hash mismatch")
+    if not legacy_contract and dataset_manifest is not None and resolved_contract.get("dataset_manifest_hash") != dataset_manifest.get("manifest_hash"):
+        v2_errors.append("dataset manifest hash mismatch")
+    canonical = _normalized_columns(resolved_contract.get("canonical_feature_cols"))
+    effective = _normalized_columns(resolved_contract.get("effective_feature_cols"))
+    removed = _normalized_columns(resolved_contract.get("removed_feature_cols"))
+    feature_cols_v2 = _normalized_columns(resolved_contract.get("feature_cols"))
+    workflow_cols = _normalized_columns(resolved_contract.get("workflow_feature_cols"))
+    manual_cols = _normalized_columns(resolved_contract.get("manual_input_feature_cols"))
+    molecular_cols = _normalized_columns(resolved_contract.get("molecular_workflow_feature_cols"))
+    derived_cols = _normalized_columns(resolved_contract.get("derived_feature_cols"))
+    if not legacy_contract and feature_cols_v2 != canonical:
+        v2_errors.append("feature_cols must equal canonical_feature_cols")
+    if not legacy_contract and feature_cols_v2 != workflow_cols + manual_cols:
+        v2_errors.append("feature source partitions do not match feature_cols")
+    if not legacy_contract and workflow_cols != molecular_cols + derived_cols:
+        v2_errors.append("workflow source partitions do not match workflow_feature_cols")
+    if not legacy_contract and (set(effective) - set(canonical) or set(removed) - set(canonical) or set(effective) & set(removed)):
+        v2_errors.append("effective/removed feature columns are inconsistent with canonical columns")
+    if v2_errors:
+        return {"ok": False, "status": "invalid", "errors": v2_errors, "diagnostics": [{"code": "contract_invalid", "feature": None, "source": "prediction_contract", "rule": "v2", "message": error} for error in v2_errors]}
+
+    required_fields = _CONTRACT_FIELDS if schema_version is None else (set() if legacy_contract else _CONTRACT_FIELDS)
+    missing_contract_fields = sorted(required_fields - set(resolved_contract))
     if missing_contract_fields:
         errors.append(
             "prediction_contract 缺少必需字段：" + ", ".join(missing_contract_fields)
         )
-    if resolved_contract.get("schema_version") != CONTRACT_SCHEMA_VERSION:
+    if schema_version is None:
+        errors.append("prediction_contract schema_version is required")
+    elif not legacy_contract and resolved_contract.get("schema_version") != CONTRACT_SCHEMA_VERSION:
         errors.append("prediction_contract 的 schema_version 不受支持。")
 
     if artifact.get("model") is None and artifact.get("pipeline") is None:
@@ -372,6 +451,21 @@ def validate_publication_artifact(
         actual_sources = collect_workflow_source_columns(workflow_payload)
         if actual_sources != resolved_contract.get("workflow_source_columns"):
             errors.append("artifact workflow source 列与 prediction_contract 不一致。")
+        workflow_features = _normalized_columns(workflow_payload.get("final_feature_names"))
+        if not workflow_features:
+            errors.append("artifact workflow 缺少 final_feature_names。")
+        elif contract_features and workflow_features != contract_features:
+            missing = [column for column in contract_features if column not in workflow_features]
+            extra_features = [column for column in workflow_features if column not in contract_features]
+            detail = []
+            if missing:
+                detail.append("缺少 " + ", ".join(missing[:8]))
+            if extra_features:
+                detail.append("多出 " + ", ".join(extra_features[:8]))
+            errors.append(
+                "artifact workflow 的 final_feature_names 必须与 prediction_contract.feature_cols "
+                "完全一致" + ("（" + "；".join(detail) + "）。" if detail else ".")
+            )
 
     status = "valid" if not errors else "invalid"
     return {"ok": not errors, "status": status, "errors": errors}

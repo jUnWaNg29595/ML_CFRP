@@ -88,8 +88,17 @@ def create_model_artifact(
     imputer: Any = None,
     metrics: Optional[Dict[str, Any]] = None,
     extra: Optional[Dict[str, Any]] = None,
+    contract_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create a serializable artifact dict."""
+    merged_extra = dict(extra or {})
+    if contract_context:
+        for key in ("prediction_contract", "registry_snapshot", "dataset_manifest", "feature_audit"):
+            if key not in contract_context:
+                continue
+            if key in merged_extra and merged_extra[key] != contract_context[key]:
+                raise ValueError(f"extra 与 contract_context 的 {key} 内容冲突")
+            merged_extra[key] = contract_context[key]
     artifact: Dict[str, Any] = {
         "artifact_version": ARTIFACT_VERSION,
         "created_at": int(time.time()),
@@ -97,7 +106,7 @@ def create_model_artifact(
         "target_col": str(target_col),
         "feature_cols": list(feature_cols) if feature_cols is not None else [],
         "metrics": metrics or {},
-        "extra": extra or {},
+        "extra": merged_extra,
     }
 
     # Prefer saving the Pipeline if available (safer/complete: includes preprocessing)
@@ -160,6 +169,7 @@ def create_model_artifact_bytes(
     imputer: Any = None,
     metrics: Optional[Dict[str, Any]] = None,
     extra: Optional[Dict[str, Any]] = None,
+    contract_context: Optional[Dict[str, Any]] = None,
     compress: int = 3,
 ) -> bytes:
     artifact = create_model_artifact(
@@ -172,6 +182,7 @@ def create_model_artifact_bytes(
         imputer=imputer,
         metrics=metrics,
         extra=extra,
+        contract_context=contract_context,
     )
     return dumps_artifact(artifact, compress=compress)
 
