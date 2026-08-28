@@ -56,10 +56,17 @@ class TrainingRunManager:
             self.export_dpi = 300
 
     def create_run_dir(self, model_name: str) -> Tuple[str, str]:
+        # 同一秒内可能完成多次训练/优化，必须避免复用目录覆盖旧记录。
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_id = f"{ts}_{_safe_name(model_name)}"
+        safe_model_name = _safe_name(model_name)
+        base_run_id = f"{ts}_{safe_model_name}"
+        run_id = base_run_id
+        suffix = 1
+        while os.path.exists(os.path.join(self.base_dir, run_id)):
+            run_id = f"{base_run_id}_{suffix}"
+            suffix += 1
         run_dir = os.path.join(self.base_dir, run_id)
-        os.makedirs(run_dir, exist_ok=True)
+        os.makedirs(run_dir, exist_ok=False)
         return run_id, run_dir
 
     def save_run(
@@ -77,6 +84,7 @@ class TrainingRunManager:
         feature_cols: Optional[List[str]] = None,
         target_col: Optional[str] = None,
         extra: Optional[Dict[str, Any]] = None,
+        contract_context: Optional[Dict[str, Any]] = None,
     ) -> TrainingRunSummary:
         run_id, run_dir = self.create_run_dir(model_name)
 
@@ -84,6 +92,35 @@ class TrainingRunManager:
         meta.setdefault("model_name", model_name)
         meta.setdefault("run_id", run_id)
         meta.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
+
+        if isinstance(contract_context, dict):
+            prediction_contract = contract_context.get("prediction_contract")
+            registry_snapshot = contract_context.get("registry_snapshot")
+            dataset_manifest = contract_context.get("dataset_manifest")
+            feature_audit = contract_context.get("feature_audit")
+            if isinstance(registry_snapshot, dict):
+                meta.setdefault("feature_registry_version", registry_snapshot.get("registry_version"))
+                meta.setdefault("feature_registry_hash", registry_snapshot.get("registry_hash"))
+            meta.setdefault("dataset_id", (dataset_manifest or {}).get("dataset_id") if isinstance(dataset_manifest, dict) else contract_context.get("dataset_id"))
+            if isinstance(dataset_manifest, dict):
+                meta.setdefault("dataset_manifest_hash", dataset_manifest.get("manifest_hash"))
+            elif contract_context.get("dataset_manifest_hash") is not None:
+                meta.setdefault("dataset_manifest_hash", contract_context.get("dataset_manifest_hash"))
+            if isinstance(feature_audit, dict):
+                canonical = list(feature_audit.get("canonical_feature_cols") or [])
+                effective = list(feature_audit.get("effective_feature_cols") or [])
+                meta.setdefault("canonical_feature_count", len(canonical))
+                meta.setdefault("effective_feature_count", len(effective))
+                meta.setdefault("removed_feature_cols", list(feature_audit.get("removed_feature_cols") or []))
+            # Persist only the contract-bearing keys. Arbitrary request/input fields
+            # are intentionally excluded from the run directory.
+            contract_payload = {
+                key: contract_context[key]
+                for key in ("prediction_contract", "registry_snapshot", "dataset_manifest", "feature_audit")
+                if key in contract_context
+            }
+            with open(os.path.join(run_dir, "contract.json"), "w", encoding="utf-8") as f:
+                json.dump(contract_payload, f, ensure_ascii=False, indent=2)
 
         with open(os.path.join(run_dir, "metadata.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -154,6 +191,7 @@ class TrainingRunManager:
                         "roc_auc": meta.get("roc_auc"),
                     },
                     extra=extra,
+                    contract_context=contract_context,
                 )
 
                 with open(os.path.join(run_dir, "model.pkl"), "wb") as f:
@@ -215,6 +253,19 @@ class TrainingRunManager:
                 break
 
         return out
+
+    def load_metadata(self, run_id: str) -> Dict[str, Any]:
+        """读取单条 Run 的轻量元数据，不加载曲线、CSV 或模型文件。"""
+        run_dir = os.path.join(self.base_dir, str(run_id))
+        meta_path = os.path.join(run_dir, "metadata.json")
+        if not os.path.isfile(meta_path):
+            return {}
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                value = json.load(f)
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
 
     def load_run(self, run_id: str, load_model: bool = False) -> Dict[str, Any]:
         run_dir = os.path.join(self.base_dir, run_id)

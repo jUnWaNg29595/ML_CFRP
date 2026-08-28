@@ -2,6 +2,21 @@ import json
 import pandas as pd
 
 
+def test_artifact_round_trip_keeps_registry_and_manifest_hash():
+    from core.model_io import create_model_artifact, dumps_artifact, loads_artifact
+
+    context = {
+        "prediction_contract": {"schema_version": 2, "feature_registry_hash": "r1", "dataset_manifest_hash": "m1"},
+        "registry_snapshot": {"registry_hash": "r1"},
+        "dataset_manifest": {"manifest_hash": "m1"},
+        "feature_audit": {"canonical_feature_cols": ["x"], "effective_feature_cols": ["x"], "removed_feature_cols": []},
+    }
+    artifact = create_model_artifact(model_name="demo", target_col="tg_c", feature_cols=["x"], model=None, contract_context=context)
+    restored = loads_artifact(dumps_artifact(artifact))
+    assert restored["extra"]["prediction_contract"]["feature_registry_hash"] == "r1"
+    assert restored["extra"]["dataset_manifest"]["manifest_hash"] == "m1"
+
+
 def test_training_lock_rejects_unregistered_column_before_model_creation(tmp_path):
     from core.feature_registry import compute_registry_hash
     from core.training_contract import lock_training_contract

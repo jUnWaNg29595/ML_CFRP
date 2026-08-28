@@ -12769,6 +12769,7 @@ def _render_binary_classification_results(
     cv_strategy: str | None = None,
     cv_folds: int | None = None,
     cv_repeats: int | None = None,
+    feature_contract_context: dict | None = None,
 ):
     st.markdown("### 分类指标（Test）")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -12983,6 +12984,7 @@ def _render_binary_classification_results(
                 **_current_molecular_feature_artifact_extra(),
                 **_current_melting_point_artifact_extra(target_col),
             },
+            contract_context=feature_contract_context,
         )
         st.session_state.last_training_run_id = summary.run_id
         st.caption(f"已保存训练记录：{summary.run_id}")
@@ -14491,6 +14493,7 @@ def page_model_training():
                             cv_strategy=(cv_strategy if cv_res is not None else None),
                             cv_folds=(int(cv_folds) if cv_res is not None else None),
                             cv_repeats=(int(cv_repeats) if cv_res is not None else None),
+                            feature_contract_context=training_feature_contract_context,
                         )
                         return
 
@@ -14924,6 +14927,7 @@ def page_model_training():
                             feature_cols=effective_feature_cols,
                             target_col=target_col,
                             extra={**_current_molecular_feature_artifact_extra(), **_current_melting_point_artifact_extra(target_col)},
+                            contract_context=training_feature_contract_context,
                         )
                         st.session_state.last_training_run_id = summary.run_id
                         st.caption(f"🗂️ 已保存训练记录: {summary.run_id}（可在【📈 训练记录】查看）")
@@ -15011,6 +15015,7 @@ def page_model_training():
                                 target_col=target_col,
                                 model_name=model_name,
                                 extra=_extra,
+                                contract_context=training_feature_contract_context,
                             )
 
                             run_dir = summary.path if summary else manager.base_dir
@@ -15383,6 +15388,7 @@ def page_model_training():
                                 imputer=st.session_state.get("imputer"),
                                 metrics=metrics,
                                 extra=extra_export,
+                                contract_context=st.session_state.get("training_feature_contract_context"),
                             )
                             safe_name = (str(st.session_state.get("model_name") or model_name) or "model").replace(" ", "_")
                             st.download_button(
