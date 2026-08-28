@@ -153,8 +153,8 @@ def apply_feature_review_decision(
     if action not in {"accept", "edit_accept"}:
         raise ValueError("unsupported feature review action")
     suggestion_status = suggestion.get("status")
-    if suggestion_status is None or str(suggestion_status).strip().lower() != "approved":
-        raise ValueError("只能批准 status=approved 的特征审核建议")
+    if suggestion_status is None or str(suggestion_status).strip().lower() != "pending_review":
+        raise ValueError("只能批准 status=pending_review 的特征审核建议")
     feature_id = suggestion.get("feature_id")
     registry_feature = None
     if isinstance(registry, Mapping):
@@ -185,6 +185,8 @@ def apply_feature_review_decision(
     if action == "edit_accept":
         if not isinstance(edited, Mapping):
             raise ValueError("edit_accept 必须提供编辑后的字段")
+        if "status" in edited and str(edited.get("status") or "").strip().lower() != "pending_review":
+            raise ValueError("编辑后的 status 必须为 pending_review")
         suggestion = {**dict(suggestion), **dict(edited)}
         raw_columns = suggestion.get("raw_columns")
         if isinstance(raw_columns, str):
@@ -194,9 +196,6 @@ def apply_feature_review_decision(
         source_role = str(suggestion.get("source_role") or "").strip()
         if source_role not in {"manual_input", "molecular_workflow", "derived_workflow"}:
             raise ValueError("编辑后的 source_role 无效")
-        edited_status = suggestion.get("status")
-        if edited_status is not None and str(edited_status).strip().lower() != "approved":
-            raise ValueError("只能批准 status=approved 的特征审核建议")
     if isinstance(registry_feature, Mapping):
         source_type = str(registry_feature.get("source_type") or "").strip()
         if source_type != source_role:
