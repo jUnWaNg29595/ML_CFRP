@@ -91,6 +91,127 @@ def test_profile_references_and_snapshot_filtering():
     assert snapshot["registry_hash"] == payload["approval"]["approved_hash"]
 
 
+def test_compact_snapshot_hash_cannot_be_replaced_with_contract_hash():
+    from core.feature_registry import build_registry_snapshot, compute_registry_hash
+    from core.prediction_portal import validate_publication_artifact, build_prediction_contract
+    from core.dataset_manifest import compute_dataset_manifest_hash
+
+    feature = _feature(feature_id="a", name="a", status="approved")
+    registry = _registry([feature], {"p": {"feature_ids": ["a"], "status": "approved", "target_col": "tg_c"}}, {"status": "approved"})
+    registry["approval"]["approved_hash"] = compute_registry_hash(registry)
+    snapshot = build_registry_snapshot(registry, "p")
+    tampered = dict(snapshot)
+    tampered["features"] = [dict(feature, unit="tampered")]
+    import hashlib, json
+    tampered["registry_hash"] = "forged-parent-hash"
+    tampered["selected_features_hash"] = hashlib.sha256(json.dumps({"profile_id": tampered["profile_id"], "model_profile": tampered["model_profile"], "features": tampered["features"]}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    manifest = {"schema_version": 1, "dataset_id": "d", "model_profile_id": "p", "source_bindings": [], "feature_bindings": [], "status": "approved"}
+    manifest["manifest_hash"] = compute_dataset_manifest_hash(manifest)
+    artifact = {"model": object(), "pipeline": None, "feature_cols": ["a"], "target_col": "tg_c", "extra": {}}
+    contract = build_prediction_contract(artifact=artifact, feature_cols=["a"], target_col="tg_c", registry_snapshot=tampered, dataset_manifest=manifest, model_profile_id="p", canonical_feature_cols=["a"], effective_feature_cols=["a"], removed_feature_cols=[])
+    report = validate_publication_artifact(artifact, contract, registry_snapshot=tampered, dataset_manifest=manifest)
+    assert report["ok"] is False
+    assert any("registry" in error.lower() and "hash" in error.lower() for error in report["errors"])
+
+
+def test_publication_rejects_compact_snapshot_when_payload_is_not_approved():
+    from core.dataset_manifest import compute_dataset_manifest_hash
+    from core.feature_registry import build_registry_snapshot, compute_registry_hash
+    from core.prediction_portal import build_prediction_contract, validate_publication_artifact
+
+    feature = _feature(feature_id="a", name="a", status="approved")
+    registry = _registry(
+        [feature],
+        {"p": {"feature_ids": ["a"], "status": "approved", "target_col": "tg_c"}},
+        {"status": "draft"},
+    )
+    snapshot = {
+        "schema_version": 1,
+        "registry_version": registry["registry_version"],
+        "registry_hash": compute_registry_hash(registry),
+        "registry_payload": registry,
+        "profile_id": "p",
+        "model_profile": registry["model_profiles"]["p"],
+        "features": [feature],
+        "selected_features_hash": "ignored-by-gate",
+    }
+    manifest = {"schema_version": 1, "dataset_id": "d", "model_profile_id": "p", "source_bindings": [], "feature_bindings": [], "status": "approved"}
+    manifest["manifest_hash"] = compute_dataset_manifest_hash(manifest)
+    artifact = {"model": object(), "pipeline": None, "feature_cols": ["a"], "target_col": "tg_c", "extra": {}}
+    contract = build_prediction_contract(artifact=artifact, feature_cols=["a"], target_col="tg_c", registry_snapshot=snapshot, dataset_manifest=manifest, model_profile_id="p", canonical_feature_cols=["a"], effective_feature_cols=["a"], removed_feature_cols=[])
+
+    report = validate_publication_artifact(artifact, contract, registry_snapshot=snapshot, dataset_manifest=manifest)
+
+    assert report["ok"] is False
+    assert any("approved" in error.lower() for error in report["errors"])
+
+
+def test_publication_rejects_compact_snapshot_without_payload_even_with_registry_hash():
+    from core.dataset_manifest import compute_dataset_manifest_hash
+    from core.prediction_portal import build_prediction_contract, validate_publication_artifact
+
+    snapshot = {
+        "schema_version": 1,
+        "registry_version": "v1",
+        "registry_hash": "claimed-approved-hash",
+        "profile_id": "p",
+        "model_profile": {"feature_ids": ["a"], "status": "approved", "target_col": "tg_c"},
+        "features": [_feature(feature_id="a", name="a", status="approved")],
+        "selected_features_hash": "claimed-selected-hash",
+    }
+    manifest = {"schema_version": 1, "dataset_id": "d", "model_profile_id": "p", "source_bindings": [], "feature_bindings": [], "status": "approved"}
+    manifest["manifest_hash"] = compute_dataset_manifest_hash(manifest)
+    artifact = {"model": object(), "pipeline": None, "feature_cols": ["a"], "target_col": "tg_c", "extra": {}}
+    contract = build_prediction_contract(artifact=artifact, feature_cols=["a"], target_col="tg_c", registry_snapshot=snapshot, dataset_manifest=manifest, model_profile_id="p", canonical_feature_cols=["a"], effective_feature_cols=["a"], removed_feature_cols=[])
+
+    report = validate_publication_artifact(artifact, contract, registry_snapshot=snapshot, dataset_manifest=manifest)
+
+    assert report["ok"] is False
+    assert any("payload" in error.lower() or "approved" in error.lower() for error in report["errors"])
+
+
+def test_publication_rejects_compact_snapshot_top_level_feature_tampering_with_recomputed_hashes():
+    import hashlib
+    from core.dataset_manifest import compute_dataset_manifest_hash
+    from core.feature_registry import build_registry_snapshot, compute_registry_hash
+    from core.prediction_portal import build_prediction_contract, validate_publication_artifact
+
+    feature = _feature(feature_id="a", name="a", status="approved")
+    registry = _registry([feature], {"p": {"feature_ids": ["a"], "status": "approved", "target_col": "tg_c"}}, {"status": "approved"})
+    registry["approval"]["approved_hash"] = compute_registry_hash(registry)
+    snapshot = build_registry_snapshot(registry, "p")
+    snapshot["features"] = [dict(snapshot["features"][0], unit="tampered")]
+    snapshot["selected_features_hash"] = hashlib.sha256(json.dumps({"profile_id": snapshot["profile_id"], "model_profile": snapshot["model_profile"], "features": snapshot["features"]}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    manifest = {"schema_version": 1, "dataset_id": "d", "model_profile_id": "p", "source_bindings": [], "feature_bindings": [], "status": "approved"}
+    manifest["manifest_hash"] = compute_dataset_manifest_hash(manifest)
+    artifact = {"model": object(), "pipeline": None, "feature_cols": ["a"], "target_col": "tg_c", "extra": {}}
+    contract = build_prediction_contract(artifact=artifact, feature_cols=["a"], target_col="tg_c", registry_snapshot=snapshot, dataset_manifest=manifest, model_profile_id="p", canonical_feature_cols=["a"], effective_feature_cols=["a"], removed_feature_cols=[])
+
+    report = validate_publication_artifact(artifact, contract, registry_snapshot=snapshot, dataset_manifest=manifest)
+
+    assert report["ok"] is False
+    assert any("feature" in error.lower() and ("mismatch" in error.lower() or "一致" in error) for error in report["errors"])
+
+
+def test_publication_rejects_full_snapshot_with_unapproved_model_profile():
+    from core.dataset_manifest import compute_dataset_manifest_hash
+    from core.feature_registry import compute_registry_hash
+    from core.prediction_portal import build_prediction_contract, validate_publication_artifact
+
+    feature = _feature(feature_id="a", name="a", status="approved")
+    registry = _registry([feature], {"p": {"feature_ids": ["a"], "status": "draft", "target_col": "tg_c"}}, {"status": "approved"})
+    registry["approval"]["approved_hash"] = compute_registry_hash(registry)
+    manifest = {"schema_version": 1, "dataset_id": "d", "model_profile_id": "p", "source_bindings": [], "feature_bindings": [], "status": "approved"}
+    manifest["manifest_hash"] = compute_dataset_manifest_hash(manifest)
+    artifact = {"model": object(), "pipeline": None, "feature_cols": ["a"], "target_col": "tg_c", "extra": {}}
+    contract = build_prediction_contract(artifact=artifact, feature_cols=["a"], target_col="tg_c", registry_snapshot=registry, dataset_manifest=manifest, model_profile_id="p", canonical_feature_cols=["a"], effective_feature_cols=["a"], removed_feature_cols=[])
+
+    report = validate_publication_artifact(artifact, contract, registry_snapshot=registry, dataset_manifest=manifest)
+
+    assert report["ok"] is False
+    assert any("profile" in error.lower() and "approved" in error.lower() for error in report["errors"])
+
+
 def test_blocked_feature_requires_reason():
     from core.feature_registry import validate_registry
 

@@ -87,10 +87,24 @@ def build_feature_review_context(frame: Any, registry: Mapping[str, Any], profil
     target_columns = _target_column_names(profile, columns)
     review_columns = [column for column in columns if str(column) not in target_columns]
     feature_ids = set(profile.get("feature_ids", []) if isinstance(profile, Mapping) else [])
+    normalized_columns = {_normalized_column(column) for column in review_columns}
+
+    def mappable(item: Mapping[str, Any]) -> bool:
+        names = [item.get("name"), item.get("feature_id")]
+        for key in ("aliases", "accepted_aliases"):
+            values = item.get(key) or []
+            names.extend([values] if isinstance(values, str) else values if isinstance(values, list) else [])
+        for name in names:
+            token = _normalized_column(name)
+            if token and any(token in column or column in token for column in normalized_columns):
+                return True
+        return False
     definitions = [
         _feature_summary(item)
         for item in (registry.get("features", []) if isinstance(registry, Mapping) else [])
-        if isinstance(item, Mapping) and (not feature_ids or item.get("feature_id") in feature_ids)
+        if isinstance(item, Mapping)
+        and item.get("source_type") not in {"target", "metadata"}
+        and ((feature_ids and item.get("feature_id") in feature_ids) or (not feature_ids and mappable(item)))
     ]
     dtypes = {
         str(column): str(getattr(frame[column], "dtype", ""))
@@ -121,7 +135,11 @@ def request_feature_mapping_review(client: Any, context: Mapping[str, Any]) -> d
     return parse_feature_mapping_response(response)
 
 
-def apply_feature_review_decision(manifest: Mapping[str, Any], suggestion: Mapping[str, Any], action: str, reviewer: str) -> dict[str, Any]:
+def apply_feature_review_decision(
+    manifest: Mapping[str, Any], suggestion: Mapping[str, Any], action: str, reviewer: str,
+    registry: Mapping[str, Any] | None = None, edited: Mapping[str, Any] | None = None,
+    profile_id: str | None = None,
+) -> dict[str, Any]:
     updated = copy.deepcopy(dict(manifest))
     action = str(action).strip().lower()
     reviewer = str(reviewer or "").strip()
@@ -134,14 +152,59 @@ def apply_feature_review_decision(manifest: Mapping[str, Any], suggestion: Mappi
         return updated
     if action not in {"accept", "edit_accept"}:
         raise ValueError("unsupported feature review action")
+    suggestion_status = suggestion.get("status")
+    if suggestion_status is not None and str(suggestion_status).strip().lower() != "approved":
+        raise ValueError("只能批准 status=approved 的特征审核建议")
     feature_id = suggestion.get("feature_id")
+    registry_feature = None
+    if isinstance(registry, Mapping):
+        registry_feature = next(
+            (item for item in registry.get("features", [])
+             if isinstance(item, Mapping) and item.get("feature_id") == feature_id),
+            None,
+        )
+        valid_ids = {
+            str(item.get("feature_id")) for item in registry.get("features", [])
+            if isinstance(item, Mapping) and item.get("feature_id")
+        }
+        if feature_id not in valid_ids:
+            raise ValueError("feature_id 不属于 registry 合法候选")
+        if profile_id:
+            profile = registry.get("model_profiles", {}).get(profile_id) if isinstance(registry.get("model_profiles"), Mapping) else None
+            profile_ids = set(profile.get("feature_ids", [])) if isinstance(profile, Mapping) else set()
+            if feature_id not in profile_ids:
+                raise ValueError("feature_id 不属于当前 profile 合法候选")
     raw_columns = suggestion.get("raw_columns")
     if not isinstance(feature_id, str) or not feature_id.strip() or not isinstance(raw_columns, list) or not raw_columns:
         raise ValueError("approved binding requires feature_id and raw_columns")
+    if "source_role" not in suggestion or not str(suggestion.get("source_role") or "").strip():
+        raise ValueError("source_role 必须显式提供")
+    source_role = str(suggestion.get("source_role") or "").strip()
+    if source_role not in {"manual_input", "molecular_workflow", "derived_workflow"}:
+        raise ValueError("source_role 必须是允许的输入/工作流来源")
+    if action == "edit_accept":
+        if not isinstance(edited, Mapping):
+            raise ValueError("edit_accept 必须提供编辑后的字段")
+        suggestion = {**dict(suggestion), **dict(edited)}
+        raw_columns = suggestion.get("raw_columns")
+        if isinstance(raw_columns, str):
+            raw_columns = [item.strip() for item in raw_columns.split(",") if item.strip()]
+        if not isinstance(raw_columns, list) or not raw_columns:
+            raise ValueError("编辑后的 raw_columns 不能为空")
+        source_role = str(suggestion.get("source_role") or "").strip()
+        if source_role not in {"manual_input", "molecular_workflow", "derived_workflow"}:
+            raise ValueError("编辑后的 source_role 无效")
+        edited_status = suggestion.get("status")
+        if edited_status is not None and str(edited_status).strip().lower() != "approved":
+            raise ValueError("只能批准 status=approved 的特征审核建议")
+    if isinstance(registry_feature, Mapping):
+        source_type = str(registry_feature.get("source_type") or "").strip()
+        if source_type != source_role:
+            raise ValueError("source_role 必须与 registry feature.source_type 对齐")
     binding = {
         "feature_id": feature_id.strip(),
         "raw_columns": [str(column).strip() for column in raw_columns],
-        "source_role": str(suggestion.get("source_role") or "manual_input").strip(),
+        "source_role": source_role,
         "unit": str(suggestion.get("unit") or "unknown").strip(),
         "review_status": "approved",
         "approved_by": reviewer,

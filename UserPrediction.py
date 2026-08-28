@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import base64
 import json
+import hashlib
 import re
 from datetime import datetime
 from html import escape as html_escape
@@ -15,14 +16,15 @@ import pandas as pd
 import streamlit as st
 
 from core.model_io import load_model_artifact_bytes
-from core.portal_prediction import run_confirmed_prediction
+from core.portal_prediction import load_published_portal_model, run_confirmed_prediction, validate_publication_artifact
+from core.prediction_portal import activate_publication
 from core.portal_ai import PortalAIClient, PortalAIError
 from core.portal_ai_config import AIServiceConfig, load_ai_config, redacted_ai_config
 from core.portal_ui import inject_scientific_theme, render_material_card, render_stage_timeline, render_status_badge, svg_icon
 from core.portal_tasks import PortalTaskManager
 
 
-APP_NAME = "CFRP 预测应用平台"
+APP_NAME = "邹华维课题组材料预测平台"
 VERSION = "0.1.0"
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -142,7 +144,64 @@ def _ai_service_dataclass(service: Dict[str, Any]) -> AIServiceConfig:
     return AIServiceConfig(**{key: value for key, value in service.items() if key in allowed})
 
 
-def render_ai_assistant_tab(config: Dict[str, Any], material_key: str, target_key: str, target_cfg: Dict[str, Any]) -> None:
+def _model_contract(model: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    artifact = model.get("_artifact") if isinstance(model, dict) else None
+    extra = artifact.get("extra") if isinstance(artifact, dict) else {}
+    contract = model.get("contract") if isinstance(model, dict) else None
+    if not isinstance(contract, dict) and isinstance(extra, dict):
+        contract = extra.get("prediction_contract")
+    snapshot = model.get("registry_snapshot") if isinstance(model, dict) else None
+    if not isinstance(snapshot, dict) and isinstance(extra, dict):
+        snapshot = extra.get("registry_snapshot")
+    return (dict(contract) if isinstance(contract, dict) else {}, dict(snapshot) if isinstance(snapshot, dict) else {})
+
+
+def _is_publishable_ui_model(model: Dict[str, Any]) -> bool:
+    if not isinstance(model, dict) or model.get("enabled") is not True or str(model.get("publication_status") or "").strip().lower() != "published":
+        return False
+    gate = model.get("gate_report")
+    if not isinstance(gate, dict) or gate.get("ok") is not True or str(gate.get("status") or "").strip().lower() != "valid":
+        return False
+    contract, snapshot = _model_contract(model)
+    profile = snapshot.get("model_profile") if isinstance(snapshot, dict) else None
+    if contract.get("schema_version") != 2 or not snapshot or not isinstance(profile, dict) or profile.get("status") != "approved":
+        return False
+    if any(not isinstance(item, dict) or item.get("status") != "approved" for item in snapshot.get("features") or []):
+        return False
+    artifact = model.get("_artifact")
+    if isinstance(artifact, dict):
+        report = validate_publication_artifact(
+            artifact,
+            contract,
+            registry_snapshot=snapshot,
+            dataset_manifest=artifact.get("extra", {}).get("dataset_manifest") if isinstance(artifact.get("extra"), dict) else None,
+        )
+        if report.get("ok") is not True or str(report.get("status") or "").lower() != "valid":
+            return False
+    return True
+
+
+def toggle_model_enabled(
+    config: Dict[str, Any], material_key: str, target_key: str, model: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Toggle a model release, gating every transition to enabled."""
+    if not isinstance(model, dict):
+        raise ValueError("模型记录无效。")
+    if model.get("enabled") is True:
+        model["enabled"] = False
+        model["updated_at"] = now_iso()
+        return config
+    candidate = copy.deepcopy(model)
+    candidate["enabled"] = True
+    return activate_publication(
+        config, material_key=material_key, target_key=target_key, entry=candidate
+    )
+
+
+def render_ai_assistant_tab(
+    config: Dict[str, Any], material_key: str, target_key: str, target_cfg: Dict[str, Any],
+    contract: Dict[str, Any] | None = None, registry_snapshot: Dict[str, Any] | None = None,
+) -> None:
     st.markdown('### AI 辅助输入')
     st.caption('AI 只提取和整理你提供的信息；每个字段必须确认、修改后确认或明确拒绝，不能自动生成 EEW、AHEW、PHR、分子特征或工艺参数。')
     try:
@@ -163,11 +222,14 @@ def render_ai_assistant_tab(config: Dict[str, Any], material_key: str, target_ke
             st.warning('请先输入待解析的文本。')
         else:
             try:
+                contract = contract if isinstance(contract, dict) else {}
+                registry_snapshot = registry_snapshot if isinstance(registry_snapshot, dict) else {}
+                field_defs = build_manual_input_fields(contract, registry_snapshot) + build_workflow_source_fields(contract, registry_snapshot)
                 response = PortalAIClient(_ai_service_dataclass(service)).parse_input({
                     'material_type': material_key, 'target': target_key,
                     'field_descriptions': [
-                        {'name': item.get('name'), 'label': item.get('label'), 'kind': item.get('kind'), 'required': item.get('required', False)}
-                        for item in target_cfg.get('parameters', [])
+                        {'name': item.get('name'), 'label': item.get('label'), 'kind': item.get('kind'), 'required': item.get('required', False), 'allow_ai_generation': False}
+                        for item in field_defs
                     ], 'user_text': user_text,
                 })
                 st.session_state[state_key] = build_ai_confirmation_state(response)
@@ -229,9 +291,8 @@ def render_portal_task_panel(task_id: str | None, *, session_key: str) -> None:
             manager.cancel_task(task_id)
             st.rerun()
     with control_cols[2]:
-        if status in {"failed", "cancelled"} and st.button("重试任务", key=f"retry_{session_key}_{task_id}", width="stretch"):
-            st.session_state[session_key] = manager.retry_task(task_id)
-            st.rerun()
+        if status in {"failed", "cancelled"} and st.button("重新提交输入", key=f"retry_{session_key}_{task_id}", width="stretch"):
+            st.info("请重新填写并提交预测输入；系统不会自动重放原始请求。")
     if status == "completed" and isinstance(snapshot.get("result"), dict):
         st.markdown(render_result(snapshot["result"]), unsafe_allow_html=True)
         result = snapshot["result"]
@@ -479,11 +540,101 @@ def parameter_from_feature(feature: str) -> Dict[str, Any]:
         "label": str(feature),
         "kind": "number",
         "required": True,
-        "default": 0.0,
+        "default": None,
         "placeholder": "",
-        "help": "由模型特征列自动生成，可在管理页面调整",
+        "help": "仅作为迁移提示；预测值必须来自已批准契约或用户显式输入",
         "options": [],
     }
+
+
+def _contract_feature_definitions(contract: Dict[str, Any], registry_snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    definitions: Dict[str, Dict[str, Any]] = {}
+    # The registry snapshot is authoritative. Contract definitions are only a
+    # fallback for embedded v2 artifacts that carry their approved snapshot.
+    if not isinstance(registry_snapshot, dict) or not registry_snapshot:
+        return definitions
+    if registry_snapshot.get("schema_version") != 1 or not isinstance(registry_snapshot.get("features"), list):
+        return definitions
+    sources = [registry_snapshot]
+    for source in sources:
+        items = source.get("features") if isinstance(source, dict) else None
+        if not isinstance(items, list):
+            items = source.get("feature_definitions") if isinstance(source, dict) else None
+        for item in items or []:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if name:
+                    definitions[name] = dict(item)
+    return definitions
+
+
+def build_manual_input_fields(contract: Dict[str, Any], registry_snapshot: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    """Build editable fields only from the contract's approved manual partition."""
+    contract = contract if isinstance(contract, dict) else {}
+    registry_snapshot = registry_snapshot if isinstance(registry_snapshot, dict) else {}
+    definitions = _contract_feature_definitions(contract, registry_snapshot)
+    names = [str(name) for name in contract.get("manual_input_feature_cols") or [] if str(name).strip()]
+    fields: List[Dict[str, Any]] = []
+    for name in names:
+        definition = definitions.get(name, {})
+        if (
+            definition.get("source_type") != "manual_input"
+            or definition.get("status") != "approved"
+            or definition.get("default_policy") != "explicit_only"
+        ):
+            continue
+        data_type = str(definition.get("data_type") or "float").lower()
+        kind = "integer" if data_type in {"integer", "int"} else "number" if data_type in {"float", "number"} else "select" if definition.get("enum_values") or definition.get("options") else "text"
+        fields.append({
+            "name": name,
+            "label": definition.get("label") or definition.get("display_name") or name,
+            "unit": definition.get("unit"),
+            "data_type": definition.get("data_type") or "float",
+            "kind": kind,
+            "required": bool(definition.get("required_for_prediction", True)),
+            "nullable": bool(definition.get("nullable", False)),
+            "default": None,
+            "valid_range": definition.get("valid_range"),
+            "options": list(definition.get("enum_values") or definition.get("options") or []),
+            "source_type": "manual_input",
+        })
+    return fields
+
+
+def build_workflow_source_fields(contract: Dict[str, Any], registry_snapshot: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    """Build read-only workflow source slots declared by the prediction contract."""
+    contract = contract if isinstance(contract, dict) else {}
+    registry_snapshot = registry_snapshot if isinstance(registry_snapshot, dict) else {}
+    profile = registry_snapshot.get("model_profile")
+    if contract.get("schema_version") != 2 or not registry_snapshot or not isinstance(profile, dict) or profile.get("status") != "approved":
+        return []
+    if any(not isinstance(item, dict) or item.get("status") != "approved" for item in registry_snapshot.get("features") or []):
+        return []
+    # v2's canonical field name is intentionally the only accepted source for
+    # the editable portal UI. Legacy aliases remain read-only compatibility
+    # data in the backend and must not silently create controls here.
+    declared = contract.get("workflow_source_fields") or []
+    fields: List[Dict[str, Any]] = []
+    for item in declared:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("column") or item.get("name") or "").strip()
+        if not name:
+            continue
+        roles = item.get("roles") or item.get("source_roles") or []
+        if isinstance(roles, str):
+            roles = [roles]
+        fields.append({
+            "name": name,
+            "label": item.get("label") or name,
+            "roles": [str(role) for role in roles],
+            "required": bool(item.get("required", not bool(item.get("nullable", False)))),
+            "nullable": bool(item.get("nullable", False)),
+            "default": None,
+            "kind": "smiles" if "smiles" in name.lower() else "text",
+            "source_type": "workflow",
+        })
+    return fields
 
 
 def sync_parameters_from_features(target_cfg: Dict[str, Any], feature_cols: List[str]) -> bool:
@@ -615,13 +766,18 @@ def upsert_model_entry(
     entry = {
         "id": model_id,
         "label": label or artifact.get("model_name") or Path(file_name).stem,
-        "enabled": True if existing_entry is None else bool(existing_entry.get("enabled", True)),
+        # Imported artifacts enter validation first; publication requires an
+        # explicit successful gate report and activation action.
+        "enabled": False,
+        "publication_status": "needs_validation",
+        "gate_report": {},
         "notes": notes,
         "model_name": artifact.get("model_name") or "ImportedModel",
         "target_col": artifact.get("target_col") or target_key,
         "feature_cols": list(feature_cols),
         "feature_source": "override" if feature_override else ("artifact" if artifact.get("feature_cols") else "input_order"),
         "artifact_path": saved_path.relative_to(PROJECT_ROOT).as_posix(),
+        "artifact_hash": hashlib.sha256(file_bytes).hexdigest(),
         "source_filename": file_name,
         "created_at": existing_entry.get("created_at") if existing_entry else now_iso(),
         "updated_at": now_iso(),
@@ -714,23 +870,62 @@ def metric_text(metrics: Dict[str, Any]) -> str:
     return "已登记"
 
 
+def _material_icon(material_key: str) -> str:
+    return {
+        "epoxy_resin": "resin",
+        "ud_cfrp": "carbon_fiber",
+    }.get(material_key, "molecule")
+
+
+def _material_statistics(material_cfg: Dict[str, Any]) -> Tuple[int, int]:
+    targets = [target for _, target in target_items(material_cfg) if target.get("enabled", True)]
+    published_models = sum(
+        1
+        for target in targets
+        for model in model_items(target)
+        if model.get("enabled") is True and str(model.get("publication_status") or "").strip().lower() == "published"
+    )
+    return len(targets), published_models
+
+
+def _portal_service_status() -> Tuple[str, str, int]:
+    try:
+        ai_config = load_ai_config(PROJECT_ROOT)
+        services = [
+            item for item in ai_config.get("services", [])
+            if item.get("enabled") and item.get("purpose") in {"both", "input_parsing", "result_explanation"}
+        ]
+    except Exception:
+        return "不可用", "AI 配置读取失败，仍可使用手动与批量预测", 0
+    if not services:
+        return "未配置", "AI 为可选能力，不影响 Python 预测流程", 0
+    return "已连接", f"{services[0].get('label') or services[0].get('service_id') or 'AI 服务'} 可用于输入解析", len(services)
+
+
 def material_card_html(material_key: str, material_cfg: Dict[str, Any]) -> str:
-    state_text = "已开放" if material_cfg.get("enabled") else "暂未开放"
-    state_class = "status-open" if material_cfg.get("enabled") else "status-closed"
-    description = material_cfg.get("description") or ""
-    image_uri = portal_asset(material_image_name(material_key))
-    image_html = f'<div class="portal-card-image" style="background-image: url({image_uri});"></div>' if image_uri else ""
+    status = "enabled" if material_cfg.get("enabled") else "unknown"
+    target_count, model_count = _material_statistics(material_cfg)
+    label = html_escape(str(material_cfg.get("label") or material_key))
+    description = html_escape(str(material_cfg.get("description") or ""))
+    icon_markup = svg_icon(_material_icon(material_key), 28, label)
+    state_markup = render_status_badge(status)
     return f"""
-    <div class="portal-card">
-        {image_html}
+    <article class="portal-card portal-material-entry" data-material="{html_escape(material_key)}">
         <div class="portal-card-top">
-            <div class="portal-title">{material_cfg.get('label', '')}</div>
-            <div class="status-pill {state_class}">{state_text}</div>
+            <div class="portal-card-icon">{icon_markup}</div>
+            <div class="portal-title-group">
+                <div class="portal-title">{label}</div>
+                <div class="portal-card-code">{html_escape(material_key.upper())}</div>
+            </div>
+            <div class="portal-card-state">{state_markup}</div>
         </div>
         <div class="portal-desc">{description}</div>
-    </div>
+        <div class="portal-card-metrics">
+            <span><strong>{target_count}</strong> 个性能项</span>
+            <span><strong>{model_count}</strong> 个已发布模型</span>
+        </div>
+    </article>
     """
-
 
 def init_smiles_field_state(state_key: str, default_value: Any) -> None:
     if state_key not in st.session_state:
@@ -791,7 +986,7 @@ def render_smiles_field(field: Dict[str, Any], scope_key: str) -> str:
 
     if st.session_state.get(result_key):
         st.caption("最近一次结构图识别结果")
-        st.dataframe(pd.DataFrame(st.session_state[result_key]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(st.session_state[result_key]), width="stretch", hide_index=True)
 
     return st.session_state.get(state_key, "")
 
@@ -834,7 +1029,7 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str) ->
                 value = st.number_input(
                     label,
                     key=f"{key_base}_number",
-                    value=default_number(field.get("default"), 0.0),
+                    value=None if field.get("default") is None else default_number(field.get("default"), 0.0),
                     help=field.get("help") or None,
                     format="%.6f",
                 )
@@ -842,16 +1037,18 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str) ->
                 value = st.number_input(
                     label,
                     key=f"{key_base}_integer",
-                    value=default_integer(field.get("default"), 0),
+                    value=None if field.get("default") is None else default_integer(field.get("default"), 0),
                     help=field.get("help") or None,
                     step=1,
                 )
-                value = int(value)
+                value = None if value is None else int(value)
             elif kind == "select":
                 options = parse_options(field.get("options"))
+                default_value = str(field.get("default", "") or "")
                 if not options:
                     options = [""]
-                default_value = str(field.get("default", "") or "")
+                elif not default_value:
+                    options = [""] + options
                 default_index = options.index(default_value) if default_value in options else 0
                 value = st.selectbox(
                     label,
@@ -871,7 +1068,7 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str) ->
                     help=field.get("help") or None,
                 )
 
-        if required and kind in {"text", "select", "smiles"} and str(value).strip() == "":
+        if required and (kind in {"text", "select", "smiles"} and str(value).strip() == "" or kind in {"number", "integer"} and value is None):
             errors.append(f"{label} 不能为空")
         values[field["name"]] = value
 
@@ -884,29 +1081,89 @@ def reset_user_selection() -> None:
 
 
 def render_user_home(config: Dict[str, Any]) -> None:
-    hero_uri = portal_asset("portal-hero.png")
+    materials = material_items(config)
+    enabled_materials = [item for item in materials if item[1].get("enabled", True)]
+    total_targets = sum(_material_statistics(material_cfg)[0] for _, material_cfg in materials)
+    total_models = sum(_material_statistics(material_cfg)[1] for _, material_cfg in materials)
+    ai_status, ai_detail, ai_service_count = _portal_service_status()
+    ai_badge = render_status_badge("enabled" if ai_service_count else "unknown")
+
     st.markdown(
         f"""
-        <div class="portal-hero visual" style="background-image: linear-gradient(90deg, rgba(248,250,252,0.96) 0%, rgba(248,250,252,0.84) 48%, rgba(248,250,252,0.22) 100%), url({hero_uri});">
-            <div class="hero-kicker">Prediction Workspace</div>
-            <h1>材料预测入口</h1>
-            <p>先选择预测方向，再进入对应的性能预测流程。环氧树脂和单向碳纤维复合材料入口均已开放。</p>
-        </div>
+        <section class="portal-hero portal-home-hero">
+            <div class="portal-home-copy">
+                <div class="portal-brand-mark"><span class="portal-brand-line"></span>邹华维课题组</div>
+                <div class="hero-kicker">材料预测平台 · Scientific prediction workspace</div>
+                <h1>从材料输入到可复现预测</h1>
+                <p>选择材料方向，确认结构与工艺输入，沿着可追踪的特征流程调用已发布模型。AI 只负责辅助整理，Python 负责可信计算。</p>
+                <div class="portal-hero-actions">
+                    <span class="portal-assurance">{svg_icon("validation", 16)} 输入需人工确认</span>
+                    <span class="portal-assurance">{svg_icon("features", 16)} 特征流程可追溯</span>
+                    <span class="portal-assurance">{svg_icon("calculation", 16)} 模型版本可核验</span>
+                </div>
+            </div>
+            <div class="portal-home-status">
+                <div class="portal-status-heading">系统状态</div>
+                <div class="portal-status-row"><span>{svg_icon("calculation", 18)} 预测门户</span>{render_status_badge("enabled")}</div>
+                <div class="portal-status-row"><span>{svg_icon("result", 18)} 已发布模型</span><strong>{total_models}</strong></div>
+                <div class="portal-status-row"><span>{svg_icon("ai", 18)} AI 输入助手</span>{ai_badge}</div>
+                <div class="portal-status-detail">{html_escape(ai_detail)}</div>
+            </div>
+        </section>
         """,
         unsafe_allow_html=True,
     )
 
-    materials = material_items(config)
-    cols = st.columns(len(materials))
-    for col, (material_key, material_cfg) in zip(cols, materials):
-        with col:
+    action_col, status_col = st.columns([1.1, 2.4])
+    with action_col:
+        if st.button("打开 AI 输入助手", key="home_open_ai", type="primary", width="stretch"):
+            if enabled_materials:
+                st.session_state["predict_selected_material"] = enabled_materials[0][0]
+                st.session_state["predict_selected_target"] = ""
+                st.session_state["predict_open_ai_assistant"] = True
+                st.rerun()
+            else:
+                st.warning("当前没有已开放的材料方向。")
+    with status_col:
+        st.caption("AI 未配置时仍可使用手动输入和批量上传；所有 AI 建议必须逐项确认后才会进入预测任务。")
+
+    st.markdown("<div class=\"portal-section-heading\"><span>01</span> 选择材料方向</div>", unsafe_allow_html=True)
+    if not materials:
+        st.info("当前还没有配置材料方向，请先在管理页面完成配置。")
+        return
+
+    cols = st.columns(max(1, min(3, len(materials))))
+    for index, (material_key, material_cfg) in enumerate(materials):
+        with cols[index % len(cols)]:
             st.markdown(material_card_html(material_key, material_cfg), unsafe_allow_html=True)
-            button_text = "进入该方向" if material_cfg.get("enabled") else "暂未开放"
-            if st.button(button_text, key=f"open_{material_key}", disabled=not material_cfg.get("enabled"), use_container_width=True):
+            button_text = "进入预测工作台" if material_cfg.get("enabled") else "方向暂未开放"
+            if st.button(button_text, key=f"open_{material_key}", disabled=not material_cfg.get("enabled"), width="stretch"):
                 st.session_state["predict_selected_material"] = material_key
                 st.session_state["predict_selected_target"] = ""
+                st.session_state["predict_open_ai_assistant"] = False
                 st.rerun()
 
+    if len(materials) <= 2:
+        st.markdown(
+            f"<article class=\"portal-card portal-placeholder-card\">{svg_icon('molecule', 24)}<div><div class=\"portal-title\">更多材料方向</div><div class=\"portal-card-code\">EXTENSIBLE MATERIAL LIBRARY</div><div class=\"portal-desc\">后续可在管理页面新增材料体系、性能项和已发布模型，不影响现有预测入口。</div></div></article>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div class=\"portal-section-heading\"><span>02</span> 可复现工作流</div>", unsafe_allow_html=True)
+    st.markdown(render_stage_timeline("validated", 0), unsafe_allow_html=True)
+    workflow_cols = st.columns(4)
+    workflow_items = [
+        ("input", "输入确认", "手动、批量或 AI 建议均需人工确认"),
+        ("validation", "结构校验", "SMILES / BigSMILES 由 Python 复核"),
+        ("features", "特征准备", "按发布模型绑定的流程和顺序执行"),
+        ("result", "结果解释", "预测值、版本和警告一起保留"),
+    ]
+    for column, (icon_name, title, description) in zip(workflow_cols, workflow_items):
+        with column:
+            st.markdown(
+                f"<div class=\"portal-workflow-card\">{svg_icon(icon_name, 22)}<strong>{title}</strong><p>{description}</p></div>",
+                unsafe_allow_html=True,
+            )
 
 def render_model_brief(models: List[Dict[str, Any]]) -> None:
     if not models:
@@ -941,7 +1198,7 @@ def render_prediction_results(result_df: pd.DataFrame, infos: List[str], errors:
         st.warning("没有可展示的预测结果。")
         return
 
-    st.dataframe(result_df, use_container_width=True)
+    st.dataframe(result_df, width="stretch")
     csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "下载预测结果 CSV",
@@ -963,25 +1220,30 @@ def render_user_page(config: Dict[str, Any]) -> None:
         st.rerun()
         return
 
-    image_uri = portal_asset(material_image_name(selected_material))
+    target_count, model_count = _material_statistics(material_cfg)
     top1, top2 = st.columns([6, 1.4])
     with top1:
         st.markdown(
             f"""
-            <div class="portal-hero compact visual detail" style="background-image: linear-gradient(90deg, rgba(248,250,252,0.95) 0%, rgba(248,250,252,0.86) 54%, rgba(248,250,252,0.28) 100%), url({image_uri});">
-                <div class="hero-kicker">User Page</div>
-                <h1>{material_cfg.get('label', '')}</h1>
-                <p>{material_cfg.get('description', '')}</p>
-            </div>
+            <section class="portal-hero compact portal-detail-hero">
+                <div class="hero-kicker">Prediction workbench</div>
+                <h1>{html_escape(str(material_cfg.get('label') or selected_material))}</h1>
+                <p>{html_escape(str(material_cfg.get('description') or ''))}</p>
+                <div class="portal-hero-actions">
+                    <span class="portal-assurance">{svg_icon('result', 16)} {target_count} 个可用性能项</span>
+                    <span class="portal-assurance">{svg_icon('calculation', 16)} {model_count} 个已发布模型</span>
+                    <span class="portal-assurance">{svg_icon('validation', 16)} 输入确认后计算</span>
+                </div>
+            </section>
             """,
             unsafe_allow_html=True,
         )
     with top2:
         st.write("")
-        if st.button("返回方向选择", use_container_width=True):
+        if st.button("返回方向选择", key=f"back_to_materials_{selected_material}", width="stretch"):
             reset_user_selection()
+            st.session_state["predict_open_ai_assistant"] = False
             st.rerun()
-
     if not material_cfg.get("enabled"):
         st.warning(material_cfg.get("coming_soon_message") or "该方向暂未开放。")
         return
@@ -1012,7 +1274,7 @@ def render_user_page(config: Dict[str, Any]) -> None:
 
     st.caption(target_cfg.get("description") or "当前性能项描述未填写。")
 
-    enabled_models = [model for model in model_items(target_cfg) if model.get("enabled", True)]
+    enabled_models = [model for model in model_items(target_cfg) if _is_publishable_ui_model(model)]
     render_model_brief(enabled_models)
     if not enabled_models:
         return
@@ -1034,29 +1296,44 @@ def render_user_page(config: Dict[str, Any]) -> None:
     if not selected_models:
         st.warning("请至少选择一个模型。")
         return
+    selected_contract, registry_snapshot = _model_contract(selected_models[0])
+    manual_fields = build_manual_input_fields(selected_contract, registry_snapshot)
+    workflow_fields = build_workflow_source_fields(selected_contract, registry_snapshot)
 
     confirmed_by_user = st.checkbox(
         "我确认已检查输入结构、配方/工艺参数，并同意调用已发布模型进行预测",
         key=f"prediction_confirmation_{selected_material}_{selected_target}",
     )
     st.caption("门户预测不会自动补齐缺失特征；模型必须处于已启用、已发布且通过契约验证状态。")
+    st.markdown(render_stage_timeline("validated", 0), unsafe_allow_html=True)
 
-    tab_manual, tab_batch, tab_ai, tab_config = st.tabs(["手动输入", "批量上传", "AI 辅助输入", "当前配置"])
+    open_ai = bool(st.session_state.get("predict_open_ai_assistant"))
+    if open_ai:
+        tab_ai, tab_manual, tab_batch, tab_config = st.tabs(["AI 辅助输入", "手动输入", "批量上传", "当前配置"])
+    else:
+        tab_manual, tab_batch, tab_ai, tab_config = st.tabs(["手动输入", "批量上传", "AI 辅助输入", "当前配置"])
 
     with tab_manual:
         st.markdown("### 手动输入参数")
-        manual_df, validation_errors = render_parameter_inputs(target_cfg.get("parameters") or [], f"manual_{selected_material}_{selected_target}")
+        # Workflow source columns are collected here as explicit human inputs so
+        # the submitted frame preserves the raw values required for replay.
+        manual_df, validation_errors = render_parameter_inputs(manual_fields + workflow_fields, f"manual_{selected_material}_{selected_target}")
         if validation_errors:
             for err in validation_errors:
                 st.warning(err)
         if st.button("开始手动预测", type="primary", key=f"predict_manual_{selected_material}_{selected_target}"):
             if validation_errors:
                 st.error("请先补全必填项后再预测。")
+            elif not confirmed_by_user:
+                st.error("请先确认已检查输入结构和配方/工艺参数。")
             else:
                 task_key = f"portal_task_manual_{selected_material}_{selected_target}"
                 st.session_state[task_key] = submit_prediction_task(config, selected_material, selected_target, manual_df, explain=False)
                 st.rerun()
-        render_portal_task_panel(st.session_state.get(f"portal_task_manual_{selected_material}_{selected_target}"), session_key=f"manual_{selected_material}_{selected_target}")
+        render_portal_task_panel(
+            st.session_state.get(f"portal_task_manual_{selected_material}_{selected_target}"),
+            session_key=f"manual_{selected_material}_{selected_target}",
+        )
 
     with tab_batch:
         st.markdown("### 上传待预测数据")
@@ -1068,24 +1345,30 @@ def render_user_page(config: Dict[str, Any]) -> None:
         if uploaded is not None:
             try:
                 batch_df = load_data_file(uploaded)
-                st.dataframe(batch_df.head(20), use_container_width=True)
+                st.dataframe(batch_df.head(20), width="stretch")
                 if st.button("执行批量预测", type="primary", key=f"predict_batch_{selected_material}_{selected_target}"):
-                    task_key = f"portal_task_batch_{selected_material}_{selected_target}"
-                    st.session_state[task_key] = submit_prediction_task(config, selected_material, selected_target, batch_df, explain=False)
-                    st.rerun()
-                render_portal_task_panel(st.session_state.get(f"portal_task_batch_{selected_material}_{selected_target}"), session_key=f"batch_{selected_material}_{selected_target}")
+                    if not confirmed_by_user:
+                        st.error("请先确认已检查批量输入结构和配方/工艺参数。")
+                    else:
+                        task_key = f"portal_task_batch_{selected_material}_{selected_target}"
+                        st.session_state[task_key] = submit_prediction_task(config, selected_material, selected_target, batch_df, explain=False)
+                        st.rerun()
+                render_portal_task_panel(
+                    st.session_state.get(f"portal_task_batch_{selected_material}_{selected_target}"),
+                    session_key=f"batch_{selected_material}_{selected_target}",
+                )
             except Exception as exc:
                 st.error(f"读取文件失败: {exc}")
         else:
             st.info("适合已经准备好批量输入表格的场景。缺失特征不会被自动补齐，系统会按发布契约校验并提示具体问题。")
 
     with tab_ai:
-        render_ai_assistant_tab(config, selected_material, selected_target, target_cfg)
+        render_ai_assistant_tab(config, selected_material, selected_target, target_cfg, selected_contract, registry_snapshot)
 
     with tab_config:
         st.markdown("### 当前性能项参数")
-        param_df = parameter_editor_df(target_cfg.get("parameters") or [])
-        st.dataframe(param_df, use_container_width=True, hide_index=True)
+        param_df = parameter_editor_df(manual_fields + workflow_fields)
+        st.dataframe(param_df, width="stretch", hide_index=True)
 
         st.markdown("### 当前已选模型")
         model_preview_rows = []
@@ -1101,7 +1384,7 @@ def render_user_page(config: Dict[str, Any]) -> None:
                     "更新时间": model.get("updated_at", ""),
                 }
             )
-        st.dataframe(pd.DataFrame(model_preview_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(model_preview_rows), width="stretch", hide_index=True)
 
 
 def save_material_basic_settings(config: Dict[str, Any], material_key: str, label: str, enabled: bool, description: str, coming_soon_message: str) -> None:
@@ -1194,7 +1477,7 @@ def render_admin_page(config: Dict[str, Any]) -> None:
             st.markdown("#### 输入参数配置")
             editor_df = st.data_editor(
                 parameter_editor_df(target_cfg.get("parameters") or []),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 num_rows="dynamic",
                 key=f"parameter_editor_{selected_material}_{selected_target}",
@@ -1273,10 +1556,13 @@ def render_admin_page(config: Dict[str, Any]) -> None:
                     with c2:
                         toggle_label = "停用" if model.get("enabled", True) else "启用"
                         if st.button(toggle_label, key=f"toggle_model_{model['id']}"):
-                            model["enabled"] = not bool(model.get("enabled", True))
-                            model["updated_at"] = now_iso()
-                            save_config(config)
-                            st.rerun()
+                            try:
+                                toggle_model_enabled(config, selected_material, selected_target, model)
+                            except ValueError as exc:
+                                st.error(f"模型启用失败：{exc}")
+                            else:
+                                save_config(config)
+                                st.rerun()
                     with c3:
                         if st.button("移除记录", key=f"remove_model_{model['id']}"):
                             target_cfg["models"] = [item for item in target_cfg.get("models", []) if item.get("id") != model["id"]]
@@ -1357,148 +1643,178 @@ def render_admin_page(config: Dict[str, Any]) -> None:
 CUSTOM_CSS = """
 <style>
 :root {
-    --portal-ink: #1f2937;
-    --portal-muted: #6b7280;
-    --portal-line: #e5e7eb;
-    --portal-accent: #0f766e;
-    --portal-warm: #fff8ef;
-    --portal-closed: #b91c1c;
-    --portal-open: #047857;
+    --portal-ink: #17324d;
+    --portal-muted: #667085;
+    --portal-line: #d8e1e8;
+    --portal-accent: #0f7490;
+    --portal-cyan: #0f7490;
+    --portal-blue: #2563a8;
+    --portal-green: #16805d;
+    --portal-amber: #a46708;
+    --portal-red: #b4233c;
+    --portal-surface: #ffffff;
+    --portal-surface-strong: #f7fafc;
 }
 .main .block-container {
-    padding-top: 1.4rem;
-    padding-bottom: 3rem;
-    max-width: 1200px;
+    max-width: 1380px;
+    padding-top: 1.8rem;
+    padding-bottom: 3.5rem;
 }
-.portal-hero {
-    background:
-        radial-gradient(circle at top right, rgba(20, 184, 166, 0.16), transparent 32%),
-        linear-gradient(135deg, #fff7ed 0%, #f8fafc 100%);
-    border: 1px solid #fde68a;
-    border-radius: 8px;
-    padding: 1.35rem 1.5rem;
-    margin-bottom: 1rem;
-    overflow: hidden;
+[data-testid="stAppViewContainer"] { background: #f4f7fa; }
+[data-testid="stHeader"] { background: rgba(244, 247, 250, 0.92); }
+[data-testid="stSidebar"] { background: #edf3f7; border-right: 1px solid var(--portal-line); }
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { color: #17324d; }
+[data-testid="stSidebar"] [data-testid="stMetricValue"] { color: var(--portal-accent); }
+[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li { color: #475467; }
+[data-testid="stTextInput"] label, [data-testid="stTextArea"] label, [data-testid="stNumberInput"] label, [data-testid="stSelectbox"] label, [data-testid="stFileUploader"] label { color: #344054; }
+[data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="select"] > div { background: #ffffff; border-color: #cbd5e1; color: #172b3a; }
+[data-baseweb="input"] input, [data-baseweb="textarea"] textarea { color: #172b3a; }
+[data-baseweb="select"] span { color: #344054; }
+[data-testid="stButton"] button, [data-testid="stDownloadButton"] button {
+    border: 1px solid #b8c7d4;
+    border-radius: 7px;
+    background: #ffffff;
+    color: #17324d;
+    transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
 }
-.portal-hero.compact {
-    margin-bottom: 0;
-}
-.portal-hero.visual {
-    min-height: 230px;
-    background-size: cover;
-    background-position: center;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    border-color: #cbd5e1;
-}
-.portal-hero.visual.detail {
-    min-height: 160px;
-    background-position: center right;
-}
-.portal-hero h1 {
-    margin: 0.15rem 0 0.35rem 0;
-    font-size: 2rem;
-    color: var(--portal-ink);
-}
-.portal-hero p {
-    margin: 0;
-    color: var(--portal-muted);
-    line-height: 1.6;
-    max-width: 42rem;
-}
-.hero-kicker {
-    display: inline-block;
-    background: rgba(15, 118, 110, 0.12);
-    color: var(--portal-accent);
-    padding: 0.25rem 0.6rem;
-    border-radius: 999px;
-    font-size: 0.78rem;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-}
-.portal-card, .model-card {
+[data-testid="stButton"] button:hover, [data-testid="stDownloadButton"] button:hover { border-color: var(--portal-accent); background: #f0f8fa; transform: translateY(-1px); }
+[data-testid="stButton"] button[kind="primary"] { background: #0f7490; border-color: #0f7490; color: #ffffff; }
+[data-testid="stTabs"] [role="tab"] { color: #667085; }
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] { color: var(--portal-accent); }
+[data-testid="stDataFrame"] { border: 1px solid var(--portal-line); border-radius: 8px; overflow: hidden; }
+[data-testid="stSidebar"] .sidebar-brand { padding: .15rem 0 .85rem; border-bottom: 1px solid #d8e1e8; }
+[data-testid="stSidebar"] .sidebar-brand-mark { color: #17324d; font-size: .9rem; font-weight: 800; letter-spacing: .04em; }
+[data-testid="stSidebar"] .sidebar-brand-mark span { color: #17324d; }
+[data-testid="stSidebar"] .sidebar-subtitle { margin-top: .28rem; color: #667085; font-size: .75rem; }
+[data-testid="stSidebar"] .sidebar-section-title { margin: 1rem 0 .45rem; color: #667085; font-size: .7rem; font-weight: 750; letter-spacing: .1em; text-transform: uppercase; }
+[data-testid="stSidebar"] .sidebar-context { padding: .75rem .8rem; border: 1px solid #cce4ea; border-radius: 8px; background: #f1fafb; }
+[data-testid="stSidebar"] .sidebar-context-label { color: #667085; font-size: .7rem; }
+[data-testid="stSidebar"] .sidebar-context-value { margin-top: .2rem; color: #17324d; font-size: .92rem; font-weight: 700; line-height: 1.35; }
+[data-testid="stSidebar"] .sidebar-context-meta { margin-top: .25rem; color: #175b6b; font-size: .72rem; }
+[data-testid="stSidebar"] .sidebar-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: .45rem; }
+[data-testid="stSidebar"] .sidebar-stat { padding: .55rem .45rem; border: 1px solid #d8e1e8; border-radius: 7px; background: #ffffff; text-align: center; }
+[data-testid="stSidebar"] .sidebar-stat-value { color: #17324d; font-size: 1.08rem; font-weight: 750; line-height: 1.1; }
+[data-testid="stSidebar"] .sidebar-stat-label { margin-top: .25rem; color: #667085; font-size: .65rem; line-height: 1.25; }
+[data-testid="stSidebar"] .sidebar-flow { display: grid; gap: .45rem; }
+[data-testid="stSidebar"] .sidebar-flow-item { display: flex; align-items: center; gap: .5rem; color: #667085; font-size: .76rem; }
+[data-testid="stSidebar"] .sidebar-flow-item strong { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: #e7edf2; color: #667085; font-size: .65rem; }
+[data-testid="stSidebar"] .sidebar-flow-item.active { color: #175b6b; font-weight: 700; }
+[data-testid="stSidebar"] .sidebar-flow-item.active strong { background: #0f7490; color: #ffffff; }
+[data-testid="stSidebar"] [data-testid="stRadio"] > label { color: #667085; font-size: .72rem; font-weight: 700; }
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] { gap: .35rem; }
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radio"] { min-height: 2rem; padding: .35rem .55rem; border: 1px solid #d8e1e8; border-radius: 6px; background: #ffffff; }
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radio"][aria-checked="true"] { border-color: #8fc5cf; background: #f1fafb; color: #175b6b; }
+[data-testid="stSidebar"] [data-testid="stButton"] button { min-height: 2.35rem; font-size: .78rem; }
+.portal-hero, .portal-card, .model-card, .portal-status-panel, .portal-workflow-card {
     border: 1px solid var(--portal-line);
-    background: white;
-    border-radius: 8px;
-    padding: 0.85rem 0.9rem 0.9rem 0.9rem;
-    box-shadow: 0 10px 22px rgba(15, 23, 42, 0.04);
-    margin-bottom: 0.8rem;
-    overflow: hidden;
+    border-radius: 10px;
+    background: var(--portal-surface);
+    box-shadow: 0 8px 24px rgba(23, 50, 77, 0.07);
 }
-.portal-card {
-    padding-top: 0;
-    transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+.portal-hero { padding: 1.65rem 1.8rem; margin-bottom: 1.15rem; }
+.portal-home-hero { min-height: 270px; display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(260px, 0.8fr); gap: 2rem; align-items: center; background: #ffffff; }
+.portal-home-copy { min-width: 0; }
+.portal-brand-mark { color: #17324d; font-size: .86rem; font-weight: 800; letter-spacing: .06em; }
+.portal-brand-mark span { color: #17324d; }
+.portal-brand-line { display: inline-block; width: 26px; height: 2px; margin-right: 8px; vertical-align: middle; background: var(--portal-cyan); }
+.hero-kicker { display: inline-block; margin-top: .9rem; color: var(--portal-cyan); font-size: .73rem; font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }
+.portal-hero h1 { margin: .35rem 0 .65rem; color: #17324d; font-size: clamp(2rem, 4vw, 3.15rem); letter-spacing: 0; line-height: 1.08; }
+.portal-hero p { max-width: 48rem; margin: 0; color: #667085; line-height: 1.7; }
+.portal-hero-actions { display: flex; flex-wrap: wrap; gap: .65rem; margin-top: 1.2rem; }
+.portal-assurance { display: inline-flex; align-items: center; gap: .4rem; padding: .4rem .65rem; border: 1px solid #cce4ea; border-radius: 999px; color: #175b6b; background: #f1fafb; font-size: .77rem; }
+.portal-assurance .portal-icon { color: var(--portal-cyan); }
+.portal-home-status { padding: 1.05rem 1.15rem; border: 1px solid var(--portal-line); border-radius: 8px; background: #f7fafc; }
+.portal-status-heading { margin-bottom: .8rem; color: #17324d; font-size: .82rem; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+.portal-status-row { display: flex; align-items: center; justify-content: space-between; gap: .7rem; padding: .65rem 0; border-top: 1px solid #e7edf2; color: #475467; font-size: .85rem; }
+.portal-status-row > span { display: inline-flex; align-items: center; gap: .45rem; }
+.portal-status-row .portal-icon { color: var(--portal-blue); }
+.portal-status-row strong { color: #17324d; font-size: 1.15rem; }
+.portal-status-detail { margin-top: .55rem; color: var(--portal-muted); font-size: .75rem; line-height: 1.5; }
+.portal-section-heading { display: flex; align-items: center; gap: .7rem; margin: 1.65rem 0 .8rem; color: #17324d; font-size: 1.1rem; font-weight: 750; }
+.portal-section-heading span { color: var(--portal-cyan); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .75rem; letter-spacing: .1em; }
+.portal-card, .model-card { padding: 1.05rem 1.1rem; margin-bottom: .8rem; }
+.portal-material-entry { min-height: 185px; transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease; }
+.portal-material-entry:hover { border-color: #74b9c6; box-shadow: 0 12px 28px rgba(23, 50, 77, .12); transform: translateY(-2px); }
+.portal-card-top { display: flex; align-items: flex-start; gap: .75rem; }
+.portal-card-icon { display: grid; place-items: center; width: 44px; height: 44px; flex: 0 0 44px; border: 1px solid #cce4ea; border-radius: 9px; color: var(--portal-cyan); background: #f1fafb; }
+.portal-title-group { min-width: 0; flex: 1; }
+.portal-title, .model-card-title { color: #17324d; font-size: 1.08rem; font-weight: 750; }
+.portal-card-code { margin-top: .2rem; color: #667085; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .68rem; letter-spacing: .08em; }
+.portal-card-state { padding-top: .15rem; }
+.portal-desc, .model-card-notes { color: var(--portal-muted); font-size: .88rem; line-height: 1.6; }
+.portal-material-entry .portal-desc { min-height: 2.8rem; margin: 1rem 0 .85rem; }
+.portal-card-metrics { display: flex; flex-wrap: wrap; gap: .55rem; padding-top: .75rem; border-top: 1px solid #e7edf2; color: #667085; font-size: .77rem; }
+.portal-card-metrics strong { color: #17324d; }
+.portal-workflow-card { min-height: 118px; padding: 1rem; background: #f7fafc; }
+.portal-workflow-card .portal-icon { display: block; margin-bottom: .65rem; color: var(--portal-cyan); }
+.portal-workflow-card strong { color: #17324d; font-size: .88rem; }
+.portal-workflow-card p { margin: .4rem 0 0; color: var(--portal-muted); font-size: .76rem; line-height: 1.5; }
+.portal-status-badge { display: inline-flex; align-items: center; gap: .38rem; color: #475467; font-size: .73rem; white-space: nowrap; }
+.portal-status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--portal-blue); box-shadow: 0 0 0 3px rgba(37, 99, 168, .12); }
+.portal-status-badge.success .portal-status-dot { background: var(--portal-green); box-shadow: 0 0 0 3px rgba(22, 128, 93, .12); }
+.portal-status-badge.danger .portal-status-dot { background: var(--portal-red); box-shadow: 0 0 0 3px rgba(180, 35, 60, .12); }
+.portal-stage-wrap { margin: .5rem 0 1.1rem; }
+.portal-stage { color: #98a2b3; }
+.portal-stage.done, .portal-stage.active { color: #344054; }
+.portal-stage-marker { border-color: #cbd5e1; }
+.portal-stage.done .portal-stage-marker { color: #ffffff; background: var(--portal-green); border-color: var(--portal-green); }
+.portal-stage.active .portal-stage-marker { color: #ffffff; background: var(--portal-cyan); border-color: var(--portal-cyan); }
+.status-pill { border-radius: 999px; padding: .24rem .62rem; font-size: .73rem; font-weight: 700; }
+.status-open { color: #176b4f; background: #e8f5ef; }
+.status-closed { color: #a61b35; background: #fdecef; }
+.model-card-meta { display: flex; flex-wrap: wrap; gap: .5rem; margin: .55rem 0; }
+.model-card-meta span { border: 1px solid #cce4ea; border-radius: 999px; padding: .18rem .55rem; color: #175b6b; background: #f1fafb; font-size: .74rem; }
+@media (max-width: 800px) {
+    .main .block-container { padding: .75rem .65rem 2.25rem; max-width: 100%; }
+    [data-testid="stHorizontalBlock"] { gap: .65rem; }
+    [data-testid="stSidebar"] { min-width: 86vw; max-width: 86vw; }
+    [data-testid="stSidebar"] .sidebar-stats { gap: .35rem; }
+    [data-testid="stSidebar"] .sidebar-stat { padding: .5rem .3rem; }
+    [data-testid="stSidebar"] .sidebar-stat-value { font-size: 1rem; }
+    [data-testid="stSidebar"] .sidebar-context { padding: .7rem; }
+    .portal-hero { padding: 1.1rem; margin-bottom: .85rem; }
+    .portal-home-hero { grid-template-columns: 1fr; gap: 1.1rem; min-height: 0; }
+    .portal-detail-hero { min-height: 0; }
+    .portal-home-status { margin-top: .15rem; }
+    .portal-hero-actions { gap: .4rem; margin-top: .95rem; }
+    .portal-assurance { padding: .34rem .5rem; font-size: .7rem; }
+    .portal-hero h1 { font-size: 1.85rem; line-height: 1.18; }
+    .portal-hero p { font-size: .88rem; line-height: 1.6; }
+    .portal-section-heading { margin-top: 1.25rem; font-size: 1rem; }
+    .portal-card, .model-card { padding: .9rem; margin-bottom: .65rem; }
+    .portal-material-entry { min-height: 0; }
+    .portal-card-top { gap: .6rem; }
+    .portal-card-state { margin-left: auto; }
+    .portal-card-metrics { gap: .4rem; padding-top: .6rem; font-size: .72rem; }
+    .portal-workflow-card { min-height: 0; padding: .85rem; }
+    .portal-stage-wrap { overflow-x: auto; padding: 10px 2px; margin-bottom: .8rem; }
+    .portal-stage { min-width: 112px; font-size: .72rem; }
+    [data-testid="stTabs"] [role="tablist"] { overflow-x: auto; scrollbar-width: none; }
+    [data-testid="stTabs"] [role="tab"] { flex: 0 0 auto; min-height: 2.5rem; padding: .45rem .65rem; font-size: .82rem; }
+    [data-testid="stButton"] button, [data-testid="stDownloadButton"] button { min-height: 2.65rem; }
+    [data-testid="stDataFrame"] { max-width: 100%; overflow-x: auto; }
 }
-.portal-card:hover {
-    border-color: rgba(15, 118, 110, 0.36);
-    box-shadow: 0 14px 30px rgba(15, 23, 42, 0.08);
-    transform: translateY(-1px);
-}
-.portal-card-image {
-    height: 168px;
-    margin: 0 -0.9rem 0.85rem -0.9rem;
-    background-size: cover;
-    background-position: center;
-    border-bottom: 1px solid var(--portal-line);
-}
-.portal-card-top {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 0.75rem;
-    margin-bottom: 0.65rem;
-}
-.portal-title, .model-card-title {
-    font-size: 1.08rem;
-    font-weight: 700;
-    color: var(--portal-ink);
-}
-.portal-desc, .model-card-notes {
-    color: var(--portal-muted);
-    line-height: 1.6;
-    font-size: 0.94rem;
-}
-.status-pill {
-    border-radius: 999px;
-    padding: 0.24rem 0.62rem;
-    font-size: 0.75rem;
-    font-weight: 700;
-    white-space: nowrap;
-}
-.status-open {
-    color: var(--portal-open);
-    background: rgba(16, 185, 129, 0.12);
-}
-.status-closed {
-    color: var(--portal-closed);
-    background: rgba(239, 68, 68, 0.10);
-}
-.model-card-meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    margin-bottom: 0.55rem;
-}
-.model-card-meta span {
-    background: var(--portal-warm);
-    border: 1px solid #fde68a;
-    border-radius: 999px;
-    padding: 0.16rem 0.52rem;
-    font-size: 0.77rem;
-    color: #92400e;
+@media (max-width: 480px) {
+    .portal-brand-mark { font-size: .78rem; letter-spacing: .02em; }
+    [data-testid="stSidebar"] .sidebar-brand-mark { font-size: .84rem; }
+    .portal-hero h1 { font-size: 1.6rem; }
+    .portal-home-status { padding: .85rem .9rem; }
+    .portal-status-row { font-size: .78rem; }
+    .portal-title, .model-card-title { font-size: 1rem; }
+    .portal-card-code { font-size: .62rem; }
 }
 </style>
 """
 
-
 def render_sidebar(config: Dict[str, Any]) -> str:
     with st.sidebar:
-        st.title(APP_NAME)
-        st.caption(f"版本 {VERSION}")
-        st.markdown("---")
+        st.markdown(
+            '<div class="sidebar-brand"><div class="sidebar-brand-mark"><span>邹华维课题组</span></div>'
+            '<div class="sidebar-subtitle">材料预测平台</div></div>',
+            unsafe_allow_html=True,
+        )
 
-        mode = st.radio("工作区", ["用户页面", "管理页面"], index=0)
+        mode = st.radio("工作区", ["用户页面", "管理页面"], index=0, horizontal=True)
         material_count = len(config.get("materials") or {})
         target_count = sum(len(material.get("targets") or {}) for _, material in material_items(config))
         model_count = sum(
@@ -1507,14 +1823,57 @@ def render_sidebar(config: Dict[str, Any]) -> str:
             for _, target in target_items(material)
         )
 
-        st.markdown("### 当前配置")
-        st.metric("材料方向", material_count)
-        st.metric("性能项", target_count)
-        st.metric("模型数量", model_count)
-        st.caption(f"配置文件: {CONFIG_PATH.name}")
+        selected_material = st.session_state.get("predict_selected_material", "")
+        selected_target = st.session_state.get("predict_selected_target", "")
+        material_cfg = (config.get("materials") or {}).get(selected_material, {})
+        target_cfg = (material_cfg.get("targets") or {}).get(selected_target, {})
+        selected_material_label = material_cfg.get("label") or "尚未选择材料方向"
+        selected_target_label = target_cfg.get("label") or "请选择预测性能"
+        ai_open = bool(st.session_state.get("predict_open_ai_assistant"))
 
-        st.markdown("---")
-        st.caption("管理页面负责配置入口、参数和模型；用户页面负责选方向、传数据和执行预测。")
+        if mode == "用户页面":
+            st.markdown('<div class="sidebar-section-title">当前预测</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="sidebar-context"><div class="sidebar-context-label">材料方向</div>'
+                f'<div class="sidebar-context-value">{html_escape(str(selected_material_label))}</div>'
+                f'<div class="sidebar-context-meta">目标：{html_escape(str(selected_target_label))}</div></div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown('<div class="sidebar-section-title">快速操作</div>', unsafe_allow_html=True)
+            if st.button("回到材料方向", key="sidebar_home", width="stretch", disabled=not selected_material):
+                reset_user_selection()
+                st.session_state["predict_open_ai_assistant"] = False
+                st.rerun()
+            if st.button("打开 AI 输入助手", key="sidebar_ai", width="stretch", disabled=not selected_material):
+                st.session_state["predict_open_ai_assistant"] = True
+                st.rerun()
+            st.caption("AI 状态：已打开" if ai_open else "AI 状态：可从工作台开启")
+        else:
+            st.markdown('<div class="sidebar-section-title">管理导航</div>', unsafe_allow_html=True)
+            st.caption("材料、性能项和模型配置集中在管理页面中。")
+
+        st.markdown('<div class="sidebar-section-title">系统概览</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="sidebar-stats">'
+            f'<div class="sidebar-stat"><div class="sidebar-stat-value">{material_count}</div><div class="sidebar-stat-label">材料方向</div></div>'
+            f'<div class="sidebar-stat"><div class="sidebar-stat-value">{target_count}</div><div class="sidebar-stat-label">性能项</div></div>'
+            f'<div class="sidebar-stat"><div class="sidebar-stat-value">{model_count}</div><div class="sidebar-stat-label">模型数量</div></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(f"配置文件：{CONFIG_PATH.name}")
+
+        st.markdown('<div class="sidebar-section-title">预测流程</div>', unsafe_allow_html=True)
+        active_step = 1 if not selected_material else 2 if not selected_target else 3
+        st.markdown(
+            '<div class="sidebar-flow">'
+            f'<div class="sidebar-flow-item {"active" if active_step == 1 else ""}"><strong>1</strong><span>选择材料</span></div>'
+            f'<div class="sidebar-flow-item {"active" if active_step == 2 else ""}"><strong>2</strong><span>确认输入</span></div>'
+            f'<div class="sidebar-flow-item {"active" if active_step == 3 else ""}"><strong>3</strong><span>调用模型</span></div>'
+            '<div class="sidebar-flow-item"><strong>4</strong><span>查看结果</span></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
     return mode
 
@@ -1522,7 +1881,7 @@ def render_sidebar(config: Dict[str, Any]) -> str:
 def main() -> None:
     st.set_page_config(
         page_title=APP_NAME,
-        page_icon="🧪",
+        page_icon=str(ASSET_ROOT / "portal-icon.svg"),
         layout="wide",
         initial_sidebar_state="expanded",
     )

@@ -54,3 +54,56 @@ def test_feature_review_rejects_unbounded_source_role_and_missing_evidence():
             "feature_id": "pressure", "raw_columns": ["p_raw"], "source_role": "invented_role",
             "status": "approved", "unit": 123, "rationale_zh": "",
         }], "conflicts": []})
+
+
+def test_empty_profile_does_not_send_full_registry_and_excludes_target():
+    from core.feature_mapping_review import build_feature_review_context
+    frame = pd.DataFrame({"pressure_raw": [1.0], "tg_c": [100.0]})
+    registry = {"model_profiles": {"p": {"feature_ids": [], "target_col": "tg_c", "status": "approved"}},
+                "features": [{"feature_id": "pressure", "name": "pressure", "source_type": "manual_input", "status": "approved"},
+                             {"feature_id": "unrelated", "name": "secret", "source_type": "manual_input", "status": "approved"}]}
+    context = build_feature_review_context(frame, registry, "p")
+    assert [item["feature_id"] for item in context["candidate_features"]] == ["pressure"]
+
+
+def test_apply_review_rejects_invalid_feature_and_source_role_and_requires_edit_payload():
+    from core.feature_mapping_review import apply_feature_review_decision
+    manifest = {"status": "draft", "feature_bindings": []}
+    with pytest.raises(ValueError):
+        apply_feature_review_decision(manifest, {"feature_id": "other", "raw_columns": ["x"], "source_role": "manual_input"}, "accept", "u", registry={"features": [{"feature_id": "known"}]})
+    with pytest.raises(ValueError):
+        apply_feature_review_decision(manifest, {"feature_id": "known", "raw_columns": ["x"], "source_role": "target"}, "accept", "u", registry={"features": [{"feature_id": "known"}]})
+    with pytest.raises(ValueError):
+        apply_feature_review_decision(manifest, {"feature_id": "known", "raw_columns": ["x"], "source_role": "manual_input"}, "edit_accept", "u", registry={"features": [{"feature_id": "known"}]})
+
+
+def test_apply_review_rejects_nonapproved_suggestion_status():
+    from core.feature_mapping_review import apply_feature_review_decision
+
+    manifest = {"status": "draft", "feature_bindings": []}
+    suggestion = {"feature_id": "known", "raw_columns": ["x"], "source_role": "manual_input", "status": "pending_review"}
+    with pytest.raises(ValueError, match="approved|状态"):
+        apply_feature_review_decision(manifest, suggestion, "accept", "u", registry={"features": [{"feature_id": "known", "source_type": "manual_input"}]})
+    assert manifest["feature_bindings"] == []
+
+
+def test_apply_review_requires_explicit_source_role_and_registry_alignment():
+    from core.feature_mapping_review import apply_feature_review_decision
+
+    manifest = {"status": "draft", "feature_bindings": []}
+    with pytest.raises(ValueError, match="source_role|来源"):
+        apply_feature_review_decision(manifest, {"feature_id": "known", "raw_columns": ["x"]}, "accept", "u", registry={"features": [{"feature_id": "known", "source_type": "manual_input"}]})
+    with pytest.raises(ValueError, match="source|来源"):
+        apply_feature_review_decision(manifest, {"feature_id": "known", "raw_columns": ["x"], "source_role": "manual_input"}, "accept", "u", registry={"features": [{"feature_id": "known", "source_type": "molecular_workflow"}]})
+
+
+def test_apply_review_rejects_nonapproved_edited_status():
+    from core.feature_mapping_review import apply_feature_review_decision
+
+    suggestion = {"feature_id": "known", "raw_columns": ["x"], "source_role": "manual_input", "status": "approved"}
+    with pytest.raises(ValueError, match="approved|状态"):
+        apply_feature_review_decision(
+            {"status": "draft", "feature_bindings": []}, suggestion, "edit_accept", "u",
+            registry={"features": [{"feature_id": "known", "source_type": "manual_input"}]},
+            edited={"status": "conflict"},
+        )

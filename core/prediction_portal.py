@@ -34,6 +34,7 @@ _CONTRACT_FIELDS = {
     "imputer_present",
     "scaler_present",
     "numeric_ranges",
+    "workflow_source_fields",
 }
 _MOLECULAR_FEATURE_TOKENS = (
     "xtb",
@@ -244,6 +245,7 @@ def build_prediction_contract(
         "workflow_schema_version": workflow_payload.get("schema_version"),
         "source_columns": source_columns,
         "workflow_source_columns": copy.deepcopy(source_columns),
+        "workflow_source_fields": copy.deepcopy(source_columns),
         "workflow_present": bool(workflow_payload),
         "molecular_features_indicated": bool(
             source_columns or _is_molecular_feature_set(resolved_features)
@@ -276,7 +278,7 @@ def build_prediction_contract(
             "derived_feature_cols": derived_cols,
             "manual_input_feature_cols": manual_cols,
             "feature_definitions": copy.deepcopy(definitions),
-            "workflow_source_fields": [],
+            "workflow_source_fields": copy.deepcopy(source_columns),
             "contract_hash": "",
         })
         base["contract_hash"] = compute_contract_hash(base)
@@ -302,31 +304,129 @@ def validate_publication_artifact(
 
     artifact = _as_mapping(artifact)
     errors: list[str] = []
+
+    def diagnostics(items: list[str], *, code: str = "publication_invalid", source: str = "publication") -> list[dict[str, Any]]:
+        return [{"code": code, "feature": None, "source": source, "rule": "publication_gate", "message": str(item)} for item in items]
+
+    extra = _as_mapping(artifact.get("extra"))
     saved_contract = _contract_from_artifact(artifact)
     if contract is not None and saved_contract is not None:
         if not _contracts_match(_as_mapping(contract), saved_contract):
             errors.append("显式 prediction_contract 与 artifact 已保存的 prediction_contract 不一致。")
     resolved_contract = contract if contract is not None else saved_contract
     if resolved_contract is None:
+        message = "artifact 缺少 prediction_contract，需要重新验证。"
         return {
             "ok": False,
             "status": "needs_validation",
-            "errors": ["artifact 缺少 prediction_contract，需要重新验证。"],
+            "errors": [message],
+            "diagnostics": diagnostics([message], code="missing_contract", source="artifact"),
         }
     resolved_contract = _as_mapping(resolved_contract)
 
     schema_version = resolved_contract.get("schema_version")
     legacy_contract = schema_version in {None, 1}
     if schema_version not in {None, 1, 2}:
-        return {"ok": False, "status": "needs_validation", "errors": ["prediction_contract schema_version is unsupported."]}
+        message = "prediction_contract schema_version is unsupported."
+        return {"ok": False, "status": "needs_validation", "errors": [message], "diagnostics": diagnostics([message], code="unsupported_schema", source="prediction_contract")}
+    if legacy_contract:
+        errors.append("schema-1/legacy prediction_contract 只能审计，必须重新验证后才能发布。")
     v2_errors: list[str] = []
-    if not legacy_contract and resolved_contract.get("contract_hash") != compute_contract_hash(resolved_contract):
+    if resolved_contract.get("contract_hash") != compute_contract_hash(resolved_contract):
         v2_errors.append("prediction_contract contract_hash mismatch")
-    if not legacy_contract and registry_snapshot is not None:
-        if resolved_contract.get("feature_registry_version") != registry_snapshot.get("registry_version") or resolved_contract.get("feature_registry_hash") != registry_snapshot.get("registry_hash"):
+    artifact_registry = extra.get("registry_snapshot") if isinstance(extra.get("registry_snapshot"), Mapping) else None
+    artifact_manifest = extra.get("dataset_manifest") if isinstance(extra.get("dataset_manifest"), Mapping) else None
+    resolved_registry = registry_snapshot if isinstance(registry_snapshot, Mapping) else artifact_registry
+    resolved_manifest = dataset_manifest if isinstance(dataset_manifest, Mapping) else artifact_manifest
+    if resolved_registry is None:
+        v2_errors.append("v2 artifact 缺少 registry_snapshot")
+    else:
+        from .feature_registry import compute_registry_hash, get_model_profile, validate_registry
+        # A full registry can be hashed directly. build_registry_snapshot
+        # intentionally carries the parent registry hash, so for that compact
+        # shape the hash is verified against the contract provenance while the
+        # selected definitions are compared semantically below.
+        if "model_profile" in resolved_registry and "model_profiles" not in resolved_registry:
+            computed_registry_hash = resolved_registry.get("registry_hash")
+            if not isinstance(computed_registry_hash, str) or not computed_registry_hash.strip():
+                v2_errors.append("registry_snapshot registry_hash is missing")
+            registry_payload = resolved_registry.get("registry_payload")
+            if isinstance(registry_payload, Mapping):
+                registry_report = validate_registry(registry_payload, require_approved=True)
+                if not registry_report.get("ok"):
+                    v2_errors.extend("registry_payload " + str(error) for error in registry_report.get("errors", []))
+                computed_payload_hash = compute_registry_hash(registry_payload)
+                if computed_registry_hash != computed_payload_hash:
+                    v2_errors.append("compact registry_snapshot registry payload hash mismatch")
+                if registry_payload.get("registry_version") != resolved_registry.get("registry_version"):
+                    v2_errors.append("compact registry_snapshot registry version mismatch")
+                profile_id = resolved_registry.get("profile_id")
+                try:
+                    expected_profile = get_model_profile(registry_payload, profile_id)
+                except (KeyError, TypeError, ValueError):
+                    expected_profile = None
+                if not isinstance(expected_profile, Mapping):
+                    v2_errors.append("compact registry_snapshot profile cannot be proven from registry_payload")
+                elif dict(resolved_registry.get("model_profile") or {}) != dict(expected_profile):
+                    v2_errors.append("compact registry_snapshot model_profile mismatch with registry_payload")
+                if isinstance(expected_profile, Mapping):
+                    definitions = {
+                        item.get("feature_id"): item
+                        for item in registry_payload.get("features", [])
+                        if isinstance(item, Mapping) and item.get("feature_id")
+                    }
+                    expected_features = [
+                        copy.deepcopy(dict(definitions[feature_id]))
+                        for feature_id in expected_profile.get("feature_ids", [])
+                        if feature_id in definitions
+                    ]
+                    if list(resolved_registry.get("features") or []) != expected_features:
+                        v2_errors.append("compact registry_snapshot features mismatch with registry_payload profile")
+            else:
+                v2_errors.append("compact registry_snapshot 缺少 registry_payload，无法证明 registry approved")
+            selected = resolved_registry.get("features")
+            selected_hash = resolved_registry.get("selected_features_hash")
+            if not isinstance(selected, list) or not isinstance(selected_hash, str) or not selected_hash.strip():
+                v2_errors.append("compact registry_snapshot 缺少 selected_features_hash")
+            else:
+                selected_payload = {
+                    "profile_id": resolved_registry.get("profile_id"),
+                    "model_profile": resolved_registry.get("model_profile"),
+                    "features": selected,
+                }
+                expected_selected_hash = hashlib.sha256(
+                    json.dumps(selected_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                if selected_hash != expected_selected_hash:
+                    v2_errors.append("compact registry_snapshot selected feature hash mismatch")
+        else:
+            registry_report = validate_registry(resolved_registry, require_approved=True)
+            if not registry_report.get("ok"):
+                v2_errors.extend("registry " + str(error) for error in registry_report.get("errors", []))
+            profile_id = resolved_contract.get("model_profile_id")
+            profiles = resolved_registry.get("model_profiles")
+            profile = profiles.get(profile_id) if isinstance(profiles, Mapping) else None
+            if not isinstance(profile, Mapping):
+                v2_errors.append("registry model_profile cannot be proven")
+            elif profile.get("status") != "approved":
+                v2_errors.append("registry model_profile is not approved")
+            computed_registry_hash = compute_registry_hash(resolved_registry)
+            if resolved_registry.get("registry_hash") != computed_registry_hash:
+                v2_errors.append("registry_snapshot registry_hash mismatch")
+        if resolved_contract.get("feature_registry_version") != resolved_registry.get("registry_version") or resolved_contract.get("feature_registry_hash") != computed_registry_hash:
             v2_errors.append("feature registry version/hash mismatch")
-    if not legacy_contract and dataset_manifest is not None and resolved_contract.get("dataset_manifest_hash") != dataset_manifest.get("manifest_hash"):
-        v2_errors.append("dataset manifest hash mismatch")
+    if resolved_manifest is None:
+        v2_errors.append("v2 artifact 缺少 dataset_manifest")
+    else:
+        try:
+            from .dataset_manifest import compute_dataset_manifest_hash
+            computed_manifest_hash = compute_dataset_manifest_hash(resolved_manifest)
+        except Exception:
+            computed_manifest_hash = None
+        if resolved_manifest.get("manifest_hash") != computed_manifest_hash:
+            v2_errors.append("dataset_manifest manifest_hash mismatch")
+        if resolved_contract.get("dataset_manifest_hash") != computed_manifest_hash:
+            v2_errors.append("dataset manifest hash mismatch")
     canonical = _normalized_columns(resolved_contract.get("canonical_feature_cols"))
     effective = _normalized_columns(resolved_contract.get("effective_feature_cols"))
     removed = _normalized_columns(resolved_contract.get("removed_feature_cols"))
@@ -335,18 +435,64 @@ def validate_publication_artifact(
     manual_cols = _normalized_columns(resolved_contract.get("manual_input_feature_cols"))
     molecular_cols = _normalized_columns(resolved_contract.get("molecular_workflow_feature_cols"))
     derived_cols = _normalized_columns(resolved_contract.get("derived_feature_cols"))
-    if not legacy_contract and feature_cols_v2 != canonical:
+    if feature_cols_v2 != canonical:
         v2_errors.append("feature_cols must equal canonical_feature_cols")
-    if not legacy_contract and feature_cols_v2 != workflow_cols + manual_cols:
+    if feature_cols_v2 != workflow_cols + manual_cols:
         v2_errors.append("feature source partitions do not match feature_cols")
-    if not legacy_contract and workflow_cols != molecular_cols + derived_cols:
+    if workflow_cols != molecular_cols + derived_cols:
         v2_errors.append("workflow source partitions do not match workflow_feature_cols")
-    if not legacy_contract and (set(effective) - set(canonical) or set(removed) - set(canonical) or set(effective) & set(removed)):
+    source_columns_decl = resolved_contract.get("source_columns")
+    workflow_columns_decl = resolved_contract.get("workflow_source_columns")
+    source_fields_decl = resolved_contract.get("workflow_source_fields")
+    if isinstance(source_columns_decl, list) and isinstance(workflow_columns_decl, list) and source_columns_decl != workflow_columns_decl:
+        v2_errors.append("workflow_source_columns must equal source_columns")
+    if isinstance(source_columns_decl, list) and isinstance(source_fields_decl, list) and source_columns_decl != source_fields_decl:
+        v2_errors.append("workflow_source_fields must equal source_columns")
+    if (set(effective) - set(canonical) or set(removed) - set(canonical) or set(effective) & set(removed) or set(effective) | set(removed) != set(canonical)):
         v2_errors.append("effective/removed feature columns are inconsistent with canonical columns")
+    if resolved_registry is not None:
+        registry_features = {
+            str(item.get("name")): item
+            for item in resolved_registry.get("features", [])
+            if isinstance(item, Mapping) and item.get("name")
+        }
+        for feature in canonical:
+            definition = registry_features.get(feature)
+            if definition is None:
+                v2_errors.append(f"feature is not registered: {feature}")
+            elif definition.get("status") != "approved":
+                v2_errors.append(f"feature is not approved: {feature}")
+        contract_definitions = {
+            str(item.get("name")): item
+            for item in resolved_contract.get("feature_definitions") or []
+            if isinstance(item, Mapping) and item.get("name")
+        }
+        for feature in canonical:
+            expected = registry_features.get(feature)
+            actual = contract_definitions.get(feature)
+            if expected is None or actual is None or dict(expected) != dict(actual):
+                v2_errors.append(f"feature definition mismatch: {feature}")
+        registry_workflow = {
+            str(item.get("name")) for item in registry_features.values()
+            if item.get("source_type") in {"molecular_workflow", "derived_workflow"}
+        }
+        registry_manual = {
+            str(item.get("name")) for item in registry_features.values()
+            if item.get("source_type") == "manual_input"
+        }
+        if set(workflow_cols) != registry_workflow.intersection(canonical):
+            v2_errors.append("workflow feature partition does not match registry source_type")
+        if set(manual_cols) != registry_manual.intersection(canonical):
+            v2_errors.append("manual feature partition does not match registry source_type")
+    # Legacy contracts are still inspected for useful diagnostics, but their
+    # v2-only hash/partition checks must not mask the underlying compatibility
+    # errors or change their required needs_validation status.
+    if legacy_contract:
+        v2_errors.clear()
     if v2_errors:
-        return {"ok": False, "status": "invalid", "errors": v2_errors, "diagnostics": [{"code": "contract_invalid", "feature": None, "source": "prediction_contract", "rule": "v2", "message": error} for error in v2_errors]}
+        return {"ok": False, "status": "invalid", "errors": v2_errors, "diagnostics": diagnostics(v2_errors, code="contract_invalid", source="prediction_contract")}
 
-    required_fields = _CONTRACT_FIELDS if schema_version is None else (set() if legacy_contract else _CONTRACT_FIELDS)
+    required_fields = _CONTRACT_FIELDS
     missing_contract_fields = sorted(required_fields - set(resolved_contract))
     if missing_contract_fields:
         errors.append(
@@ -383,6 +529,8 @@ def validate_publication_artifact(
         "workflow_source_columns"
     ):
         errors.append("prediction_contract 的 workflow source 列记录不一致。")
+    if not isinstance(resolved_contract.get("workflow_source_fields"), list):
+        errors.append("prediction_contract 的 workflow_source_fields 必须是列表。")
     if not isinstance(resolved_contract.get("numeric_ranges"), Mapping):
         errors.append("prediction_contract 的 numeric_ranges 必须是映射。")
     else:
@@ -467,8 +615,8 @@ def validate_publication_artifact(
                 "完全一致" + ("（" + "；".join(detail) + "）。" if detail else ".")
             )
 
-    status = "valid" if not errors else "invalid"
-    return {"ok": not errors, "status": status, "errors": errors}
+    status = "needs_validation" if legacy_contract else ("valid" if not errors else "invalid")
+    return {"ok": not errors, "status": status, "errors": errors, "diagnostics": diagnostics(errors) if errors else []}
 
 
 def make_publication_entry(
@@ -484,7 +632,16 @@ def make_publication_entry(
     metrics: Mapping[str, Any] | None,
     version: str,
     published_at: str,
+    publication_status: str = "needs_validation",
+    enabled: bool = False,
+    gate_report: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    gate_ok = (
+        isinstance(gate_report, Mapping)
+        and gate_report.get("ok") is True
+        and str(gate_report.get("status") or "").strip().lower() == "valid"
+    )
+    is_published = str(publication_status).strip().lower() == "published" and bool(enabled) and gate_ok
     return {
         "id": f"{material_key}:{target_key}:{version}",
         "material_key": str(material_key),
@@ -498,8 +655,9 @@ def make_publication_entry(
         "metrics": copy.deepcopy(dict(metrics or {})),
         "version": str(version),
         "published_at": str(published_at),
-        "enabled": True,
-        "publication_status": "published",
+        "enabled": is_published,
+        "publication_status": "published" if is_published else "needs_validation",
+        "gate_report": copy.deepcopy(dict(gate_report or {})),
     }
 
 
@@ -514,15 +672,65 @@ def _publication_models(config: dict[str, Any], material_key: str, target_key: s
     return models
 
 
+def _validate_entry_for_activation(entry: Mapping[str, Any], config: Mapping[str, Any]) -> None:
+    """Revalidate the artifact before changing active-release state."""
+    gate_report = entry.get("gate_report")
+    if not (isinstance(gate_report, Mapping) and gate_report.get("ok") is True
+            and str(gate_report.get("status") or "").strip().lower() == "valid"):
+        raise ValueError("只能激活已通过发布门禁的 published entry。")
+    artifact = entry.get("_artifact")
+    if not isinstance(artifact, Mapping):
+        artifact_path = str(entry.get("artifact_path") or "").strip()
+        if artifact_path:
+            roots = [Path(str(config[key])) for key in ("project_root", "portal_root", "root") if config.get(key)]
+            roots.extend((Path.cwd(), Path(__file__).resolve().parents[1]))
+            path = Path(artifact_path)
+            if not path.is_absolute():
+                path = next(((root / path).resolve() for root in roots if (root / path).is_file()), (roots[0] / path).resolve())
+            try:
+                from .model_io import load_model_artifact_bytes
+                artifact = load_model_artifact_bytes(path.read_bytes()) if path.is_file() else None
+            except Exception:
+                artifact = None
+    if not isinstance(artifact, Mapping):
+        raise ValueError("发布 entry 缺少可验证 artifact。")
+    contract = entry.get("contract")
+    if not isinstance(contract, Mapping):
+        contract = _as_mapping(_as_mapping(artifact.get("extra")).get("prediction_contract"))
+    if not contract:
+        raise ValueError("发布 entry 缺少可验证 prediction_contract。")
+    artifact_path = str(entry.get("artifact_path") or "").strip()
+    artifact_hash = str(entry.get("artifact_hash") or "").strip().lower()
+    if not artifact_path or not artifact_hash:
+        raise ValueError("发布 entry 缺少 artifact_path 或 artifact_hash。")
+    if artifact_path or artifact_hash:
+        roots = [Path(str(config[key])) for key in ("project_root", "portal_root", "root") if config.get(key)]
+        roots.extend((Path.cwd(), Path(__file__).resolve().parents[1]))
+        path = Path(artifact_path)
+        if not path.is_absolute():
+            path = next(((root / path).resolve() for root in roots if (root / path).is_file()), (roots[0] / path).resolve())
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest().lower() != artifact_hash:
+            raise ValueError("发布 artifact_hash 校验失败。")
+    report = validate_publication_artifact(artifact, contract)
+    if report.get("ok") is not True or str(report.get("status") or "").lower() != "valid":
+        raise ValueError("发布 artifact 未通过重新验证：" + "; ".join(map(str, report.get("errors") or [])))
+
+
 def activate_publication(
     config: dict[str, Any], *, material_key: str, target_key: str, entry: dict[str, Any]
 ) -> dict[str, Any]:
     """Activate one release and disable all other releases in place."""
 
-    models = _publication_models(config, material_key, target_key)
     version = str(entry.get("version") or "").strip()
     if not version:
         raise ValueError("发布版本不能为空。")
+    _validate_entry_for_activation(entry, config)
+    if (
+        str(entry.get("publication_status") or "").strip().lower() != "published"
+        or entry.get("enabled") is not True
+    ):
+        raise ValueError("只能激活已通过发布门禁的 published entry。")
+    models = _publication_models(config, material_key, target_key)
     for model in models:
         if isinstance(model, dict):
             model["enabled"] = False
@@ -559,6 +767,10 @@ def rollback_publication(
         raise ValueError(f"Unknown publication version（未知发布版本）: {requested}")
     if len(matches) > 1:
         raise ValueError(f"Duplicate publication version（重复发布版本）: {requested}")
+    target_entry = matches[0]
+    _validate_entry_for_activation(target_entry, config)
+    if str(target_entry.get("publication_status") or "").strip().lower() != "published":
+        raise ValueError("只能回退到已通过发布门禁的 published entry。")
     for model in models:
         if not isinstance(model, dict):
             continue
@@ -812,14 +1024,22 @@ def stop_prediction_portal(
 def should_show_publication(contract_report: Mapping[str, Any]) -> bool:
     return bool(
         isinstance(contract_report, Mapping)
-        and contract_report.get("ok")
-        and contract_report.get("status") != "needs_validation"
+        and contract_report.get("ok") is True
+        and str(contract_report.get("status") or "").strip().lower() == "valid"
         and not contract_report.get("errors")
     )
 
 
 def select_active_publication(models: list[dict[str, Any]]) -> dict[str, Any] | None:
-    active = [model for model in models if isinstance(model, dict) and model.get("enabled")]
+    active = [
+        model for model in models
+        if isinstance(model, dict)
+        and model.get("enabled") is True
+        and str(model.get("publication_status") or "").strip().lower() == "published"
+        and isinstance(model.get("gate_report"), Mapping)
+        and model["gate_report"].get("ok") is True
+        and str(model["gate_report"].get("status") or "").strip().lower() == "valid"
+    ]
     if len(active) > 1:
         raise ValueError("Multiple enabled publication releases（多个启用版本）")
     return active[0] if active else None
