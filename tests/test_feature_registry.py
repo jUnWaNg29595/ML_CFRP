@@ -107,6 +107,118 @@ def test_workflow_requires_rule_inputs_and_implementation():
     assert any("input_fields" in error or "implementation" in error for error in report["errors"])
 
 
+def test_workflow_requires_unit_and_null_invalid_policies():
+    from core.feature_registry import validate_registry
+
+    rule = {
+        "input_fields": ["schedule"],
+        "implementation": "core.process_features:derive_declared_feature",
+        "null_policy": "",
+        "invalid_policy": "",
+    }
+    feature = _feature(
+        feature_id="derived",
+        name="derived",
+        source_type="derived_workflow",
+        unit="",
+        default_policy="workflow_only",
+        calculation_rule=rule,
+    )
+    report = validate_registry(_registry([feature]))
+    assert report["ok"] is False
+    assert any("unit" in error for error in report["errors"])
+    assert any("null_policy" in error for error in report["errors"])
+    assert any("invalid_policy" in error for error in report["errors"])
+
+
+def test_profile_status_target_and_blocked_list_are_bidirectionally_validated():
+    from core.feature_registry import validate_registry
+
+    blocked = _feature(feature_id="blocked", name="blocked", status="blocked", blocking_reason="unknown")
+    approved = _feature(feature_id="approved", name="approved", status="approved")
+    base_profile = {"feature_ids": ["blocked", "approved"], "status": "approved", "target_col": "tg_c"}
+
+    missing_status = _registry([blocked, approved], {"p": {**base_profile, "status": ""}})
+    assert validate_registry(missing_status)["ok"] is False
+
+    missing_target = _registry([blocked, approved], {"p": {**base_profile, "target_col": ""}})
+    assert validate_registry(missing_target)["ok"] is False
+
+    missing_blocked = _registry([blocked, approved], {"p": {**base_profile, "blocked_feature_ids": []}})
+    report = validate_registry(missing_blocked)
+    assert report["ok"] is False
+    assert any("blocked" in error for error in report["errors"])
+
+    wrong_blocked = _registry([blocked, approved], {"p": {**base_profile, "blocked_feature_ids": ["approved"]}})
+    report = validate_registry(wrong_blocked)
+    assert report["ok"] is False
+    assert any("blocked" in error for error in report["errors"])
+
+
+def test_approved_profile_requires_approved_definitions():
+    from core.feature_registry import validate_registry
+
+    legacy = _feature(feature_id="legacy", name="legacy", status="legacy_observed", legacy_source="artifact")
+    profile = {"feature_ids": ["legacy"], "status": "approved", "target_col": "tg_c"}
+    report = validate_registry(_registry([legacy], {"p": profile}))
+    assert report["ok"] is False
+    assert any("approved" in error for error in report["errors"])
+
+
+def test_snapshot_rejects_unapproved_registry_and_blocked_profile():
+    from core.feature_registry import build_registry_snapshot, compute_registry_hash
+
+    approved_feature = _feature(feature_id="a", name="a", status="approved")
+    profile = {"feature_ids": ["a"], "status": "approved", "target_col": "tg_c"}
+    registry = _registry([approved_feature], {"p": profile}, {"status": "draft"})
+    with pytest.raises(ValueError):
+        build_registry_snapshot(registry, "p")
+
+    registry["approval"] = {"status": "approved"}
+    registry["approval"]["approved_hash"] = compute_registry_hash(registry)
+    registry["model_profiles"]["p"]["status"] = "blocked"
+    with pytest.raises(ValueError):
+        build_registry_snapshot(registry, "p")
+
+
+def test_bootstrap_uses_ordinal_audit_ids_and_preserves_legacy_name():
+    from scripts.bootstrap_feature_registry import build_registry
+
+    payload = build_registry(ARTIFACT)
+    legacy = [item for item in payload["features"] if item["status"] == "legacy_observed"]
+    assert len(legacy) == 504
+    assert all(item["feature_id"].startswith("cfrp.tg.legacy_observed.") for item in legacy)
+    assert all(item.get("legacy_name") == item["name"] for item in legacy)
+    assert all(item["feature_id"].rsplit(".", 1)[-1].isdigit() for item in legacy)
+
+
+def test_known_gap_id_is_explicit_and_survives_model_column_rename():
+    from scripts.bootstrap_feature_registry import GAP_FEATURE_IDS, _gap_definition
+
+    original = _gap_definition("cure_total_time_h")
+    renamed = _gap_definition("cure_total_time_h")
+    assert original["feature_id"] == GAP_FEATURE_IDS["cure_total_time_h"]
+    assert renamed["feature_id"] == "cfrp.tg.cure_total_time_h"
+    assert renamed["feature_id"] != "cfrp.tg.cure_total_time_hours"
+
+
+def test_bootstrap_source_counts_and_artifact_bytes_unchanged():
+    from scripts.bootstrap_feature_registry import GAPS, build_registry
+
+    before = ARTIFACT.read_bytes()
+    payload = build_registry(ARTIFACT)
+    after = ARTIFACT.read_bytes()
+    assert before == after
+    counts = {}
+    for item in payload["features"]:
+        counts[item["source_type"]] = counts.get(item["source_type"], 0) + 1
+    assert counts["derived_workflow"] == 18
+    assert counts["manual_input"] == 7
+    assert counts["molecular_workflow"] == 2
+    assert counts["unknown"] == 1
+    assert len(GAPS) == 28
+
+
 def test_bootstrap_output_counts_and_blocked_ratio():
     output = ROOT / "prediction_portal/feature_registry.test.json"
     try:

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -50,32 +49,61 @@ GAPS: dict[str, tuple[str, str | None]] = {
     "curing_agent_smiles_n_components": ("molecular_workflow", "由固化剂结构输入拆分组件计数"),
 }
 
+# These IDs are semantic commitments, kept explicit so source/model column
+# spelling changes cannot silently create a new feature identity.
+GAP_FEATURE_IDS = {
+    name: f"cfrp.tg.{name}" for name in GAPS
+}
+
+GAP_UNITS = {
+    "cure_stage_count": "stage",
+    "cure_total_time_h": "h",
+    "cure_max_temperature_c": "°C",
+    "cure_final_temperature_c": "°C",
+    "cure_temp_time_integral_c_h": "°C*h",
+    "cure_time_weighted_avg_temperature_c": "°C",
+    "post_cure_stage_count": "stage",
+    "post_cure_total_time_h": "h",
+    "post_cure_max_temperature_c": "°C",
+    "post_cure_final_temperature_c": "°C",
+    "post_cure_temp_time_integral_c_h": "°C*h",
+    "post_cure_time_weighted_avg_temperature_c": "°C",
+    "post_cure_temperature_c": "°C",
+    "has_post_cure": "code",
+    "total_cure_stage_count": "stage",
+    "total_heat_treatment_time_h": "h",
+    "overall_max_cure_temperature_c": "°C",
+    "overall_temp_time_integral_c_h": "°C*h",
+    "degree_of_cure_pct": "%",
+    "gel_time_min": "min",
+    "curing_pressure_mpa": "MPa",
+    "eew_g_eq": "g/eq",
+    "ahew_g_eq": "g/eq",
+    "tg_method": "code",
+    "tg_standard": "code",
+    "stoichiometric_ratio_r": "unknown",
+    "resin_smiles_n_components": "component",
+    "curing_agent_smiles_n_components": "component",
+}
+
 DERIVED_IMPLEMENTATION = "core.process_features:derive_declared_feature"
 MOLECULAR_IMPLEMENTATION = "core.molecular_features:derive_declared_feature"
 
 
-def _slug(value: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
-    return slug or "feature"
-
-
-def _feature_id(name: str) -> str:
-    return "cfrp.tg." + _slug(name)
-
-
-def _legacy_definition(name: str, artifact_path: str) -> dict[str, Any]:
+def _legacy_definition(name: str, ordinal: int, artifact_path: str) -> dict[str, Any]:
     return {
-        "feature_id": _feature_id(name),
+        "feature_id": f"cfrp.tg.legacy_observed.{ordinal:04d}",
         "name": name,
         "label": name,
-        "source_type": "molecular_workflow",
+        "legacy_name": name,
+        "source_type": "metadata",
         "data_type": "float",
-        "unit": None,
+        "unit": "unknown",
         "required_for_prediction": True,
         "nullable": False,
         "default_policy": "workflow_only",
         "calculation_rule": {
-            "implementation": MOLECULAR_IMPLEMENTATION,
+            "implementation": "legacy.artifact:observed_feature",
             "version": "legacy-observed-1",
             "input_fields": ["resin_smiles", "curing_agent_smiles"],
             "null_policy": "reject",
@@ -91,12 +119,12 @@ def _gap_definition(name: str) -> dict[str, Any]:
     source_type, reason = GAPS[name]
     blocked = source_type == "unknown"
     definition: dict[str, Any] = {
-        "feature_id": _feature_id(name),
+        "feature_id": GAP_FEATURE_IDS[name],
         "name": name,
         "label": name,
         "source_type": source_type,
         "data_type": "integer" if name.endswith("count") or name in {"has_post_cure", "tg_method", "tg_standard"} else "float",
-        "unit": "stage" if name.endswith("stage_count") else None,
+        "unit": GAP_UNITS[name],
         "required_for_prediction": True,
         "nullable": False,
         "default_policy": "explicit_only" if source_type == "manual_input" else ("forbidden" if blocked else "workflow_only"),
@@ -134,10 +162,14 @@ def build_registry(artifact_path: Path) -> dict[str, Any]:
     # identify which of those ordered columns were produced by the old
     # workflow.
     workflow_set = set(workflow_features)
-    definitions = [
-        _legacy_definition(name, str(artifact_path)) if name in workflow_set else _gap_definition(name)
-        for name in model_features
-    ]
+    definitions = []
+    legacy_ordinal = 1
+    for name in model_features:
+        if name in workflow_set:
+            definitions.append(_legacy_definition(name, legacy_ordinal, str(artifact_path)))
+            legacy_ordinal += 1
+        else:
+            definitions.append(_gap_definition(name))
     # Ensure every historical gap is represented, even if a future artifact changes order.
     missing_gaps = [name for name in GAPS if name not in model_features]
     if missing_gaps:

@@ -11,6 +11,7 @@ from typing import Any, Mapping
 SOURCE_TYPES = {"molecular_workflow", "derived_workflow", "manual_input", "target", "metadata", "unknown"}
 DEFAULT_POLICIES = {"forbidden", "explicit_only", "workflow_only"}
 FEATURE_STATUSES = {"draft", "approved", "legacy_observed", "deprecated", "blocked"}
+PROFILE_STATUSES = {"draft", "approved", "deprecated", "blocked"}
 _REVIEW_KEYS = {"approved_hash", "approved_at", "approved_by", "reviewer", "reviewed_at", "review_note", "review_notes", "change_summary", "change_summaries", "review_metadata"}
 
 def _without_mutable_approval_metadata(payload: Any) -> Any:
@@ -76,6 +77,9 @@ def validate_registry(payload: Mapping[str, Any], require_approved: bool = False
             errors.append(f"{prefix}.default_policy is invalid: {policy}")
         if status not in FEATURE_STATUSES:
             errors.append(f"{prefix}.status is invalid: {status}")
+        unit = feature.get("unit")
+        if not isinstance(unit, str) or not unit.strip():
+            errors.append(f"{prefix}.unit is required")
         if "required_for_prediction" in feature and not isinstance(feature.get("required_for_prediction"), bool):
             errors.append(f"{prefix}.required_for_prediction must be boolean")
         if "nullable" in feature and not isinstance(feature.get("nullable"), bool):
@@ -93,6 +97,9 @@ def validate_registry(payload: Mapping[str, Any], require_approved: bool = False
                     errors.append(f"{prefix}.calculation_rule.input_fields is required")
                 if not isinstance(rule.get("implementation"), str) or not rule.get("implementation"):
                     errors.append(f"{prefix}.calculation_rule.implementation is required")
+                for policy_name in ("null_policy", "invalid_policy"):
+                    if not isinstance(rule.get(policy_name), str) or not rule.get(policy_name).strip():
+                        errors.append(f"{prefix}.calculation_rule.{policy_name} is required")
         if source_type == "unknown" and status != "blocked":
             errors.append(f"{prefix} unknown feature must be blocked")
         if status == "blocked" and not any(feature.get(key) for key in ("blocking_reason", "block_reason", "reason")):
@@ -125,13 +132,34 @@ def validate_registry(payload: Mapping[str, Any], require_approved: bool = False
             if feature_id in seen_refs:
                 errors.append(f"model profile {profile_id} references duplicate feature_id: {feature_id}")
             seen_refs.add(feature_id)
+        profile_status = profile.get("status")
+        if profile_status not in PROFILE_STATUSES:
+            errors.append(f"model profile {profile_id}.status is invalid: {profile_status}")
+        target_col = profile.get("target_col")
+        if not isinstance(target_col, str) or not target_col.strip():
+            errors.append(f"model profile {profile_id}.target_col is required")
+        if profile_status == "approved":
+            for feature_id in refs:
+                definition = definitions.get(feature_id)
+                if definition is not None and definition.get("status") != "approved":
+                    errors.append(f"model profile {profile_id} approved profile requires approved feature: {feature_id}")
         blocked = profile.get("blocked_feature_ids", [])
-        if blocked and not isinstance(blocked, list):
+        if not isinstance(blocked, list):
             errors.append(f"model profile {profile_id}.blocked_feature_ids must be a list")
-        elif isinstance(blocked, list):
+            blocked = []
+        if isinstance(blocked, list):
+            blocked_set = set(blocked)
+            actual_blocked = {
+                feature_id for feature_id in refs
+                if definitions.get(feature_id, {}).get("status") == "blocked"
+            }
             for feature_id in blocked:
                 if feature_id not in refs:
                     errors.append(f"model profile {profile_id}.blocked_feature_ids references feature outside profile: {feature_id}")
+                elif definitions.get(feature_id, {}).get("status") != "blocked":
+                    errors.append(f"model profile {profile_id}.blocked_feature_ids requires blocked feature: {feature_id}")
+            if blocked_set != actual_blocked:
+                errors.append(f"model profile {profile_id}.blocked_feature_ids must match blocked definitions")
     approval_status = approval.get("status")
     if approval_status not in {"draft", "approved", "deprecated"}:
         errors.append(f"approval.status is invalid: {approval_status}")
@@ -159,11 +187,18 @@ def get_model_profile(registry: Mapping[str, Any], profile_id: str) -> dict[str,
     return copy.deepcopy(dict(profile))
 
 def build_registry_snapshot(registry: Mapping[str, Any], profile_id: str) -> dict[str, Any]:
+    report = validate_registry(registry, require_approved=True)
+    if not report["ok"]:
+        raise ValueError("cannot build snapshot from unapproved registry: " + "; ".join(report["errors"]))
     profile = get_model_profile(registry, profile_id)
+    if profile.get("status") != "approved":
+        raise ValueError(f"model profile is not approved: {profile_id}")
     definitions = {item.get("feature_id"): item for item in registry.get("features", []) if isinstance(item, Mapping)}
     selected = []
     for feature_id in profile.get("feature_ids", []):
         if feature_id not in definitions:
             raise KeyError(f"model profile references unknown feature_id: {feature_id}")
+        if definitions[feature_id].get("status") != "approved":
+            raise ValueError(f"model profile references non-approved feature: {feature_id}")
         selected.append(copy.deepcopy(dict(definitions[feature_id])))
     return {"schema_version": registry.get("schema_version"), "registry_version": registry.get("registry_version"), "registry_hash": compute_registry_hash(registry), "profile_id": profile_id, "model_profile": profile, "features": selected}
