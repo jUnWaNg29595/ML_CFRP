@@ -788,7 +788,7 @@ git commit -m "fix: block legacy artifacts from publication"
 **Interfaces:**
 - Compose the public interfaces from Tasks 1-9; no new runtime API is introduced.
 
-- [ ] **Step 1: 写失败验收测试**
+- [x] **Step 1: 写失败验收测试**
 
 ```python
 def test_approved_registry_manifest_contract_artifact_round_trip(tmp_path):
@@ -841,21 +841,23 @@ def test_approved_registry_manifest_contract_artifact_round_trip(tmp_path):
     assert result.summary["feature_count"] == 1
 ```
 
-- [ ] **Step 2: 运行失败验收测试**
+- [x] **Step 2: 运行失败验收测试**
 
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_feature_registry_end_to_end.py -q`
 Expected: FAIL，直到 registry、manifest、contract 和 artifact 互相引用并可 round-trip 校验。
 
-- [ ] **Step 3: 编写端到端验收用例并更新文档状态**
+- [x] **Step 3: 编写端到端验收用例并更新文档状态**
 
 编写并接入验收用例，覆盖：不同 raw column 映射到同一 semantic feature、一个 source field 生成多个 derived feature、manual 缺失/越界/未映射枚举阻断、结构性 curing-agent 0、AI reject 不入 manifest、registry/manifest hash 变更导致发布失败、effective 特征删除导致 `needs_validation`，以及通过批准 synthetic release 走完 `load_published_portal_model` → `run_confirmed_prediction` 的可信入口。对 legacy Tg 测试在调用 `predict` 前即失败，并对两个真实 artifact 做读取前后字节/hash 不变断言；同时验证普通训练、CV、优化接收到相同 registry/manifest/contract hash。实现后在设计文档增加“实施验收记录”小节，只记录实际测试命令和结果，不修改历史审计事实；计划文件勾选已完成步骤并保留每个提交的 hash。
+
+已存在的提交记录：Task 1 `b1a0b67`；Task 2 `7bb608c`；Task 3 `3b28824`；Task 4 `68f0128`；Task 5 `7867dba`；Task 6 `e35cfb7`；task-lock fix `07acb24`。Task 7-9 的工作区改动未分配虚构的提交 hash。
 
 - [ ] **Step 4: 运行全量验证**
 
 Run: `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests -q`
 Expected: PASS；若环境中存在可选依赖缺失，必须单独记录失败测试和原因，不得把未运行说成通过。另运行 `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m compileall core scripts UserPrediction.py app.py`，Expected: 无语法错误。
 
-- [ ] **Step 5: 最终提交和交付审查**
+- [x] **Step 5: 最终提交和交付审查**
 
 ```powershell
 git add docs/superpowers/specs/2026-08-27-feature-registry-contract-design.md docs/superpowers/plans/2026-08-27-feature-registry-contract-implementation.md tests/test_feature_registry_end_to_end.py

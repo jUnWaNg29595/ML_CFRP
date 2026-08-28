@@ -503,3 +503,13 @@ AI 特征管理不负责：用户预测输入解析、预测结果解释、自�
 - 不让 AI 生成缺失特征或执行代码；
 - 不把 AI 扩展成与特征审核无关的通用管理或预测助手；
 - 不在契约闭合前执行真实 Tg 预测。
+
+## 实施验收记录
+
+以下为当前仓库中已核实的聚焦验收结果；未将全量测试声明为通过：
+
+- `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_contract_v2.py tests/test_prediction_portal.py tests/test_prediction_feature_contract.py -q`：15 passed。
+- `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_process_features.py tests/test_molecular_feature_workflow.py -q`：55 passed。
+- `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_training_contract.py tests/test_training_runs.py -q`：20 passed。
+- `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_portal_tasks.py -q`：7 passed。
+- `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest tests/test_feature_registry_end_to_end.py -q`：1 passed（1.54s）。
