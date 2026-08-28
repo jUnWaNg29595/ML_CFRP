@@ -20,3 +20,17 @@ Command:
 `C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m compileall -q core tests`
 
 Result: passed.
+
+## Whole-Branch Training Context Fix
+
+Commits `ecbf3d1` and `51081b4` add model-specific training context routing. Graph and raw-frame models use their own input columns without applying the strict numeric contract; ordinary models retain strict canonical-column validation. The app now uses the complete `RAW_FRAME_MODEL_NAMES` set plus the Epoxy PINN path for both training and cross-validation.
+
+Coverage:
+
+`C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m pytest -q tests/test_training_contract.py::test_training_page_routes_model_specific_context_for_all_raw_frame_models tests/test_training_contract.py::test_model_specific_training_inputs_do_not_reuse_strict_numeric_context`
+
+Output: `2 passed`.
+
+`C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe -m compileall -q app.py core/training_contract.py core/model_trainer.py`
+
+Output: passed (no output).

@@ -33,7 +33,7 @@ def test_training_page_routes_model_specific_context_for_all_raw_frame_models():
     raw_frame_line = next(line for line in app_source.splitlines() if line.strip().startswith("raw_frame_models ="))
     assert "set(RAW_FRAME_MODEL_NAMES)" in raw_frame_line
     assert "Epoxy PINN (Physics-Informed)" in raw_frame_line
-    assert "feature_contract_context=model_training_context" in app_source
+    assert app_source.count("feature_contract_context=model_training_context") >= 2
 
 
 def test_artifact_round_trip_keeps_registry_and_manifest_hash():
