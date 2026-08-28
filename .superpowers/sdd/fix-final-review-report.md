@@ -3,7 +3,7 @@
 ## Scope
 
 - `core/prediction_portal.py`: validate approved dataset manifests against the full registry payload (or full registry), bind contract/profile IDs, and require canonical `workflow_source_fields` for v2 contracts while retaining aliases for schema-1/legacy compatibility.
-- `core/feature_mapping_review.py`: require an explicit `status=approved` on suggestions accepted or edited into approved bindings.
+- `core/feature_mapping_review.py`: require an explicit `status=pending_review` on AI suggestions accepted or edited into approved bindings; the resulting local binding is marked `review_status=approved`.
 - `core/feature_registry_ui.py`: expose `unknown` suggestions in the status filter.
 - Added regression tests covering manifest tampering/approval, profile binding, v2 source-field aliases, missing review status, and the UI filter.
 
