@@ -153,7 +153,7 @@ def apply_feature_review_decision(
     if action not in {"accept", "edit_accept"}:
         raise ValueError("unsupported feature review action")
     suggestion_status = suggestion.get("status")
-    if suggestion_status is not None and str(suggestion_status).strip().lower() != "approved":
+    if suggestion_status is None or str(suggestion_status).strip().lower() != "approved":
         raise ValueError("只能批准 status=approved 的特征审核建议")
     feature_id = suggestion.get("feature_id")
     registry_feature = None

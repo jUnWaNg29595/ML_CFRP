@@ -21,3 +21,10 @@ def test_feature_review_ui_persists_ai_and_local_decision_records():
     assert "feature_reviews" in source
     assert "ai_response" in source
     assert "local_decision" in source
+
+
+def test_feature_review_ui_exposes_unknown_status_filter():
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "core" / "feature_registry_ui.py").read_text(encoding="utf-8")
+    assert '"unknown"' in source

@@ -338,6 +338,7 @@ def validate_publication_artifact(
     artifact_manifest = extra.get("dataset_manifest") if isinstance(extra.get("dataset_manifest"), Mapping) else None
     resolved_registry = registry_snapshot if isinstance(registry_snapshot, Mapping) else artifact_registry
     resolved_manifest = dataset_manifest if isinstance(dataset_manifest, Mapping) else artifact_manifest
+    manifest_registry: Mapping[str, Any] | None = None
     if resolved_registry is None:
         v2_errors.append("v2 artifact 缺少 registry_snapshot")
     else:
@@ -352,6 +353,7 @@ def validate_publication_artifact(
                 v2_errors.append("registry_snapshot registry_hash is missing")
             registry_payload = resolved_registry.get("registry_payload")
             if isinstance(registry_payload, Mapping):
+                manifest_registry = registry_payload
                 registry_report = validate_registry(registry_payload, require_approved=True)
                 if not registry_report.get("ok"):
                     v2_errors.extend("registry_payload " + str(error) for error in registry_report.get("errors", []))
@@ -361,6 +363,8 @@ def validate_publication_artifact(
                 if registry_payload.get("registry_version") != resolved_registry.get("registry_version"):
                     v2_errors.append("compact registry_snapshot registry version mismatch")
                 profile_id = resolved_registry.get("profile_id")
+                if resolved_contract.get("model_profile_id") != profile_id:
+                    v2_errors.append("prediction_contract model_profile_id 与 compact registry_snapshot profile_id 不一致")
                 try:
                     expected_profile = get_model_profile(registry_payload, profile_id)
                 except (KeyError, TypeError, ValueError):
@@ -400,6 +404,7 @@ def validate_publication_artifact(
                 if selected_hash != expected_selected_hash:
                     v2_errors.append("compact registry_snapshot selected feature hash mismatch")
         else:
+            manifest_registry = resolved_registry
             registry_for_validation = dict(resolved_registry)
             registry_for_validation.pop("registry_hash", None)
             registry_report = validate_registry(registry_for_validation, require_approved=True)
@@ -429,6 +434,19 @@ def validate_publication_artifact(
             v2_errors.append("dataset_manifest manifest_hash mismatch")
         if resolved_contract.get("dataset_manifest_hash") != computed_manifest_hash:
             v2_errors.append("dataset manifest hash mismatch")
+        if manifest_registry is None:
+            v2_errors.append("dataset_manifest 缺少可验证 registry")
+        else:
+            from .dataset_manifest import validate_dataset_manifest
+            manifest_report = validate_dataset_manifest(
+                resolved_manifest,
+                manifest_registry,
+                require_approved=True,
+            )
+            if not manifest_report.get("ok"):
+                v2_errors.extend("dataset_manifest " + str(error) for error in manifest_report.get("errors", []))
+            if resolved_manifest.get("model_profile_id") != resolved_contract.get("model_profile_id"):
+                v2_errors.append("dataset_manifest model_profile_id 与 prediction_contract 不一致")
     canonical = _normalized_columns(resolved_contract.get("canonical_feature_cols"))
     effective = _normalized_columns(resolved_contract.get("effective_feature_cols"))
     removed = _normalized_columns(resolved_contract.get("removed_feature_cols"))
@@ -448,8 +466,10 @@ def validate_publication_artifact(
     source_fields_decl = resolved_contract.get("workflow_source_fields")
     if isinstance(source_columns_decl, list) and isinstance(workflow_columns_decl, list) and source_columns_decl != workflow_columns_decl:
         v2_errors.append("workflow_source_columns must equal source_columns")
-    if isinstance(source_columns_decl, list) and isinstance(source_fields_decl, list) and source_columns_decl != source_fields_decl:
+    if isinstance(source_fields_decl, list) and isinstance(source_columns_decl, list) and source_columns_decl != source_fields_decl:
         v2_errors.append("workflow_source_fields must equal source_columns")
+    if isinstance(source_fields_decl, list) and isinstance(workflow_columns_decl, list) and workflow_columns_decl != source_fields_decl:
+        v2_errors.append("workflow_source_columns must equal workflow_source_fields")
     if (set(effective) - set(canonical) or set(removed) - set(canonical) or set(effective) & set(removed) or set(effective) | set(removed) != set(canonical)):
         v2_errors.append("effective/removed feature columns are inconsistent with canonical columns")
     if resolved_registry is not None:
@@ -494,7 +514,9 @@ def validate_publication_artifact(
     if v2_errors:
         return {"ok": False, "status": "invalid", "errors": v2_errors, "diagnostics": diagnostics(v2_errors, code="contract_invalid", source="prediction_contract")}
 
-    required_fields = _CONTRACT_FIELDS
+    required_fields = _CONTRACT_FIELDS - {"source_columns", "workflow_source_columns"}
+    if legacy_contract:
+        required_fields = set(_CONTRACT_FIELDS)
     missing_contract_fields = sorted(required_fields - set(resolved_contract))
     if missing_contract_fields:
         errors.append(
@@ -523,16 +545,19 @@ def validate_publication_artifact(
     elif contract_features and artifact_features != contract_features:
         errors.append("artifact 与 prediction_contract 的 feature_cols 顺序或内容不一致。")
 
-    if not isinstance(resolved_contract.get("source_columns"), list):
-        errors.append("prediction_contract 的 source_columns 必须是列表。")
-    if not isinstance(resolved_contract.get("workflow_source_columns"), list):
-        errors.append("prediction_contract 的 workflow_source_columns 必须是列表。")
-    elif resolved_contract.get("source_columns") != resolved_contract.get(
-        "workflow_source_columns"
-    ):
-        errors.append("prediction_contract 的 workflow source 列记录不一致。")
     if not isinstance(resolved_contract.get("workflow_source_fields"), list):
         errors.append("prediction_contract 的 workflow_source_fields 必须是列表。")
+    if not legacy_contract:
+        for alias in ("source_columns", "workflow_source_columns"):
+            value = resolved_contract.get(alias)
+            if value is not None and not isinstance(value, list):
+                errors.append(f"prediction_contract 的 {alias} 必须是列表（如提供）。")
+        if isinstance(source_fields_decl, list) and isinstance(source_columns_decl, list) and source_columns_decl != source_fields_decl:
+            errors.append("prediction_contract 的 workflow_source_fields 与 source_columns 不一致。")
+        if isinstance(source_fields_decl, list) and isinstance(workflow_columns_decl, list) and workflow_columns_decl != source_fields_decl:
+            errors.append("prediction_contract 的 workflow_source_fields 与 workflow_source_columns 不一致。")
+    elif isinstance(resolved_contract.get("source_columns"), list) and isinstance(resolved_contract.get("workflow_source_columns"), list) and resolved_contract.get("source_columns") != resolved_contract.get("workflow_source_columns"):
+        errors.append("prediction_contract 的 workflow source 列记录不一致。")
     if not isinstance(resolved_contract.get("numeric_ranges"), Mapping):
         errors.append("prediction_contract 的 numeric_ranges 必须是映射。")
     else:
@@ -559,7 +584,11 @@ def validate_publication_artifact(
     elif contract_features and list(resolution.get("feature_cols", [])) != contract_features:
         errors.append("模型公开的特征列与 prediction_contract 不一致。")
 
-    source_columns = resolved_contract.get("source_columns") or []
+    source_columns = (
+        resolved_contract.get("workflow_source_fields")
+        if isinstance(resolved_contract.get("workflow_source_fields"), list)
+        else resolved_contract.get("source_columns") or []
+    )
     workflow_present = bool(resolved_contract.get("workflow_present"))
     if source_columns and not workflow_present:
         errors.append("分子源列存在，但 prediction_contract 缺少可复现 workflow。")
@@ -599,7 +628,10 @@ def validate_publication_artifact(
         ):
             errors.append("artifact workflow schema_version 与 prediction_contract 不一致。")
         actual_sources = collect_workflow_source_columns(workflow_payload)
-        if actual_sources != resolved_contract.get("workflow_source_columns"):
+        expected_sources = resolved_contract.get("workflow_source_fields")
+        if not isinstance(expected_sources, list):
+            expected_sources = resolved_contract.get("workflow_source_columns")
+        if actual_sources != expected_sources:
             errors.append("artifact workflow source 列与 prediction_contract 不一致。")
         workflow_features = _normalized_columns(workflow_payload.get("final_feature_names"))
         if not workflow_features:

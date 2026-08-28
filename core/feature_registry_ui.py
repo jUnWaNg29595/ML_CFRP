@@ -44,7 +44,7 @@ def render_feature_registry_page(
     if not isinstance(suggestions, list):
         suggestions = []
     reviewer = st.text_input("本地审核人", key="feature_review_reviewer", placeholder="请输入审核身份")
-    status_filter = st.selectbox("查看", ["pending_review", "conflict", "approved"], key="feature_review_status")
+    status_filter = st.selectbox("查看", ["pending_review", "conflict", "unknown", "approved"], key="feature_review_status")
     rows = []
     candidates = list(suggestions)
     for binding in manifest.get("feature_bindings", []) if isinstance(manifest.get("feature_bindings"), list) else []:

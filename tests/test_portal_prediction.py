@@ -11,7 +11,7 @@ from core.molecular_feature_workflow import (
     materialize_workflow_source_columns,
 )
 from core.dataset_manifest import compute_dataset_manifest_hash
-from core.prediction_portal import compute_contract_hash
+from core.prediction_portal import compute_contract_hash, validate_publication_artifact
 from core.feature_registry import compute_registry_hash
 import json
 from core.prediction_molecular_baseline import collect_workflow_source_columns
@@ -101,7 +101,15 @@ def _v2_context(workflow, feature_cols, feature_definitions):
         'dataset_id': 'portal-fixture',
         'model_profile_id': 'fixture-profile',
         'source_bindings': [],
-        'feature_bindings': [],
+        'feature_bindings': [
+            {
+                'feature_id': item.get('feature_id'),
+                'raw_columns': ['resin_smiles'],
+                'source_role': item.get('source_type'),
+                'unit': item.get('unit', 'unknown'),
+            }
+            for item in feature_definitions
+        ],
         'status': 'approved',
     }
     dataset_manifest['manifest_hash'] = compute_dataset_manifest_hash(dataset_manifest)
@@ -171,6 +179,88 @@ def _artifact(model=None):
             'dataset_manifest': dataset_manifest,
         },
     }
+
+
+def test_v2_contract_requires_canonical_workflow_source_fields_but_aliases_are_optional():
+    artifact = _artifact()
+    manifest = artifact["extra"]["dataset_manifest"]
+    manifest["feature_bindings"] = [{
+        "feature_id": "x",
+        "raw_columns": ["resin_smiles"],
+        "source_role": "molecular_workflow",
+        "unit": "unknown",
+    }]
+    manifest["manifest_hash"] = compute_dataset_manifest_hash(manifest)
+    contract = artifact["extra"]["prediction_contract"]
+    contract["dataset_manifest_hash"] = manifest["manifest_hash"]
+    contract.pop("source_columns", None)
+    contract.pop("workflow_source_columns", None)
+    contract["contract_hash"] = compute_contract_hash(contract)
+
+    report = validate_publication_artifact(artifact)
+
+    assert report["ok"] is True, report["errors"]
+
+
+def test_v2_contract_rejects_inconsistent_source_aliases_when_present():
+    artifact = _artifact()
+    contract = artifact["extra"]["prediction_contract"]
+    contract["source_columns"] = [{"column": "tampered", "roles": ["resin"]}]
+    contract["contract_hash"] = compute_contract_hash(contract)
+
+    report = validate_publication_artifact(artifact)
+
+    assert report["ok"] is False
+    assert any("source" in error.lower() and "equal" in error.lower() for error in report["errors"])
+
+
+def test_compact_snapshot_requires_contract_profile_id_to_match_registry_profile():
+    artifact = _artifact()
+    contract = artifact["extra"]["prediction_contract"]
+    contract["model_profile_id"] = "different-profile"
+    contract["contract_hash"] = compute_contract_hash(contract)
+
+    report = validate_publication_artifact(artifact)
+
+    assert report["ok"] is False
+    assert any("profile" in error.lower() for error in report["errors"])
+
+
+def test_resolved_manifest_must_be_approved_and_registry_consistent():
+    artifact = _artifact()
+    manifest = dict(artifact["extra"]["dataset_manifest"])
+    manifest["status"] = "draft"
+    manifest["manifest_hash"] = compute_dataset_manifest_hash(manifest)
+    artifact["extra"]["dataset_manifest"] = manifest
+    contract = artifact["extra"]["prediction_contract"]
+    contract["dataset_manifest_hash"] = manifest["manifest_hash"]
+    contract["contract_hash"] = compute_contract_hash(contract)
+
+    report = validate_publication_artifact(artifact)
+
+    assert report["ok"] is False
+    assert any("manifest is not approved" in error.lower() for error in report["errors"])
+
+
+def test_resolved_manifest_rejects_tampered_bindings_even_with_recomputed_hash():
+    artifact = _artifact()
+    manifest = dict(artifact["extra"]["dataset_manifest"])
+    manifest["feature_bindings"] = [{
+        "feature_id": "not-in-registry",
+        "raw_columns": ["resin_smiles"],
+        "source_role": "molecular_workflow",
+        "unit": "unknown",
+    }]
+    manifest["manifest_hash"] = compute_dataset_manifest_hash(manifest)
+    artifact["extra"]["dataset_manifest"] = manifest
+    contract = artifact["extra"]["prediction_contract"]
+    contract["dataset_manifest_hash"] = manifest["manifest_hash"]
+    contract["contract_hash"] = compute_contract_hash(contract)
+
+    report = validate_publication_artifact(artifact)
+
+    assert report["ok"] is False
+    assert any("unknown feature_id" in error for error in report["errors"])
 
 
 def _config(artifact=None, *, enabled=True, status='published'):
