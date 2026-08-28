@@ -1,5 +1,39 @@
 import json
 import pandas as pd
+from pathlib import Path
+
+
+def test_model_specific_training_inputs_do_not_reuse_strict_numeric_context():
+    from core.training_contract import select_training_context_for_model
+
+    context = {"canonical_feature_cols": ["temperature", "pressure"], "reject_unknown_columns": True}
+
+    assert select_training_context_for_model(
+        context, "GCN", ["smiles"], graph_model_names={"GCN"}, raw_frame_model_names={"FT-Transformer"}
+    ) is None
+    assert select_training_context_for_model(
+        context, "FT-Transformer", ["smiles", "temperature"], graph_model_names={"GCN"}, raw_frame_model_names={"FT-Transformer"}
+    ) is None
+    assert select_training_context_for_model(
+        context, "线性回归", ["temperature", "pressure"], graph_model_names={"GCN"}, raw_frame_model_names={"FT-Transformer"}
+    ) is context
+    try:
+        select_training_context_for_model(
+            context, "线性回归", ["smiles"], graph_model_names={"GCN"}, raw_frame_model_names={"FT-Transformer"}
+        )
+    except ValueError as exc:
+        assert "missing contract columns" in str(exc)
+    else:
+        raise AssertionError("ordinary models must retain strict context validation")
+
+
+def test_training_page_routes_model_specific_context_for_all_raw_frame_models():
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    assert "RAW_FRAME_MODEL_NAMES" in app_source
+    raw_frame_line = next(line for line in app_source.splitlines() if line.strip().startswith("raw_frame_models ="))
+    assert "set(RAW_FRAME_MODEL_NAMES)" in raw_frame_line
+    assert "Epoxy PINN (Physics-Informed)" in raw_frame_line
+    assert "feature_contract_context=model_training_context" in app_source
 
 
 def test_artifact_round_trip_keeps_registry_and_manifest_hash():

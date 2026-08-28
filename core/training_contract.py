@@ -30,6 +30,28 @@ def assert_training_context(context: Mapping[str, Any], frame_columns: Sequence[
         raise ValueError("training frame contains unregistered columns: " + ", ".join(map(str, unknown)))
 
 
+def select_training_context_for_model(
+    context: Mapping[str, Any] | None,
+    model_name: str,
+    frame_columns: Sequence[str],
+    *,
+    graph_model_names: Sequence[str] = (),
+    raw_frame_model_names: Sequence[str] = (),
+) -> Mapping[str, Any] | None:
+    """Apply the numeric feature contract only to models that consume that frame.
+
+    Graph and raw-frame models have their own input contracts (for example SMILES
+    strings or auxiliary raw columns), so the canonical numeric context must not
+    be asserted against those frames.
+    """
+    if context is None:
+        return None
+    if str(model_name) in set(graph_model_names) or str(model_name) in set(raw_frame_model_names):
+        return None
+    assert_training_context(context, frame_columns)
+    return context
+
+
 def lock_training_contract(registry_path: str | Path, dataset_manifest: Mapping[str, Any], material_type: str, target: str, target_col: str, feature_cols: Sequence[str], frame: Any, workflow: Mapping[str, Any] | None) -> dict[str, Any]:
     registry = load_registry(registry_path)
     report = validate_registry(registry, require_approved=True)
