@@ -47,23 +47,6 @@ def build_manual_feature_suggestion(
     }
 
 
-def _reviewable_profile_features(registry: Mapping[str, Any], profile_id: str) -> list[dict[str, Any]]:
-    profiles = registry.get("model_profiles", {}) if isinstance(registry, Mapping) else {}
-    profile = profiles.get(profile_id, {}) if isinstance(profiles, Mapping) else {}
-    feature_ids = list(profile.get("feature_ids", [])) if isinstance(profile, Mapping) else []
-    definitions = {
-        item.get("feature_id"): item
-        for item in (registry.get("features", []) if isinstance(registry, Mapping) else [])
-        if isinstance(item, Mapping) and item.get("feature_id")
-    }
-    return [
-        dict(definitions[feature_id])
-        for feature_id in feature_ids
-        if feature_id in definitions
-        and definitions[feature_id].get("source_type") in _REVIEW_SOURCE_ROLES
-    ]
-
-
 def build_feature_mapping_candidates(registry: Mapping[str, Any], profile_id: str) -> list[dict[str, Any]]:
     """Return profile candidates with explicit approval capability metadata.
 
@@ -82,17 +65,25 @@ def build_feature_mapping_candidates(registry: Mapping[str, Any], profile_id: st
     for feature_id in feature_ids:
         definition = definitions.get(feature_id)
         if not isinstance(definition, Mapping):
-            continue
-        candidate = dict(definition)
-        source_type = str(candidate.get("source_type") or "unknown")
-        status = str(candidate.get("status") or "unknown")
-        allowed = source_type in _REVIEW_SOURCE_ROLES and status not in {"blocked", "deprecated"}
+            # Keep broken profile references visible so they can be repaired
+            # in the registry review workflow instead of disappearing.
+            candidate = {
+                "feature_id": str(feature_id),
+                "name": str(feature_id),
+                "source_type": "unknown",
+                "status": "unknown",
+            }
+        else:
+            candidate = dict(definition)
+        source_type = str(candidate.get("source_type") or "unknown").strip()
+        status = str(candidate.get("status") or "unknown").strip().lower()
+        allowed = source_type in _REVIEW_SOURCE_ROLES and status in {"draft", "approved"}
         candidate["approval_allowed"] = allowed
         if not allowed:
             reasons = []
             if source_type not in _REVIEW_SOURCE_ROLES:
                 reasons.append(f"source_type={source_type}")
-            if status in {"blocked", "deprecated"}:
+            if status not in {"draft", "approved"}:
                 reasons.append(f"status={status}")
             candidate["approval_note"] = "不可直接批准：" + "，".join(reasons)
         else:
@@ -240,6 +231,11 @@ def render_feature_registry_page(
         suggestions = []
     reviewer = st.text_input("本地审核人", key="feature_review_reviewer", placeholder="请输入审核身份")
     status_filter = st.selectbox("查看", ["pending_review", "conflict", "unknown", "approved"], key="feature_review_status")
+    candidate_by_id = {
+        str(item.get("feature_id")): item
+        for item in mapping_candidates
+        if isinstance(item, Mapping) and item.get("feature_id")
+    }
     rows = []
     candidates = list(suggestions)
     for binding in manifest.get("feature_bindings", []) if isinstance(manifest.get("feature_bindings"), list) else []:
@@ -290,11 +286,19 @@ def render_feature_registry_page(
                     value=str(suggestion.get("unit") or ""),
                     key=f"feature_review_unit_{index}",
                 )
+            registry_candidate = candidate_by_id.get(feature_id)
+            can_decide = bool(
+                reviewer
+                and profile_id
+                and status == "pending_review"
+                and isinstance(registry_candidate, Mapping)
+                and registry_candidate.get("approval_allowed")
+            )
             action_cols = st.columns(3)
             with action_cols[0]:
-                accept = st.button("接受", key=f"feature_review_accept_{index}", disabled=not bool(reviewer))
+                accept = st.button("接受", key=f"feature_review_accept_{index}", disabled=not can_decide)
             with action_cols[1]:
-                edit_accept = st.button("编辑后接受", key=f"feature_review_edit_accept_{index}", disabled=not bool(reviewer))
+                edit_accept = st.button("编辑后接受", key=f"feature_review_edit_accept_{index}", disabled=not can_decide)
             with action_cols[2]:
                 reject = st.button("拒绝", key=f"feature_review_reject_{index}", disabled=not bool(reviewer))
             action = "accept" if accept else "edit_accept" if edit_accept else "reject" if reject else None

@@ -95,3 +95,42 @@ def test_feature_registry_ui_keeps_new_candidate_workspace_when_no_reviewable_fe
     assert "新建规范 feature_id" in source
     assert "新建候选仅保存为 pending_review" in source
     assert "approval_allowed" in source
+
+
+def test_feature_mapping_candidates_require_reviewable_feature_status():
+    from core.feature_registry_ui import build_feature_mapping_candidates
+
+    registry = {
+        "model_profiles": {"p": {"feature_ids": ["legacy_role", "missing_status", "draft_role"]}},
+        "features": [
+            {"feature_id": "legacy_role", "name": "legacy_x", "source_type": "manual_input", "status": "legacy_observed"},
+            {"feature_id": "missing_status", "name": "missing_x", "source_type": "derived_workflow"},
+            {"feature_id": "draft_role", "name": "draft_x", "source_type": "manual_input", "status": "draft"},
+        ],
+    }
+
+    candidates = build_feature_mapping_candidates(registry, "p")
+    by_id = {item["feature_id"]: item for item in candidates}
+    assert by_id["legacy_role"]["approval_allowed"] is False
+    assert "legacy_observed" in by_id["legacy_role"]["approval_note"]
+    assert by_id["missing_status"]["approval_allowed"] is False
+    assert "status=unknown" in by_id["missing_status"]["approval_note"]
+    assert by_id["draft_role"]["approval_allowed"] is True
+
+
+def test_feature_mapping_candidates_keep_missing_profile_references_visible():
+    from core.feature_registry_ui import build_feature_mapping_candidates
+
+    registry = {
+        "model_profiles": {"p": {"feature_ids": ["missing_feature"]}},
+        "features": [],
+    }
+    candidates = build_feature_mapping_candidates(registry, "p")
+    assert candidates == [{
+        "feature_id": "missing_feature",
+        "name": "missing_feature",
+        "source_type": "unknown",
+        "status": "unknown",
+        "approval_allowed": False,
+        "approval_note": "不可直接批准：source_type=unknown，status=unknown",
+    }]

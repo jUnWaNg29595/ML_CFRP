@@ -200,6 +200,16 @@ def apply_feature_review_decision(
         source_type = str(registry_feature.get("source_type") or "").strip()
         if source_type != source_role:
             raise ValueError("source_role 必须与 registry feature.source_type 对齐")
+    if isinstance(registry, Mapping):
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            raise ValueError("registry 审核必须提供 model profile_id")
+        profiles = registry.get("model_profiles")
+        profile = profiles.get(profile_id) if isinstance(profiles, Mapping) else None
+        if not isinstance(profile, Mapping):
+            raise ValueError("model profile 不存在，无法批准特征绑定")
+        profile_ids = set(profile.get("feature_ids", []))
+        if feature_id not in profile_ids:
+            raise ValueError("feature_id 不属于当前 profile 合法候选")
     binding = {
         "feature_id": feature_id.strip(),
         "raw_columns": [str(column).strip() for column in raw_columns],

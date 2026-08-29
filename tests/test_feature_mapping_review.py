@@ -153,6 +153,19 @@ def test_apply_review_requires_explicit_source_role_and_registry_alignment():
         apply_feature_review_decision(manifest, {"feature_id": "known", "raw_columns": ["x"], "source_role": "manual_input", "status": "pending_review"}, "accept", "u", registry={"features": [{"feature_id": "known", "source_type": "molecular_workflow"}]})
 
 
+def test_apply_review_requires_profile_when_registry_is_provided():
+    from core.feature_mapping_review import apply_feature_review_decision
+
+    with pytest.raises(ValueError, match="profile"):
+        apply_feature_review_decision(
+            {"status": "draft", "feature_bindings": []},
+            {"feature_id": "known", "raw_columns": ["x"], "source_role": "manual_input", "status": "pending_review"},
+            "accept",
+            "u",
+            registry={"features": [{"feature_id": "known", "source_type": "manual_input"}], "model_profiles": {}},
+        )
+
+
 def test_apply_review_rejects_nonapproved_edited_status():
     from core.feature_mapping_review import apply_feature_review_decision
 
