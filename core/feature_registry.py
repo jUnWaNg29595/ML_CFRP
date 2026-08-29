@@ -341,4 +341,193 @@ __all__ = [
     "build_registry_snapshot",
     "register_new_feature",
     "save_registry_atomic",
+    "MANUAL_INPUT_KEYWORDS",
+    "MOLECULAR_WORKFLOW_KEYWORDS",
+    "RECIPE_INPUT_KEYWORDS",
+    "classify_feature_source_type",
+    "normalize_manifest_entry",
+    "validate_manifest_source_type_consistency",
 ]
+
+
+# ---------------------------------------------------------------------------
+# 特征来源分类规则（业务硬约束）：
+# 工艺参数、测试字段、人工记录 → manual_input（即使是数值字段，不得因可计算而改为 derived）；
+# 由 SMILES/结构自动提取 → molecular_workflow；
+# 由配方原始输入按明确公式计算（calculation_rule 必填）→ derived_workflow；
+# 配方原始输入（树脂/固化剂 SMILES、配比、PHR 等）本身不是派生特征；
+# 无法确定来源 → unknown（阻断正式训练与发布）。
+# ---------------------------------------------------------------------------
+MANUAL_INPUT_KEYWORDS: tuple[str, ...] = (
+    "固化温度", "固化时间", "升温速率", "保温", "后固化", "压力", "真空", "真空度",
+    "湿度", "气氛", "混合", "脱泡", "成型", "加工", "工艺", "批次", "环境",
+    "测试方法", "测试标准", "测试仪器", "测试温度", "测试湿度", "样品状态",
+    "测试条件", "试验条件", "重复次数", "前处理", "测试", "试验",
+    "备注", "等级", "目视", "观察", "异常", "人工", "外观", "评级",
+    "curing temperature", "cure time", "curing time", "ramp rate", "heating rate",
+    "postcure", "post-cure", "dwell", "hold time", "pressure", "vacuum",
+    "humidity", "atmosphere", "degas", "batch", "specimen", "test method",
+    "test standard", "test condition", "notes", "grade", "visual", "operator",
+)
+
+MOLECULAR_WORKFLOW_KEYWORDS: tuple[str, ...] = (
+    "分子量", "分子描述", "原子数", "环数", "官能团", "指纹", "描述符",
+    "morgan", "maccs", "rdkit", "拓扑",
+    "molecular weight", "molwt", "atom count", "ring count", "hbd", "hba",
+    "tpsa", "logp", "fingerprint", "descriptor", "xtb", "homo", "lumo",
+    "fp_bit", "fr_", "num_", "n_atoms", "n_rings", "n_hbd", "n_hba",
+)
+
+RECIPE_INPUT_KEYWORDS: tuple[str, ...] = (
+    "树脂名称", "固化剂名称", "树脂smiles", "固化剂smiles", "组分数量",
+    "配比", "phr", "称量", "配方比例", "份数", "resin smiles",
+    "hardener smiles", "curing agent smiles", "component count",
+    "mix ratio", "weight ratio", "resin phr", "hardener phr",
+)
+
+
+def _feature_search_text(definition: Any) -> str:
+    """拼出用于关键词匹配的小写文本（name + label + aliases + description）。"""
+    if isinstance(definition, str):
+        return definition.strip().lower()
+    if not isinstance(definition, Mapping):
+        return ""
+    parts: list[str] = []
+    for key in ("name", "label", "raw_column", "column"):
+        value = definition.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    for key in ("aliases", "accepted_aliases", "legacy_name"):
+        value = definition.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+        elif isinstance(value, (list, tuple)):
+            parts.extend(str(item) for item in value if str(item).strip())
+    description = definition.get("description") or definition.get("label_zh")
+    if isinstance(description, str):
+        parts.append(description)
+    return " ".join(parts).lower()
+
+
+def _has_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    return any(keyword in text for keyword in keywords)
+
+
+def classify_feature_source_type(definition: Any, extra_hints: Mapping[str, Any] | None = None) -> str:
+    """按业务语义把特征归类为 source_type（纯函数，不修改任何数据）。
+
+    优先级：
+    1. definition 已登记合法 source_type（且非 unknown 占位）→ 直接尊重；
+    2. 有 calculation_rule/implementation 的系统计算 → derived_workflow；
+    3. 名称/别名命中分子特征关键词 → molecular_workflow；
+    4. 名称/别名命中工艺/测试/人工记录关键词 → manual_input（数值型不改变归类）；
+    5. 名称命中配方原始输入 → manual_input（extra_hints["recipe_input"]=True）；
+    6. 其他 → unknown（阻断正式训练与发布）。
+    """
+    hints: dict[str, Any] = dict(extra_hints) if isinstance(extra_hints, Mapping) else {}
+    if isinstance(definition, Mapping):
+        declared = str(definition.get("source_type") or "").strip()
+        if declared in SOURCE_TYPES and declared != "unknown":
+            return declared
+
+    text = _feature_search_text(definition)
+    rule = definition.get("calculation_rule") if isinstance(definition, Mapping) else None
+    has_rule = isinstance(rule, Mapping) and bool(rule)
+    implementation = str(definition.get("implementation") or "").strip() if isinstance(definition, Mapping) else ""
+
+    # 配方原始输入优先于分子关键词：树脂/固化剂 SMILES 是用户提供的源字段，不是系统提取
+    if _has_keyword(text, RECIPE_INPUT_KEYWORDS):
+        if isinstance(extra_hints, dict):
+            extra_hints["recipe_input"] = True
+        hints["recipe_input"] = True
+        return "manual_input"
+
+    # 有明确 calculation_rule/implementation 的系统计算 → derived_workflow（配方统计、等当量比等）
+    if (has_rule and not _has_keyword(text, MOLECULAR_WORKFLOW_KEYWORDS)) or (implementation and not _has_keyword(text, MOLECULAR_WORKFLOW_KEYWORDS)):
+        return "derived_workflow"
+
+    if _has_keyword(text, MOLECULAR_WORKFLOW_KEYWORDS):
+        return "molecular_workflow"
+
+    if _has_keyword(text, MANUAL_INPUT_KEYWORDS):
+        # 数值型不改变归类：data_type/numeric 信息不参与判断，工艺/测试字段一律 manual_input
+        return "manual_input"
+
+    return "unknown"
+
+
+def normalize_manifest_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """manifest 条目字段别名归一化（纯函数，返回规范化副本）。
+
+    别名组（规范名在前）：source_role/source_type、raw_column/raw_columns、
+    source_field/source_fields、feature_id/semantic_feature_id、unit/units、
+    aliases/accepted_aliases。规范名优先取已有值，缺失时用别名值回填；
+    回填后删除别名键。值取第一个非空。
+    """
+    if not isinstance(entry, Mapping):
+        return {}
+    value = copy.deepcopy(dict(entry))
+    alias_groups = (
+        ("source_role", "source_type"),
+        ("raw_column", "raw_columns"),
+        ("source_field", "source_fields"),
+        ("feature_id", "semantic_feature_id"),
+        ("unit", "units"),
+        ("aliases", "accepted_aliases"),
+    )
+    for canonical, alias in alias_groups:
+        canonical_value = value.get(canonical)
+        alias_value = value.get(alias)
+        if (canonical_value is None or canonical_value == "" or canonical_value == []) and alias_value not in (None, "", []):
+            value[canonical] = alias_value
+        if alias in value and alias != canonical:
+            value.pop(alias, None)
+    return value
+
+
+def validate_manifest_source_type_consistency(manifest: Mapping[str, Any], registry: Mapping[str, Any]) -> list[str]:
+    """校验 manifest 各条目声明的来源与 registry 特征 source_type 语义一致。
+
+    返回中文错误列表（不抛异常）。配方原始输入行不得声明为 derived_workflow 输出；
+    manual_input 特征不得声明为 workflow/derived 来源。
+    """
+    errors: list[str] = []
+    if not isinstance(manifest, Mapping) or not isinstance(registry, Mapping):
+        return ["manifest 或 registry 不是合法对象，无法校验来源一致性。"]
+    definitions = {
+        str(item.get("feature_id")): item
+        for item in (registry.get("features") or [])
+        if isinstance(item, Mapping) and item.get("feature_id")
+    }
+    name_to_definition = {
+        str(item.get("name")): item
+        for item in (registry.get("features") or [])
+        if isinstance(item, Mapping) and item.get("name")
+    }
+    entries: list[Any] = []
+    for key in ("feature_bindings", "mappings", "entries", "source_bindings"):
+        value = manifest.get(key)
+        if isinstance(value, list):
+            entries.extend(value)
+    for index, raw_entry in enumerate(entries):
+        entry = normalize_manifest_entry(raw_entry) if isinstance(raw_entry, Mapping) else {}
+        if not entry:
+            errors.append(f"manifest 条目[{index}] 不是对象。")
+            continue
+        feature_id = str(entry.get("feature_id") or "").strip()
+        declared_role = str(entry.get("source_role") or "").strip().lower()
+        definition = definitions.get(feature_id) or name_to_definition.get(feature_id)
+        if definition is None:
+            continue  # 未登记特征由 manifest/registry 各自校验负责
+        source_type = str(definition.get("source_type") or "").strip().lower()
+        if source_type == "manual_input" and declared_role in {"molecular_workflow", "derived_workflow", "workflow", "derived", "computed"}:
+            errors.append(
+                f"特征 {definition.get('name') or feature_id} 在 registry 中为 manual_input（工艺/测试/人工记录字段），"
+                f"但 manifest 声明为 {declared_role}，来源不一致。数值型工艺字段也不允许声明为派生特征。"
+            )
+        if source_type in {"molecular_workflow", "derived_workflow"} and declared_role == "manual_input":
+            errors.append(
+                f"特征 {definition.get('name') or feature_id} 在 registry 中为 {source_type}（系统计算），"
+                f"但 manifest 声明为 manual_input，来源不一致。"
+            )
+    return errors

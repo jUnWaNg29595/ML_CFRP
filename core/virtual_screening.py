@@ -2,8 +2,12 @@
 """Virtual molecule generation + screening utilities."""
 
 from __future__ import annotations
+import copy
+import hashlib
+import json
 import signal
 import os
+from pathlib import Path
 
 import itertools
 import inspect
@@ -31,6 +35,29 @@ from .molecular_feature_workflow import (
     materialize_workflow_source_columns,
 )
 from .post_feature_mapping import sanitize_feature_columns
+
+# 候选级审计状态机（纯逻辑模块，无 rdkit/streamlit 依赖）。
+from . import screening_audit as _screening_audit
+from .screening_audit import (
+    FILTERED_BY_CHEMISTRY,
+    FILTERED_BY_FEASIBILITY,
+    FILTERED_BY_MELTING_POINT,
+    FEATURE_INVALID,
+    MISSING_REQUIRED_INPUT,
+    MODEL_PREDICTION_FAILED,
+    OUT_OF_RANGE,
+    SELECTED,
+    STRUCTURE_INVALID,
+    VALID,
+    WORKFLOW_FAILED,
+    CANDIDATE_STATUSES,
+    find_candidate,
+    merge_model_results,
+    new_candidate_pool,
+    record_filter,
+    set_candidate_status,
+    summarize_funnel,
+)
 
 
 DEFAULT_EPOXY_RULES = {
@@ -4523,3 +4550,594 @@ def render_industrial_filter_ui(st_module, label: str = "固化剂"):
             max_logp = st_module.number_input(f"最大LogP", 0, 15, 6, key=f"vs_ind_max_logp_{label}")
         st_module.caption("已启用：PAINS排除 + Lipinski违规模块 + 重原子/可旋转键约束")
     return enable_filter, {"max_melting_point": float(max_mp), "min_mol_wt": float(min_mw), "max_mol_wt": float(max_mw), "min_logp": float(min_logp), "max_logp": float(max_logp)}
+
+# ============================================================================
+# 契约化高通量筛选（screening_plan / 正式-探索模式 / 候选级审计 / 持久化）
+# 说明：正式模式（已发布且 gate 通过的模型 + prediction_contract）与探索模式
+# （缺少 contract 或未发布模型）由 screening_mode_for_artifact 区分；工艺/测试
+# 条件必须通过 fixed_inputs 显式固定，禁止用训练集均值/0/模板行填充。
+# ============================================================================
+
+_SCREENING_PLAN_REQUIRED_FIELDS = (
+    "model_id",
+    "model_version",
+    "artifact_hash",
+    "candidate_source",
+    "resin_col",
+    "hardener_col",
+    "missing_value_rule",
+    "chemistry_filter_rule",
+    "melting_point_model_version",
+    "random_state",
+    "batch_params",
+    "ranking_params",
+    "fixed_inputs",
+    "feature_cols",
+    "screening_plan_hash",
+)
+_FIXED_INPUT_REQUIRED_KEYS = (
+    "feature_id",
+    "value",
+    "unit",
+    "source",
+    "reviewer",
+    "allow_missing",
+    "allow_zero",
+)
+_PLAN_HASH_EXCLUDED_KEYS = (
+    "screening_plan_hash",
+    "contract",
+    "created_at",
+    "plan_metadata",
+)
+DEFAULT_MISSING_VALUE_RULE = "strict_required"
+DEFAULT_CHEMISTRY_FILTER_RULE = "default_epoxy_rules"
+
+
+def _as_plain_mapping(value: Any) -> Dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if value is None:
+        return {}
+    raise ValueError(f"期望 dict 类型，实际为 {type(value).__name__}")
+
+
+def _as_list_of_mappings(value: Any, *, name: str) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} 必须是列表")
+    result: List[Dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"{name}[{index}] 必须是 dict")
+        result.append(dict(item))
+    return result
+
+
+def _normalized_fixed_inputs(fixed_inputs: Any) -> List[Dict[str, Any]]:
+    fixed = _as_list_of_mappings(fixed_inputs, name="fixed_inputs")
+    normalized: List[Dict[str, Any]] = []
+    for index, item in enumerate(fixed):
+        feature_id = str(item.get("feature_id") or "").strip()
+        if not feature_id:
+            raise ValueError(f"fixed_inputs[{index}] 缺少非空 feature_id")
+        value = item.get("value")
+        if value is not None:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"fixed_inputs[{index}] 的 value 必须是数值或 None"
+                )
+        unit = str(item.get("unit") or "unknown").strip() or "unknown"
+        source = str(item.get("source") or "unknown").strip() or "unknown"
+        reviewer = str(item.get("reviewer") or "").strip()
+        allow_missing = bool(item.get("allow_missing"))
+        allow_zero = bool(item.get("allow_zero"))
+        normalized.append(
+            {
+                "feature_id": feature_id,
+                "value": value,
+                "unit": unit,
+                "source": source,
+                "reviewer": reviewer,
+                "allow_missing": allow_missing,
+                "allow_zero": allow_zero,
+            }
+        )
+    return normalized
+
+
+def compute_screening_plan_hash(plan: Mapping[str, Any]) -> str:
+    """sha256 over the plan minus hash/derived keys (stable + reproducible)."""
+    payload = copy.deepcopy(dict(plan))
+    for key in _PLAN_HASH_EXCLUDED_KEYS:
+        payload.pop(key, None)
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _contract_from_artifact_or_param(artifact: Any, contract: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(contract, Mapping):
+        return dict(contract)
+    if isinstance(artifact, Mapping):
+        extra = artifact.get("extra")
+        if isinstance(extra, Mapping):
+            stored = extra.get("prediction_contract")
+            if isinstance(stored, Mapping):
+                return dict(stored)
+    return None
+
+
+def _screening_fixed_input_cols_from_contract(contract: Mapping[str, Any]) -> List[str]:
+    """Collect fixed process columns declared by a prediction contract."""
+    if not isinstance(contract, Mapping):
+        return []
+    result: List[str] = []
+    seen: set = set()
+    declared = contract.get("screening_fixed_input_cols")
+    if isinstance(declared, (list, tuple)):
+        for item in declared:
+            text = str(item or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                result.append(text)
+    manual = contract.get("manual_input_feature_cols")
+    if isinstance(manual, (list, tuple)):
+        for item in manual:
+            if not isinstance(item, Mapping):
+                text = str(item or "").strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    result.append(text)
+                continue
+            marked = item.get("fixed") or item.get("is_fixed") or item.get("fixed_input")
+            if bool(marked):
+                text = str(item.get("name") or item.get("feature_id") or "").strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    result.append(text)
+    return result
+
+
+def build_screening_plan(
+    *,
+    model_id: str,
+    model_version: str,
+    artifact_hash: str,
+    contract: Optional[Mapping[str, Any]] = None,
+    model_profile_id: Optional[str] = None,
+    registry_hash: Optional[str] = None,
+    workflow_hash: Optional[str] = None,
+    candidate_source: Optional[str] = None,
+    resin_col: Optional[str] = None,
+    hardener_col: Optional[str] = None,
+    fixed_inputs: Optional[Any] = None,
+    missing_value_rule: Optional[str] = None,
+    chemistry_filter_rule: Optional[Any] = None,
+    melting_point_model_version: Optional[str] = None,
+    random_state: int = 42,
+    batch_params: Optional[Mapping[str, Any]] = None,
+    ranking_params: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a serializable, hash-locked screening plan.
+
+    The plan records model identity, contract linkage, candidate source /
+    component roles, explicitly fixed process-test inputs (``fixed_inputs``),
+    missing-value / chemistry-filter rules, melting-point model version, the
+    random seed and batch/ranking parameters.  With a ``contract`` the plan
+    also mirrors ``contract.feature_cols`` and any contract-declared fixed
+    input columns; without one the plan is flagged ``contract_missing: true``
+    (exploratory screening).
+    """
+    normalized_contract = _contract_from_artifact_or_param(None, contract)
+    contract_missing = normalized_contract is None
+
+    if contract_missing:
+        feature_cols: List[str] = []
+        fixed_input_cols: List[str] = []
+        contract_hash: Optional[str] = None
+    else:
+        raw_cols = normalized_contract.get("feature_cols")
+        if isinstance(raw_cols, (list, tuple)):
+            feature_cols = [str(col) for col in raw_cols]
+        elif raw_cols is None:
+            feature_cols = []
+        else:
+            feature_cols = [str(raw_cols)]
+        fixed_input_cols = _screening_fixed_input_cols_from_contract(normalized_contract)
+        contract_hash = str(normalized_contract.get("contract_hash") or "") or None
+
+    normalized_fixed = _normalized_fixed_inputs(fixed_inputs)
+    if contract_missing and not normalized_fixed and fixed_input_cols:
+        # 正式契约声明了固定输入列但调用方未提供值：保留列名清单供上游补齐。
+        pass
+
+    plan: Dict[str, Any] = {
+        "schema_version": 1,
+        "model_id": str(model_id or "").strip(),
+        "model_version": str(model_version or "").strip(),
+        "artifact_hash": str(artifact_hash or "").strip(),
+        "contract_hash": contract_hash,
+        "contract_missing": contract_missing,
+        "feature_cols": feature_cols,
+        "fixed_input_cols": fixed_input_cols,
+        "model_profile_id": str(model_profile_id or "").strip() or None,
+        "registry_hash": str(registry_hash or "").strip() or None,
+        "workflow_hash": str(workflow_hash or "").strip() or None,
+        "candidate_source": str(candidate_source or "").strip() or "unknown",
+        "resin_col": str(resin_col or "resin_smiles"),
+        "hardener_col": str(hardener_col or "hardener_smiles"),
+        "fixed_inputs": normalized_fixed,
+        "missing_value_rule": str(missing_value_rule or DEFAULT_MISSING_VALUE_RULE),
+        "chemistry_filter_rule": (
+            copy.deepcopy(chemistry_filter_rule)
+            if chemistry_filter_rule is not None
+            else DEFAULT_CHEMISTRY_FILTER_RULE
+        ),
+        "melting_point_model_version": str(melting_point_model_version or "").strip() or None,
+        "random_state": int(random_state) if random_state is not None else 42,
+        "batch_params": copy.deepcopy(_as_plain_mapping(batch_params)),
+        "ranking_params": copy.deepcopy(_as_plain_mapping(ranking_params)),
+        "screening_plan_hash": "",
+    }
+    plan["screening_plan_hash"] = compute_screening_plan_hash(plan)
+    return plan
+
+
+def validate_screening_plan(plan: Mapping[str, Any]) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(plan, Mapping):
+        return ["screening_plan 必须是 dict"]
+    for field in _SCREENING_PLAN_REQUIRED_FIELDS:
+        if field not in plan:
+            errors.append(f"缺少必需字段: {field}")
+    if errors:
+        return errors
+    fixed = plan.get("fixed_inputs")
+    if not isinstance(fixed, list):
+        errors.append("fixed_inputs 必须是列表")
+    else:
+        for index, item in enumerate(fixed):
+            if not isinstance(item, Mapping):
+                errors.append(f"fixed_inputs[{index}] 必须是 dict")
+                continue
+            missing_keys = [k for k in _FIXED_INPUT_REQUIRED_KEYS if k not in item]
+            if missing_keys:
+                errors.append(
+                    f"fixed_inputs[{index}] 缺少字段: {', '.join(missing_keys)}"
+                )
+                continue
+            value = item.get("value")
+            allow_missing = bool(item.get("allow_missing"))
+            if value is None and not allow_missing:
+                errors.append(
+                    f"fixed_inputs[{index}]（{item.get('feature_id')}）value 为 None "
+                    f"但 allow_missing=false"
+                )
+    if str(plan.get("screening_plan_hash") or "") != compute_screening_plan_hash(plan):
+        errors.append("screening_plan_hash 与 plan 内容不一致")
+    return errors
+
+
+def apply_fixed_inputs(frame_or_dict: Any, plan: Mapping[str, Any]) -> Dict[str, Any]:
+    """Apply the plan's fixed process/test inputs to a candidate frame.
+
+    Returns ``{"frame", "fixed_cols", "missing_records"}`` where
+    ``missing_records`` lists ``{candidate_id or index, feature_id}`` for
+    candidates that violate ``allow_missing=false`` fixed inputs (caller marks
+    them ``MISSING_REQUIRED_INPUT``).  Fixed inputs are *explicit overrides*:
+    they are never filled with training medians, zeros or template rows.
+    """
+    plan = plan if isinstance(plan, Mapping) else {}
+    fixed_inputs = _normalized_fixed_inputs(plan.get("fixed_inputs"))
+    if isinstance(frame_or_dict, pd.DataFrame):
+        frame = frame_or_dict.copy()
+        index_labels: List[Any] = list(frame.index)
+        if "candidate_id" in frame.columns:
+            index_labels = list(frame["candidate_id"])
+    elif isinstance(frame_or_dict, Mapping):
+        frame = pd.DataFrame([dict(frame_or_dict)])
+        index_labels = [frame_or_dict.get("candidate_id", 0)]
+    else:
+        raise ValueError("apply_fixed_inputs 只接受 DataFrame 或 dict")
+
+    missing_records: List[Dict[str, Any]] = []
+    fixed_cols: List[str] = []
+    for item in fixed_inputs:
+        feature_id = str(item.get("feature_id") or "")
+        value = item.get("value")
+        allow_missing = bool(item.get("allow_missing"))
+        allow_zero = bool(item.get("allow_zero"))
+        if not feature_id:
+            continue
+        fixed_cols.append(feature_id)
+        if value is None:
+            # 值缺失：不允许静默填充均值/0，只记录违规候选。
+            if not allow_missing:
+                for pos, label in enumerate(index_labels):
+                    missing_records.append(
+                        {"candidate_id": label, "feature_id": feature_id}
+                    )
+            continue
+        numeric_value = float(value)
+        if numeric_value == 0.0 and not allow_zero:
+            for pos, label in enumerate(index_labels):
+                missing_records.append(
+                    {"candidate_id": label, "feature_id": feature_id}
+                )
+            continue
+        frame[feature_id] = numeric_value
+    return {
+        "frame": frame,
+        "fixed_cols": fixed_cols,
+        "missing_records": missing_records,
+    }
+
+
+def _entry_gate_ok(entry: Any) -> bool:
+    gate = entry.get("gate_report") if isinstance(entry, Mapping) else None
+    return (
+        isinstance(gate, Mapping)
+        and gate.get("ok") is True
+        and str(gate.get("status") or "").strip().lower() == "valid"
+    )
+
+
+def screening_mode_for_artifact(
+    artifact: Any = None,
+    config: Any = None,
+    material_type: Optional[str] = None,
+    target: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Decide 'formal' vs 'exploratory' screening mode for one artifact.
+
+    Formal mode requires ALL of: artifact.extra.prediction_contract, a
+    publication entry with publication_status=published, a passing gate
+    report, and a matching artifact hash.  Any missing item downgrades to
+    exploratory mode with Chinese reasons recorded (and callers must persist
+    ``result_is_formal=False``).
+
+    When ``core.prediction_portal`` / ``core.portal_prediction`` can be
+    imported (guarded — circular-import safe) they resolve the publication
+    entry; otherwise this is a pure field check on ``artifact``/``entry``.
+    """
+    reasons: List[str] = []
+    artifact_map = artifact if isinstance(artifact, Mapping) else {}
+    extra = artifact_map.get("extra") if isinstance(artifact_map, Mapping) else None
+    extra = extra if isinstance(extra, Mapping) else {}
+    contract = extra.get("prediction_contract")
+    has_contract = isinstance(contract, Mapping) and bool(contract)
+
+    artifact_hash = ""
+    if isinstance(artifact_map, Mapping):
+        artifact_hash = str(artifact_map.get("artifact_hash") or "").strip().lower()
+
+    entry: Optional[Mapping[str, Any]] = None
+    if isinstance(config, Mapping) and material_type and target:
+        try:
+            from .portal_prediction import load_published_portal_model  # 防御性导入
+
+            loaded = load_published_portal_model(config, material_type, target)
+            entry = loaded.get("entry") if isinstance(loaded, Mapping) else None
+        except Exception as exc:  # 未发布 / 未启用 / 校验失败等
+            reasons.append(f"发布模型加载失败：{exc}")
+
+    if entry is None and isinstance(config, Mapping):
+        # 纯字段检查：在门户配置里寻找匹配 artifact_hash 的已发布 entry。
+        try:
+            materials = config.get("materials")
+            if isinstance(materials, Mapping):
+                material_block = materials.get(str(material_type)) if material_type else None
+                targets = material_block.get("targets") if isinstance(material_block, Mapping) else None
+                models = targets.get(str(target)) if isinstance(targets, Mapping) else None
+                models = models.get("models") if isinstance(models, Mapping) else None
+                if isinstance(models, list):
+                    for item in models:
+                        if not isinstance(item, Mapping):
+                            continue
+                        if str(item.get("artifact_hash") or "").strip().lower() == artifact_hash and artifact_hash:
+                            entry = item
+                            break
+        except Exception:
+            entry = None
+
+    result_is_formal = True
+    if not has_contract:
+        result_is_formal = False
+        reasons.append("artifact 缺少 prediction_contract，属于探索模式")
+
+    if entry is None:
+        result_is_formal = False
+        if not reasons or "发布模型加载失败" not in str(reasons[0]):
+            reasons.append("模型未在发布配置中登记为已发布版本")
+    else:
+        status = str(entry.get("publication_status") or "").strip().lower()
+        if status != "published":
+            result_is_formal = False
+            reasons.append(f"模型发布状态为 {status or '未登记'}，不是 published")
+        if entry.get("enabled") is not True:
+            result_is_formal = False
+            reasons.append("发布 entry 未启用（enabled != true）")
+        if not _entry_gate_ok(entry):
+            result_is_formal = False
+            reasons.append("发布门禁报告缺失或未通过（gate_report 非 ok/valid）")
+        entry_hash = str(entry.get("artifact_hash") or "").strip().lower()
+        if artifact_hash and entry_hash and artifact_hash != entry_hash:
+            result_is_formal = False
+            reasons.append("artifact hash 与发布 entry 的 artifact_hash 不匹配")
+
+    if result_is_formal:
+        reasons = reasons or ["artifact 满足正式筛选要求：存在 prediction_contract 且已发布、门禁通过、hash 匹配"]
+    if not artifact_map and not entry:
+        reasons.append("未提供可判定的模型 artifact，按手动导入处理")
+
+    mode = "formal" if result_is_formal else "exploratory"
+    return {
+        "mode": mode,
+        "reasons": reasons,
+        "contract": dict(contract) if has_contract else None,
+        "result_is_formal": result_is_formal,
+    }
+
+
+def resolve_screening_feature_cols(artifact_or_contract: Any = None) -> Dict[str, Any]:
+    """Resolve screening feature columns strictly for the current model.
+
+    Formal mode: ``contract.feature_cols`` is the ONLY source.  Exploratory
+    mode (no contract): fall back to artifact.feature_cols /
+    extra.effective_feature_cols with warnings.  Session-state multi-source
+    inference is intentionally not used here.
+    """
+    contract: Optional[Mapping[str, Any]] = None
+    artifact: Optional[Mapping[str, Any]] = None
+    if isinstance(artifact_or_contract, Mapping):
+        if "feature_cols" in artifact_or_contract and (
+            "schema_version" in artifact_or_contract or "contract_hash" in artifact_or_contract
+        ):
+            contract = artifact_or_contract
+        else:
+            artifact = artifact_or_contract
+            extra = artifact.get("extra")
+            if isinstance(extra, Mapping):
+                stored = extra.get("prediction_contract")
+                if isinstance(stored, Mapping):
+                    contract = stored
+
+    if isinstance(contract, Mapping) and contract.get("feature_cols"):
+        cols = [str(col) for col in contract["feature_cols"]]
+        return {
+            "feature_cols": cols,
+            "source": "contract",
+            "warnings": [],
+            "result_is_formal": True,
+        }
+
+    warnings: List[str] = []
+    fallback: List[str] = []
+    if isinstance(artifact, Mapping):
+        extra = artifact.get("extra")
+        extra = extra if isinstance(extra, Mapping) else {}
+        for source_name, payload in (
+            ("artifact.extra.effective_feature_cols", extra.get("effective_feature_cols")),
+            ("artifact.feature_cols", artifact.get("feature_cols")),
+        ):
+            if isinstance(payload, (list, tuple)) and payload:
+                fallback = [str(col) for col in payload]
+                warnings.append(
+                    f"无 prediction_contract，特征列回退自 {source_name}（探索模式）"
+                )
+                break
+    if not fallback:
+        warnings.append("未找到任何可用特征列（无 contract 且 artifact 缺少特征清单）")
+    return {
+        "feature_cols": fallback,
+        "source": "artifact_fallback",
+        "warnings": warnings,
+        "result_is_formal": False,
+    }
+
+
+def screening_fixed_input_cols(contract: Any = None) -> List[str]:
+    """Return contract-declared fixed process columns (empty when absent)."""
+    return _screening_fixed_input_cols_from_contract(
+        contract if isinstance(contract, Mapping) else {}
+    )
+
+def _audit_json_value(value: Any) -> Any:
+    """Best-effort conversion of pandas/numpy values for JSONL output."""
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return {str(k): _audit_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_audit_json_value(item) for item in value]
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            return str(value)
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def save_screening_audit(
+    plan: Mapping[str, Any],
+    pool: Any,
+    results: Any,
+    out_dir: Any,
+) -> str:
+    """Persist plan + per-candidate audit + results + summary to disk.
+
+    Writes ``screening_plan.json``, ``candidate_audit.jsonl``,
+    ``screening_results.csv`` (only when ``results`` is a DataFrame) and
+    ``audit_summary.json``; returns the audit directory path.
+    """
+    plan = plan if isinstance(plan, Mapping) else {}
+    audit_dir = Path(str(out_dir))
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    plan_payload = copy.deepcopy(dict(plan))
+    plan_path = audit_dir / "screening_plan.json"
+    plan_path.write_text(
+        json.dumps(plan_payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    if pool is None:
+        pool = []
+    if isinstance(pool, pd.DataFrame):
+        pool_records = [
+            {str(k): _audit_json_value(v) for k, v in row.items()}
+            for _, row in pool.iterrows()
+        ]
+    else:
+        pool_records = [
+            {str(k): _audit_json_value(v) for k, v in dict(item).items()}
+            for item in pool
+        ]
+    audit_path = audit_dir / "candidate_audit.jsonl"
+    with audit_path.open("w", encoding="utf-8") as handle:
+        for record in pool_records:
+            handle.write(
+                json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+
+    results_payload = None
+    if isinstance(results, pd.DataFrame):
+        results_path = audit_dir / "screening_results.csv"
+        results.to_csv(results_path, index=False, encoding="utf-8-sig")
+        results_payload = str(results_path)
+
+    funnel = summarize_funnel(pool_records)
+    summary = {
+        "model_id": plan.get("model_id"),
+        "model_version": plan.get("model_version"),
+        "contract_hash": plan.get("contract_hash"),
+        "workflow_hash": plan.get("workflow_hash"),
+        "registry_hash": plan.get("registry_hash"),
+        "screening_plan_hash": plan.get("screening_plan_hash"),
+        "result_is_formal": bool(
+            plan.get("result_is_formal", not plan.get("contract_missing", True))
+        ),
+        "total_candidates": funnel.get("total"),
+        "remaining_candidates": funnel.get("remaining"),
+        "funnel": funnel.get("stages"),
+        "status_counts": funnel.get("status_counts"),
+        "results_file": results_payload,
+    }
+    summary_path = audit_dir / "audit_summary.json"
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return str(audit_dir)

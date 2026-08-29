@@ -89,7 +89,7 @@ def lock_training_contract(registry_path: str | Path, dataset_manifest: Mapping[
         "workflow_feature_cols": [column for column in columns if definitions[column].get("source_type") in {"molecular_workflow", "derived_workflow"}],
         "manual_input_feature_cols": [column for column in columns if definitions[column].get("source_type") == "manual_input"],
     }
-    return {
+    context: dict[str, Any] = {
         "material_type": str(material_type), "target": str(target), "target_col": str(target_col),
         "canonical_feature_cols": columns, "effective_feature_cols": columns.copy(), "removed_feature_cols": [],
         "feature_registry_version": snapshot.get("registry_version"), "feature_registry_hash": snapshot.get("registry_hash"),
@@ -98,6 +98,39 @@ def lock_training_contract(registry_path: str | Path, dataset_manifest: Mapping[
         "dataset_manifest": copy.deepcopy(dict(dataset_manifest)), "workflow": copy.deepcopy(dict(workflow or {})),
         **source_partitions, "reject_unknown_columns": True,
     }
+    # 构造 prediction_contract v2 并计算 contract_hash；失败不阻断旧路径（记录 contract_errors）。
+    try:
+        from .prediction_portal import build_prediction_contract, compute_contract_hash
+
+        class _ContractStub:
+            """lock 阶段尚无拟合好的模型；门禁只在发布时做真实模型校验。"""
+
+            feature_names_in_ = list(columns)
+            n_features_in_ = len(columns)
+
+        stub_artifact = {"model": _ContractStub(), "pipeline": None}
+        contract = build_prediction_contract(
+            artifact=stub_artifact,
+            feature_cols=columns,
+            target_col=str(target_col),
+            workflow=workflow,
+            training_frame=frame,
+            registry_snapshot=snapshot,
+            dataset_manifest=copy.deepcopy(dict(dataset_manifest)),
+            model_profile_id=profile_id,
+            canonical_feature_cols=columns,
+            effective_feature_cols=columns.copy(),
+            removed_feature_cols=[],
+            removed_feature_reasons={},
+        )
+        context["prediction_contract"] = contract
+        context["contract_hash"] = contract.get("contract_hash")
+        context["contract_errors"] = []
+    except Exception as exc:  # noqa: BLE001 - 旧路径兼容：contract 构造失败不阻断训练锁定
+        context["prediction_contract"] = None
+        context["contract_hash"] = None
+        context["contract_errors"] = [f"prediction_contract 构造失败：{exc}"]
+    return context
 
 
 def diagnose_training_blockers(
@@ -174,3 +207,19 @@ def audit_training_result(context: Mapping[str, Any], train_result: Mapping[str,
         effective = feature_names or canonical.copy()
     removed = [column for column in canonical if column not in effective]
     return {"canonical_feature_cols": canonical, "effective_feature_cols": effective, "removed_feature_cols": removed, "removed_feature_reasons": {column: "feature_mask" for column in removed}, "publishable": not removed}
+
+
+def attach_feature_audit(context: Mapping[str, Any] | dict[str, Any], train_result: Mapping[str, Any]) -> dict[str, Any]:
+    """训练完成后把 feature_audit 写入 contract_context（返回更新后的 context 副本）。
+
+    feature_audit 记录 canonical/effective/removed 特征与原因、publishable 标志；
+    该字段随后经由 create_model_artifact 进入 artifact.extra，供发布门禁降级
+    needs_validation 使用。
+    """
+    audit = audit_training_result(context, train_result)
+    if isinstance(context, dict):
+        context["feature_audit"] = audit
+        return context
+    updated = dict(context)
+    updated["feature_audit"] = audit
+    return updated

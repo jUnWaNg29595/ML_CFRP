@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -518,6 +519,70 @@ def render_feature_registry_page(
             width="stretch",
         )
 
+    # 4.5 Manifest 导出 / 审核历史 / 提交审批（G 补全区块）
+    if profile_id:
+        with st.container(border=True):
+            st.markdown("#### 📦 Manifest 工具")
+            tool_c1, tool_c2, tool_c3 = st.columns(3)
+            with tool_c1:
+                download_payload = build_manifest_download(profile_id, active_manifest, portal_root)
+                if download_payload:
+                    st.download_button(
+                        "⬇️ 导出 manifest JSON",
+                        data=download_payload[1],
+                        file_name=download_payload[0],
+                        mime="application/json",
+                        key="feature_review_manifest_download",
+                    )
+                else:
+                    st.caption("当前 profile 无 manifest 可导出。")
+            with tool_c2:
+                submit_requested_by = st.text_input(
+                    "提交人",
+                    key="feature_review_submit_requester",
+                    value=st.session_state.get("feature_review_reviewer", ""),
+                    placeholder="填写提交审批的身份",
+                )
+                if st.button(
+                    "📤 提交 manifest 审批",
+                    key="feature_review_submit_approval_btn",
+                    disabled=not bool(submit_requested_by),
+                    help="记录提交请求；最终批准仍需本地单人显式执行。",
+                ):
+                    updated_manifest = submit_manifest_for_approval(profile_id, active_manifest, submit_requested_by, portal_root)
+                    if updated_manifest is not None:
+                        st.session_state["feature_mapping_manifest"] = updated_manifest
+                        persist_review_event({
+                            "event": "manifest_submitted_for_approval",
+                            "profile_id": profile_id,
+                            "requested_by": submit_requested_by,
+                        })
+                        st.success("manifest 已标记为 submitted_for_approval；批准仍需本地显式操作。")
+                        st.rerun()
+                    else:
+                        st.warning("当前没有 manifest 可提交。")
+            with tool_c3:
+                approval_obj = active_manifest.get("approval") if isinstance(active_manifest.get("approval"), Mapping) else {}
+                if approval_obj.get("submitted"):
+                    st.caption(f"审批状态：已提交（{approval_obj.get('submitted_at', '')} by {approval_obj.get('requested_by', '')}）")
+                else:
+                    st.caption(f"审批状态：{'未提交' if active_manifest.get('feature_bindings') else '暂无绑定'}")
+
+        with st.expander("🕘 审核历史（最近记录）", expanded=False):
+            history_events = list_review_history(profile_id, review_root)
+            if history_events:
+                history_rows = []
+                for record in history_events:
+                    history_rows.append({
+                        "时间": str(record.get("recorded_at") or record.get("timestamp") or ""),
+                        "事件": str(record.get("event") or record.get("action") or "unknown"),
+                        "审核人": str(record.get("reviewer") or record.get("requested_by") or "—"),
+                        "特征": str(record.get("feature_id") or "—"),
+                    })
+                st.dataframe(history_rows, width="stretch", hide_index=True)
+            else:
+                st.info("暂无审核记录。")
+
     # 5. Advanced: manual mapping creation & per-item workbench (hidden by default)
     with st.expander("⚙️ 高级功能：手工新建映射 / 新特征提案 / 逐项审核", expanded=False):
         st.markdown("#### 📝 新建特征映射建议 / 新特征提案")
@@ -761,6 +826,63 @@ def render_feature_registry_page(
     st.caption("AI 仅提供特征映射建议；写入 approved binding 需要本地单人显式批准。")
 
 
+def build_manifest_download(profile_id: str, manifest: Mapping[str, Any] | None, portal_root: Path | None = None) -> tuple[str, bytes] | None:
+    """构造 manifest 下载内容（纯函数）。返回 (文件名, JSON bytes)；无 manifest 返回 None。"""
+    if not isinstance(manifest, Mapping) or not manifest:
+        return None
+    root = portal_root or Path(__file__).resolve().parents[1] / "prediction_portal"
+    profile_slug = str(profile_id or "profile").replace("/", "_") or "profile"
+    payload = json.dumps(dict(manifest), ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+    return f"manifest_{profile_slug}.json", payload
+
+
+def list_review_history(profile_id: str, review_root: Path | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    """读取当前 profile 的审核历史事件（纯函数；目录不存在返回空列表）。"""
+    root = review_root or Path(__file__).resolve().parents[1] / "prediction_portal" / "feature_reviews"
+    if not root.is_dir():
+        return []
+    events: list[dict[str, Any]] = []
+    try:
+        files = sorted(root.glob("*.json"), reverse=True)
+    except OSError:
+        return []
+    for path in files[: limit * 4]:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, Mapping) and str(record.get("profile_id") or "") == str(profile_id):
+            events.append(dict(record))
+        if len(events) >= limit:
+            break
+    return events
+
+
+def submit_manifest_for_approval(profile_id: str, manifest: Mapping[str, Any] | None, requested_by: str, portal_root: Path | None = None) -> dict[str, Any] | None:
+    """把 manifest 标记为 submitted_for_approval（追加 approval.submitted 字段，不覆盖原状态）。
+
+    审批动作本身仍由本地单人显式批准；这里只记录提交请求与审计。
+    返回更新后的 manifest；无 manifest 时返回 None。
+    """
+    if not isinstance(manifest, Mapping) or not manifest:
+        return None
+    updated = copy.deepcopy(dict(manifest))
+    approval = updated.get("approval")
+    approval = dict(approval) if isinstance(approval, Mapping) else {}
+    approval["submitted"] = True
+    approval["submitted_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    approval["requested_by"] = str(requested_by or "local")
+    updated["approval"] = approval
+    root = portal_root or Path(__file__).resolve().parents[1] / "prediction_portal"
+    try:
+        from .feature_mapping_review import save_profile_manifest
+        if str(profile_id):
+            save_profile_manifest(str(profile_id), updated, root)
+    except Exception:
+        pass
+    return updated
+
+
 __all__ = [
     "build_feature_mapping_candidates",
     "build_manual_feature_suggestion",
@@ -768,4 +890,7 @@ __all__ = [
     "frame_column_names",
     "render_feature_registry_page",
     "sync_manifest_to_training_state",
+    "build_manifest_download",
+    "list_review_history",
+    "submit_manifest_for_approval",
 ]

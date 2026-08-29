@@ -94,11 +94,12 @@ def create_model_artifact(
     merged_extra = dict(extra or {})
     if contract_context:
         for key in ("prediction_contract", "registry_snapshot", "dataset_manifest", "feature_audit"):
-            if key not in contract_context:
+            value = contract_context.get(key)
+            if value is None and key not in contract_context:
                 continue
-            if key in merged_extra and merged_extra[key] != contract_context[key]:
+            if key in merged_extra and merged_extra[key] != value:
                 raise ValueError(f"extra 与 contract_context 的 {key} 内容冲突")
-            merged_extra[key] = contract_context[key]
+            merged_extra[key] = value
     artifact: Dict[str, Any] = {
         "artifact_version": ARTIFACT_VERSION,
         "created_at": int(time.time()),
@@ -184,7 +185,52 @@ def create_model_artifact_bytes(
         extra=extra,
         contract_context=contract_context,
     )
+    # artifact_hash 基于去除 hash 键后的规范化 payload 计算，写入 extra 供门禁核验。
+    try:
+        artifact.setdefault("extra", {})["artifact_hash"] = compute_artifact_hash(artifact)
+    except (TypeError, ValueError):
+        # joblib 对象无法 JSON 序列化时跳过内嵌 hash（发布层仍有文件 hash）。
+        pass
     return dumps_artifact(artifact, compress=compress)
+
+
+def _canonical_artifact_payload(artifact: Any) -> Dict[str, Any]:
+    """Return a JSON-serializable payload without the artifact_hash key."""
+    if isinstance(artifact, (bytes, bytearray)):
+        from typing import cast
+        payload = loads_artifact(bytes(artifact))
+    else:
+        payload = artifact
+    if not isinstance(payload, dict):
+        raise TypeError("artifact must be a dict or serialized bytes")
+    cleaned = dict(payload)
+    extra = cleaned.get("extra")
+    if isinstance(extra, dict):
+        extra = {key: value for key, value in extra.items() if key != "artifact_hash"}
+        cleaned["extra"] = extra
+    return cleaned
+
+
+def compute_artifact_hash(artifact: Any) -> str:
+    """sha256 of the canonical JSON (sorted keys) payload without artifact_hash.
+
+    接受 artifact dict 或 joblib 序列化 bytes；对无法 JSON 序列化的对象（如
+    sklearn 模型）以 repr 代替，保证 hash 仍可复现计算。
+    """
+    import hashlib
+    import json as _json
+
+    def _default(obj: Any) -> str:
+        return f"<non-serializable:{type(obj).__name__}>"
+
+    payload = _canonical_artifact_payload(artifact)
+    encoded = _json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=_default).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def artifact_hash_from_bytes(data: bytes) -> str:
+    """Compute the artifact hash for joblib-serialized artifact bytes."""
+    return compute_artifact_hash(data)
 
 
 def load_model_artifact_bytes(data: bytes) -> Dict[str, Any]:

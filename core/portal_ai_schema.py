@@ -412,6 +412,42 @@ def normalize_feature_source_role(value: object) -> str | None:
     return None
 
 
+_FEATURE_MAPPING_ALIAS_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("source_role", ("source_type",)),
+    ("raw_columns", ("raw_column",)),
+    ("source_field", ("source_fields",)),
+    ("feature_id", ("semantic_feature_id",)),
+    ("unit", ("units",)),
+    ("aliases", ("accepted_aliases",)),
+)
+
+
+def normalize_feature_mapping_aliases(entry: dict) -> dict:
+    """Normalize alternate AI key names into their canonical feature-mapping keys.
+
+    每组规范名优先：若规范键已存在且非空则仅删除别名键；
+    否则取第一个非空别名的值填入规范键。返回新 dict，不修改原对象。
+    """
+    if not isinstance(entry, dict):
+        return entry
+    normalized = dict(entry)
+    for canonical, aliases in _FEATURE_MAPPING_ALIAS_GROUPS:
+        canonical_value = normalized.get(canonical)
+        if canonical_value is not None and canonical_value != "":
+            for alias in aliases:
+                normalized.pop(alias, None)
+            continue
+        for alias in aliases:
+            alias_value = normalized.get(alias)
+            if alias_value is None or alias_value == "":
+                continue
+            if canonical not in normalized:
+                normalized[canonical] = alias_value
+            normalized.pop(alias, None)
+            break
+    return normalized
+
+
 def parse_feature_mapping_response(value: object) -> dict[str, object]:
     """Validate the narrow AI response used by feature mapping review.
 
@@ -431,11 +467,15 @@ def parse_feature_mapping_response(value: object) -> dict[str, object]:
     for item in suggestions:
         if not isinstance(item, Mapping):
             raise ValueError("feature review suggestions must contain objects")
+        item = normalize_feature_mapping_aliases(dict(item))
         feature_id = item.get("feature_id")
         raw_columns = item.get("raw_columns", [])
         source_role_raw_value = item.get("source_role", "")
         if not isinstance(feature_id, str) or not feature_id.strip():
             raise ValueError("feature review feature_id is required")
+        if isinstance(raw_columns, str):
+            # 容错：AI 返回逗号分隔字符串时自动拆分为列表。
+            raw_columns = [column.strip() for column in raw_columns.split(",") if column.strip()]
         if not isinstance(raw_columns, list) or any(not isinstance(column, str) or not column.strip() for column in raw_columns):
             raise ValueError("feature review raw_columns must be a list of strings")
         if not isinstance(source_role_raw_value, str) or not source_role_raw_value.strip():

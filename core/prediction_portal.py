@@ -650,6 +650,23 @@ def validate_publication_artifact(
             )
 
     status = "needs_validation" if legacy_contract else ("valid" if not errors else "invalid")
+    # 训练删除特征：effective != canonical 或 feature_audit.publishable=False 时，
+    # 模型只能进入 needs_validation，不得直接发布（硬规则）。
+    if status == "valid":
+        effective = _normalized_columns(resolved_contract.get("effective_feature_cols"))
+        canonical = _normalized_columns(resolved_contract.get("canonical_feature_cols"))
+        if canonical and effective and list(effective) != list(canonical):
+            message = "训练删除了 contract 声明的特征（effective != canonical），只能进入 needs_validation，不能直接发布。"
+            status = "needs_validation"
+            errors.append(message)
+            diagnostics_list = diagnostics([message], code="feature_removed", source="feature_audit")
+        else:
+            extra_audit = _as_mapping(artifact.get("extra")).get("feature_audit")
+            if isinstance(extra_audit, Mapping) and extra_audit.get("publishable") is False:
+                message = "训练审计标记特征不可发布（publishable=False），只能进入 needs_validation。"
+                status = "needs_validation"
+                errors.append(message)
+                diagnostics_list = diagnostics([message], code="feature_audit_blocked", source="feature_audit")
     return {"ok": not errors, "status": status, "errors": errors, "diagnostics": diagnostics(errors) if errors else []}
 
 
@@ -1077,3 +1094,334 @@ def select_active_publication(models: list[dict[str, Any]]) -> dict[str, Any] | 
     if len(active) > 1:
         raise ValueError("Multiple enabled publication releases（多个启用版本）")
     return active[0] if active else None
+
+
+def _publication_entry_status_label(entry: Mapping[str, Any]) -> str:
+    status = str(_as_mapping(entry).get("publication_status") or "").strip().lower()
+    labels = {
+        "published": "已发布",
+        "needs_validation": "待验证",
+        "draft": "草稿",
+        "disabled": "已停用",
+        "legacy": "legacy",
+    }
+    return labels.get(status, status or "未知")
+
+
+def publication_verdict(
+    entry: Mapping[str, Any],
+    config: Mapping[str, Any] | None = None,
+    artifact: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """汇总全部发布条件的最终 verdict（UI 与测试只调这一个函数）。"""
+
+    entry = _as_mapping(entry)
+    reasons: list[str] = []
+
+    status = str(entry.get("publication_status") or "").strip().lower()
+    artifact_hash = str(entry.get("artifact_hash") or "").strip()
+    if not artifact_hash:
+        reasons.append("发布记录缺少 artifact_hash，无法核验模型文件完整性。")
+    if status != "published":
+        reasons.append(f"publication_status={status or '缺失'}，必须为 published。")
+    if entry.get("enabled") is not True:
+        reasons.append("发布记录未启用（enabled != true）。")
+
+    gate_report = entry.get("gate_report") if isinstance(entry.get("gate_report"), Mapping) else None
+    if not isinstance(gate_report, Mapping) or gate_report.get("ok") is not True:
+        reasons.append("gate_report 缺失或 ok != true，发布门禁未通过。")
+    elif str(gate_report.get("status") or "").strip().lower() != "valid":
+        reasons.append(f"gate_report.status={gate_report.get('status')}，必须为 valid。")
+    elif gate_report.get("errors"):
+        reasons.append("gate_report 携带错误信息：" + "；".join(str(item) for item in gate_report.get("errors", [])[:5]))
+
+    artifact_path = str(entry.get("artifact_path") or "").strip()
+    if artifact_path:
+        try:
+            actual_hash = _sha256_file(Path(artifact_path))
+            if actual_hash != artifact_hash:
+                reasons.append("artifact 文件 hash 与发布记录不一致（文件可能被篡改或替换）。")
+        except OSError as exc:
+            reasons.append(f"artifact 文件无法读取：{exc}")
+    elif artifact is None:
+        reasons.append("发布记录缺少 artifact_path，无法核验 artifact hash。")
+
+    if artifact is not None:
+        report = validate_publication_artifact(artifact)
+        if not report.get("ok") or str(report.get("status")) != "valid":
+            reasons.append("artifact 发布门禁校验未通过：" + "；".join(str(error) for error in report.get("errors", [])[:5]))
+
+    if reasons:
+        verdict = "needs_validation" if status in {"needs_validation", "legacy"} or not status else "not_publishable"
+        if any("hash" in reason or "gate_report" in reason or "published" in reason for reason in reasons):
+            verdict = "not_publishable"
+        return {"verdict": verdict, "reasons": reasons}
+
+    return {"verdict": "publishable", "reasons": []}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def diagnose_platform_sync(
+    *,
+    registry: Mapping[str, Any] | None = None,
+    registry_path: Any = None,
+    profile: Mapping[str, Any] | None = None,
+    manifest: Mapping[str, Any] | None = None,
+    artifact: Mapping[str, Any] | None = None,
+    contract: Mapping[str, Any] | None = None,
+    config: Mapping[str, Any] | None = None,
+    material_type: str | None = None,
+    target: str | None = None,
+) -> dict[str, Any]:
+    """平台同步诊断：汇总 registry/profile/manifest/artifact/contract 的一致性状态。
+
+    纯函数，无 Streamlit 依赖。所有输入可为 None（None 表示缺失，不抛异常）。
+    """
+
+    checks: list[dict[str, Any]] = []
+    statuses: set[str] = set()
+
+    def add(check: str, status: str, detail: str) -> None:
+        statuses.add(status)
+        checks.append({"check": check, "status": status, "detail": detail})
+
+    def _hash8(value: Any) -> str:
+        text = str(value or "").strip()
+        return text[:8] + "…" if len(text) > 8 else (text or "缺失")
+
+    # ---- registry ----
+    resolved_registry = registry
+    if resolved_registry is None and registry_path:
+        try:
+            with open(registry_path, "r", encoding="utf-8") as handle:
+                resolved_registry = json.load(handle)
+        except Exception as exc:
+            add("registry", "error", f"registry 文件读取失败：{exc}")
+            resolved_registry = None
+    registry_version = None
+    registry_hash = None
+    if isinstance(resolved_registry, Mapping):
+        registry_version = resolved_registry.get("registry_version")
+        registry_hash = resolved_registry.get("registry_hash")
+        if not registry_hash:
+            try:
+                from .feature_registry import compute_registry_hash
+                registry_hash = compute_registry_hash(resolved_registry)
+            except Exception:
+                registry_hash = None
+        add("registry 版本/hash", "ok", f"registry_version={registry_version}，hash={_hash8(registry_hash)}")
+    else:
+        add("registry", "missing", "未提供 registry，无法校验特征语义。")
+
+    # ---- profile ----
+    profile_id = None
+    if isinstance(profile, Mapping):
+        profile_id = profile.get("model_profile_id") or profile.get("profile_id")
+        status = str(profile.get("status") or "").strip().lower()
+        if status == "approved":
+            add("profile 状态", "ok", f"profile={profile_id} 已批准。")
+        elif status:
+            add("profile 状态", "error", f"profile={profile_id} 状态为 {status}，未批准，阻断训练/发布/预测。")
+        else:
+            add("profile 状态", "missing", f"profile={profile_id} 缺少 status 字段。")
+    else:
+        add("profile", "missing", "未提供模型 profile。")
+
+    # ---- manifest ----
+    manifest_status = None
+    manifest_hash = None
+    if isinstance(manifest, Mapping):
+        manifest_status = str(manifest.get("approval") or manifest.get("mapping_status") or manifest.get("status") or "").strip().lower()
+        manifest_hash = manifest.get("manifest_hash")
+        if manifest_status in {"approved", "approved_binding"}:
+            add("manifest 状态", "ok", f"approval={manifest_status}，hash={_hash8(manifest_hash)}")
+        else:
+            add("manifest 状态", "error", f"manifest 未批准（approval={manifest_status or '缺失'}），阻断训练。")
+    else:
+        add("manifest", "missing", "未提供 dataset manifest。")
+
+    # ---- contract ----
+    resolved_contract = contract
+    if resolved_contract is None and isinstance(artifact, Mapping):
+        saved = _contract_from_artifact(artifact)
+        resolved_contract = saved if isinstance(saved, Mapping) else None
+    contract_hash = None
+    feature_cols: list[str] = []
+    manual_cols: list[str] = []
+    molecular_cols: list[str] = []
+    derived_cols: list[str] = []
+    source_fields: list[str] = []
+    if isinstance(resolved_contract, Mapping) and resolved_contract:
+        contract_hash = resolved_contract.get("contract_hash")
+        feature_cols = _normalized_columns(resolved_contract.get("feature_cols"))
+        manual_cols = _normalized_columns(resolved_contract.get("manual_input_feature_cols"))
+        molecular_cols = _normalized_columns(resolved_contract.get("molecular_workflow_feature_cols"))
+        derived_cols = _normalized_columns(resolved_contract.get("derived_feature_cols"))
+        source_fields = _normalized_columns(resolved_contract.get("workflow_source_fields"))
+        add("contract 版本/hash", "ok", f"schema_version={resolved_contract.get('schema_version')}，contract_hash={_hash8(contract_hash)}")
+    else:
+        add("contract", "missing", "缺少 prediction_contract（旧模型 legacy 或未按 v2 导出），阻断预测与正式筛选。")
+
+    # ---- artifact ----
+    artifact_hash = None
+    if isinstance(artifact, Mapping) and artifact:
+        extra = _as_mapping(artifact.get("extra"))
+        artifact_hash = extra.get("artifact_hash")
+        artifact_features = _normalized_columns(artifact.get("feature_cols"))
+        if feature_cols:
+            if artifact_features and artifact_features != feature_cols:
+                add("artifact/contract 特征顺序", "error", "artifact.feature_cols 与 contract.feature_cols 顺序或内容不一致，阻断发布。")
+            elif not artifact_features:
+                add("artifact 特征列", "missing", "artifact 缺少 feature_cols。")
+            else:
+                add("artifact/contract 特征顺序", "ok", f"{len(feature_cols)} 个特征顺序完全一致。")
+        if artifact_hash:
+            add("artifact hash", "ok", f"artifact_hash={_hash8(artifact_hash)}")
+        else:
+            add("artifact hash", "missing", "artifact 未内嵌 artifact_hash（旧版导出），无法核验完整性。")
+    else:
+        add("artifact", "missing", "未提供模型 artifact。")
+
+    # ---- 分区一致性 ----
+    partition_matches: bool | None = None
+    extra_partition: list[str] = []
+    unknown_features: list[str] = []
+    if feature_cols:
+        declared_partitions = list(manual_cols) + list(molecular_cols) + list(derived_cols)
+        if sorted(declared_partitions) == sorted(feature_cols):
+            partition_matches = True
+            add("manual/workflow/derived 分区", "ok", "分区与 feature_cols 一致。")
+        else:
+            partition_matches = False
+            missing_partition = [col for col in feature_cols if col not in declared_partitions]
+            extra_partition = [col for col in declared_partitions if col not in feature_cols]
+            detail = "contract 分区列与 feature_cols 不一致。"
+            if missing_partition:
+                detail += " 缺少分区声明：" + ", ".join(missing_partition[:8]) + "。"
+            if extra_partition:
+                detail += " 分区多出：" + ", ".join(extra_partition[:8]) + "。"
+            add("manual/workflow/derived 分区", "error", detail)
+    else:
+        add("manual/workflow/derived 分区", "missing", "无 contract，无法校验分区。")
+
+    # ---- registry snapshot 的 source_type 与 contract 分区对照 ----
+    mismatched: list[str] = []
+    if feature_cols and isinstance(resolved_registry, Mapping):
+        definitions = {
+            str(item.get("name")): item
+            for item in (resolved_registry.get("features") or [])
+            if isinstance(item, Mapping) and item.get("name")
+        }
+        unknown_features = []
+        mismatched = []
+        for column in feature_cols:
+            definition = definitions.get(column)
+            if definition is None:
+                unknown_features.append(column)
+                continue
+            source_type = str(definition.get("source_type") or "").strip().lower()
+            expected = (
+                manual_cols if source_type == "manual_input"
+                else molecular_cols if source_type == "molecular_workflow"
+                else derived_cols if source_type == "derived_workflow"
+                else None
+            )
+            if expected is not None and column not in expected:
+                mismatched.append(f"{column}(registry={source_type})")
+        if unknown_features:
+            add("特征登记", "error", "contract 特征未在 registry 登记：" + ", ".join(unknown_features[:8]) + ("…" if len(unknown_features) > 8 else ""))
+            partition_matches = False
+        elif mismatched:
+            add("特征分区对照", "error", "registry source_type 与 contract 分区不一致：" + ", ".join(mismatched[:8]) + ("…" if len(mismatched) > 8 else ""))
+            partition_matches = False
+        else:
+            add("特征登记/分区对照", "ok", "contract 全部特征已登记且分区一致。")
+    elif feature_cols:
+        add("特征登记", "missing", "无 registry，无法对照特征登记。")
+
+    # ---- 重复特征 ----
+    duplicates: list[str] = []
+    if isinstance(resolved_contract, Mapping) and resolved_contract:
+        raw_features = resolved_contract.get("feature_cols") or []
+        seen: set[str] = set()
+        for column in raw_features:
+            column_str = str(column)
+            if column_str in seen:
+                duplicates.append(column_str)
+            seen.add(column_str)
+        if duplicates:
+            add("重复特征", "error", "contract feature_cols 存在重复：" + ", ".join(sorted(set(duplicates))[:8]))
+        else:
+            add("重复特征", "ok", "无重复特征。")
+
+    feature_counts = {
+        "model_features": len(_normalized_columns(artifact.get("feature_cols"))) if isinstance(artifact, Mapping) else 0,
+        "contract_features": len(feature_cols),
+        "portal_input_features": len(manual_cols) + len(source_fields),
+        "screening_features": len(feature_cols),
+    }
+
+    def _blocked(state: str) -> None:
+        statuses.add(state)
+
+    can_predict = (
+        isinstance(resolved_contract, Mapping) and bool(resolved_contract)
+        and bool(feature_cols)
+        and partition_matches is not False
+    )
+    can_publish = (
+        can_predict
+        and isinstance(artifact, Mapping) and bool(artifact)
+        and bool(artifact_hash)
+        and partition_matches is True
+        and manifest_status == "approved"
+        and isinstance(profile, Mapping) and str(profile.get("status") or "").lower() == "approved"
+    )
+    can_screen_formally = can_predict and isinstance(artifact, Mapping) and bool(artifact)
+
+    if not can_predict:
+        _blocked("prediction_blocked")
+    if not can_screen_formally:
+        _blocked("screening_blocked")
+    if isinstance(artifact, Mapping) and bool(artifact) and not can_publish:
+        _blocked("needs_republication")
+
+    if "error" in statuses:
+        overall = ["needs_review"]
+    elif "missing" in statuses:
+        overall = ["partial"]
+    else:
+        overall = ["synced"]
+    for blocked in ("prediction_blocked", "screening_blocked", "needs_republication"):
+        if blocked in statuses:
+            overall.append(blocked)
+
+    return {
+        "overall_status": overall,
+        "checks": checks,
+        "feature_counts": feature_counts,
+        "feature_order_matches": (artifact_features == feature_cols) if (isinstance(artifact, Mapping) and feature_cols) else None,
+        "partition_matches": partition_matches,
+        "missing": unknown_features if feature_cols and isinstance(resolved_registry, Mapping) else [],
+        "unknown": unknown_features if feature_cols and isinstance(resolved_registry, Mapping) else [],
+        "duplicate": sorted(set(duplicates)),
+        "extra": extra_partition if feature_cols else [],
+        "can_publish": can_publish,
+        "can_predict": can_predict,
+        "can_screen_formally": can_screen_formally,
+        "registry_version": registry_version,
+        "registry_hash": registry_hash,
+        "profile_id": profile_id,
+        "manifest_status": manifest_status,
+        "manifest_hash": manifest_hash,
+        "contract_hash": contract_hash,
+        "artifact_hash": artifact_hash,
+        "workflow_hash": resolved_contract.get("workflow_hash") if isinstance(resolved_contract, Mapping) else None,
+    }

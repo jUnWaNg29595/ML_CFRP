@@ -177,8 +177,132 @@ def _safe_error(
     return PortalAIError(msg, stage=stage, service_id=service_id, status_code=status_code, raw_excerpt=_sanitize_excerpt(raw_excerpt), suggestion=suggestion)
 
 
-def parse_chat_completion(payload: object) -> str:
-    """Extract assistant text from an OpenAI chat completion payload."""
+def _extract_json_path(payload: object, path: str) -> object:
+    """按路径（支持 a.b.0.c 与 a['b'][0].c 两种写法）从 payload 提取值；失败抛 PortalAIParseError。"""
+    import re as _re
+
+    if not isinstance(path, str) or not path.strip():
+        raise PortalAIParseError("response_json_path 为空，无法提取响应字段", stage="json_path_extraction")
+    tokens: list[str | int] = []
+    for match in _re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)|\.(\d+)|\[(\d+)\]|\['([^']+)'\]|\[\"([^\"]+)\"\]", path.strip()):
+        if match.group(1):
+            tokens.append(match.group(1))
+        elif match.group(2):
+            tokens.append(int(match.group(2)))
+        elif match.group(3):
+            tokens.append(int(match.group(3)))
+        elif match.group(4):
+            tokens.append(match.group(4))
+        elif match.group(5):
+            tokens.append(match.group(5))
+    if not tokens:
+        raise PortalAIParseError(
+            f"response_json_path 无法解析：{path.strip()[:80]}",
+            stage="json_path_extraction",
+            suggestion="路径只支持 a.b.0.c 或 a['b'][0].c 两种写法",
+        )
+    current = payload
+    for token in tokens:
+        try:
+            if isinstance(token, int):
+                if not isinstance(current, (list, tuple)) or token >= len(current):
+                    raise IndexError(f"索引 {token} 超出列表范围")
+                current = current[token]
+            else:
+                if not isinstance(current, Mapping) or token not in current:
+                    raise KeyError(f"缺少键 {token!r}")
+                current = current[token]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise PortalAIParseError(
+                f"响应中不存在路径 {path.strip()[:80]}（在 {token!r} 处中断）",
+                stage="json_path_extraction",
+                raw_excerpt=str(payload)[:200],
+                suggestion="请检查 response_json_path 是否匹配该服务实际响应结构",
+            ) from exc
+    return current
+
+
+def _parse_gemini_candidates(payload: object) -> str:
+    """解析 Gemini generateContent 响应：candidates[0].content.parts[*].text 拼接。"""
+    if not isinstance(payload, Mapping):
+        raise PortalAIParseError(
+            "Gemini 响应不是有效的 JSON 对象",
+            stage="gemini_parsing",
+            raw_excerpt=str(payload)[:200],
+        )
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        prompt_feedback = payload.get("promptFeedback")
+        block_reason = prompt_feedback.get("blockReason") if isinstance(prompt_feedback, Mapping) else None
+        raise PortalAIParseError(
+            "Gemini 响应缺少 candidates 列表" + (f"（blockReason={block_reason}）" if block_reason else ""),
+            stage="gemini_parsing",
+            raw_excerpt=str(payload)[:200],
+            suggestion="请检查请求是否被安全策略拦截或模型名称是否正确",
+        )
+    first = candidates[0]
+    if not isinstance(first, Mapping):
+        raise PortalAIParseError(
+            "Gemini candidates[0] 结构非法",
+            stage="gemini_parsing",
+            raw_excerpt=str(first)[:200],
+        )
+    content = first.get("content")
+    if not isinstance(content, Mapping):
+        raise PortalAIParseError(
+            "Gemini 响应缺少 content 字段",
+            stage="gemini_parsing",
+            raw_excerpt=str(first)[:200],
+        )
+    parts = content.get("parts")
+    text_parts: list[str] = []
+    if isinstance(parts, list):
+        for part in parts:
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+            elif isinstance(part, str):
+                text_parts.append(part)
+    combined = "".join(text_parts).strip()
+    if combined:
+        return combined
+    raise PortalAIParseError(
+        "Gemini 响应的 parts 中没有文本内容",
+        stage="gemini_parsing",
+        raw_excerpt=str(content)[:200],
+        suggestion="请检查模型输出是否被截断或被安全策略拦截（finishReason）",
+    )
+
+
+def parse_chat_completion(payload: object, *, response_json_path: str | None = None, provider: str | None = None) -> str:
+    """Extract assistant text from an OpenAI-compatible / Gemini / custom payload.
+
+    provider 含 'gemini'（或 payload 只有 candidates 键）→ Gemini generateContent 结构；
+    response_json_path 提供时先按路径提取，再按文本/对象继续解析。
+    """
+    if response_json_path:
+        extracted = _extract_json_path(payload, response_json_path)
+        if isinstance(extracted, Mapping):
+            return parse_chat_completion(extracted, provider=provider)
+        if isinstance(extracted, list):
+            parts = [part for part in extracted if isinstance(part, str)]
+            combined = "".join(parts).strip()
+            if combined:
+                return combined
+        if isinstance(extracted, str) and extracted.strip():
+            return extracted
+        raise PortalAIParseError(
+            "response_json_path 提取结果为空或类型不受支持",
+            stage="json_path_extraction",
+            raw_excerpt=str(extracted)[:200],
+        )
+
+    provider_text = str(provider or "").strip().lower()
+    is_gemini = "gemini" in provider_text or (
+        isinstance(payload, Mapping) and "candidates" in payload and "choices" not in payload
+    )
+    if is_gemini:
+        return _parse_gemini_candidates(payload)
+
     if not isinstance(payload, Mapping):
         raise PortalAIParseError(
             "AI 服务响应不是有效的 JSON 对象",
@@ -857,4 +981,6 @@ __all__ = [
     "list_models",
     "parse_chat_completion",
     "parse_json_or_markdown_json",
+    "_parse_gemini_candidates",
+    "_extract_json_path",
 ]

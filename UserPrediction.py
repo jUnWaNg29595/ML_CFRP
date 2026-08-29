@@ -644,6 +644,178 @@ def sync_parameters_from_features(target_cfg: Dict[str, Any], feature_cols: List
     return True
 
 
+def build_input_partition_plan(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """按 contract 分区生成输入分组计划（纯函数，可独立测试）。
+
+    返回列表，每项 {group, title, description, features, kind}：
+    - required_manual：必填人工输入（manual 分区中 required_for_prediction=True）
+    - optional_manual：可选人工输入
+    - molecular：分子/结构输入（workflow_source_fields）
+    - workflow：工艺源字段（workflow_source_fields 中非分子列，当前实现并入 molecular 组由角色标注）
+    - computed：系统计算特征（derived/molecular workflow 输出，仅展示无输入框）
+    分区缺失时给出默认空组，保证 UI 不崩溃。
+    """
+    contract = contract if isinstance(contract, dict) else {}
+    manual_cols = [str(c) for c in contract.get("manual_input_feature_cols") or [] if str(c).strip()]
+    molecular_cols = [str(c) for c in contract.get("molecular_workflow_feature_cols") or [] if str(c).strip()]
+    derived_cols = [str(c) for c in contract.get("derived_feature_cols") or [] if str(c).strip()]
+    definitions = {
+        str(item.get("name")): item
+        for item in contract.get("feature_definitions") or []
+        if isinstance(item, dict) and item.get("name")
+    }
+
+    required_manual: List[str] = []
+    optional_manual: List[str] = []
+    for name in manual_cols:
+        definition = definitions.get(name, {})
+        if bool(definition.get("required_for_prediction", True)):
+            required_manual.append(name)
+        else:
+            optional_manual.append(name)
+
+    plan: List[Dict[str, Any]] = [
+        {
+            "group": "required_manual",
+            "title": "① 必填人工输入",
+            "description": "工艺/测试/人工记录字段；缺失时预测将被阻断，系统不会自动补 0。",
+            "features": required_manual,
+            "kind": "input",
+        },
+        {
+            "group": "optional_manual",
+            "title": "② 可选人工输入",
+            "description": "可留空的人工输入字段；留空值按契约声明处理并记录。",
+            "features": optional_manual,
+            "kind": "input",
+        },
+        {
+            "group": "molecular",
+            "title": "③ 分子/结构输入",
+            "description": "树脂/固化剂 SMILES 等原始结构；由当前模型 workflow 消费。",
+            "features": [],  # workflow_source_fields 由调用方填充（需要 source field 结构）
+            "kind": "workflow_source",
+        },
+        {
+            "group": "computed",
+            "title": "④ 系统计算特征",
+            "description": "以下特征由系统按登记的 workflow 自动计算，无需手动填写。",
+            "features": molecular_cols + derived_cols,
+            "kind": "display",
+        },
+    ]
+    if contract.get("screening_fixed_input_cols"):
+        plan.insert(3, {
+            "group": "fixed_inputs",
+            "title": "③-B 固定工艺条件",
+            "description": "当前预测任务使用的固定工艺/测试条件（契约 screening_fixed_input_cols）。",
+            "features": [str(c) for c in contract.get("screening_fixed_input_cols") or [] if str(c).strip()],
+            "kind": "display",
+        })
+    return plan
+
+
+def model_contract_summary(model: Dict[str, Any]) -> Dict[str, Any]:
+    """从模型条目 + contract 提取可核验信息（纯函数，可独立测试）。"""
+    model = model if isinstance(model, dict) else {}
+    contract, snapshot = _model_contract(model)
+    extra = (model.get("_artifact") or {}).get("extra") if isinstance(model.get("_artifact"), dict) else {}
+    entry_extra = model.get("extra") if isinstance(model.get("extra"), dict) else {}
+    status_raw = str(model.get("publication_status") or "").strip().lower()
+    status_labels = {
+        "published": "已发布",
+        "needs_validation": "待验证",
+        "draft": "草稿",
+        "disabled": "已停用",
+        "legacy": "legacy",
+    }
+    return {
+        "model_version": model.get("model_version") or model.get("updated_at") or "",
+        "model_profile_id": contract.get("model_profile_id") or snapshot.get("profile_id") or "",
+        "contract_schema_version": contract.get("schema_version"),
+        "feature_registry_version": contract.get("feature_registry_version") or "",
+        "feature_registry_hash": str(contract.get("feature_registry_hash") or "")[:8],
+        "workflow_hash": str(contract.get("workflow_hash") or "")[:8],
+        "artifact_hash": str(model.get("artifact_hash") or (extra or entry_extra or {}).get("artifact_hash") or "")[:8],
+        "publication_status": status_labels.get(status_raw, status_raw or "未知"),
+        "publication_status_raw": status_raw,
+        "contract_features": len(contract.get("feature_cols") or []),
+        "manual_features": len(contract.get("manual_input_feature_cols") or []),
+        "workflow_source_fields": len(contract.get("workflow_source_fields") or []),
+        "gate_status": str(((model.get("gate_report") or {}).get("status")) or "") if isinstance(model.get("gate_report"), dict) else "",
+    }
+
+
+MODEL_MANAGEMENT_AUDIT_FILE = PROJECT_ROOT / "prediction_portal" / "model_management_audit.jsonl"
+
+
+def append_model_management_audit(action: str, model_id: str = "", model_version: str = "", detail: str = "", reviewer: str = "local") -> None:
+    """把管理操作追加写入本地审计日志（JSONL，不覆盖旧记录）。"""
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "action": str(action),
+        "model_id": str(model_id),
+        "model_version": str(model_version),
+        "detail": str(detail)[:500],
+        "reviewer": str(reviewer),
+    }
+    try:
+        MODEL_MANAGEMENT_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(MODEL_MANAGEMENT_AUDIT_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def render_sync_diagnostics_panel(model: Dict[str, Any]) -> None:
+    """平台同步诊断 UI：调用 diagnose_platform_sync 展示中文状态。"""
+    try:
+        from core.prediction_portal import diagnose_platform_sync
+    except ImportError:
+        st.info("诊断模块未加载，无法展示平台同步诊断。")
+        return
+    artifact = model.get("_artifact") if isinstance(model, dict) else None
+    contract, snapshot = _model_contract(model)
+    manifest = None
+    if isinstance(artifact, dict) and isinstance(artifact.get("extra"), dict):
+        manifest = artifact["extra"].get("dataset_manifest")
+    try:
+        report = diagnose_platform_sync(
+            registry=snapshot if isinstance(snapshot, dict) and snapshot.get("registry_version") else None,
+            profile=(snapshot or {}).get("model_profile") if isinstance(snapshot, dict) else None,
+            manifest=manifest,
+            artifact=artifact if isinstance(artifact, dict) else None,
+            contract=contract if contract else None,
+        )
+    except Exception as exc:
+        st.warning(f"同步诊断执行失败：{exc}")
+        return
+    status_labels = {
+        "synced": "✅ 已同步", "partial": "🟡 部分同步", "needs_review": "⏳ 待人工审核",
+        "needs_retrain": "🔁 待重新训练", "needs_republication": "📢 待重新发布",
+        "prediction_blocked": "⛔ 不允许预测", "screening_blocked": "⛔ 不允许正式筛选",
+    }
+    overall = " | ".join(status_labels.get(s, s) for s in report.get("overall_status", []))
+    st.markdown(f"**平台同步状态：** {overall}")
+    rows = []
+    for check in report.get("checks", []):
+        icon = {"ok": "✅", "warn": "⚠️", "error": "❌", "missing": "➖"}.get(check.get("status"), "•")
+        rows.append({"状态": icon, "检查项": check.get("check", ""), "说明": check.get("detail", "")})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    counts = report.get("feature_counts") or {}
+    if counts:
+        st.caption(
+            f"特征数量：模型 {counts.get('model_features', 0)} | 契约 {counts.get('contract_features', 0)}"
+            f" | 门户输入 {counts.get('portal_input_features', 0)} | 虚拟筛选 {counts.get('screening_features', 0)}"
+        )
+    flags = []
+    flags.append(("可发布", report.get("can_publish")))
+    flags.append(("可预测", report.get("can_predict")))
+    flags.append(("可正式虚拟筛选", report.get("can_screen_formally")))
+    st.caption("　|　".join(f"{'✅' if ok else '⛔'} {label}" for label, ok in flags))
+
+
 def normalize_parameter_rows(editor_df: pd.DataFrame) -> List[Dict[str, Any]]:
     parameters: List[Dict[str, Any]] = []
     if editor_df is None or editor_df.empty:
@@ -1171,6 +1343,7 @@ def render_model_brief(models: List[Dict[str, Any]]) -> None:
         return
     for model in models:
         state_text = "启用中" if model.get("enabled", True) else "已停用"
+        summary = model_contract_summary(model)
         st.markdown(
             f"""
             <div class="model-card">
@@ -1180,11 +1353,19 @@ def render_model_brief(models: List[Dict[str, Any]]) -> None:
                     <span>{metric_text(model.get('metrics') or {})}</span>
                     <span>{state_text}</span>
                     <span>{len(model.get('feature_cols') or [])} 个特征</span>
+                    <span>发布状态：{summary['publication_status']}</span>
                 </div>
                 <div class="model-card-notes">{model.get('notes', '') or '无备注'}</div>
             </div>
             """,
             unsafe_allow_html=True,
+        )
+        st.caption(
+            f"版本 {summary['model_version']} | profile {summary['model_profile_id'] or '未声明'}"
+            f" | contract v{summary['contract_schema_version'] or '?'}"
+            f" | registry {summary['feature_registry_version']}@{summary['feature_registry_hash'] or '—'}"
+            f" | workflow {summary['workflow_hash'] or '—'}"
+            f" | artifact {summary['artifact_hash'] or '—'}"
         )
 
 
@@ -1300,6 +1481,10 @@ def render_user_page(config: Dict[str, Any]) -> None:
     manual_fields = build_manual_input_fields(selected_contract, registry_snapshot)
     workflow_fields = build_workflow_source_fields(selected_contract, registry_snapshot)
 
+    # 平台同步诊断（Agent C 后端 + 本页 UI）
+    with st.expander("🩺 平台同步诊断", expanded=False):
+        render_sync_diagnostics_panel(selected_models[0])
+
     confirmed_by_user = st.checkbox(
         "我确认已检查输入结构、配方/工艺参数，并同意调用已发布模型进行预测",
         key=f"prediction_confirmation_{selected_material}_{selected_target}",
@@ -1315,9 +1500,53 @@ def render_user_page(config: Dict[str, Any]) -> None:
 
     with tab_manual:
         st.markdown("### 手动输入参数")
-        # Workflow source columns are collected here as explicit human inputs so
-        # the submitted frame preserves the raw values required for replay.
-        manual_df, validation_errors = render_parameter_inputs(manual_fields + workflow_fields, f"manual_{selected_material}_{selected_target}")
+        # 输入分区：必填人工 / 可选人工 / 分子结构 / 系统计算，全部由当前 contract 驱动。
+        partition_plan = build_input_partition_plan(selected_contract)
+        all_input_fields: List[Dict[str, Any]] = []
+        for section in partition_plan:
+            st.markdown(f"#### {section['title']}")
+            st.caption(section["description"])
+            if section["kind"] == "workflow_source":
+                if workflow_fields:
+                    section_df, section_errors = render_parameter_inputs(
+                        workflow_fields, f"manual_{selected_material}_{selected_target}_molecular"
+                    )
+                else:
+                    section_df, section_errors = pd.DataFrame([{}]), []
+                    st.info("当前模型契约未声明分子/结构源字段。")
+            elif section["kind"] == "display":
+                if section["features"]:
+                    st.info("系统将自动计算：" + "、".join(section["features"][:12]) + ("…" if len(section["features"]) > 12 else ""))
+                else:
+                    st.caption("该模型契约未声明此分区。")
+                section_df, section_errors = pd.DataFrame([{}]), []
+            elif section["features"]:
+                section_input_fields = [field for field in manual_fields if field["name"] in section["features"]]
+                if section_input_fields:
+                    section_df, section_errors = render_parameter_inputs(
+                        section_input_fields, f"manual_{selected_material}_{selected_target}_{section['group']}"
+                    )
+                else:
+                    section_df, section_errors = pd.DataFrame([{}]), []
+                    st.caption("当前模型契约未声明此分区的可输入字段。")
+            else:
+                section_df, section_errors = pd.DataFrame([{}]), []
+                st.caption("当前模型契约未声明此分区。")
+            all_input_fields.append(section_df)
+            if section_errors:
+                for err in section_errors:
+                    st.warning(err)
+        # 合并各分区输入帧（dict 合并保持向后单行结构）
+        merged_values: Dict[str, Any] = {}
+        for frame in all_input_fields:
+            if isinstance(frame, pd.DataFrame) and not frame.empty and frame.columns.tolist() != [None]:
+                for column in frame.columns:
+                    if column:
+                        merged_values[column] = frame.iloc[0][column]
+        manual_df = pd.DataFrame([merged_values]) if merged_values else pd.DataFrame([{}])
+        validation_errors = []
+        if not manual_fields and not workflow_fields:
+            validation_errors = ["当前模型契约未声明任何输入字段，无法手动预测。"]
         if validation_errors:
             for err in validation_errors:
                 st.warning(err)
@@ -1373,14 +1602,23 @@ def render_user_page(config: Dict[str, Any]) -> None:
         st.markdown("### 当前已选模型")
         model_preview_rows = []
         for model in selected_models:
+            summary = model_contract_summary(model)
             model_preview_rows.append(
                 {
                     "模型标签": model.get("label", ""),
                     "模型类型": model.get("model_name", ""),
                     "指标": metric_text(model.get("metrics") or {}),
                     "特征数": len(model.get("feature_cols") or []),
+                    "契约特征数": summary["contract_features"],
                     "特征来源": model.get("feature_source", ""),
                     "含分子特征流程": "是" if model.get("has_feature_process") else "否",
+                    "发布状态": summary["publication_status"],
+                    "版本": summary["model_version"],
+                    "profile": summary["model_profile_id"],
+                    "contract": f"v{summary['contract_schema_version'] or '?'}",
+                    "registry": f"{summary['feature_registry_version']}@{summary['feature_registry_hash'] or '—'}",
+                    "workflow": summary["workflow_hash"] or "—",
+                    "artifact": summary["artifact_hash"] or "—",
                     "更新时间": model.get("updated_at", ""),
                 }
             )
@@ -1535,9 +1773,26 @@ def render_admin_page(config: Dict[str, Any]) -> None:
             if not registered_models:
                 st.info("该性能项下还没有模型。")
             else:
+                try:
+                    from core.prediction_portal import rollback_publication
+                    rollback_available = True
+                except ImportError:
+                    rollback_available = False
+                status_labels_admin = {
+                    "published": "✅ 已发布", "needs_validation": "⏳ 待验证",
+                    "draft": "📝 草稿", "disabled": "⛔ 已停用", "legacy": "📦 legacy",
+                }
                 for model in registered_models:
-                    c1, c2, c3 = st.columns([6, 1, 1])
+                    c1, c2, c3, c4 = st.columns([6, 1, 1, 1])
                     with c1:
+                        pub_raw = str(model.get("publication_status") or "").strip().lower()
+                        pub_label = status_labels_admin.get(pub_raw, pub_raw or "未记录")
+                        gate = model.get("gate_report") if isinstance(model.get("gate_report"), dict) else {}
+                        gate_errors = gate.get("errors") or []
+                        gate_hint = f"｜gate: {gate.get('status')}" if gate.get("status") else ""
+                        failure_hint = ""
+                        if gate_errors:
+                            failure_hint = f"｜失败原因：{str(gate_errors[0])[:120]}"
                         st.markdown(
                             f"""
                             <div class="model-card">
@@ -1547,25 +1802,61 @@ def render_admin_page(config: Dict[str, Any]) -> None:
                                     <span>{metric_text(model.get('metrics') or {})}</span>
                                     <span>{len(model.get('feature_cols') or [])} 个特征</span>
                                     <span>{'启用' if model.get('enabled', True) else '停用'}</span>
+                                    <span>{pub_label}{gate_hint}</span>
                                 </div>
-                                <div class="model-card-notes">{model.get('notes', '') or '无备注'}</div>
+                                <div class="model-card-notes">{model.get('notes', '') or '无备注'}{failure_hint}</div>
                             </div>
                             """,
                             unsafe_allow_html=True,
                         )
+                        st.caption(
+                            f"contract hash {str(model.get('contract_hash') or '—')[:8]}"
+                            f" ｜ artifact hash {str(model.get('artifact_hash') or '—')[:8]}"
+                            f" ｜ registry {str((model.get('registry_snapshot') or {}).get('registry_hash') or '—')[:8] if isinstance(model.get('registry_snapshot'), dict) else '—'}"
+                        )
                     with c2:
                         toggle_label = "停用" if model.get("enabled", True) else "启用"
-                        if st.button(toggle_label, key=f"toggle_model_{model['id']}"):
+                        toggle_confirm_key = f"toggle_confirm_{model['id']}"
+                        st.checkbox("确认", key=toggle_confirm_key, value=False, help="勾选后才能执行（二次确认）")
+                        toggle_confirmed = bool(st.session_state.get(toggle_confirm_key))
+                        if st.button(toggle_label, key=f"toggle_model_{model['id']}", disabled=not toggle_confirmed):
                             try:
                                 toggle_model_enabled(config, selected_material, selected_target, model)
                             except ValueError as exc:
                                 st.error(f"模型启用失败：{exc}")
                             else:
+                                append_model_management_audit(
+                                    action="enable" if not model.get("enabled", True) else "disable",
+                                    model_id=model["id"], model_version=model.get("updated_at", ""),
+                                    detail=f"{toggle_label} 模型 {model.get('label', '')}",
+                                )
                                 save_config(config)
                                 st.rerun()
                     with c3:
-                        if st.button("移除记录", key=f"remove_model_{model['id']}"):
+                        rollback_confirm_key = f"rollback_confirm_{model['id']}"
+                        st.checkbox("确认", key=rollback_confirm_key, value=False, help="回滚前请勾选（二次确认）")
+                        if rollback_available and st.button("回滚发布", key=f"rollback_model_{model['id']}", disabled=not bool(st.session_state.get(rollback_confirm_key))):
+                            try:
+                                rollback_publication(config, material_key=selected_material, target_key=selected_target, version=str(model.get("version") or ""))
+                            except (ValueError, TypeError) as exc:
+                                st.error(f"回滚失败：{exc}")
+                            else:
+                                append_model_management_audit(
+                                    action="rollback", model_id=model["id"], model_version=model.get("updated_at", ""),
+                                    detail=f"回滚 {model.get('label', '')} 的发布",
+                                )
+                                save_config(config)
+                                st.success(f"已回滚 {model.get('label', '')}")
+                                st.rerun()
+                    with c4:
+                        remove_confirm_key = f"remove_confirm_{model['id']}"
+                        st.checkbox("确认", key=remove_confirm_key, value=False, help="删除前请勾选（二次确认）")
+                        if st.button("移除记录", key=f"remove_model_{model['id']}", disabled=not bool(st.session_state.get(remove_confirm_key))):
                             target_cfg["models"] = [item for item in target_cfg.get("models", []) if item.get("id") != model["id"]]
+                            append_model_management_audit(
+                                action="delete", model_id=model["id"], model_version=model.get("updated_at", ""),
+                                detail=f"删除模型记录 {model.get('label', '')}",
+                            )
                             save_config(config)
                             st.rerun()
 

@@ -4300,6 +4300,51 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
             )
             st.caption('🛡️ **安全策略**：AI 全程直连不经过代理；System Prompt 与安全门禁由系统锁定保证契约安全。')
 
+        # 协议扩展字段（认证模式 / Gemini / 自定义 JSON 路径 / 额外头）
+        proto_c1, proto_c2 = st.columns(2)
+        with proto_c1:
+            auth_modes = ['bearer', 'api_key_header', 'none']
+            cur_auth = str(current.get('auth_mode', 'bearer')).lower()
+            auth_idx = auth_modes.index(cur_auth) if cur_auth in auth_modes else 0
+            auth_mode = st.selectbox(
+                '认证模式 (auth_mode)',
+                auth_modes,
+                index=auth_idx,
+                format_func=lambda v: {'bearer': 'Bearer Token (Authorization 头)', 'api_key_header': 'X-API-Key 头', 'none': '无认证'}[v],
+                key=f'{svc_key_prefix}auth_mode',
+                disabled=active_task_lock,
+            )
+            response_json_path = st.text_input(
+                '自定义响应 JSON 路径 (response_json_path)',
+                value=str(current.get('response_json_path') or ''),
+                key=f'{svc_key_prefix}response_json_path',
+                disabled=active_task_lock,
+                help="例如 choices.0.message.content 或 candidates.0.content.parts.0.text；留空使用协议默认解析。",
+                placeholder='choices.0.message.content',
+            )
+        with proto_c2:
+            provider_lower = provider.strip().lower()
+            if provider_lower == 'gemini':
+                st.info('Gemini 协议：请求将使用 models/{model}:generateContent 格式，响应按 candidates[0].content.parts 解析。')
+            elif provider_lower == 'custom':
+                st.info('自定义协议：请在请求体模板中配置；JSON 路径可用上面的 response_json_path。')
+            headers_text = st.text_area(
+                '额外请求头 (headers, JSON)',
+                value=json.dumps(current.get('headers') or {}, ensure_ascii=False) if current.get('headers') else '',
+                key=f'{svc_key_prefix}headers',
+                disabled=active_task_lock,
+                height=68,
+                help='JSON 对象，例如 {"X-Custom": "value"}；禁止填入 API Key。',
+            )
+            try:
+                extra_headers = json.loads(headers_text) if headers_text.strip() else {}
+                if not isinstance(extra_headers, dict):
+                    st.error('额外请求头必须是 JSON 对象（键值对）。')
+                    extra_headers = {}
+            except json.JSONDecodeError:
+                st.error('额外请求头不是合法 JSON，保存时将被忽略。')
+                extra_headers = {}
+
         # Normalized request preview
         norm_endpoint = normalize_endpoint_path(endpoint)
         final_url = build_request_url(base_url, norm_endpoint)
@@ -4328,6 +4373,9 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
             'json_mode': json_mode,
             'allow_json_mode_downgrade': bool(allow_downgrade),
             'response_parse_mode': resp_parse_mode,
+            'auth_mode': auth_mode,
+            'response_json_path': response_json_path.strip() or None,
+            'headers': extra_headers,
         }
         if final_key:
             payload['api_key'] = final_key
@@ -14716,6 +14764,20 @@ def page_model_training():
                             training_feature_contract_context,
                             res,
                         )
+                        # 同步 feature_audit 到 contract_context，保证训练记录与
+                        # 导出 artifact 的 extra 携带 feature_audit（发布门禁降级依据）。
+                        try:
+                            from core.training_contract import attach_feature_audit
+                            _audit_context = attach_feature_audit(training_feature_contract_context, res)
+                            st.session_state["training_feature_contract_context"] = _audit_context
+                            if not _audit_context.get("feature_audit", {}).get("publishable", True):
+                                st.warning(
+                                    "⚠️ 训练剔除了部分契约特征（"
+                                    + "、".join(_audit_context["feature_audit"].get("removed_feature_cols", [])[:8])
+                                    + "）。该模型只能进入 needs_validation 状态，不能直接发布。"
+                                )
+                        except Exception as _audit_exc:
+                            st.info(f"feature_audit 同步失败（不影响训练）：{_audit_exc}")
 
                     # [关键修复] 立即清理XGBoost临时文件并加载数据
                     if '_xgb_temp_model_path' in res and res['_xgb_temp_model_path']:
@@ -24261,6 +24323,15 @@ def page_hyperparameter_optimization():
                     training_feature_contract_context,
                     train_result,
                 )
+                # 超参优化后重训：同样同步 feature_audit 到 contract_context。
+                try:
+                    from core.training_contract import attach_feature_audit as _attach_audit
+                    _audit_ctx = _attach_audit(training_feature_contract_context, train_result)
+                    st.session_state["training_feature_contract_context"] = _audit_ctx
+                    if not _audit_ctx.get("feature_audit", {}).get("publishable", True):
+                        st.warning("⚠️ 重训剔除了部分契约特征，该模型只能进入 needs_validation，不能直接发布。")
+                except Exception:
+                    pass
 
             model_obj = train_result["model"]
             is_xgboost = train_model_name == "XGBoost" or str(type(model_obj).__name__).lower().startswith("xgb")

@@ -8,7 +8,7 @@ import os
 import re
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,9 @@ SUPPORTED_NETWORK_MODES = {"auto", "direct", "proxy"}
 DEFAULT_NETWORK_MODE = "auto"
 SUPPORTED_RESPONSE_PARSE_MODES = {"strict", "compatible"}
 DEFAULT_RESPONSE_PARSE_MODE = "compatible"
+SUPPORTED_AUTH_MODES = {"bearer", "api_key_header", "none"}
+DEFAULT_AUTH_MODE = "bearer"
+REQUEST_JSON_PATH_PATTERN = re.compile(r"[A-Za-z0-9_.\[\]]*")
 MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 300
 MIN_MAX_TOKENS = 1
@@ -68,6 +71,10 @@ class AIServiceConfig:
     response_parse_mode: str = DEFAULT_RESPONSE_PARSE_MODE
     allow_json_mode_downgrade: bool = True
     max_retries: int = 2
+    auth_mode: str = DEFAULT_AUTH_MODE
+    headers: dict = field(default_factory=dict)
+    request_template: dict | None = None
+    response_json_path: str | None = None
 
 
 def normalize_endpoint_path(endpoint: str) -> str:
@@ -393,6 +400,30 @@ def _service_mapping(value: object, *, index: int) -> dict[str, Any]:
         max_retries = 2
     else:
         max_retries = max(MIN_RETRY_ATTEMPTS, min(MAX_RETRY_ATTEMPTS, max_retries_raw))
+    auth_mode = str(service.get("auth_mode") or DEFAULT_AUTH_MODE).strip().lower()
+    if auth_mode not in SUPPORTED_AUTH_MODES:
+        auth_mode = DEFAULT_AUTH_MODE
+    extra_headers_raw = service.get("headers")
+    if isinstance(extra_headers_raw, Mapping):
+        extra_headers = {
+            str(key): str(item)
+            for key, item in extra_headers_raw.items()
+            if isinstance(key, str) and key.strip()
+        }
+    else:
+        extra_headers = {}
+    request_template_raw = service.get("request_template")
+    if isinstance(request_template_raw, Mapping):
+        request_template: dict[str, Any] | None = _as_mapping(
+            request_template_raw, label=f"services[{index}].request_template"
+        )
+    else:
+        request_template = None
+    response_json_path_raw = service.get("response_json_path")
+    if isinstance(response_json_path_raw, str) and response_json_path_raw.strip() and REQUEST_JSON_PATH_PATTERN.fullmatch(response_json_path_raw.strip()):
+        response_json_path: str | None = response_json_path_raw.strip()
+    else:
+        response_json_path = None
 
     normalized = dict(service)
     # Backwards-compatible persistence: only persist optional advanced fields when
@@ -423,6 +454,14 @@ def _service_mapping(value: object, *, index: int) -> dict[str, Any]:
         normalized["allow_json_mode_downgrade"] = allow_json_mode_downgrade
     if "max_retries" in service:
         normalized["max_retries"] = max_retries
+    if "auth_mode" in service:
+        normalized["auth_mode"] = auth_mode
+    if "headers" in service:
+        normalized["headers"] = extra_headers
+    if "request_template" in service:
+        normalized["request_template"] = request_template
+    if "response_json_path" in service:
+        normalized["response_json_path"] = response_json_path
     return normalized
 
 
@@ -446,6 +485,59 @@ def validate_ai_config(config: object) -> dict[str, Any]:
         normalized_services.append(normalized_service)
     normalized["services"] = normalized_services
     return normalized
+
+
+def _auth_headers(auth_mode: str, api_key: str | None) -> dict[str, str]:
+    if auth_mode == "bearer" and api_key:
+        return {"Authorization": f"Bearer {api_key}"}
+    if auth_mode == "api_key_header" and api_key:
+        return {"X-API-Key": api_key}
+    return {}
+
+
+def get_request_spec(config: object) -> dict[str, Any]:
+    """Resolve provider-specific request spec: {url, headers, body_kind, endpoint}.
+
+    provider 含 'gemini' → generateContent 协议；provider == 'custom' 且配置了
+    request_template → 模板协议；其余走 OpenAI-compatible /chat/completions。
+    headers = 认证头 + 配置中的额外头（额外头不覆盖认证头以外的默认）。
+    """
+    provider = str(getattr(config, "provider", "") or "").strip().lower()
+    model = str(getattr(config, "model", "") or "").strip()
+    base_url = str(getattr(config, "base_url", "") or "").strip()
+    api_key = getattr(config, "api_key", None)
+    auth_mode = str(getattr(config, "auth_mode", DEFAULT_AUTH_MODE) or DEFAULT_AUTH_MODE).strip().lower()
+    if auth_mode not in SUPPORTED_AUTH_MODES:
+        auth_mode = DEFAULT_AUTH_MODE
+
+    if "gemini" in provider:
+        endpoint = (
+            f"/models/{model}:generateContent"
+            if "/v1beta" in base_url
+            else f"/v1beta/models/{model}:generateContent"
+        )
+        body_kind = "gemini"
+    elif provider == "custom" and getattr(config, "request_template", None):
+        endpoint = normalize_endpoint_path(str(getattr(config, "endpoint", "") or DEFAULT_ENDPOINT))
+        body_kind = "template"
+    else:
+        endpoint = normalize_endpoint_path(str(getattr(config, "endpoint", "") or DEFAULT_ENDPOINT))
+        body_kind = "openai"
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    headers.update(_auth_headers(auth_mode, api_key if isinstance(api_key, str) else None))
+    extra_headers = getattr(config, "headers", None)
+    if isinstance(extra_headers, Mapping):
+        for key, value in extra_headers.items():
+            if isinstance(key, str) and key.strip() and key not in headers:
+                headers[key] = str(value)
+
+    return {
+        "url": build_request_url(base_url, endpoint),
+        "headers": headers,
+        "body_kind": body_kind,
+        "endpoint": endpoint,
+    }
 
 
 def _sanitize_url_for_output(value: str, *, secret_values: set[str]) -> str:
@@ -614,6 +706,7 @@ __all__ = [
     "validate_ai_config",
     "normalize_endpoint_path",
     "build_request_url",
+    "get_request_spec",
     "key_fingerprint",
     "get_feature_review_ai_client",
 ]
