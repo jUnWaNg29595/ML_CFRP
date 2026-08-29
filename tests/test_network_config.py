@@ -16,6 +16,18 @@ def test_save_and_disable_proxy(monkeypatch, tmp_path):
     assert json.loads(config_path.read_text(encoding='utf-8'))['proxy_type'] == 'HTTP'
 
 
+def test_default_proxy_settings(monkeypatch, tmp_path):
+    monkeypatch.setattr(network_config, 'NETWORK_CONFIG_PATH', tmp_path / 'network_config.json')
+    monkeypatch.delenv('CFRP_PROXY_ENABLED', raising=False)
+    monkeypatch.delenv('CFRP_PROXY_URL', raising=False)
+
+    settings = network_config.get_network_settings()
+
+    assert settings['enabled'] is True
+    assert settings['proxy_type'] == 'SOCKS5'
+    assert settings['proxy_url'] == 'socks5://127.0.0.1:10808'
+
+
 def test_proxy_url_normalization_and_runtime_dns(monkeypatch, tmp_path):
     monkeypatch.setattr(network_config, 'NETWORK_CONFIG_PATH', tmp_path / 'network_config.json')
     monkeypatch.delenv('CFRP_PROXY_ENABLED', raising=False)
@@ -100,6 +112,65 @@ def test_http_probe_classifies_external_access_denied(monkeypatch):
     assert report['status'] == 'access_denied'
     assert '外部' in report['message']
 
+def test_http_probe_sends_basic_proxy_auth(monkeypatch):
+    captured = {}
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def sendall(self, payload):
+            captured['payload'] = payload
+
+        def recv(self, _size):
+            return b'HTTP/1.1 200 Connection Established\\r\\n\\r\\n'
+
+    monkeypatch.setattr(
+        network_config.socket,
+        'create_connection',
+        lambda *_args, **_kwargs: FakeSocket(),
+    )
+
+    report = network_config._probe_http_proxy_endpoint(
+        'http://user:pass@127.0.0.1:8080',
+        timeout=1,
+    )
+
+    assert report['status'] == 'ok'
+    assert b'Proxy-Authorization: Basic dXNlcjpwYXNz' in captured['payload']
+
+
+def test_http_probe_prefers_auth_status_over_access_denied_body(monkeypatch):
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def sendall(self, _payload):
+            return None
+
+        def recv(self, _size):
+            return b'HTTP/1.1 407 Proxy Authentication Required\\r\\n\\r\\nAuth Result: Unauthorized'
+
+    monkeypatch.setattr(
+        network_config.socket,
+        'create_connection',
+        lambda *_args, **_kwargs: FakeSocket(),
+    )
+
+    report = network_config._probe_http_proxy_endpoint(
+        'http://127.0.0.1:8080',
+        timeout=1,
+    )
+
+    assert report['status'] == 'auth_required'
+
+
 def test_http_connection_test_stops_before_online_requests(monkeypatch):
     monkeypatch.setattr(
         network_config,
@@ -119,5 +190,78 @@ def test_http_connection_test_stops_before_online_requests(monkeypatch):
     )
 
     assert report['status'] == 'access_denied'
+    assert 'pubchem' not in report
+    assert 'huggingface' not in report
+
+
+def test_socks5_probe_failure_stops_before_online_requests(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    fake_requests = SimpleNamespace(
+        get=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError('协议探测失败后不应访问在线服务')
+        )
+    )
+    monkeypatch.setitem(sys.modules, 'requests', fake_requests)
+
+    monkeypatch.setattr(
+        network_config,
+        '_probe_socks5_endpoint',
+        lambda *_args, **_kwargs: {
+            'status': 'failed',
+            'message': 'SOCKS5 握手失败：连接被本机软件中止。',
+        },
+    )
+    monkeypatch.setattr(
+        network_config,
+        '_probe_http_proxy_endpoint',
+        lambda *_args, **_kwargs: {
+            'status': 'failed',
+            'message': 'HTTP 代理也未返回有效响应。',
+        },
+    )
+    report = network_config.test_network_connections(
+        settings={
+            'enabled': True,
+            'proxy_type': 'SOCKS5',
+            'proxy_url': '127.0.0.1:10808',
+        }
+    )
+
+    assert report['status'] == 'failed'
+    assert 'pubchem' not in report
+    assert 'huggingface' not in report
+
+
+def test_socks5_probe_connection_abort_falls_back_to_http_diagnosis(monkeypatch):
+    monkeypatch.setattr(
+        network_config,
+        '_probe_socks5_endpoint',
+        lambda *_args, **_kwargs: {
+            'status': 'failed',
+            'message': 'SOCKS5 握手失败：WinError 10053。',
+        },
+    )
+    monkeypatch.setattr(
+        network_config,
+        '_probe_http_proxy_endpoint',
+        lambda *_args, **_kwargs: {
+            'status': 'access_denied',
+            'message': 'HTTP 代理端口可连接，但代理服务器拒绝外部用户或要求认证。',
+        },
+    )
+
+    report = network_config.test_network_connections(
+        settings={
+            'enabled': True,
+            'proxy_type': 'SOCKS5',
+            'proxy_url': '127.0.0.1:10808',
+        }
+    )
+
+    assert report['status'] == 'protocol_mismatch'
+    assert report['protocol']['detected_type'] == 'HTTP'
+    assert report['protocol']['http_probe']['status'] == 'access_denied'
     assert 'pubchem' not in report
     assert 'huggingface' not in report

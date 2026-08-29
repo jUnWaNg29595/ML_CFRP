@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">邹华维课题组材料预测平台</title>
+  <desc id="desc">碳纤维网格与预测节点图标</desc>
+  <rect width="128" height="128" rx="24" fill="#17324D"/>
+  <path d="M28 30 98 98M100 28 30 100M22 48h84M22 80h84M48 22v84M80 22v84" fill="none" stroke="#8FC5CF" stroke-width="6" stroke-linecap="round" opacity=".9"/>
+  <path d="M64 24v80M24 64h80" fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" opacity=".72"/>
+  <circle cx="64" cy="64" r="16" fill="#0F7490" stroke="#FFFFFF" stroke-width="5"/>
+  <circle cx="96" cy="32" r="7" fill="#F2B544" stroke="#FFFFFF" stroke-width="3"/>
+  <circle cx="32" cy="96" r="7" fill="#F2B544" stroke="#FFFFFF" stroke-width="3"/>
+</svg>

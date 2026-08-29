@@ -1148,8 +1148,13 @@ from core.prediction_portal import (
 from core.portal_ai import PortalAIClient, PortalAIError
 from core.portal_ai_config import (
     AIServiceConfig,
+    build_request_url,
+    default_ai_config,
     exportable_ai_config,
+    get_feature_review_ai_client,
+    key_fingerprint,
     load_ai_config,
+    normalize_endpoint_path,
     redacted_ai_config,
     save_ai_config,
     validate_ai_config,
@@ -4089,7 +4094,7 @@ def _render_network_proxy_panel(active_task_lock: bool = False):
 
 
 def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
-    """Render safe AI service administration without exposing credentials."""
+    """Render safe, interactive AI service administration without exposing credentials."""
     with st.expander('AI 服务管理', expanded=False):
         config_root = Path(__file__).resolve().parent
         try:
@@ -4098,64 +4103,287 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
             st.error(f'AI 配置读取失败：{exc}')
             ai_config = {'services': []}
         services = list(ai_config.get('services') or [])
-        service_options = [item.get('service_id') for item in services if item.get('service_id')]
-        service_options = service_options or ['deepseek']
-        selected_id = st.selectbox('服务', service_options, key='portal_ai_service_selector', disabled=active_task_lock)
-        current = next((item for item in services if item.get('service_id') == selected_id), {})
+
+        # ============================================================
+        # A. 服务列表与当前特征审核服务选择
+        # ============================================================
+        st.markdown('##### 📋 服务列表')
+        service_ids = [item.get('service_id') for item in services if item.get('service_id')]
+
+        # Current feature-review designated service
+        preferred_review_id = st.session_state.get('preferred_feature_review_service_id')
+        if not preferred_review_id or preferred_review_id not in service_ids:
+            if service_ids:
+                preferred_review_id = service_ids[0]
+                st.session_state['preferred_feature_review_service_id'] = preferred_review_id
+            else:
+                preferred_review_id = None
+
+        if services:
+            overview_rows = []
+            for s in services:
+                sid = s.get('service_id', '')
+                fp = key_fingerprint(s.get('api_key'))
+                status_icon = '🟢 启用' if s.get('enabled') else '⚪ 停用'
+                is_current_reviewer = ' ⭐ (当前审核默认)' if sid == preferred_review_id else ''
+                overview_rows.append({
+                    '服务 ID': sid + is_current_reviewer,
+                    '显示名称': s.get('label', ''),
+                    '提供方': s.get('provider', ''),
+                    '模型': s.get('model', ''),
+                    '状态': status_icon,
+                    'API Key': fp or '❌ 未设置',
+                })
+            st.dataframe(overview_rows, hide_index=True, width='stretch')
+
+            # Select service to edit
+            selected_edit_id = st.selectbox(
+                '选择要编辑的服务',
+                service_ids,
+                key='portal_ai_edit_service_selector',
+                disabled=active_task_lock,
+            )
+            # Designation of feature-review active service
+            chosen_reviewer = st.selectbox(
+                '⭐ 设定当前特征审核默认服务',
+                service_ids,
+                index=service_ids.index(preferred_review_id) if preferred_review_id in service_ids else 0,
+                key='portal_ai_designated_feature_review_service',
+                disabled=active_task_lock,
+                help='特征管理页面的【分析当前数据列】与 AI 特征审核将直接使用该服务。',
+            )
+            if chosen_reviewer != st.session_state.get('preferred_feature_review_service_id'):
+                st.session_state['preferred_feature_review_service_id'] = chosen_reviewer
+                st.session_state.pop('portal_ai_client', None)
+        else:
+            st.info('尚未配置任何 AI 服务。请在下方点击【新建服务】添加。')
+            selected_edit_id = None
+
+        # Operation buttons: New / Clone / Delete
+        btn_c1, btn_c2, btn_c3 = st.columns(3)
+        with btn_c1:
+            if st.button('➕ 新建服务', key='portal_ai_btn_new_svc', disabled=active_task_lock, width='stretch'):
+                new_id = f"service_{len(services) + 1}"
+                new_svc = {
+                    'service_id': new_id, 'label': f'新建服务 {len(services) + 1}',
+                    'provider': 'openai-compatible', 'base_url': 'https://api.openai.com/v1',
+                    'endpoint': '/chat/completions', 'model': 'gpt-4o-mini',
+                    'purpose': 'both', 'timeout_seconds': 30, 'max_tokens': 2048,
+                    'temperature': 0.2, 'enabled': True, 'api_key': '',
+                }
+                services.append(new_svc)
+                save_ai_config(config_root, {'services': services})
+                st.session_state['portal_ai_edit_service_selector'] = new_id
+                st.rerun()
+        with btn_c2:
+            if selected_edit_id and st.button('📋 复制所选服务', key='portal_ai_btn_clone_svc', disabled=active_task_lock, width='stretch'):
+                source_svc = next((s for s in services if s.get('service_id') == selected_edit_id), None)
+                if source_svc:
+                    cloned_id = f"{selected_edit_id}_copy"
+                    cloned_svc = dict(source_svc)
+                    cloned_svc['service_id'] = cloned_id
+                    cloned_svc['label'] = f"{source_svc.get('label', selected_edit_id)} (副本)"
+                    services.append(cloned_svc)
+                    save_ai_config(config_root, {'services': services})
+                    st.session_state['portal_ai_edit_service_selector'] = cloned_id
+                    st.rerun()
+        with btn_c3:
+            if selected_edit_id:
+                delete_confirm = st.checkbox('确认删除所选服务', key=f'portal_ai_del_confirm_{selected_edit_id}', disabled=active_task_lock)
+                if st.button('🗑️ 删除服务', key='portal_ai_btn_del_svc', disabled=not delete_confirm or active_task_lock, width='stretch'):
+                    services = [s for s in services if s.get('service_id') != selected_edit_id]
+                    save_ai_config(config_root, {'services': services})
+                    st.session_state.pop('portal_ai_client', None)
+                    st.success(f'已删除服务 [{selected_edit_id}]')
+                    st.rerun()
+
+        # Target item to edit (keyed specifically by selected_edit_id to prevent state bleeding)
+        current = next((s for s in services if s.get('service_id') == selected_edit_id), {}) if selected_edit_id else {}
         if not current:
             current = {
-                'service_id': selected_id, 'label': 'DeepSeek', 'provider': 'openai-compatible',
-                'base_url': 'https://api.deepseek.com/v1', 'model': 'deepseek-chat',
-                'purpose': 'both', 'timeout_seconds': 30, 'max_tokens': 2048,
-                'temperature': 0.2, 'enabled': False,
+                'service_id': 'deepseek', 'label': 'DeepSeek', 'provider': 'openai-compatible',
+                'base_url': 'https://api.deepseek.com/v1', 'endpoint': '/chat/completions',
+                'model': 'deepseek-chat', 'purpose': 'both', 'timeout_seconds': 30,
+                'max_tokens': 2048, 'temperature': 0.2, 'enabled': False,
             }
+
+        svc_key_prefix = f"svc_{selected_edit_id or 'new'}_"
+
+        # ============================================================
+        # B. 基础配置
+        # ============================================================
+        st.markdown('---')
+        st.markdown(f'##### ⚙️ 基础配置（当前编辑：`{current.get("service_id", "新建")}`）')
         col1, col2 = st.columns(2)
         with col1:
-            service_id = st.text_input('服务 ID', value=str(current.get('service_id') or selected_id), key='portal_ai_service_id', disabled=active_task_lock)
-            label = st.text_input('显示名称', value=str(current.get('label') or service_id), key='portal_ai_label', disabled=active_task_lock)
-            provider = st.text_input('提供方', value=str(current.get('provider') or 'openai-compatible'), key='portal_ai_provider', disabled=active_task_lock)
-            base_url = st.text_input('兼容 API 地址', value=str(current.get('base_url') or ''), key='portal_ai_base_url', disabled=active_task_lock)
-            model = st.text_input('模型名称', value=str(current.get('model') or ''), key='portal_ai_model', disabled=active_task_lock)
+            service_id = st.text_input('服务 ID (唯一标识)', value=str(current.get('service_id') or ''), key=f'{svc_key_prefix}id', disabled=active_task_lock)
+            label = st.text_input('显示名称', value=str(current.get('label') or service_id), key=f'{svc_key_prefix}label', disabled=active_task_lock)
+            provider = st.text_input('提供方', value=str(current.get('provider') or 'openai-compatible'), key=f'{svc_key_prefix}provider', disabled=active_task_lock)
+            base_url = st.text_input('兼容 API Base URL', value=str(current.get('base_url') or ''), key=f'{svc_key_prefix}base_url', disabled=active_task_lock, help='如 https://api.openai.com/v1')
+            endpoint = st.text_input('Endpoint 路径', value=str(current.get('endpoint') or '/chat/completions'), key=f'{svc_key_prefix}endpoint', disabled=active_task_lock, help='默认 /chat/completions')
+            model = st.text_input('模型名称', value=str(current.get('model') or ''), key=f'{svc_key_prefix}model', disabled=active_task_lock)
         with col2:
-            purpose = st.selectbox('用途', ['both', 'input_parsing', 'result_explanation'], index=['both', 'input_parsing', 'result_explanation'].index(current.get('purpose', 'both')) if current.get('purpose', 'both') in {'both', 'input_parsing', 'result_explanation'} else 0, format_func=lambda value: {'both': '输入助手 + 结果解释', 'input_parsing': '仅输入助手', 'result_explanation': '仅结果解释'}[value], key='portal_ai_purpose', disabled=active_task_lock)
-            timeout_seconds = st.number_input('超时（秒）', min_value=1, max_value=300, value=int(current.get('timeout_seconds', 30)), key='portal_ai_timeout', disabled=active_task_lock)
-            max_tokens = st.number_input('最大输出 token', min_value=1, max_value=200000, value=int(current.get('max_tokens', 2048)), key='portal_ai_max_tokens', disabled=active_task_lock)
-            temperature = st.number_input('Temperature', min_value=0.0, max_value=2.0, value=float(current.get('temperature', 0.2)), step=0.05, key='portal_ai_temperature', disabled=active_task_lock)
-            enabled = st.checkbox('启用该服务', value=bool(current.get('enabled', False)), key='portal_ai_enabled', disabled=active_task_lock)
-        key_hint = '••••••••（已保存；留空表示保持不变）' if current.get('api_key') else '尚未设置 API Key'
-        st.caption(key_hint)
-        api_key = st.text_input('API Key', value='', type='password', key='portal_ai_api_key', disabled=active_task_lock, help='不会在页面、日志或脱敏导出中显示。')
+            purpose_options = ['both', 'input_parsing', 'result_explanation']
+            cur_purpose = current.get('purpose', 'both')
+            purpose_idx = purpose_options.index(cur_purpose) if cur_purpose in purpose_options else 0
+            purpose = st.selectbox(
+                '用途',
+                purpose_options,
+                index=purpose_idx,
+                format_func=lambda v: {'both': '全部 (特征审核 + 输入助手 + 结果解释)', 'input_parsing': '仅特征审核与输入助手', 'result_explanation': '仅结果解释'}[v],
+                key=f'{svc_key_prefix}purpose',
+                disabled=active_task_lock,
+            )
+            timeout_seconds = st.number_input('超时（秒）', min_value=1, max_value=300, value=int(current.get('timeout_seconds', 30)), key=f'{svc_key_prefix}timeout', disabled=active_task_lock)
+            max_tokens = st.number_input('最大输出 token', min_value=1, max_value=200000, value=int(current.get('max_tokens', 2048)), key=f'{svc_key_prefix}max_tokens', disabled=active_task_lock)
+            temperature = st.number_input('Temperature', min_value=0.0, max_value=2.0, value=float(current.get('temperature', 0.2)), step=0.05, key=f'{svc_key_prefix}temp', disabled=active_task_lock)
+            max_retries = st.number_input('重试次数 (Transient 错误)', min_value=0, max_value=5, value=int(current.get('max_retries', 2)), key=f'{svc_key_prefix}retries', disabled=active_task_lock)
+            enabled = st.checkbox('启用该服务', value=bool(current.get('enabled', False)), key=f'{svc_key_prefix}enabled', disabled=active_task_lock)
+
+        # ============================================================
+        # C. API Key 安全编辑
+        # ============================================================
+        st.markdown('##### 🔑 API Key 管理')
+        has_key = bool(current.get('api_key'))
+        key_fp = key_fingerprint(current.get('api_key'))
+        if has_key:
+            st.info(f"状态：**已配置 API Key**（指纹：`{key_fp}`）· 系统全程脱敏存储与调用。")
+        else:
+            st.warning("状态：**尚未配置 API Key**，请在下方录入。")
+
+        key_col1, key_col2 = st.columns([3, 1])
+        with key_col1:
+            new_api_key = st.text_input(
+                '替换 / 设置 API Key',
+                value='',
+                type='password',
+                key=f'{svc_key_prefix}new_key',
+                disabled=active_task_lock,
+                help='留空表示保持当前已配置的 Key 不变；输入新内容则会进行覆盖保存。',
+                placeholder='输入新的 API Key（例如 sk-xxxx）',
+            )
+        with key_col2:
+            st.write('')
+            st.write('')
+            clear_confirm = st.checkbox('确认清除 Key', key=f'{svc_key_prefix}clear_confirm', disabled=not has_key or active_task_lock)
+            clear_key_clicked = st.button('清除 Key', key=f'{svc_key_prefix}clear_btn', disabled=not clear_confirm or active_task_lock)
+
+        # ============================================================
+        # D. 请求与响应配置
+        # ============================================================
+        st.markdown('##### 🌐 请求与响应协议配置')
+        req_c1, req_c2 = st.columns(2)
+        with req_c1:
+            json_modes = ['auto', 'strict', 'off']
+            cur_json_mode = str(current.get('json_mode', 'auto')).lower()
+            jm_idx = json_modes.index(cur_json_mode) if cur_json_mode in json_modes else 0
+            json_mode = st.selectbox(
+                'JSON 输出模式 (response_format)',
+                json_modes,
+                index=jm_idx,
+                format_func=lambda v: {'auto': '自动 (优先 json_object，不支持自动降级)', 'strict': '强制开启 (强制 json_object)', 'off': '关闭 (仅依赖 Prompt 约束)'}[v],
+                key=f'{svc_key_prefix}json_mode',
+                disabled=active_task_lock,
+            )
+            allow_downgrade = st.checkbox('允许不支持 JSON mode 时自动降级', value=bool(current.get('allow_json_mode_downgrade', True)), key=f'{svc_key_prefix}allow_downgrade', disabled=active_task_lock)
+        with req_c2:
+            resp_parse_modes = ['compatible', 'strict']
+            cur_rpm = str(current.get('response_parse_mode', 'compatible')).lower()
+            rpm_idx = resp_parse_modes.index(cur_rpm) if cur_rpm in resp_parse_modes else 0
+            resp_parse_mode = st.selectbox(
+                '响应解析模式',
+                resp_parse_modes,
+                index=rpm_idx,
+                format_func=lambda v: {'compatible': '兼容模式 (支持 Markdown 代码块与 <think> 过滤)', 'strict': '严格模式 (仅接受纯 JSON 字符串)'}[v],
+                key=f'{svc_key_prefix}parse_mode',
+                disabled=active_task_lock,
+            )
+            st.caption('🛡️ **安全策略**：AI 全程直连不经过代理；System Prompt 与安全门禁由系统锁定保证契约安全。')
+
+        # Normalized request preview
+        norm_endpoint = normalize_endpoint_path(endpoint)
+        final_url = build_request_url(base_url, norm_endpoint)
+        st.caption(f"**最终请求 URL 预览**：`{final_url}`")
+
+        # Payload construction for save and testing
+        final_key = current.get('api_key') or ''
+        if new_api_key.strip():
+            final_key = new_api_key.strip()
+        elif clear_key_clicked:
+            final_key = ''
+
         payload = {
-            'service_id': service_id.strip(), 'label': label.strip(), 'provider': provider.strip(),
-            'base_url': base_url.strip(), 'model': model.strip(), 'purpose': purpose,
-            'timeout_seconds': int(timeout_seconds), 'max_tokens': int(max_tokens),
-            'temperature': float(temperature), 'enabled': bool(enabled),
+            'service_id': service_id.strip(),
+            'label': label.strip(),
+            'provider': provider.strip(),
+            'base_url': base_url.strip(),
+            'endpoint': norm_endpoint,
+            'model': model.strip(),
+            'purpose': purpose,
+            'timeout_seconds': int(timeout_seconds),
+            'max_tokens': int(max_tokens),
+            'temperature': float(temperature),
+            'max_retries': int(max_retries),
+            'enabled': bool(enabled),
+            'json_mode': json_mode,
+            'allow_json_mode_downgrade': bool(allow_downgrade),
+            'response_parse_mode': resp_parse_mode,
         }
-        if api_key.strip():
-            payload['api_key'] = api_key.strip()
-        elif current.get('api_key'):
-            payload['api_key'] = current['api_key']
-        save_col, test_col = st.columns(2)
-        with save_col:
-            if st.button('保存 AI 配置', key='portal_ai_save', width='stretch', disabled=active_task_lock):
+        if final_key:
+            payload['api_key'] = final_key
+
+        # ============================================================
+        # E. 保存与两步连接测试
+        # ============================================================
+        st.markdown('---')
+        act_col1, act_col2, act_col3 = st.columns([2, 2, 2])
+        with act_col1:
+            if st.button('💾 保存服务配置', key=f'{svc_key_prefix}save_btn', type='primary', width='stretch', disabled=active_task_lock):
                 try:
                     new_services = [item for item in services if item.get('service_id') != service_id.strip()]
                     new_services.append(payload)
                     normalized = save_ai_config(config_root, {'services': new_services})
-                    st.success(f'已安全保存 {len(normalized.get("services", []))} 个 AI 服务。')
+                    st.session_state.pop('portal_ai_client', None)
+                    st.success(f'已安全保存服务 [{service_id.strip()}]！')
+                    st.rerun()
                 except Exception as exc:
                     st.error(f'AI 配置校验或保存失败：{exc}')
-        with test_col:
-            if st.button('测试连接', key='portal_ai_test', width='stretch', disabled=active_task_lock):
+
+        with act_col2:
+            if st.button('🔍 1. 测试认证与模型列表', key=f'{svc_key_prefix}test_models_btn', width='stretch', disabled=active_task_lock or not payload.get('api_key')):
+                from core.portal_ai import test_models_endpoint
                 try:
-                    normalized = validate_ai_config({'services': [payload]})['services'][0]
-                    client = PortalAIClient(AIServiceConfig(**normalized))
-                    client.parse_input({'material_type': 'epoxy_resin', 'target': 'tg', 'text': '连接测试；不要生成预测值。'})
-                    st.success('AI 服务连接和 JSON 契约测试通过。')
-                except PortalAIError as exc:
-                    st.error(f'AI 服务测试失败：{exc}')
+                    norm_entry = validate_ai_config({'services': [payload]})['services'][0]
+                    test_cfg = AIServiceConfig(**norm_entry)
+                    res = test_models_endpoint(test_cfg)
+                    if res.get('ok'):
+                        st.success(f"✅ {res.get('message')} {res.get('diagnosis')}")
+                    else:
+                        st.warning(f"⚠️ [{res.get('stage')}] {res.get('message')}")
+                        if res.get('diagnosis'):
+                            st.info(f"💡 诊断建议：{res.get('diagnosis')}")
                 except Exception as exc:
-                    st.error(f'AI 服务配置不可用：{exc}')
+                    st.error(f"模型列表测试失败：{exc}")
+
+        with act_col3:
+            if st.button('⚡ 2. 测试 JSON 聊天接口', key=f'{svc_key_prefix}test_chat_btn', width='stretch', disabled=active_task_lock or not payload.get('api_key')):
+                try:
+                    norm_entry = validate_ai_config({'services': [payload]})['services'][0]
+                    client = PortalAIClient(AIServiceConfig(**norm_entry))
+                    result = client.health_check()
+                    if result.ok:
+                        st.success(f"✅ {result.message}（{result.diagnosis}）")
+                    else:
+                        st.error(f"❌ [{result.stage}] {result.message}")
+                        if result.diagnosis:
+                            st.info(f"💡 诊断建议：{result.diagnosis}")
+                except PortalAIError as exc:
+                    st.error(f'AI 接口诊断：{exc}')
+                except Exception as exc:
+                    st.error(f'AI 服务连接异常：{exc}')
+
+        # Config export
+        st.markdown('---')
         st.markdown('**当前脱敏配置**')
         st.json(redacted_ai_config(ai_config), expanded=False)
         st.download_button(
@@ -4166,7 +4394,7 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
             key='portal_ai_export',
             disabled=active_task_lock,
         )
-        st.caption('AI 只辅助输入和解释；不会生成分子特征、修改模型输入或替代 Python 预测。')
+        st.caption('AI 只辅助输入和特征审核建议；不会自动批准、生成虚假测量值或替代 Python 预测。')
 
 def render_sidebar():
     """渲染侧边栏导航"""
@@ -7738,7 +7966,8 @@ def page_data_enhancement():
 def page_feature_registry():
     """Render the feature-only AI review and local approval workflow."""
     registry = {}
-    registry_path = Path(__file__).resolve().parent / "prediction_portal" / "feature_registry.json"
+    app_root = Path(__file__).resolve().parent
+    registry_path = app_root / "prediction_portal" / "feature_registry.json"
     try:
         if registry_path.is_file():
             registry = json.loads(registry_path.read_text(encoding="utf-8"))
@@ -7749,7 +7978,18 @@ def page_feature_registry():
         frame = st.session_state.get("data")
     profile_id = st.session_state.get("model_profile_id") or st.session_state.get("training_model_profile_id")
     manifest = st.session_state.get("feature_mapping_manifest") or {"status": "draft", "feature_bindings": []}
-    render_feature_registry_page(frame=frame, registry=registry, profile_id=profile_id, manifest=manifest)
+
+    preferred_service_id = st.session_state.get("preferred_feature_review_service_id")
+    ai_client, _ = get_feature_review_ai_client(app_root, preferred_service_id=preferred_service_id)
+    render_feature_registry_page(
+        frame=frame,
+        registry=registry,
+        profile_id=profile_id,
+        manifest=manifest,
+        ai_client=ai_client,
+        registry_path=registry_path,
+        preferred_service_id=preferred_service_id,
+    )
 
 
 def page_molecular_features():
@@ -13095,31 +13335,66 @@ def _lock_current_training_contract(frame, feature_cols, target_col, workflow=No
         assert_training_context(existing, [] if frame_columns is None else list(frame_columns))
         return existing
 
+    app_root = Path(__file__).resolve().parent
     registry_path = (
         st.session_state.get("training_feature_registry_path")
         or st.session_state.get("feature_registry_path")
-        or (Path(__file__).resolve().parent / "prediction_portal" / "feature_registry.json")
+        or (app_root / "prediction_portal" / "feature_registry.json")
     )
+    # 读取顺序：training_dataset_manifest → dataset_manifest →
+    # feature_dataset_manifest → feature_mapping_manifest → 持久化文件
     manifest = (
         st.session_state.get("training_dataset_manifest")
         or st.session_state.get("dataset_manifest")
         or st.session_state.get("feature_dataset_manifest")
+        or st.session_state.get("feature_mapping_manifest")
     )
     if isinstance(manifest, (str, Path)):
         manifest = json.loads(Path(manifest).read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
-        raise ValueError("未提供 approved dataset manifest，训练前无法锁定 feature contract")
+        # 最后回退：尝试读取当前 profile 对应的持久化 manifest 文件
+        profile_id_hint = (
+            st.session_state.get("model_profile_id")
+            or st.session_state.get("training_model_profile_id")
+        )
+        if profile_id_hint:
+            persisted_path = app_root / "prediction_portal" / "manifests" / f"manifest_{profile_id_hint}.json"
+            if persisted_path.is_file():
+                try:
+                    manifest = json.loads(persisted_path.read_text(encoding="utf-8"))
+                except Exception:
+                    manifest = None
+    if not isinstance(manifest, dict):
+        from core.training_contract import diagnose_training_blockers
+        blockers = diagnose_training_blockers(registry_path, None)
+        detail = "；".join(blockers) if blockers else "请先在【特征管理】页面完成特征映射审核"
+        raise ValueError(f"未提供 approved dataset manifest，训练前无法锁定 feature contract（{detail}）")
 
-    context = lock_training_contract(
-        registry_path,
-        manifest,
-        material_type=str(manifest.get("material_type") or "unknown"),
-        target=str(manifest.get("target") or target_col),
-        target_col=str(target_col),
-        feature_cols=columns,
-        frame=frame,
-        workflow=workflow,
-    )
+    # draft manifest 不能当作 approved manifest 使用：先诊断并给出具体阻断原因
+    if str(manifest.get("status") or "").strip().lower() != "approved":
+        from core.training_contract import diagnose_training_blockers
+        blockers = diagnose_training_blockers(registry_path, manifest)
+        detail = "；".join(blockers) if blockers else "manifest 未批准"
+        raise ValueError(f"dataset manifest 未批准，无法锁定训练契约（{detail}）")
+
+    try:
+        context = lock_training_contract(
+            registry_path,
+            manifest,
+            material_type=str(manifest.get("material_type") or "unknown"),
+            target=str(manifest.get("target") or target_col),
+            target_col=str(target_col),
+            feature_cols=columns,
+            frame=frame,
+            workflow=workflow,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        from core.training_contract import diagnose_training_blockers
+        blockers = diagnose_training_blockers(registry_path, manifest)
+        if blockers:
+            raise ValueError(f"{message}（具体阻断原因：{'；'.join(blockers)}）") from exc
+        raise
     st.session_state["training_feature_contract_context"] = context
     return context
 
@@ -25264,7 +25539,7 @@ def _render_structure_result(result, output_dir: Path, *, key_prefix: str) -> No
     )
 
 
-def _page_smiles_to_structure_image() -> None:
+def _page_smiles_to_structure_image(*, render_result: bool = True) -> None:
     """Render one SMILES or BigSMILES expression with the vendored renderer."""
     st.subheader("单条结构渲染")
     st.caption("普通 SMILES 使用 RDKit 绘图；BigSMILES 保留重复单元和连接端语义。")
@@ -25348,12 +25623,17 @@ def _page_smiles_to_structure_image() -> None:
             st.session_state.pop("structure_visualization_single_result", None)
             st.error(f"结构图生成失败：{exc}")
 
-    result = st.session_state.get("structure_visualization_single_result")
-    output_dir_text = st.session_state.get("structure_visualization_single_output_dir")
-    if result is not None and output_dir_text:
-        _render_structure_result(result, Path(output_dir_text), key_prefix="structure_visualization_single")
-    else:
-        st.info("输入结构后点击“生成结构图”。")
+    if render_result:
+        result = st.session_state.get("structure_visualization_single_result")
+        output_dir_text = st.session_state.get("structure_visualization_single_output_dir")
+        if result is not None and output_dir_text:
+            _render_structure_result(
+                result,
+                Path(output_dir_text),
+                key_prefix="structure_visualization_single",
+            )
+        else:
+            st.info("输入结构后点击“生成结构图”。")
 
 
 def _page_batch_structure_check() -> None:
@@ -25512,9 +25792,23 @@ def page_smiles_structure_tools() -> None:
     with image_tab:
         page_image_to_smiles()
     with render_tab:
-        _page_smiles_to_structure_image()
+        _page_smiles_to_structure_image(render_result=False)
     with batch_tab:
         _page_batch_structure_check()
+
+    # Streamlit resets the selected tab to the first tab after a widget-triggered
+    # rerun. Keep the latest render below the tabs so it remains visible immediately
+    # after the user clicks "生成结构图".
+    single_result = st.session_state.get("structure_visualization_single_result")
+    single_output_dir = st.session_state.get("structure_visualization_single_output_dir")
+    if single_result is not None and single_output_dir:
+        st.markdown("---")
+        st.subheader("最近生成的结构图")
+        _render_structure_result(
+            single_result,
+            Path(single_output_dir),
+            key_prefix="structure_visualization_latest",
+        )
 
 
 def page_structure_recognition() -> None:

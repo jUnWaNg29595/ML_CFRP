@@ -548,6 +548,106 @@ class AdvancedDataCleaner:
         self.cleaned_data = df.loc[final_indices].reset_index(drop=True)
         return self.cleaned_data
 
+    def balance_numeric_target_bins(
+        self,
+        column,
+        n_bins=10,
+        max_samples_per_bin=None,
+        random_state=42,
+        keep_missing=True,
+    ):
+        """按连续数值目标的等宽区间降采样，缓解目标分布过度集中。
+
+        该方法只删除多数区间中的重复样本，不生成伪造样本；稀疏区间会被完整保留。
+        缺失或非有限目标值默认保留，便于用户在缺失值处理阶段单独决定如何处理。
+
+        Returns:
+            tuple[pd.DataFrame, dict]: 清洗后的数据和区间统计信息。
+        """
+        if column not in self.cleaned_data.columns:
+            raise ValueError(f"目标列 '{column}' 不在数据中")
+
+        try:
+            n_bins = int(n_bins)
+        except (TypeError, ValueError):
+            raise ValueError("n_bins 必须是整数")
+        if n_bins < 2:
+            raise ValueError("n_bins 至少为 2")
+        try:
+            cap = None if max_samples_per_bin is None else int(max_samples_per_bin)
+        except (TypeError, ValueError):
+            raise ValueError("max_samples_per_bin 必须是整数")
+        if cap is not None and cap < 1:
+            raise ValueError("max_samples_per_bin 至少为 1")
+
+        values = pd.to_numeric(self.cleaned_data[column], errors="coerce")
+        finite_mask = np.isfinite(values.to_numpy(dtype=float))
+        valid_values = values[finite_mask]
+        empty_stats = {
+            "column": column,
+            "n_bins": n_bins,
+            "bin_edges": [],
+            "counts_before": [],
+            "counts_after": [],
+            "removed_rows": 0,
+            "missing_rows": int((~finite_mask).sum()),
+        }
+        if valid_values.empty:
+            rows_before = len(self.cleaned_data)
+            if not keep_missing:
+                self.cleaned_data = self.cleaned_data.iloc[0:0].copy()
+                empty_stats["removed_rows"] = rows_before
+            return self.cleaned_data, empty_stats
+
+        value_min = float(valid_values.min())
+        value_max = float(valid_values.max())
+        if np.isclose(value_min, value_max):
+            empty_stats.update({
+                "bin_edges": [value_min, value_max],
+                "counts_before": [int(len(valid_values))],
+                "counts_after": [int(len(valid_values))],
+            })
+            if keep_missing:
+                self.cleaned_data = self.cleaned_data.copy()
+            else:
+                self.cleaned_data = self.cleaned_data.loc[finite_mask].copy()
+                empty_stats["removed_rows"] = int((~finite_mask).sum())
+            self.cleaned_data = self.cleaned_data.reset_index(drop=True)
+            return self.cleaned_data, empty_stats
+
+        edges = np.linspace(value_min, value_max, n_bins + 1)
+        bin_ids = np.digitize(valid_values.to_numpy(dtype=float), edges[1:-1], right=False)
+        counts_before = np.bincount(bin_ids, minlength=n_bins).astype(int)
+
+        rng = np.random.default_rng(int(random_state))
+        valid_indices = self.cleaned_data.index[finite_mask].to_numpy()
+        keep_indices = []
+        counts_after = np.zeros(n_bins, dtype=int)
+        for bin_id in range(n_bins):
+            bin_indices = valid_indices[bin_ids == bin_id]
+            if cap is not None and len(bin_indices) > cap:
+                selected = rng.choice(bin_indices, size=cap, replace=False)
+            else:
+                selected = bin_indices
+            keep_indices.extend(selected.tolist())
+            counts_after[bin_id] = len(selected)
+
+        if keep_missing:
+            keep_indices.extend(self.cleaned_data.index[~finite_mask].tolist())
+        keep_indices = sorted(set(keep_indices))
+        rows_before = len(self.cleaned_data)
+        self.cleaned_data = self.cleaned_data.loc[keep_indices].reset_index(drop=True)
+        stats = {
+            "column": column,
+            "n_bins": n_bins,
+            "bin_edges": edges.astype(float).tolist(),
+            "counts_before": counts_before.astype(int).tolist(),
+            "counts_after": counts_after.astype(int).tolist(),
+            "removed_rows": int(rows_before - len(self.cleaned_data)),
+            "missing_rows": int((~finite_mask).sum()),
+        }
+        return self.cleaned_data, stats
+
     def balance_category_counts(self, column, max_samples=None):
         """
         平衡类别计数：强制限制某一列（如SMILES）中每个类别的最大样本数。

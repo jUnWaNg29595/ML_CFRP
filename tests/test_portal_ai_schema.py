@@ -231,3 +231,132 @@ def test_parse_suggestion_rejects_non_string_state_and_source(field, malformed_v
                 ]
             }
         )
+
+
+# ============================================================
+# source_role normalization and safe downgrade tests
+# ============================================================
+
+from core.portal_ai_schema import normalize_feature_source_role
+
+
+def test_normalize_source_role_canonical_values_pass_through():
+    assert normalize_feature_source_role("manual_input") == "manual_input"
+    assert normalize_feature_source_role("molecular_workflow") == "molecular_workflow"
+    assert normalize_feature_source_role("derived_workflow") == "derived_workflow"
+    assert normalize_feature_source_role("unknown") == "unknown"
+
+
+def test_normalize_source_role_limited_aliases():
+    assert normalize_feature_source_role("manual") == "manual_input"
+    assert normalize_feature_source_role("measured") == "manual_input"
+    assert normalize_feature_source_role("experimental") == "manual_input"
+    assert normalize_feature_source_role("人工输入") == "manual_input"
+    assert normalize_feature_source_role("molecular") == "molecular_workflow"
+    assert normalize_feature_source_role("descriptor") == "molecular_workflow"
+    assert normalize_feature_source_role("分子特征") == "molecular_workflow"
+    assert normalize_feature_source_role("derived") == "derived_workflow"
+    assert normalize_feature_source_role("computed") == "derived_workflow"
+    assert normalize_feature_source_role("calculated") == "derived_workflow"
+    assert normalize_feature_source_role("派生") == "derived_workflow"
+    assert normalize_feature_source_role("uncertain") == "unknown"
+    assert normalize_feature_source_role("不确定") == "unknown"
+
+
+def test_normalize_source_role_case_and_whitespace_insensitive():
+    assert normalize_feature_source_role("  Manual_Input  ") == "manual_input"
+    assert normalize_feature_source_role("MANUAL-INPUT") == "manual_input"
+    assert normalize_feature_source_role("molecular_workflow ") == "molecular_workflow"
+    assert normalize_feature_source_role(" Derived Workflow ") == "derived_workflow"
+
+
+def test_normalize_source_role_never_guesses_unknown_strings():
+    assert normalize_feature_source_role("completely_made_up_role") is None
+    assert normalize_feature_source_role("target") is None
+    assert normalize_feature_source_role("metadata") is None
+    assert normalize_feature_source_role("这是一段很长的中文句子描述来源") is None
+    assert normalize_feature_source_role("") is None
+    assert normalize_feature_source_role(None) is None
+    assert normalize_feature_source_role(123) is None
+
+
+def test_parse_feature_mapping_downgrades_unknown_source_role_to_conflict():
+    result = parse_feature_mapping_response({
+        "suggestions": [{
+            "feature_id": "cfrp.tg.pressure",
+            "raw_columns": ["压强"],
+            "source_role": "fabricated_role_xyz",
+            "status": "pending_review",
+            "confidence": 0.9,
+            "rationale_zh": "列名匹配",
+        }],
+        "conflicts": [],
+    })
+    sugg = result["suggestions"][0]
+    assert sugg["source_role"] == "unknown"
+    assert sugg["status"] == "conflict"
+    assert sugg["source_role_raw"] == "fabricated_role_xyz"
+    assert sugg["source_role_downgraded"] is True
+    assert "需要人工审核" in sugg["rationale_zh"]
+    assert any("fabricated_role_xyz" in item for item in result["conflicts"])
+
+
+def test_parse_feature_mapping_target_and_metadata_become_unknown_conflict():
+    result = parse_feature_mapping_response({
+        "suggestions": [
+            {
+                "feature_id": "a",
+                "raw_columns": ["col_a"],
+                "source_role": "target",
+                "status": "pending_review",
+                "confidence": 0.9,
+                "rationale_zh": "x",
+            },
+            {
+                "feature_id": "b",
+                "raw_columns": ["col_b"],
+                "source_role": "metadata",
+                "status": "pending_review",
+                "confidence": 0.9,
+                "rationale_zh": "y",
+            },
+        ],
+        "conflicts": [],
+    })
+    for sugg in result["suggestions"]:
+        assert sugg["source_role"] == "unknown"
+        assert sugg["status"] == "conflict"
+
+
+def test_parse_feature_mapping_known_alias_is_normalized_not_downgraded():
+    result = parse_feature_mapping_response({
+        "suggestions": [{
+            "feature_id": "cfrp.tg.pressure",
+            "raw_columns": ["压强"],
+            "source_role": "computed",
+            "status": "pending_review",
+            "confidence": 0.9,
+            "rationale_zh": "列名匹配",
+        }],
+        "conflicts": [],
+    })
+    sugg = result["suggestions"][0]
+    assert sugg["source_role"] == "derived_workflow"
+    assert sugg["status"] == "pending_review"
+    assert "source_role_raw" not in sugg
+
+
+def test_parse_feature_mapping_empty_source_role_still_rejected():
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="source_role"):
+        parse_feature_mapping_response({
+            "suggestions": [{
+                "feature_id": "a",
+                "raw_columns": ["col"],
+                "source_role": "",
+                "status": "pending_review",
+                "confidence": 0.9,
+                "rationale_zh": "x",
+            }],
+            "conflicts": [],
+        })

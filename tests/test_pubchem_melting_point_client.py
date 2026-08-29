@@ -4,6 +4,71 @@ import pytest
 from core import pubchem_client
 from core.melting_point_data import parse_melting_point_text
 
+def test_split_structure_queries_accepts_newlines_and_semicolons():
+    assert pubchem_client.split_structure_queries(' C1OC1\n [O;r3]1[#6;r3][#6;r3]1; C1OC1 ') == [
+        'C1OC1',
+        '[O;r3]1[#6;r3][#6;r3]1',
+    ]
+
+
+def test_fetch_records_by_smarts_queries_merges_and_deduplicates(monkeypatch, tmp_path):
+    monkeypatch.setattr(pubchem_client, 'PUBCHEM_CACHE_DIR', tmp_path)
+    calls = []
+
+    def fetch_records(query, **kwargs):
+        calls.append(query)
+        if query == 'C1OC1':
+            return pd.DataFrame([{
+                'cid': 1, 'smiles': 'C1OC1', 'mp_raw': '40 °C', 'mp_c': 40.0,
+                'component_role': 'resin', 'hardener_class': '',
+            }])
+        return pd.DataFrame([{
+            'cid': 1, 'smiles': 'C1OC1', 'mp_raw': '40 °C', 'mp_c': 40.0,
+            'component_role': 'resin', 'hardener_class': '',
+        }, {
+            'cid': 2, 'smiles': 'CC1OC1', 'mp_raw': '20 °C', 'mp_c': 20.0,
+            'component_role': 'resin', 'hardener_class': '',
+        }])
+
+    monkeypatch.setattr(pubchem_client, 'fetch_melting_point_records_by_smarts', fetch_records)
+    result = pubchem_client.fetch_melting_point_records_by_smarts_queries(
+        'C1OC1; [O;r3]1[#6;r3][#6;r3]1', component_role='resin', per_query_max_cids=10,
+    )
+
+    assert calls == ['C1OC1', '[O;r3]1[#6;r3][#6;r3]1']
+    assert result['cid'].tolist() == [1, 2]
+    assert result.attrs['query_count'] == 2
+
+
+def test_build_cached_melting_point_records_filters_nonindustrial_candidates(monkeypatch, tmp_path):
+    monkeypatch.setattr(pubchem_client, 'PUBCHEM_CACHE_DIR', tmp_path)
+    pd.DataFrame([
+        {'cid': 10, 'smiles': 'C1OC1', 'mol_wt': 58.08},
+        {'cid': 11, 'smiles': 'CC1OC1', 'mol_wt': 72.11},
+        {'cid': 12, 'smiles': 'c1ccccc1C1OC1', 'mol_wt': 132.16},
+        {'cid': 13, 'smiles': 'c1ccccc1CC1OC1', 'mol_wt': 146.19},
+        {'cid': 14, 'smiles': 'c1ccccc1CC(C)(C)c2ccc(CC3OC3)cc2', 'mol_wt': 280.0},
+        {'cid': 15, 'smiles': 'c1ccccc1.C1OC1', 'mol_wt': 136.0},
+    ]).to_csv(tmp_path / 'properties.csv', index=False)
+    import json
+    annotations = {
+        10: '-100 °C', 11: '40 °C', 12: '60 °C', 13: '70 °C', 14: '120 °C', 15: '90 °C',
+    }
+    for cid, value in annotations.items():
+        (tmp_path / f'melting_point_annotation_cid_{cid}_v1.json').write_text(
+            json.dumps([{
+                'cid': cid, 'mp_raw': value, 'source_url': '', 'source_name': '', 'source_record': cid,
+            }]), encoding='utf-8',
+        )
+
+    result = pubchem_client.build_cached_melting_point_records(
+        'C1OC1', component_role='resin', min_molecular_weight=150.0, max_melting_point_c=500.0,
+    )
+
+    assert result['cid'].tolist() == [14]
+    assert result.iloc[0]['component_role'] == 'resin'
+    assert result.iloc[0]['hardener_class'] == ''
+
 
 def test_extracts_melting_point_annotation_and_source(monkeypatch, tmp_path):
     monkeypatch.setattr(pubchem_client, "PUBCHEM_CACHE_DIR", tmp_path)

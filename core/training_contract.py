@@ -100,6 +100,70 @@ def lock_training_contract(registry_path: str | Path, dataset_manifest: Mapping[
     }
 
 
+def diagnose_training_blockers(
+    registry_path: str | Path,
+    manifest: Mapping[str, Any] | None,
+) -> list[str]:
+    """Return concrete, user-facing reasons why training cannot lock a contract."""
+    blockers: list[str] = []
+    if not isinstance(manifest, Mapping):
+        blockers.append("manifest 不存在：请先在【特征管理】页面完成特征映射审核并批准")
+        return blockers
+
+    manifest_status = str(manifest.get("status") or "draft").strip().lower()
+    if manifest_status != "approved":
+        blockers.append(f"manifest 仍为 {manifest_status}，未批准；请先在【特征管理】页面批准全部特征映射")
+
+    registry_report = None
+    try:
+        registry = load_registry(registry_path)
+        registry_report = validate_registry(registry, require_approved=True)
+        if not registry_report["ok"]:
+            approval_status = str((registry.get("approval") or {}).get("status") or "draft")
+            if approval_status != "approved":
+                blockers.append(f"Registry 仍为 {approval_status}，需要先完成 Registry 审核（approval.approved_hash 必须匹配）")
+            profile_statuses = []
+            for pid, prof in (registry.get("model_profiles") or {}).items():
+                if isinstance(prof, Mapping):
+                    profile_statuses.append(f"{pid}={prof.get('status', 'unknown')}")
+            if profile_statuses:
+                blockers.append("model profile 状态: " + ", ".join(profile_statuses) + "；blocked/draft profile 不能锁定训练契约")
+            other = [e for e in registry_report["errors"] if "approval" not in e and "profile" not in e]
+            if other:
+                blockers.append("Registry 校验错误: " + "; ".join(other[:5]))
+    except Exception as exc:
+        blockers.append(f"Registry 读取失败：{exc}")
+        return blockers
+
+    if registry_report is not None:
+        try:
+            registry = load_registry(registry_path)
+            manifest_report = validate_dataset_manifest(manifest, registry, require_approved=False)
+            if not manifest_report["ok"]:
+                errors = manifest_report["errors"]
+                # Split into useful categories
+                missing_features = [e for e in errors if e.startswith("manifest missing required profile features")]
+                conflicts = [e for e in errors if "unknown feature_id" in e]
+                others = [e for e in errors if e not in missing_features and e not in conflicts]
+                if missing_features:
+                    blockers.append("缺少 feature binding：" + "; ".join(missing_features[:3]))
+                if conflicts:
+                    blockers.append("存在未登记/冲突的 feature binding：" + "; ".join(conflicts[:5]))
+                if others:
+                    blockers.append("manifest 校验错误：" + "; ".join(others[:5]))
+        except Exception as exc:
+            blockers.append(f"manifest 校验异常：{exc}")
+
+    # conflict/unknown binding report runs regardless of registry validity
+    for binding in manifest.get("feature_bindings", []) if isinstance(manifest.get("feature_bindings"), list) else []:
+        if not isinstance(binding, Mapping):
+            continue
+        review_status = str(binding.get("review_status") or "unknown")
+        if review_status in {"conflict", "unknown"}:
+            blockers.append(f"binding {binding.get('feature_id')} 状态为 {review_status}，需要人工处理")
+    return blockers
+
+
 def audit_training_result(context: Mapping[str, Any], train_result: Mapping[str, Any]) -> dict[str, Any]:
     canonical = list(context.get("canonical_feature_cols") or [])
     feature_names = list(train_result.get("feature_names") or [])

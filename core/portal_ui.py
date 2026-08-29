@@ -5,9 +5,9 @@ from __future__ import annotations
 from html import escape
 
 TOKENS = {
-    'navy': '#071a2f', 'navy_surface': '#0d2742', 'cyan': '#22d3ee',
-    'blue': '#38bdf8', 'green': '#34d399', 'amber': '#fbbf24',
-    'red': '#fb7185', 'slate': '#94a3b8',
+    'navy': '#17324d', 'navy_surface': '#ffffff', 'cyan': '#0f7490',
+    'blue': '#2563a8', 'green': '#16805d', 'amber': '#a46708',
+    'red': '#b4233c', 'slate': '#667085',
 }
 
 _ICONS = {
@@ -74,13 +74,13 @@ def inject_scientific_theme() -> None:
     import streamlit as st
     st.markdown('''
 <style>
-:root { --portal-navy:#071a2f; --portal-surface:#0d2742; --portal-cyan:#22d3ee; --portal-blue:#38bdf8; --portal-green:#34d399; --portal-amber:#fbbf24; --portal-red:#fb7185; --portal-slate:#94a3b8; }
-[data-testid="stAppViewContainer"] { background: radial-gradient(circle at 80% 0%, rgba(34,211,238,.08), transparent 35%), linear-gradient(135deg, #071a2f 0%, #0b1f36 46%, #0f2b46 100%); color:#e2e8f0; }
-[data-testid="stHeader"] { background:rgba(7,26,47,.72); }
-[data-testid="stSidebar"] { background:#061426; border-right:1px solid rgba(148,163,184,.16); }
-.portal-shell, .portal-hero, .portal-material-card, .portal-model-card, .portal-status-panel { border:1px solid rgba(148,163,184,.18); border-radius:16px; background:rgba(13,39,66,.72); box-shadow:0 18px 45px rgba(0,0,0,.18); }
+:root { --portal-navy:#17324d; --portal-surface:#ffffff; --portal-cyan:#0f7490; --portal-blue:#2563a8; --portal-green:#16805d; --portal-amber:#a46708; --portal-red:#b4233c; --portal-slate:#667085; }
+[data-testid="stAppViewContainer"] { background:#f4f7fa; color:#172b3a; }
+[data-testid="stHeader"] { background:rgba(244,247,250,.92); }
+[data-testid="stSidebar"] { background:#edf3f7; border-right:1px solid #d8e1e8; }
+.portal-shell, .portal-hero, .portal-material-card, .portal-model-card, .portal-status-panel { border:1px solid #d8e1e8; border-radius:10px; background:#ffffff; box-shadow:0 8px 24px rgba(23,50,77,.07); }
 .portal-hero { padding:28px 32px; margin-bottom:18px; }
-.portal-hero h1, .portal-hero h2, .portal-hero h3 { color:#f8fafc; letter-spacing:-.02em; }
+.portal-hero h1, .portal-hero h2, .portal-hero h3 { color:#17324d; letter-spacing:0; }
 .portal-kicker, .hero-kicker { color:var(--portal-cyan); text-transform:uppercase; letter-spacing:.12em; font-size:.72rem; font-weight:700; }
 .portal-icon { display:inline-block; vertical-align:middle; }
 .portal-material-card { min-height:130px; padding:20px; display:flex; gap:16px; transition:transform .15s ease, border-color .15s ease; }
@@ -88,16 +88,22 @@ def inject_scientific_theme() -> None:
 .portal-card-icon { color:var(--portal-cyan); flex:0 0 auto; }
 .portal-card-heading { display:flex; gap:12px; align-items:center; justify-content:space-between; }
 .portal-card-heading h3 { margin:0; font-size:1.05rem; }
-.portal-card-body p { color:#a9bacb; margin:.45rem 0 0; font-size:.9rem; line-height:1.55; }
-.portal-status-badge { display:inline-flex; align-items:center; gap:6px; color:#cbd5e1; font-size:.75rem; white-space:nowrap; }
-.portal-status-dot { width:7px; height:7px; border-radius:50%; background:var(--portal-blue); box-shadow:0 0 0 3px rgba(56,189,248,.12); }
-.portal-status-badge.success .portal-status-dot { background:var(--portal-green); box-shadow:0 0 0 3px rgba(52,211,153,.12); }
-.portal-status-badge.danger .portal-status-dot { background:var(--portal-red); box-shadow:0 0 0 3px rgba(251,113,133,.12); }
+.portal-card-body p { color:#667085; margin:.45rem 0 0; font-size:.9rem; line-height:1.55; }
+.portal-status-badge { display:inline-flex; align-items:center; gap:6px; color:#475467; font-size:.75rem; white-space:nowrap; }
+.portal-status-dot { width:7px; height:7px; border-radius:50%; background:var(--portal-blue); box-shadow:0 0 0 3px rgba(37,99,168,.12); }
+.portal-status-badge.success .portal-status-dot { background:var(--portal-green); box-shadow:0 0 0 3px rgba(22,128,93,.12); }
+.portal-status-badge.danger .portal-status-dot { background:var(--portal-red); box-shadow:0 0 0 3px rgba(180,35,60,.12); }
 .portal-stage-wrap { display:flex; gap:8px; align-items:flex-start; overflow-x:auto; padding:14px 4px; }
-.portal-stage { flex:1 0 120px; display:flex; gap:8px; align-items:center; color:#64748b; font-size:.78rem; }
-.portal-stage-marker { width:26px; height:26px; display:grid; place-items:center; border-radius:50%; border:1px solid #334155; color:#64748b; }
-.portal-stage.done, .portal-stage.active { color:#dbeafe; }.portal-stage.done .portal-stage-marker { color:#06251d; background:var(--portal-green); border-color:var(--portal-green); }.portal-stage.active .portal-stage-marker { color:#082f49; background:var(--portal-cyan); border-color:var(--portal-cyan); }
-.portal-help { color:#94a3b8; font-size:.82rem; }
+.portal-stage { flex:1 0 120px; display:flex; gap:8px; align-items:center; color:#98a2b3; font-size:.78rem; }
+.portal-stage-marker { width:26px; height:26px; display:grid; place-items:center; border-radius:50%; border:1px solid #cbd5e1; color:#667085; }
+.portal-stage.done, .portal-stage.active { color:#344054; }.portal-stage.done .portal-stage-marker { color:#ffffff; background:var(--portal-green); border-color:var(--portal-green); }.portal-stage.active .portal-stage-marker { color:#ffffff; background:var(--portal-cyan); border-color:var(--portal-cyan); }
+.portal-help { color:#667085; font-size:.82rem; }
+@media (max-width: 800px) {
+    .portal-hero { padding:18px 16px; }
+    .portal-material-card { min-height:0; padding:16px; }
+    .portal-stage-wrap { gap:6px; }
+    .portal-stage { flex-basis:112px; font-size:.72rem; }
+}
 </style>
 ''', unsafe_allow_html=True)
 

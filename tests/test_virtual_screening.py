@@ -7,6 +7,9 @@ import pytest
 import core.virtual_screening as virtual_screening
 from core.training_runs import TrainingRunManager
 
+
+APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
+
 from core.molecular_features import (
     OptimizedRDKitFeatureExtractor,
     _safe_fragment_mol_from_text,
@@ -253,6 +256,64 @@ def test_legacy_string_component_columns_remain_single_columns_and_keep_hardener
         "resin_smiles",
         "hardener_smiles",
     ]
+
+
+def test_training_run_manager_keeps_same_second_runs_separate(tmp_path, monkeypatch):
+    from core.training_runs import TrainingRunManager
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            import datetime
+            return datetime.datetime(2026, 8, 26, 23, 59, 59)
+
+    monkeypatch.setattr("core.training_runs.datetime", FixedDateTime)
+    manager = TrainingRunManager(base_dir=str(tmp_path))
+    first = manager.save_run("demo", {"r2": 0.1})
+    second = manager.save_run("demo", {"r2": 0.2})
+
+    assert first.run_id != second.run_id
+    assert manager.load_metadata(first.run_id)["r2"] == 0.1
+    assert manager.load_metadata(second.run_id)["r2"] == 0.2
+
+
+def test_training_run_manager_persists_optimization_trial_table(tmp_path):
+    from core.training_runs import TrainingRunManager
+
+    manager = TrainingRunManager(base_dir=str(tmp_path))
+    trials = pd.DataFrame(
+        [
+            {"trial": 0, "state": "COMPLETE", "mean_cv_r2": 0.7},
+            {"trial": 1, "state": "FAIL", "failure_reason": "bad data"},
+        ]
+    )
+    summary = manager.save_run(
+        "Ridge回归 [Optuna]",
+        {
+            "task_kind": "optimization",
+            "status": "completed",
+            "n_trials": 2,
+            "trial_summary": {"completed": 1, "failed": 1},
+        },
+        extra_tables={"optimization_trials": trials},
+    )
+
+    payload = manager.load_run(summary.run_id)
+    assert payload["metadata"]["task_kind"] == "optimization"
+    loaded_trials = payload["extra_tables"]["optimization_trials.csv"]
+    pd.testing.assert_frame_equal(loaded_trials, trials, check_dtype=False, check_exact=False, check_names=True)
+
+
+def test_training_records_page_contains_overview_and_optimization_details():
+    source = APP_PATH.read_text(encoding="utf-8-sig")
+    start = source.index("def page_training_records():")
+    page_source = source[start:]
+
+    assert "全部训练 / 优化记录" in page_source
+    assert "记录类型" in page_source
+    assert "模型筛选" in page_source
+    assert "optimization_trials.csv" in page_source
+    assert "Optuna 优化详情" in page_source
 
 
 def test_training_run_model_artifact_receives_molecular_feature_metadata(tmp_path, monkeypatch):

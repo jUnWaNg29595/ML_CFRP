@@ -1,3 +1,5 @@
+import json
+
 import pandas as pd
 import pytest
 
@@ -189,3 +191,327 @@ def test_apply_review_rejects_nonapproved_edited_status():
             registry={"features": [{"feature_id": "known", "source_type": "manual_input"}]},
             edited={"status": "conflict"},
         )
+
+
+# ============================================================
+# source_role approval gate tests
+# ============================================================
+
+def test_apply_review_rejects_unknown_source_role():
+    from core.feature_mapping_review import apply_feature_review_decision
+
+    with pytest.raises(ValueError, match="source_role"):
+        apply_feature_review_decision(
+            {"status": "draft", "feature_bindings": []},
+            {"feature_id": "known", "raw_columns": ["x"], "source_role": "unknown", "status": "pending_review"},
+            "accept",
+            "u",
+            registry={"features": [{"feature_id": "known", "source_type": "manual_input"}]},
+        )
+
+
+def test_apply_review_rejects_conflict_and_unknown_status():
+    from core.feature_mapping_review import apply_feature_review_decision
+
+    for status in ("conflict", "unknown", "rejected"):
+        with pytest.raises(ValueError, match="pending_review|状态"):
+            apply_feature_review_decision(
+                {"status": "draft", "feature_bindings": []},
+                {"feature_id": "known", "raw_columns": ["x"], "source_role": "manual_input", "status": status},
+                "accept",
+                "u",
+                registry={"features": [{"feature_id": "known", "source_type": "manual_input"}]},
+            )
+
+
+def test_downgraded_ai_suggestion_cannot_be_approved_until_reclassified():
+    """An AI suggestion with unknown source_role must not produce an approved binding."""
+    from core.feature_mapping_review import apply_feature_review_decision
+    from core.portal_ai_schema import parse_feature_mapping_response
+
+    response = parse_feature_mapping_response({
+        "suggestions": [{
+            "feature_id": "known",
+            "raw_columns": ["x"],
+            "source_role": "weird_role",
+            "status": "pending_review",
+            "confidence": 0.9,
+            "rationale_zh": "evidence",
+        }],
+        "conflicts": [],
+    })
+    sugg = response["suggestions"][0]
+    assert sugg["status"] == "conflict"
+    with pytest.raises(ValueError, match="pending_review|状态"):
+        apply_feature_review_decision(
+            {"status": "draft", "feature_bindings": []},
+            sugg,
+            "accept",
+            "u",
+            registry={"features": [{"feature_id": "known", "source_type": "manual_input"}],
+                      "model_profiles": {"p": {"feature_ids": ["known"]}}},
+            profile_id="p",
+        )
+
+
+def test_human_reclassified_downgraded_suggestion_can_be_approved():
+    """After the human edits source_role to a valid role, approval works."""
+    from core.feature_mapping_review import apply_feature_review_decision
+    from core.portal_ai_schema import parse_feature_mapping_response
+
+    response = parse_feature_mapping_response({
+        "suggestions": [{
+            "feature_id": "known",
+            "raw_columns": ["x"],
+            "source_role": "weird_role",
+            "status": "pending_review",
+            "confidence": 0.9,
+            "rationale_zh": "evidence",
+        }],
+        "conflicts": [],
+    })
+    sugg = dict(response["suggestions"][0])
+    # Human reclassification: set status back to pending_review after fixing role
+    sugg["source_role"] = "manual_input"
+    sugg["status"] = "pending_review"
+    updated = apply_feature_review_decision(
+        {"status": "draft", "feature_bindings": []},
+        sugg,
+        "accept",
+        "u",
+        registry={"features": [{"feature_id": "known", "source_type": "manual_input", "status": "draft"}],
+                  "model_profiles": {"p": {"feature_ids": ["known"]}}},
+        profile_id="p",
+    )
+    assert updated["feature_bindings"][0]["review_status"] == "approved"
+
+
+# ============================================================
+# Batch approval workflow tests
+# ============================================================
+
+def _batch_registry():
+    return {
+        "features": [
+            {"feature_id": "f_safe1", "name": "f_safe1", "source_type": "manual_input", "status": "draft"},
+            {"feature_id": "f_safe2", "name": "f_safe2", "source_type": "molecular_workflow", "status": "approved"},
+            {"feature_id": "f_unknown", "name": "f_unknown", "source_type": "manual_input", "status": "draft"},
+        ],
+        "model_profiles": {"p": {"feature_ids": ["f_safe1", "f_safe2", "f_unknown"], "target_col": "tg", "status": "draft"}},
+    }
+
+
+def _safe_suggestion(fid="f_safe1", confidence=0.9, **overrides):
+    base = {
+        "feature_id": fid,
+        "raw_columns": [f"col_{fid}"],
+        "source_role": "manual_input" if fid == "f_safe1" else "molecular_workflow",
+        "status": "pending_review",
+        "confidence": confidence,
+        "rationale_zh": "列名与单位一致",
+        "unit": "%",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_classify_suggestions_split_safe_and_attention():
+    from core.feature_mapping_review import classify_feature_suggestions
+
+    suggestions = [
+        _safe_suggestion("f_safe1", confidence=0.9),
+        _safe_suggestion("f_safe2", confidence=0.6),
+        {"feature_id": "f_unknown", "raw_columns": ["c"], "source_role": "unknown", "status": "conflict", "confidence": 0.9},
+    ]
+    safe, attention = classify_feature_suggestions(suggestions, _batch_registry(), "p")
+    assert [s["feature_id"] for s in safe] == ["f_safe1"]
+    assert len(attention) == 2
+
+
+def test_classify_new_proposal_and_low_confidence_need_attention():
+    from core.feature_mapping_review import classify_feature_suggestions
+
+    suggestions = [
+        _safe_suggestion("f_safe1"),
+        _safe_suggestion("not_in_profile", confidence=0.99),
+        _safe_suggestion("f_safe2", confidence=0.84),
+    ]
+    safe, attention = classify_feature_suggestions(suggestions, _batch_registry(), "p")
+    assert [s["feature_id"] for s in safe] == ["f_safe1"]
+    reasons_all = " ".join(str(r) for item in attention for r in item.get("_review_reasons", []))
+    assert "不属于当前 profile" in reasons_all or "新特征提案" in reasons_all
+    assert any("低于安全阈值" in r for item in attention for r in item.get("_review_reasons", []))
+
+
+def test_batch_approve_safe_suggestions_writes_all_bindings():
+    from core.feature_mapping_review import batch_approve_safe_feature_suggestions
+
+    manifest = {"schema_version": 1, "status": "draft", "feature_bindings": []}
+    suggestions = [
+        _safe_suggestion("f_safe1", confidence=0.92),
+        _safe_suggestion("f_safe2", confidence=0.95),
+    ]
+    updated = batch_approve_safe_feature_suggestions(manifest, suggestions, _batch_registry(), "p", "reviewer-alice")
+    assert updated["status"] == "approved"
+    assert updated["approval"]["status"] == "approved"
+    assert updated["approval"]["approved_by"] == "reviewer-alice"
+    assert len(updated["feature_bindings"]) == 2
+    for b in updated["feature_bindings"]:
+        assert b["review_status"] == "approved"
+        assert b["approved_by"] == "reviewer-alice"
+        assert b["feature_id"] in {"f_safe1", "f_safe2"}
+    assert "manifest_hash" in updated
+
+
+def test_batch_approve_atomic_when_any_item_invalid(monkeypatch):
+    """If any single suggestion fails write validation, nothing is written."""
+    import core.feature_mapping_review as fmr
+    from core.feature_mapping_review import batch_approve_safe_feature_suggestions
+
+    manifest = {"schema_version": 1, "status": "draft", "feature_bindings": []}
+    good = _safe_suggestion("f_safe1", confidence=0.95)
+    bad = _safe_suggestion("f_safe2", confidence=0.95)
+    bad["raw_columns"] = []  # passes nothing: invalid at write time
+
+    original_classify = fmr.classify_feature_suggestions
+
+    def fake_classify(suggestions, registry, profile_id):
+        # Simulate a classify/write disagreement: return the invalid item as safe
+        return [good, bad], []
+
+    monkeypatch.setattr(fmr, "classify_feature_suggestions", fake_classify)
+    with pytest.raises(ValueError, match="中止"):
+        batch_approve_safe_feature_suggestions(manifest, [good, bad], _batch_registry(), "p", "reviewer-alice")
+    # Manifest must remain unchanged
+    assert manifest["status"] == "draft"
+    assert manifest["feature_bindings"] == []
+
+
+def test_batch_approve_requires_reviewer():
+    from core.feature_mapping_review import batch_approve_safe_feature_suggestions
+
+    with pytest.raises(ValueError, match="reviewer"):
+        batch_approve_safe_feature_suggestions(
+            {"status": "draft", "feature_bindings": []},
+            [_safe_suggestion()],
+            _batch_registry(),
+            "p",
+            "",
+        )
+
+
+def test_batch_approve_with_no_safe_suggestions_raises():
+    from core.feature_mapping_review import batch_approve_safe_feature_suggestions
+
+    with pytest.raises(ValueError, match="没有可批量批准"):
+        batch_approve_safe_feature_suggestions(
+            {"status": "draft", "feature_bindings": []},
+            [_safe_suggestion("f_unknown", confidence=0.3)],
+            _batch_registry(),
+            "p",
+            "reviewer-alice",
+        )
+
+
+def test_batch_approve_does_not_modify_registry_feature_status():
+    from core.feature_mapping_review import batch_approve_safe_feature_suggestions
+
+    registry = _batch_registry()
+    batch_approve_safe_feature_suggestions(
+        {"status": "draft", "feature_bindings": []},
+        [_safe_suggestion("f_safe1", confidence=0.95)],
+        registry,
+        "p",
+        "reviewer-alice",
+    )
+    assert registry["features"][0]["status"] == "draft"
+
+
+# ============================================================
+# Training manifest sync & blocker diagnostics tests
+# ============================================================
+
+def test_training_manifest_sync_via_session_helper():
+    """sync_manifest_to_training_state writes training_dataset_manifest for approved manifests only."""
+    import core.feature_registry_ui as ui
+
+    class FakeSession(dict):
+        pass
+
+    # We cannot use real streamlit; test via monkeypatched session_state
+    import streamlit
+
+    class _FakeState(dict):
+        pass
+
+    original = streamlit.session_state
+    fake = _FakeState()
+    try:
+        # Patch module-level usage: function uses st.session_state internally
+        streamlit.session_state = fake
+        approved_manifest = {"schema_version": 1, "status": "approved", "feature_bindings": [{"feature_id": "a"}]}
+        ui.sync_manifest_to_training_state(approved_manifest)
+        assert fake["training_dataset_manifest"]["status"] == "approved"
+        assert fake["feature_mapping_manifest"]["status"] == "approved"
+
+        fake.clear()
+        draft_manifest = {"schema_version": 1, "status": "draft", "feature_bindings": []}
+        ui.sync_manifest_to_training_state(draft_manifest)
+        assert "training_dataset_manifest" not in fake
+        assert fake["feature_mapping_manifest"]["status"] == "draft"
+    finally:
+        streamlit.session_state = original
+
+
+def test_diagnose_training_blockers_reports_missing_manifest():
+    from core.training_contract import diagnose_training_blockers
+
+    blockers = diagnose_training_blockers("nonexistent/registry.json", None)
+    assert any("manifest 不存在" in b for b in blockers)
+
+
+def test_diagnose_training_blockers_reports_draft_manifest_and_registry(tmp_path):
+    from core.training_contract import diagnose_training_blockers
+
+    registry_path = tmp_path / "feature_registry.json"
+    registry_path.write_text(json.dumps({
+        "schema_version": 1,
+        "registry_version": "test",
+        "approval": {"status": "draft"},
+        "model_profiles": {"p": {"feature_ids": [], "target_col": "tg", "status": "draft"}},
+        "features": [],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    manifest = {"schema_version": 1, "status": "draft", "feature_bindings": []}
+    blockers = diagnose_training_blockers(registry_path, manifest)
+    joined = " ".join(blockers)
+    assert "manifest 仍为 draft" in joined
+    assert "Registry 仍为 draft" in joined
+
+
+def test_diagnose_training_blockers_reports_conflict_bindings(tmp_path):
+    from core.training_contract import diagnose_training_blockers
+
+    registry_path = tmp_path / "feature_registry.json"
+    registry_path.write_text(json.dumps({
+        "schema_version": 1,
+        "registry_version": "test",
+        "approval": {"status": "draft"},
+        "model_profiles": {"p": {"feature_ids": ["f1"], "target_col": "tg", "status": "draft"}},
+        "features": [{"feature_id": "f1", "name": "f1", "source_type": "manual_input", "status": "draft", "unit": "%", "default_policy": "explicit_only"}],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    manifest = {
+        "schema_version": 1,
+        "status": "draft",
+        "model_profile_id": "p",
+        "feature_bindings": [{
+            "feature_id": "f1",
+            "raw_columns": ["col_a"],
+            "source_role": "manual_input",
+            "unit": "%",
+            "review_status": "conflict",
+        }],
+    }
+    blockers = diagnose_training_blockers(registry_path, manifest)
+    assert any("conflict" in b for b in blockers)

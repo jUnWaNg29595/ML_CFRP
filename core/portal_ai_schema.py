@@ -374,29 +374,78 @@ def sanitize_ai_context(value: object) -> dict[str, object]:
     return sanitized if isinstance(sanitized, dict) else {}
 
 
+_CANONICAL_SOURCE_ROLES = frozenset({"manual_input", "molecular_workflow", "derived_workflow", "unknown"})
+
+_SOURCE_ROLE_ALIASES: dict[str, str] = {}
+for _alias_group, _canonical in (
+    (("manual", "manual_input", "manual input", "measured", "experimental", "人工输入", "手工输入"), "manual_input"),
+    (("molecular", "molecular_workflow", "molecular workflow", "descriptor", "分子特征"), "molecular_workflow"),
+    (("derived", "derived_workflow", "derived workflow", "computed", "calculated", "workflow_derived", "派生", "计算"), "derived_workflow"),
+    (("unknown", "uncertain", "不确定", "无法判断"), "unknown"),
+):
+    for _alias in _alias_group:
+        _SOURCE_ROLE_ALIASES[_alias.lower()] = _canonical
+
+
+def normalize_feature_source_role(value: object) -> str | None:
+    """Normalize an AI-returned source_role into one canonical value, or None.
+
+    Only a finite alias table is honoured: unknown strings return None so the
+    caller can downgrade to a conflict suggestion instead of guessing.
+    target/metadata are never mapped to an approvable role.
+    """
+    if not isinstance(value, str):
+        return None
+    token = value.strip().lower()
+    if not token:
+        return None
+    # Limited standardization: collapse whitespace, hyphens and underscores
+    token = " ".join(token.split())
+    if token in _CANONICAL_SOURCE_ROLES:
+        return token
+    compact = token.replace("-", " ").replace("_", " ")
+    compact = " ".join(compact.split())
+    if compact in _SOURCE_ROLE_ALIASES:
+        return _SOURCE_ROLE_ALIASES[compact]
+    if token in _SOURCE_ROLE_ALIASES:
+        return _SOURCE_ROLE_ALIASES[token]
+    return None
+
+
 def parse_feature_mapping_response(value: object) -> dict[str, object]:
-    """Validate the narrow AI response used by feature mapping review."""
+    """Validate the narrow AI response used by feature mapping review.
+
+    Unrecognized source_role values are NOT hard failures: the suggestion is
+    downgraded to source_role=unknown / status=conflict with the raw value kept
+    in source_role_raw so a human must reclassify it locally.
+    """
     if not isinstance(value, Mapping):
         raise ValueError("feature review response must be an object")
     suggestions = value.get("suggestions", [])
     conflicts = value.get("conflicts", [])
     if not isinstance(suggestions, list) or not isinstance(conflicts, list):
         raise ValueError("feature review suggestions/conflicts must be lists")
-    allowed_roles = {"molecular_workflow", "derived_workflow", "manual_input", "target", "metadata", "unknown"}
     allowed_statuses = {"pending_review", "conflict", "unknown"}
+    downgraded_conflicts: list[str] = []
     normalized: list[dict[str, object]] = []
     for item in suggestions:
         if not isinstance(item, Mapping):
             raise ValueError("feature review suggestions must contain objects")
         feature_id = item.get("feature_id")
         raw_columns = item.get("raw_columns", [])
-        source_role = item.get("source_role", "")
+        source_role_raw_value = item.get("source_role", "")
         if not isinstance(feature_id, str) or not feature_id.strip():
             raise ValueError("feature review feature_id is required")
         if not isinstance(raw_columns, list) or any(not isinstance(column, str) or not column.strip() for column in raw_columns):
             raise ValueError("feature review raw_columns must be a list of strings")
-        if not isinstance(source_role, str) or source_role.strip() not in allowed_roles:
+        if not isinstance(source_role_raw_value, str) or not source_role_raw_value.strip():
             raise ValueError("feature review source_role is invalid")
+        normalized_role = normalize_feature_source_role(source_role_raw_value)
+        source_role_downgraded = False
+        if normalized_role is None:
+            # Safe downgrade: never guess; flag for human review.
+            source_role_downgraded = True
+            normalized_role = "unknown"
         confidence = _validate_confidence(item.get("confidence"), label="feature review confidence")
         rationale = item.get("rationale_zh", "")
         if not isinstance(rationale, str):
@@ -409,22 +458,38 @@ def parse_feature_mapping_response(value: object) -> dict[str, object]:
         unit = item.get("unit")
         if unit is not None and (not isinstance(unit, str) or not unit.strip()):
             raise ValueError("feature review unit must be a non-empty string or null")
-        if not rationale.strip() and status.strip() not in {"pending_review", "unknown", "conflict"}:
+        if source_role_downgraded:
+            status = "conflict"
+            downgrade_note = f"AI 返回了未识别来源类型（原始值：{source_role_raw_value.strip()[:80]}），需要人工审核。"
+            rationale = (rationale.strip() + "；" if rationale.strip() else "") + downgrade_note
+            downgraded_conflicts.append(
+                f"特征 {feature_id.strip()} 的来源类型 '{source_role_raw_value.strip()[:80]}' 无法归一化，已降级为 unknown/conflict，等待人工审核。"
+            )
+        elif normalized_role in {"target", "metadata"}:
+            # Defensive: target/metadata must never become approvable roles.
+            status = "conflict"
+            normalized_role = "unknown"
+        rationale_stripped = rationale.strip()
+        if not rationale_stripped and status.strip() not in {"pending_review", "unknown", "conflict"}:
             raise ValueError("feature review suggestion requires evidence or explicit pending/unknown semantics")
         if not raw_columns and status.strip() not in {"pending_review", "unknown", "conflict"}:
             raise ValueError("feature review suggestion requires raw-column evidence")
-        normalized.append({
+        normalized_item: dict[str, object] = {
             "feature_id": feature_id.strip(),
             "raw_columns": [column.strip() for column in raw_columns],
-            "source_role": source_role.strip(),
+            "source_role": normalized_role,
             "confidence": confidence,
-            "rationale_zh": rationale[:MAX_TEXT_LENGTH],
+            "rationale_zh": rationale_stripped[:MAX_TEXT_LENGTH],
             "unit": unit.strip()[:120] if isinstance(unit, str) else None,
             "status": status.strip(),
-        })
+        }
+        if source_role_downgraded:
+            normalized_item["source_role_raw"] = source_role_raw_value.strip()[:160]
+            normalized_item["source_role_downgraded"] = True
+        normalized.append(normalized_item)
     if any(not isinstance(item, str) or not item.strip() for item in conflicts):
         raise ValueError("feature review conflicts must contain non-empty strings")
-    normalized_conflicts = [str(item).strip() for item in conflicts]
+    normalized_conflicts = [str(item).strip() for item in conflicts] + downgraded_conflicts
     rationale = value.get("rationale_zh", "")
     if rationale is not None and not isinstance(rationale, str):
         raise ValueError("feature review rationale_zh must be a string")

@@ -3,7 +3,12 @@ import pytest
 
 from core.melting_point_data import (
     canonicalize_smiles,
+    classify_melting_point_records,
     deduplicate_melting_point_records,
+    filter_melting_point_training_dataset,
+    normalize_component_role,
+    normalize_hardener_class,
+    normalize_melting_point_category,
     parse_melting_point_text,
     prepare_melting_point_dataset,
     summarize_melting_point_dataset,
@@ -11,6 +16,91 @@ from core.melting_point_data import (
     load_persisted_melting_point_dataset,
     normalize_melting_point_units,
 )
+
+
+def test_normalize_component_role_and_hardener_class_aliases():
+    assert normalize_component_role('环氧树脂') == 'resin'
+    assert normalize_component_role('curing agent') == 'hardener'
+    assert normalize_component_role('未分类') == 'unknown'
+    assert normalize_hardener_class('amine') == '胺'
+    assert normalize_hardener_class('anhydride') == '酸酐'
+    assert normalize_hardener_class('') == ''
+
+
+def test_melting_point_category_aliases_use_six_training_categories():
+    assert normalize_melting_point_category('epoxy resin') == '环氧树脂'
+    assert normalize_melting_point_category('amine') == '胺'
+    assert normalize_melting_point_category('anhydride') == '酸酐'
+    assert normalize_melting_point_category('phenol') == '酚'
+    assert normalize_melting_point_category('thiol') == '硫醇'
+    assert normalize_melting_point_category('imidazole') == '咪唑'
+
+
+def test_structure_classification_assigns_only_unambiguous_known_categories():
+    frame = pd.DataFrame({
+        'smiles': ['C1OC1', 'CCN', 'c1ccc(O)cc1', 'CCO'],
+        'component_role': ['general', 'general', 'general', 'general'],
+    })
+    result = classify_melting_point_records(frame, infer_from_structure=True)
+    assert result['component_category'].tolist()[:3] == ['环氧树脂', '胺', '酚']
+    assert result.iloc[3]['component_category'] == '未分类'
+    assert result.iloc[3]['component_role'] == 'unknown'
+
+
+def test_general_role_does_not_remain_as_training_role():
+    result = classify_melting_point_records(
+        pd.DataFrame({'smiles': ['CCO'], 'component_role': ['general']})
+    )
+    assert result.iloc[0]['component_role'] == 'unknown'
+    assert result.iloc[0]['component_category'] == '未分类'
+
+
+def test_filter_melting_point_training_dataset_separates_resin_and_hardener():
+    frame = pd.DataFrame([
+        {'smiles': 'CCO', 'mp_raw': '10 °C', 'component_role': 'resin'},
+        {'smiles': 'CCN', 'mp_raw': '20 °C', 'component_role': 'hardener', 'hardener_class': '胺'},
+        {'smiles': 'CCS', 'mp_raw': '30 °C', 'component_role': 'hardener', 'hardener_class': '硫醇'},
+    ])
+
+    resin, resin_report = filter_melting_point_training_dataset(frame, scope='resin')
+    hardener, hardener_report = filter_melting_point_training_dataset(
+        frame,
+        scope='hardener_class',
+        hardener_classes=['胺'],
+    )
+
+    assert resin['component_role'].tolist() == ['resin']
+    assert hardener['hardener_class'].tolist() == ['胺']
+    assert resin_report['selected_count'] == 1
+    assert hardener_report['selected_count'] == 1
+
+
+def test_filter_melting_point_training_dataset_supports_named_category():
+    frame = pd.DataFrame([
+        {'smiles': 'C1OC1', 'mp_raw': '10 °C', 'component_role': 'unknown'},
+        {'smiles': 'CCN', 'mp_raw': '20 °C', 'component_role': 'unknown'},
+    ])
+    selected, report = filter_melting_point_training_dataset(
+        frame,
+        scope='category',
+        category='胺',
+        infer_from_structure=True,
+    )
+    assert selected['component_category'].tolist() == ['胺']
+    assert report['selected_count'] == 1
+
+
+def test_filter_melting_point_training_dataset_does_not_silently_include_unknown_role():
+    frame = pd.DataFrame([
+        {'smiles': 'CCO', 'mp_raw': '10 °C'},
+        {'smiles': 'CCN', 'mp_raw': '20 °C', 'component_role': 'hardener', 'hardener_class': 'amine'},
+    ])
+
+    selected, report = filter_melting_point_training_dataset(frame, scope='hardener')
+
+    assert len(selected) == 1
+    assert selected.iloc[0]['component_role'] == 'hardener'
+    assert report['unknown_role_count'] == 1
 
 
 def test_parse_celsius_single_value():
@@ -156,6 +246,18 @@ def test_prepare_dataset_excludes_invalid_and_missing_smiles():
 
     assert len(result) == 1
     assert result.iloc[0]['canonical_smiles'] is not None
+
+
+def test_prepare_dataset_rejects_implausible_upper_outliers():
+    frame = pd.DataFrame([
+        {'smiles': 'CCO', 'mp_raw': '78 °C'},
+        {'smiles': 'CCN', 'mp_raw': '812.49 °C'},
+        {'smiles': 'CCC', 'mp_raw': '40036 °C'},
+    ])
+
+    result = prepare_melting_point_dataset(frame)
+
+    assert result['mp_c'].tolist() == [78.0]
 
 
 def test_parse_mixture_is_distinct_from_estimated_quality():

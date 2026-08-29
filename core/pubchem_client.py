@@ -26,10 +26,12 @@ configure_network_proxy()
 
 try:
     from rdkit import Chem
+    from rdkit.Chem import Descriptors
 
     RDKIT_AVAILABLE = True
 except Exception:
     Chem = None
+    Descriptors = None
     RDKIT_AVAILABLE = False
 
 import numpy as np
@@ -216,6 +218,35 @@ def _clean_query_text(text: str) -> str:
         s = s.split(":", 1)[-1].strip()
     s = "".join(s.split())
     return s
+
+
+def split_structure_queries(value: object) -> List[str]:
+    """Split a user-provided structure query list into unique normalized entries."""
+    if value is None:
+        return []
+    text = str(value).replace('\r', '\n')
+    queries: List[str] = []
+    seen = set()
+    chunks: List[str] = []
+    current: List[str] = []
+    bracket_depth = 0
+    for character in text:
+        if character == '[':
+            bracket_depth += 1
+        elif character == ']' and bracket_depth:
+            bracket_depth -= 1
+        if character == '\n' or (character == ';' and bracket_depth == 0):
+            chunks.append(''.join(current))
+            current = []
+        else:
+            current.append(character)
+    chunks.append(''.join(current))
+    for item in chunks:
+        query = _clean_query_text(item)
+        if query and query not in seen:
+            queries.append(query)
+            seen.add(query)
+    return queries
 
 
 def _extract_cids(payload: Dict) -> Tuple[List[int], Optional[str]]:
@@ -1079,4 +1110,200 @@ def fetch_melting_point_records_by_smarts(
     PUBCHEM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     if not annotations.attrs.get("failed_cids"):
         result.to_csv(cache_path, index=False, encoding="utf-8-sig")
+    return result
+
+
+def fetch_melting_point_records_by_smarts_queries(
+    queries: object,
+    *,
+    component_role: str = "unknown",
+    hardener_class: str = "",
+    per_query_max_cids: int = 5000,
+    **kwargs,
+) -> pd.DataFrame:
+    """Fetch and merge records for multiple independent structure queries."""
+    query_list = split_structure_queries(queries)
+    frames: List[pd.DataFrame] = []
+    for query in query_list:
+        frame = fetch_melting_point_records_by_smarts(
+            query,
+            component_role=component_role,
+            hardener_class=hardener_class,
+            max_cids=per_query_max_cids,
+            **kwargs,
+        )
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            frame = frame.copy()
+            frame["query_group"] = query
+            frames.append(frame)
+    if not frames:
+        result = pd.DataFrame()
+        result.attrs.update({"query_count": len(query_list), "query_sources": query_list})
+        return result
+    result = pd.concat(frames, ignore_index=True)
+    if "canonical_smiles" not in result.columns and "smiles" in result.columns:
+        result["canonical_smiles"] = result["smiles"].map(canonicalize_smiles)
+    dedup_columns = [column for column in ("canonical_smiles", "component_role", "hardener_class") if column in result.columns]
+    if dedup_columns:
+        result = result.drop_duplicates(subset=dedup_columns, keep="first").reset_index(drop=True)
+    result.attrs.update({
+        "query_count": len(query_list),
+        "query_sources": query_list,
+        "records_before_dedup": int(sum(len(frame) for frame in frames)),
+        "records_after_dedup": int(len(result)),
+    })
+    return result
+
+
+def _load_cached_properties_frames() -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+    if not PUBCHEM_CACHE_DIR.exists():
+        return pd.DataFrame(columns=["cid", "smiles", "mol_wt"])
+    for path in PUBCHEM_CACHE_DIR.glob("*.csv"):
+        try:
+            frame = pd.read_csv(path)
+        except Exception:
+            continue
+        if not {"cid", "smiles"}.issubset(frame.columns):
+            continue
+        frame = frame.copy()
+        frame["cid"] = pd.to_numeric(frame["cid"], errors="coerce")
+        frame = frame[frame["cid"].notna()].copy()
+        frame["smiles"] = frame["smiles"].fillna("").astype(str).str.strip()
+        if "mol_wt" not in frame.columns:
+            frame["mol_wt"] = np.nan
+        frames.append(frame[["cid", "smiles", "mol_wt"]])
+    if not frames:
+        return pd.DataFrame(columns=["cid", "smiles", "mol_wt"])
+    result = pd.concat(frames, ignore_index=True, sort=False)
+    result["cid"] = result["cid"].astype(int)
+    result = result[result["smiles"].ne("")].drop_duplicates("cid", keep="first")
+    return result.reset_index(drop=True)
+
+
+def _load_cached_annotation_rows() -> Dict[int, List[Dict]]:
+    annotations: Dict[int, List[Dict]] = {}
+    if not PUBCHEM_CACHE_DIR.exists():
+        return annotations
+    for path in PUBCHEM_CACHE_DIR.glob("melting_point_annotation_cid_*_v*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            payload = payload.get("rows", [])
+        if not isinstance(payload, list):
+            continue
+        match = path.name.split("melting_point_annotation_cid_", 1)[-1].split("_v", 1)[0]
+        try:
+            cid = int(match)
+        except (TypeError, ValueError):
+            continue
+        annotations[cid] = [row for row in payload if isinstance(row, dict)]
+    return annotations
+
+
+def build_cached_melting_point_records(
+    queries: object,
+    *,
+    component_role: str = "resin",
+    hardener_class: str = "",
+    min_molecular_weight: float = 150.0,
+    max_molecular_weight: Optional[float] = None,
+    min_melting_point_c: float = -273.15,
+    max_melting_point_c: float = 500.0,
+    min_epoxy_count: int = 1,
+    single_fragment_only: bool = True,
+    exclude_cids: Optional[Sequence[int]] = None,
+    exclude_canonical_smiles: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Build quality-filtered records from existing PubChem property/annotation caches."""
+    if not RDKIT_AVAILABLE:
+        return pd.DataFrame()
+    query_molecules = []
+    for query in split_structure_queries(queries):
+        try:
+            molecule = Chem.MolFromSmiles(query) if _is_plain_smiles_query(query) else Chem.MolFromSmarts(query)
+        except Exception:
+            molecule = None
+        if molecule is not None:
+            query_molecules.append(molecule)
+    if not query_molecules:
+        return pd.DataFrame()
+    epoxy_pattern = None
+    if int(min_epoxy_count or 0) > 0:
+        try:
+            epoxy_pattern = Chem.MolFromSmarts("C1OC1")
+        except Exception:
+            epoxy_pattern = None
+    excluded_cids = {int(value) for value in (exclude_cids or [])}
+    excluded_smiles = {str(value) for value in (exclude_canonical_smiles or []) if value}
+    properties = _load_cached_properties_frames()
+    annotations = _load_cached_annotation_rows()
+    rows: List[Dict] = []
+    seen_smiles = set(excluded_smiles)
+    for _, property_row in properties.iterrows():
+        cid = int(property_row["cid"])
+        if cid in excluded_cids or cid not in annotations:
+            continue
+        smiles = str(property_row["smiles"]).strip()
+        try:
+            molecule = Chem.MolFromSmiles(smiles)
+        except Exception:
+            molecule = None
+        if molecule is None:
+            continue
+        if single_fragment_only and len(Chem.GetMolFrags(molecule)) != 1:
+            continue
+        if not any(molecule.HasSubstructMatch(pattern) for pattern in query_molecules):
+            continue
+        epoxy_count = (
+            len(molecule.GetSubstructMatches(epoxy_pattern, uniquify=True))
+            if epoxy_pattern is not None
+            else 0
+        )
+        if int(min_epoxy_count or 0) > epoxy_count:
+            continue
+        canonical = Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True)
+        if canonical in seen_smiles:
+            continue
+        molecular_weight = pd.to_numeric(property_row.get("mol_wt"), errors="coerce")
+        if pd.isna(molecular_weight):
+            molecular_weight = Descriptors.MolWt(molecule)
+        if float(molecular_weight) < float(min_molecular_weight):
+            continue
+        if max_molecular_weight is not None and float(molecular_weight) > float(max_molecular_weight):
+            continue
+        for annotation in annotations[cid]:
+            parsed = parse_melting_point_text(annotation.get("mp_raw"))
+            mp_c = parsed.get("mp_c")
+            if parsed.get("mp_quality") != "high" or mp_c is None:
+                continue
+            if not (float(min_melting_point_c) <= float(mp_c) <= float(max_melting_point_c)):
+                continue
+            seen_smiles.add(canonical)
+            row = {
+                "cid": cid,
+                "smiles": smiles,
+                "canonical_smiles": canonical,
+                "mol_wt": float(molecular_weight),
+                "component_role": component_role,
+                "hardener_class": hardener_class,
+                "source": "PubChem cached PUG View",
+                "query_smarts": "; ".join(split_structure_queries(queries)),
+                "n_epoxy": int(epoxy_count),
+            }
+            row.update(annotation)
+            row.update(parsed)
+            rows.append(row)
+            break
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.drop_duplicates("canonical_smiles", keep="first").reset_index(drop=True)
+    result.attrs.update({
+        "cache_source": "disk",
+        "candidate_count": int(len(result)),
+        "min_molecular_weight": float(min_molecular_weight),
+        "max_melting_point_c": float(max_melting_point_c),
+    })
     return result

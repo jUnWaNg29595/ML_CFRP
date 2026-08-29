@@ -7,12 +7,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 DEFAULT_PROXY_URL = 'socks5://127.0.0.1:10808'
@@ -225,6 +226,17 @@ def _proxy_reply_contains_access_denied(reply: bytes) -> bool:
     )
 
 
+def _proxy_authorization_header(proxy_url: str) -> Optional[str]:
+    """Build a Basic proxy-auth header without exposing credentials in reports."""
+    parsed = urlsplit(proxy_url)
+    if parsed.username is None:
+        return None
+    username = unquote(parsed.username)
+    password = unquote(parsed.password or '')
+    token = base64.b64encode(f'{username}:{password}'.encode('utf-8')).decode('ascii')
+    return f'Proxy-Authorization: Basic {token}'
+
+
 def _probe_socks5_endpoint(proxy_url: str, timeout: float = 5.0) -> Dict[str, Any]:
     """Probe a SOCKS5 endpoint and classify common HTTP-port mistakes."""
     parsed = urlsplit(proxy_url)
@@ -267,24 +279,28 @@ def _probe_http_proxy_endpoint(proxy_url: str, timeout: float = 5.0) -> Dict[str
             request = (
                 f'CONNECT {target} HTTP/1.1\r\n'
                 f'Host: {target}\r\n'
-                'Proxy-Connection: Keep-Alive\r\n\r\n'
-            ).encode('ascii')
-            sock.sendall(request)
+                'Proxy-Connection: Keep-Alive\r\n'
+            )
+            authorization = _proxy_authorization_header(proxy_url)
+            if authorization:
+                request += f'{authorization}\r\n'
+            request += '\r\n'
+            sock.sendall(request.encode('ascii'))
             reply = sock.recv(2048)
         text = _decode_proxy_reply(reply)
         first_line = text.splitlines()[0] if text.splitlines() else ''
         if not first_line.upper().startswith('HTTP/'):
             result.update(status='failed', message='HTTP 代理未返回有效的 HTTP 响应。')
-        elif _proxy_reply_contains_access_denied(reply):
-            result.update(
-                status='access_denied',
-                message='HTTP 代理端口可连接，但代理服务器拒绝外部用户或要求认证。',
-            )
         else:
             parts = first_line.split()
             code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
             if code in (401, 407):
                 result.update(status='auth_required', message='HTTP 代理要求认证，请填写正确的用户名和密码。')
+            elif _proxy_reply_contains_access_denied(reply):
+                result.update(
+                    status='access_denied',
+                    message='HTTP 代理端口可连接，但代理服务器拒绝外部用户或要求认证。',
+                )
             elif code is not None and 200 <= code < 300:
                 result.update(status='ok', message='HTTP CONNECT 代理握手成功。')
             else:
@@ -314,14 +330,27 @@ def test_network_connections(
         return result
     if settings['proxy_type'] == 'SOCKS5':
         result['protocol'] = _probe_socks5_endpoint(proxy, timeout=min(timeout, 8))
-        if result['protocol'].get('status') == 'protocol_mismatch':
+        if result['protocol'].get('status') != 'ok':
             http_proxy = proxy.replace('socks5h://', 'http://', 1).replace('socks5://', 'http://', 1)
-            result['protocol']['http_probe'] = _probe_http_proxy_endpoint(
+            http_probe = _probe_http_proxy_endpoint(
                 http_proxy,
                 timeout=min(timeout, 8),
             )
-            result['status'] = 'protocol_mismatch'
-            result['message'] = result['protocol']['message']
+            result['protocol']['http_probe'] = http_probe
+            if http_probe.get('status') in {'ok', 'access_denied', 'auth_required'}:
+                result['protocol'].update(
+                    status='protocol_mismatch',
+                    detected_type='HTTP',
+                    message=(
+                        '该端口实际提供 HTTP 代理，不是 SOCKS5。请将代理类型改为 HTTP；'
+                        '如果 HTTP 诊断提示拒绝访问，请检查代理软件的认证或出口权限。'
+                    ),
+                )
+                result['status'] = 'protocol_mismatch'
+                result['message'] = result['protocol']['message']
+            else:
+                result['status'] = result['protocol'].get('status', 'failed')
+                result['message'] = result['protocol'].get('message', 'SOCKS5 代理握手失败。')
             return result
     elif settings['proxy_type'] == 'HTTP':
         result['protocol'] = _probe_http_proxy_endpoint(proxy, timeout=min(timeout, 8))

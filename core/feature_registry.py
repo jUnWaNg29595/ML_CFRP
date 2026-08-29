@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -213,11 +214,131 @@ def build_registry_snapshot(registry: Mapping[str, Any], profile_id: str) -> dic
         if definitions[feature_id].get("status") != "approved":
             raise ValueError(f"model profile references non-approved feature: {feature_id}")
         selected.append(copy.deepcopy(dict(definitions[feature_id])))
-    # Keep the complete semantic registry alongside the selected compact view.
-    # The parent hash is independently verifiable by consumers without access
-    # to the source registry, so changing the hash and contract together cannot
-    # turn an altered definition into a valid publication.
     snapshot = {"schema_version": registry.get("schema_version"), "registry_version": registry.get("registry_version"), "registry_hash": compute_registry_hash(registry), "registry_payload": copy.deepcopy(dict(registry)), "profile_id": profile_id, "model_profile": profile, "features": selected}
     selected_payload = {"profile_id": profile_id, "model_profile": profile, "features": selected}
     snapshot["selected_features_hash"] = hashlib.sha256(json.dumps(selected_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     return snapshot
+
+
+def register_new_feature(
+
+    registry: Mapping[str, Any],
+    feature_definition: Mapping[str, Any],
+    *,
+    reviewer: str,
+    target_profile_id: str | None = None,
+    review_note: str = "",
+) -> dict[str, Any]:
+    """Explicitly register a newly approved semantic feature into registry draft."""
+    reviewer_name = str(reviewer or "").strip()
+    if not reviewer_name:
+        raise ValueError("reviewer is required to register a new feature")
+    feature_id = str(feature_definition.get("feature_id") or "").strip()
+    name = str(feature_definition.get("name") or feature_id).strip()
+    if not feature_id:
+        raise ValueError("feature_id cannot be empty")
+    if not name:
+        raise ValueError("feature name cannot be empty")
+    unit = str(feature_definition.get("unit") or "unknown").strip()
+    if not unit:
+        unit = "unknown"
+    source_type = str(feature_definition.get("source_type") or "manual_input").strip()
+    if source_type not in SOURCE_TYPES:
+        raise ValueError(f"invalid source_type: {source_type}")
+
+    updated = copy.deepcopy(dict(registry))
+    features = updated.setdefault("features", [])
+    existing_ids = {item.get("feature_id") for item in features if isinstance(item, Mapping)}
+    existing_names = {item.get("name") for item in features if isinstance(item, Mapping)}
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    status = str(feature_definition.get("status") or "draft").strip().lower()
+    if status not in {"draft", "approved"}:
+        status = "draft"
+
+    new_entry: dict[str, Any] = {
+        "feature_id": feature_id,
+        "name": name,
+        "label": str(feature_definition.get("label") or name).strip(),
+        "source_type": source_type,
+        "data_type": str(feature_definition.get("data_type") or "float").strip(),
+        "unit": unit,
+        "required_for_prediction": bool(feature_definition.get("required_for_prediction", False)),
+        "nullable": bool(feature_definition.get("nullable", True)),
+        "default_policy": str(feature_definition.get("default_policy") or "explicit_only").strip(),
+        "description": str(feature_definition.get("description") or review_note or "人工审核登记的新特征").strip(),
+        "status": status,
+    }
+    if "aliases" in feature_definition:
+        aliases = feature_definition["aliases"]
+        new_entry["aliases"] = [str(a).strip() for a in (aliases if isinstance(aliases, list) else [aliases]) if str(a).strip()]
+    if "accepted_aliases" in feature_definition:
+        acc_aliases = feature_definition["accepted_aliases"]
+        new_entry["accepted_aliases"] = [str(a).strip() for a in (acc_aliases if isinstance(acc_aliases, list) else [acc_aliases]) if str(a).strip()]
+    if "legacy_name" in feature_definition and feature_definition["legacy_name"]:
+        new_entry["legacy_name"] = str(feature_definition["legacy_name"]).strip()
+    if source_type in {"derived_workflow", "molecular_workflow"}:
+        rule = feature_definition.get("calculation_rule")
+        if isinstance(rule, Mapping):
+            new_entry["calculation_rule"] = dict(rule)
+        else:
+            new_entry["calculation_rule"] = {
+                "implementation": "workflow.default",
+                "version": "v1",
+                "input_fields": feature_definition.get("input_fields") or ["resin_smiles"],
+                "null_policy": "reject",
+                "invalid_policy": "reject",
+            }
+
+    if feature_id in existing_ids:
+        # Update existing definition in place
+        for idx, item in enumerate(features):
+            if isinstance(item, Mapping) and item.get("feature_id") == feature_id:
+                features[idx] = new_entry
+                break
+    else:
+        if name in existing_names:
+            raise ValueError(f"duplicate feature name: {name}")
+        features.append(new_entry)
+
+    # Optionally add to profile feature_ids if explicit profile target given
+    if target_profile_id:
+        profiles = updated.setdefault("model_profiles", {})
+        profile = profiles.get(target_profile_id)
+        if isinstance(profile, dict):
+            profile_feature_ids = profile.setdefault("feature_ids", [])
+            if feature_id not in profile_feature_ids:
+                profile_feature_ids.append(feature_id)
+
+    # Bump version and validate
+    ver = updated.get("registry_version", "2026.08.27")
+    updated["registry_version"] = ver
+    val_report = validate_registry(updated, require_approved=False)
+    if not val_report["ok"]:
+        raise ValueError("新特征加入后 registry 校验失败: " + "; ".join(val_report["errors"]))
+    return updated
+
+
+def save_registry_atomic(path: str | Path, registry: Mapping[str, Any]) -> None:
+    """Save registry using temporary file and atomic replace."""
+    from .feature_mapping_review import save_atomic_json
+    target = Path(path).resolve()
+    val = validate_registry(registry, require_approved=False)
+    if not val["ok"]:
+        raise ValueError("无法保存不合法的 registry: " + "; ".join(val["errors"]))
+    save_atomic_json(target, dict(registry))
+
+
+__all__ = [
+    "SOURCE_TYPES",
+    "DEFAULT_POLICIES",
+    "FEATURE_STATUSES",
+    "PROFILE_STATUSES",
+    "compute_registry_hash",
+    "validate_registry",
+    "load_registry",
+    "get_model_profile",
+    "build_registry_snapshot",
+    "register_new_feature",
+    "save_registry_atomic",
+]

@@ -124,6 +124,31 @@ def test_correlation_data_matches_selected_numeric_columns():
     assert result.loc["a", "a"] == 1.0
 
 
+def test_correlation_plot_shows_sample_count_by_default():
+    frame = pd.DataFrame({"a": [1.0, 2.0, None], "b": [2.0, 4.0, 8.0]})
+
+    figure = EnhancedDataExplorer(frame).plot_correlation_matrix(["a", "b"])
+
+    assert figure is not None
+    assert figure.data[0].text[0][0] == "1.00<br>n=2"
+    assert "n=%{text}" not in figure.data[0].hovertemplate
+    assert "%{text}" in figure.data[0].hovertemplate
+
+
+def test_correlation_plot_can_hide_sample_count():
+    frame = pd.DataFrame({"a": [1.0, 2.0, None], "b": [2.0, 4.0, 8.0]})
+
+    figure = EnhancedDataExplorer(frame).plot_correlation_matrix(
+        ["a", "b"], show_sample_count=False
+    )
+
+    assert figure is not None
+    assert figure.data[0].text[0][0] == "1.00"
+    assert "n=" not in figure.data[0].hovertemplate
+    assert "%{text}" not in figure.data[0].hovertemplate
+    assert "相关系数: %{z:.3f}" in figure.data[0].hovertemplate
+
+
 def test_distribution_data_is_long_form_and_excludes_missing_values():
     frame = pd.DataFrame({"a": [1.0, None], "b": [3.0, 4.0]})
     result = EnhancedDataExplorer(frame).distribution_data(["a", "b"])
@@ -153,6 +178,45 @@ def test_boxplot_data_uses_same_long_form_as_distribution_data():
         {"feature": "b", "value": 3.0},
         {"feature": "b", "value": 4.0},
     ]
+
+
+def test_distribution_plot_uses_explicit_columns_beyond_default_prefix():
+    frame = pd.DataFrame({
+        "feature_a": [1.0, 2.0],
+        "feature_b": [3.0, 4.0],
+        "feature_c": [5.0, 6.0],
+    })
+    figure = EnhancedDataExplorer(frame).plot_distributions(
+        cols=["feature_c"], max_cols=None
+    )
+
+    assert figure is not None
+    assert len(figure.data) == 1
+    assert figure.layout.annotations[0].text.startswith("feature_c")
+
+
+def test_boxplot_uses_explicit_columns_beyond_default_prefix():
+    frame = pd.DataFrame({
+        "feature_a": [1.0, 2.0],
+        "feature_b": [3.0, 4.0],
+        "feature_c": [5.0, 6.0],
+    })
+    figure = EnhancedDataExplorer(frame).plot_boxplots(
+        cols=["feature_c"], max_cols=None
+    )
+
+    assert figure is not None
+    assert len(figure.data) == 1
+    assert figure.data[0].name.startswith("feature_c")
+
+
+def test_explicit_column_selection_filters_invalid_columns_and_deduplicates():
+    frame = pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]})
+    figure = EnhancedDataExplorer(frame).plot_boxplots(
+        cols=["b", "missing", "b", "a"], max_cols=None
+    )
+
+    assert [trace.name.split(" (n=")[0] for trace in figure.data] == ["b", "a"]
 
 
 def test_figure_to_bytes_exports_plotly_html():

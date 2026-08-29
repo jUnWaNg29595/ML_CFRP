@@ -200,6 +200,107 @@ def test_data_explore_preview_keeps_explicit_empty_selection_hidden(monkeypatch)
     assert displayed == []
 
 
+def test_molecular_feature_cleanup_collects_recorded_workflow_and_known_prefix_columns():
+    import app
+
+    columns = [
+        "resin_smiles",
+        "resin_xtb_gap",
+        "hardener_maccs_1",
+        "custom_embedding_0",
+        "temperature",
+    ]
+    state = {
+        "molecular_feature_names": ["resin_xtb_gap"],
+        "molecular_feature_workflow": {
+            "final_feature_names": ["hardener_maccs_1"],
+            "steps": [{"feature_names": ["custom_embedding_0"]}],
+        },
+        "molecular_feature_config": {"feature_names": ["legacy_feature"]},
+        "molecular_features": None,
+    }
+
+    assert app._collect_molecular_feature_columns(columns, state) == [
+        "resin_xtb_gap",
+        "hardener_maccs_1",
+        "custom_embedding_0",
+    ]
+
+
+def test_feature_selection_page_exposes_molecular_feature_cleanup_without_touching_raw_data():
+    import app
+
+    source = APP_PATH.read_text(encoding="utf-8-sig")
+    start = source.index("def page_feature_selection():")
+    end = source.index(
+        "\n\n# ============================================================\n# 页面：模型训练",
+        start,
+    )
+    page_source = source[start:end]
+
+    assert "清除已提取分子特征" in page_source
+    assert "_clear_molecular_features_from_session" in page_source
+    assert "st.session_state.data" not in page_source
+
+
+def test_molecular_feature_cleanup_creates_named_backup_before_mutating_state(monkeypatch):
+    import app
+
+    state = {
+        "data": pd.DataFrame(
+            {
+                "resin_smiles": ["CCO"],
+                "resin_xtb_gap": [1.2],
+                "temperature": [80],
+            }
+        ),
+        "processed_data": pd.DataFrame(
+            {
+                "resin_smiles": ["CCO"],
+                "resin_xtb_gap": [1.2],
+                "temperature": [80],
+            }
+        ),
+        "molecular_feature_names": ["resin_xtb_gap"],
+        "molecular_features": pd.DataFrame({"resin_xtb_gap": [1.2]}),
+        "molecular_feature_workflow": {"final_feature_names": ["resin_xtb_gap"]},
+        "molecular_feature_config": {"feature_names": ["resin_xtb_gap"]},
+        "molecular_feature_trace": [{"output_columns": ["resin_xtb_gap"]}],
+        "feature_cols": ["resin_xtb_gap", "temperature"],
+        "multiselect_features": ["resin_xtb_gap"],
+        "source_feature_names": ["resin_smiles", "resin_xtb_gap", "temperature"],
+    }
+    saved = []
+
+    monkeypatch.setattr(app.st, "session_state", state, raising=False)
+    monkeypatch.setattr(
+        app,
+        "_save_session_snapshot",
+        lambda tag: saved.append(tag) or (True, "ok"),
+    )
+
+    removed = app._clear_molecular_features_from_session()
+
+    assert removed == ["resin_xtb_gap"]
+    assert saved and saved[0].startswith("before_molecular_feature_clear_")
+    assert state["data"].columns.tolist() == ["resin_smiles", "resin_xtb_gap", "temperature"]
+    assert state["data"]["resin_xtb_gap"].tolist() == [1.2]
+    assert state["processed_data"].columns.tolist() == ["resin_smiles", "temperature"]
+    assert state["molecular_feature_clear_backup_tag"] == saved[0]
+
+
+def test_molecular_feature_cleanup_page_has_restore_entry():
+    source = APP_PATH.read_text(encoding="utf-8-sig")
+    assert "def _render_molecular_feature_clear_restore_control(" in source
+    assert "恢复清除前分子特征" in source
+    assert "molecular_feature_clear_backup_tag" in source
+    for function_name in ("page_molecular_features", "page_feature_selection"):
+        start = source.index(f"def {function_name}():")
+        next_function = source.find("\ndef ", start + 5)
+        page_source = source[start:next_function if next_function != -1 else len(source)]
+        assert "_render_molecular_feature_clear_restore_control" in page_source
+
+
 def test_data_explore_export_center_supports_raw_and_processed_data():
     source = APP_PATH.read_text(encoding="utf-8-sig")
     start = source.index("def page_data_explore():")

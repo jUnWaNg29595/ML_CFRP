@@ -72,8 +72,14 @@ class EnhancedDataExplorer:
     def boxplot_data(self, cols=None):
         return self.distribution_data(cols)
 
-    def plot_correlation_matrix(self, cols=None, width=1200, height=800):
-        """绘制相关性热图（支持自定义列子集）"""
+    def plot_correlation_matrix(
+        self,
+        cols=None,
+        width=1200,
+        height=800,
+        show_sample_count=True,
+    ):
+        """绘制相关性热图（支持自定义列子集和样本数显示控制）"""
         # 默认使用全部数值列
         if cols is None:
             cols = self.numeric_cols
@@ -93,21 +99,34 @@ class EnhancedDataExplorer:
                 for j, col2 in enumerate(cols):
                     n_matrix.iloc[i, j] = self.data[[col1, col2]].dropna().shape[0]
 
-            # 创建显示文本：相关系数 + 样本数
+            # 创建显示文本：相关系数，可选显示样本数
             text_matrix = []
             for i in range(len(cols)):
                 row = []
                 for j in range(len(cols)):
                     corr_val = corr.iloc[i, j]
-                    n_val = n_matrix.iloc[i, j]
-                    row.append(f"{corr_val:.2f}<br>n={n_val}")
+                    n_val = int(n_matrix.iloc[i, j])
+                    if show_sample_count:
+                        row.append(f"{corr_val:.2f}<br>n={n_val}")
+                    else:
+                        row.append(f"{corr_val:.2f}")
                 text_matrix.append(row)
+
+            hovertemplate = (
+                '%{x} vs %{y}<br>'
+                '相关系数: %{z:.3f}<br>%{text}<extra></extra>'
+            )
+            if not show_sample_count:
+                hovertemplate = (
+                    '%{x} vs %{y}<br>'
+                    '相关系数: %{z:.3f}<extra></extra>'
+                )
 
             fig = go.Figure(data=go.Heatmap(
                 z=corr.values, x=corr.columns, y=corr.columns,
                 colorscale='RdBu', zmid=0,
                 text=text_matrix, texttemplate='%{text}',
-                hovertemplate='%{x} vs %{y}<br>相关系数: %{z:.3f}<br>%{text}<extra></extra>'
+                hovertemplate=hovertemplate
             ))
             fig.update_layout(title='相关性矩阵', width=width, height=height)
             return fig
@@ -115,10 +134,12 @@ class EnhancedDataExplorer:
             print(f"相关性矩阵绘制错误: {e}")
             return None
 
-    def plot_distributions(self, max_cols=15, width=1400, height=1000):
-        if not self.numeric_cols:
+    def plot_distributions(self, max_cols=15, width=1400, height=1000, cols=None):
+        cols = self._valid_numeric_columns(cols)
+        if max_cols is not None:
+            cols = cols[:max_cols]
+        if not cols:
             return None
-        cols = self.numeric_cols[:max_cols]
         n_cols = min(3, len(cols))
         n_rows = (len(cols) + n_cols - 1) // n_cols
         titles = [f"{c} (n={self.data[c].notna().sum()})" for c in cols]
@@ -143,11 +164,14 @@ class EnhancedDataExplorer:
         fig.update_layout(title='缺失值分布', width=width, height=max(400, len(missing) * 25))
         return fig
 
-    def plot_boxplots(self, max_cols=10, width=1200, height=600):
-        if not self.numeric_cols:
+    def plot_boxplots(self, max_cols=10, width=1200, height=600, cols=None):
+        cols = self._valid_numeric_columns(cols)
+        if max_cols is not None:
+            cols = cols[:max_cols]
+        if not cols:
             return None
         fig = go.Figure()
-        for col in self.numeric_cols[:max_cols]:
+        for col in cols:
             n = self.data[col].notna().sum()
             fig.add_trace(go.Box(y=self.data[col].dropna(), name=f"{col} (n={n})"))
         fig.update_layout(title='箱线图', width=width, height=height)

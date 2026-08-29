@@ -105,7 +105,7 @@ def test_compact_snapshot_hash_cannot_be_replaced_with_contract_hash():
     import hashlib, json
     tampered["registry_hash"] = "forged-parent-hash"
     tampered["selected_features_hash"] = hashlib.sha256(json.dumps({"profile_id": tampered["profile_id"], "model_profile": tampered["model_profile"], "features": tampered["features"]}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-    manifest = {"schema_version": 1, "dataset_id": "d", "model_profile_id": "p", "source_bindings": [], "feature_bindings": [], "status": "approved"}
+    manifest = {"schema_version": 1, "dataset_id": "d", "model_profile_id": "p", "source_bindings": [], "feature_bindings": [{"feature_id": "a", "raw_columns": ["a_raw"], "source_role": "manual_input", "unit": "C"}], "status": "approved"}
     manifest["manifest_hash"] = compute_dataset_manifest_hash(manifest)
     artifact = {"model": object(), "pipeline": None, "feature_cols": ["a"], "target_col": "tg_c", "extra": {}}
     contract = build_prediction_contract(artifact=artifact, feature_cols=["a"], target_col="tg_c", registry_snapshot=tampered, dataset_manifest=manifest, model_profile_id="p", canonical_feature_cols=["a"], effective_feature_cols=["a"], removed_feature_cols=[])
@@ -225,7 +225,7 @@ def test_publication_accepts_full_approved_snapshot_with_declared_registry_hash(
     registry = _registry([feature], {"p": {"feature_ids": ["a"], "status": "approved", "target_col": "tg_c"}}, {"status": "approved"})
     registry["approval"]["approved_hash"] = compute_registry_hash(registry)
     registry["registry_hash"] = compute_registry_hash(registry)
-    manifest = {"schema_version": 1, "dataset_id": "d", "model_profile_id": "p", "source_bindings": [], "feature_bindings": [], "status": "approved"}
+    manifest = {"schema_version": 1, "dataset_id": "d", "model_profile_id": "p", "source_bindings": [], "feature_bindings": [{"feature_id": "a", "raw_columns": ["a_raw"], "source_role": "manual_input", "unit": "C"}], "status": "approved"}
     manifest["manifest_hash"] = compute_dataset_manifest_hash(manifest)
     artifact = {"model": Model(), "pipeline": None, "feature_cols": ["a"], "target_col": "tg_c", "extra": {}}
     contract = build_prediction_contract(artifact=artifact, feature_cols=["a"], target_col="tg_c", registry_snapshot=registry, dataset_manifest=manifest, model_profile_id="p", canonical_feature_cols=["a"], effective_feature_cols=["a"], removed_feature_cols=[])

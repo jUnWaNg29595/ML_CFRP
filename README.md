@@ -113,10 +113,10 @@
 - **混合策略**: 综合不确定性与多样性
 - **批量推荐**: 批量推荐最有价值的实验
 
-#### 6. 🖼️ 图像转SMILES
-- **DECIMER集成**: 从化学结构图像识别SMILES
-- **多格式支持**: PNG, JPG, PDF等
-- **批量处理**: 支持批量图像识别
+#### 6. 🧪 SMILES / BigSMILES 结构图像工具
+- **图像转 SMILES**: 使用 DECIMER 从化学结构图像或剪贴板图片识别 SMILES
+- **SMILES / BigSMILES 转图片**: 使用 RDKit 和本地 BigSMILES 绘图器生成结构图
+- **批量结构检查**: 读取 CSV/XLSX/XLSM，追加解析状态、规范化结构和图片路径
 
 ---
 
@@ -140,9 +140,10 @@ CFRP系统/
 │   ├── active_learning.py      # 主动学习
 │   └── ...                     # 其他模块
 │
-├── DECIMER/                    # 图像转SMILES
+├── DECIMER/                    # 图像转 SMILES
 │   ├── decimer.py
 │   └── efficientnetv2/
+├── bigsmiles_ui/               # SMILES / BigSMILES 结构绘图与批量检查
 │
 ├── docs/                       # 文档
 └── scripts/                    # 辅助脚本
@@ -192,11 +193,13 @@ pip install torch_geometric
 pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.3.0+cu118.html
 ```
 
-**图像转SMILES (可选):**
+**结构图像工具 (可选):**
 ```bash
 pip install tensorflow>=2.12.0,<=2.20.0
 pip install opencv-python pillow-heif efficientnet selfies pyyaml
 pip install pymupdf  # PDF支持
+# 批量结构检查需要：
+pip install openpyxl
 ```
 
 #### 3. 启动应用

@@ -22,12 +22,21 @@ DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_PURPOSE = "both"
 SUPPORTED_PURPOSES = {"input_parsing", "result_explanation", "both"}
+DEFAULT_ENDPOINT = "/chat/completions"
+SUPPORTED_JSON_MODES = {"auto", "strict", "off"}
+DEFAULT_JSON_MODE = "auto"
+SUPPORTED_NETWORK_MODES = {"auto", "direct", "proxy"}
+DEFAULT_NETWORK_MODE = "auto"
+SUPPORTED_RESPONSE_PARSE_MODES = {"strict", "compatible"}
+DEFAULT_RESPONSE_PARSE_MODE = "compatible"
 MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 300
 MIN_MAX_TOKENS = 1
 MAX_MAX_TOKENS = 200_000
 MIN_TEMPERATURE = 0.0
 MAX_TEMPERATURE = 2.0
+MIN_RETRY_ATTEMPTS = 0
+MAX_RETRY_ATTEMPTS = 5
 MAX_TEXT_LENGTH = 200
 PRIVATE_FILE_MODE = 0o600
 
@@ -46,6 +55,7 @@ class AIServiceConfig:
     label: str = ""
     provider: str = ""
     base_url: str = ""
+    endpoint: str = DEFAULT_ENDPOINT
     model: str = ""
     purpose: str = DEFAULT_PURPOSE
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
@@ -53,6 +63,58 @@ class AIServiceConfig:
     temperature: float = DEFAULT_TEMPERATURE
     enabled: bool = True
     api_key: str | None = None
+    json_mode: str = DEFAULT_JSON_MODE
+    network_mode: str = DEFAULT_NETWORK_MODE
+    response_parse_mode: str = DEFAULT_RESPONSE_PARSE_MODE
+    allow_json_mode_downgrade: bool = True
+    max_retries: int = 2
+
+
+def normalize_endpoint_path(endpoint: str) -> str:
+    """Normalize an endpoint path: ensure leading slash, no trailing slash, no duplication."""
+    value = str(endpoint or "").strip()
+    if not value:
+        return DEFAULT_ENDPOINT
+    if not value.startswith("/"):
+        value = "/" + value
+    # Collapse repeated slashes
+    while "//" in value:
+        value = value.replace("//", "/")
+    value = value.rstrip("/")
+    if not value:
+        return DEFAULT_ENDPOINT
+    # Avoid duplicating chat/completions
+    if value.count("/chat/completions") > 1:
+        value = "/chat/completions"
+    return value
+
+
+def build_request_url(base_url: str, endpoint: str = DEFAULT_ENDPOINT) -> str:
+    """Build the final request URL without /v1/v1 or endpoint duplication."""
+    base = str(base_url or "").strip().rstrip("/")
+    while "//" in base.replace("://", ""):
+        base = base.replace("://", "::").replace("//", "/").replace("::", "://")
+    # Strip duplicated /v1 segments
+    while base.count("/v1/v1"):
+        base = base.replace("/v1/v1", "/v1")
+    endpoint_path = normalize_endpoint_path(endpoint)
+    # Avoid appending endpoint again if base_url already ends with it
+    if base.endswith(endpoint_path):
+        final = base
+    else:
+        # If the base URL already ends with /chat/completions from a previous merge, don't append again
+        final = base + endpoint_path
+    return final
+
+
+def key_fingerprint(api_key: str | None) -> str:
+    """Return a safe display fingerprint: last 4 chars, or empty when unset."""
+    value = str(api_key or "").strip()
+    if not value:
+        return ""
+    if len(value) <= 4:
+        return "****"
+    return f"••••{value[-4:]}"
 
 
 def _config_path(root: Path) -> Path:
@@ -67,6 +129,67 @@ def default_ai_config() -> dict[str, Any]:
     """Return a new empty AI configuration without runtime portal fields."""
 
     return _default_config()
+
+
+def get_feature_review_ai_client(
+    root: Path | str | None = None,
+    *,
+    purpose: str = "feature_review",
+    preferred_service_id: str | None = None,
+) -> tuple[Any | None, str]:
+    """Resolve the user-selected feature-review AI client without leaking API keys."""
+    from .portal_ai import PortalAIClient
+
+    config_root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
+    try:
+        config = load_ai_config(config_root)
+    except Exception as exc:
+        return None, f"AI 配置文件读取失败：{exc}（请检查 {CONFIG_DIRECTORY}/{CONFIG_FILENAME}）"
+    services = config.get("services", [])
+    if not isinstance(services, list) or not services:
+        return None, "未配置任何 AI 服务，请前往左侧边栏【AI 服务管理】添加并启用服务。"
+    enabled_services = [s for s in services if isinstance(s, Mapping) and s.get("enabled")]
+    if not enabled_services:
+        return None, "所有 AI 服务均处于未启用状态，请前往左侧边栏【AI 服务管理】勾选启用。"
+
+    # Honour the explicitly selected feature-review service; never silently switch.
+    selected = None
+    if preferred_service_id:
+        for item in enabled_services:
+            if str(item.get("service_id") or "") == str(preferred_service_id):
+                selected = item
+                break
+        if selected is None:
+            # Selected service exists but is disabled, or was deleted
+            all_ids = {str(item.get("service_id") or "") for item in services}
+            if str(preferred_service_id) in all_ids:
+                return None, (
+                    f"当前特征审核服务 [{preferred_service_id}] 处于未启用状态，"
+                    "请前往左侧边栏【AI 服务管理】启用它，或显式切换到其他服务。"
+                )
+            return None, (
+                f"当前特征审核服务 [{preferred_service_id}] 已不存在，"
+                "请在左侧边栏【AI 服务管理】重新选择特征审核服务。"
+            )
+    else:
+        selected = enabled_services[0]
+
+    key = str((selected or {}).get("api_key") or "").strip()
+    service_id = str((selected or {}).get("service_id") or "unknown")
+    if not key:
+        return None, (
+            f"当前特征审核服务 [{service_id}] 未设置 API Key，"
+            "请前往左侧边栏【AI 服务管理】补充 Key。"
+        )
+    try:
+        validated = validate_ai_config({"services": [dict(selected)]})["services"][0]
+        client = PortalAIClient(AIServiceConfig(**validated))
+        label = str(validated.get("label") or validated.get("service_id") or "AI 服务")
+        model = str(validated.get("model") or "")
+        return client, f"AI 服务就绪（{label} · 模型：{model or '默认'} · 服务ID: {service_id}）"
+    except Exception as exc:
+        return None, f"当前特征审核服务 [{service_id}] 配置校验失败：{exc}"
+
 
 
 def _plain_value(value: object, *, label: str) -> object:
@@ -227,6 +350,7 @@ def _service_mapping(value: object, *, index: int) -> dict[str, Any]:
     label = _text(service.get("label", service_id), label=f"services[{index}].label")
     provider = _text(service.get("provider", "openai-compatible"), label=f"services[{index}].provider")
     base_url = _validate_url(service.get("base_url"), provider=provider)
+    endpoint = normalize_endpoint_path(str(service.get("endpoint") or DEFAULT_ENDPOINT))
     model = _text(service.get("model"), label=f"services[{index}].model")
     purpose = _text(service.get("purpose", DEFAULT_PURPOSE), label=f"services[{index}].purpose")
     if purpose not in SUPPORTED_PURPOSES:
@@ -252,7 +376,27 @@ def _service_mapping(value: object, *, index: int) -> dict[str, Any]:
     if api_key is not None and not isinstance(api_key, str):
         raise ValueError(f"services[{index}].api_key must be a string")
 
+    json_mode = str(service.get("json_mode") or DEFAULT_JSON_MODE).strip().lower()
+    if json_mode not in SUPPORTED_JSON_MODES:
+        json_mode = DEFAULT_JSON_MODE
+    network_mode = str(service.get("network_mode") or DEFAULT_NETWORK_MODE).strip().lower()
+    if network_mode not in SUPPORTED_NETWORK_MODES:
+        network_mode = DEFAULT_NETWORK_MODE
+    response_parse_mode = str(service.get("response_parse_mode") or DEFAULT_RESPONSE_PARSE_MODE).strip().lower()
+    if response_parse_mode not in SUPPORTED_RESPONSE_PARSE_MODES:
+        response_parse_mode = DEFAULT_RESPONSE_PARSE_MODE
+    allow_json_mode_downgrade = service.get("allow_json_mode_downgrade", True)
+    if not isinstance(allow_json_mode_downgrade, bool):
+        allow_json_mode_downgrade = True
+    max_retries_raw = service.get("max_retries", 2)
+    if isinstance(max_retries_raw, bool) or not isinstance(max_retries_raw, int):
+        max_retries = 2
+    else:
+        max_retries = max(MIN_RETRY_ATTEMPTS, min(MAX_RETRY_ATTEMPTS, max_retries_raw))
+
     normalized = dict(service)
+    # Backwards-compatible persistence: only persist optional advanced fields when
+    # explicitly present in the source config; runtime dataclass supplies defaults.
     normalized.update(
         {
             "service_id": service_id,
@@ -267,6 +411,18 @@ def _service_mapping(value: object, *, index: int) -> dict[str, Any]:
             "enabled": enabled,
         }
     )
+    if "endpoint" in service:
+        normalized["endpoint"] = endpoint
+    if "json_mode" in service:
+        normalized["json_mode"] = json_mode
+    if "network_mode" in service:
+        normalized["network_mode"] = network_mode
+    if "response_parse_mode" in service:
+        normalized["response_parse_mode"] = response_parse_mode
+    if "allow_json_mode_downgrade" in service:
+        normalized["allow_json_mode_downgrade"] = allow_json_mode_downgrade
+    if "max_retries" in service:
+        normalized["max_retries"] = max_retries
     return normalized
 
 
@@ -456,4 +612,8 @@ __all__ = [
     "redacted_ai_config",
     "save_ai_config",
     "validate_ai_config",
+    "normalize_endpoint_path",
+    "build_request_url",
+    "key_fingerprint",
+    "get_feature_review_ai_client",
 ]
