@@ -166,6 +166,19 @@ def test_apply_review_requires_profile_when_registry_is_provided():
         )
 
 
+@pytest.mark.parametrize("registry_status", ["legacy_observed", "blocked", "deprecated", "unknown"])
+def test_apply_review_rejects_nonreviewable_registry_feature_status(registry_status):
+    from core.feature_mapping_review import apply_feature_review_decision
+
+    registry = {
+        "features": [{"feature_id": "known", "source_type": "manual_input", "status": registry_status}],
+        "model_profiles": {"p": {"feature_ids": ["known"]}},
+    }
+    suggestion = {"feature_id": "known", "raw_columns": ["x"], "source_role": "manual_input", "status": "pending_review"}
+    with pytest.raises(ValueError, match="status"):
+        apply_feature_review_decision({"status": "draft", "feature_bindings": []}, suggestion, "accept", "u", registry=registry, profile_id="p")
+
+
 def test_apply_review_rejects_nonapproved_edited_status():
     from core.feature_mapping_review import apply_feature_review_decision
 

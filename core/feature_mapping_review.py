@@ -169,11 +169,6 @@ def apply_feature_review_decision(
         }
         if feature_id not in valid_ids:
             raise ValueError("feature_id 不属于 registry 合法候选")
-        if profile_id:
-            profile = registry.get("model_profiles", {}).get(profile_id) if isinstance(registry.get("model_profiles"), Mapping) else None
-            profile_ids = set(profile.get("feature_ids", [])) if isinstance(profile, Mapping) else set()
-            if feature_id not in profile_ids:
-                raise ValueError("feature_id 不属于当前 profile 合法候选")
     raw_columns = suggestion.get("raw_columns")
     if not isinstance(feature_id, str) or not feature_id.strip() or not isinstance(raw_columns, list) or not raw_columns:
         raise ValueError("approved binding requires feature_id and raw_columns")
@@ -210,6 +205,10 @@ def apply_feature_review_decision(
         profile_ids = set(profile.get("feature_ids", []))
         if feature_id not in profile_ids:
             raise ValueError("feature_id 不属于当前 profile 合法候选")
+    if isinstance(registry_feature, Mapping):
+        registry_status = str(registry_feature.get("status") or "unknown").strip().lower()
+        if registry_status not in {"draft", "approved"}:
+            raise ValueError("registry feature status 不允许批准：" + registry_status)
     binding = {
         "feature_id": feature_id.strip(),
         "raw_columns": [str(column).strip() for column in raw_columns],
