@@ -447,15 +447,15 @@ def render_feature_registry_page(
             "也不会绕过训练和发布门禁。"
         )
 
-        # 审核人输入（稳定 key + session state 保留，页面刷新不丢失）
+        # 审核人输入：稳定 key 由 Streamlit 自动跨 rerun 持久化；
+        # 注意：widget key 在本次运行中已绑定，不允许再对同名 session key 赋值
+        # （StreamlitAPIException），因此这里不做手动回写。
         reviewer = st.text_input(
             "本地审核人",
-            value=str(st.session_state.get("feature_review_reviewer") or ""),
             key="feature_review_reviewer",
             placeholder="请输入审核身份（例如：reviewer-alice）",
         )
-        st.session_state["feature_review_reviewer"] = reviewer
-        if not reviewer.strip():
+        if not str(reviewer or "").strip():
             st.warning("请先填写审核人（本地审核人），确认框才能勾选。")
 
         # 建议状态统计（三）

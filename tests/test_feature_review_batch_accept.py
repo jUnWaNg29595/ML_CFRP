@@ -103,9 +103,37 @@ class FakeCtx:
         return False
 
 
+class FakeSessionState(dict):
+    """模拟 Streamlit session_state 的 widget-key 保护语义。
+
+    真实 Streamlit 禁止在 widget 实例化后对同名 key 赋值（StreamlitAPIException）。
+    这里跟踪被 widget 使用的 key（widget_keys），赋值时若命中则抛异常，
+    保证测试能捕获"对 widget key 手动赋值"这类真实运行时错误。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.widget_keys: set[str] = set()
+
+    def register_widget(self, key):
+        if key:
+            self.widget_keys.add(str(key))
+
+    def __setitem__(self, key, value):
+        if str(key) in self.widget_keys:
+            raise StreamlitAPIException(
+                f"`st.session_state.{key}` cannot be modified after the widget with key `{key}` is instantiated"
+            )
+        super().__setitem__(key, value)
+
+
+class StreamlitAPIException(Exception):
+    pass
+
+
 def make_fake_st(button_results: dict[str, bool] | None = None, checkbox_values: dict[str, bool] | None = None):
     fake = types.ModuleType("streamlit")
-    fake.session_state = {}
+    fake.session_state = FakeSessionState()
     fake.calls = []
     button_results = button_results or {}
     checkbox_values = checkbox_values or {}
@@ -117,6 +145,8 @@ def make_fake_st(button_results: dict[str, bool] | None = None, checkbox_values:
         def inner(*args, **kwargs):
             _record(name, args, kwargs)
             key = kwargs.get("key")
+            if key and name in ("button", "checkbox", "text_input", "text_area", "selectbox", "radio", "multiselect", "download_button"):
+                fake.session_state.register_widget(key)
             if name in ("container", "expander", "sidebar"):
                 return FakeCtx(fake, name)
             if name == "columns":
@@ -506,17 +536,24 @@ def test_sync_manifest_only_approved_writes_training_key(fake_st):
 # ---------------------------------------------------------------------------
 
 def test_reviewer_persists_across_reruns(fake_st):
-    """reviewer 保存到 session state；第二次渲染（模拟 rerun）仍保留（验收 16）。"""
+    """reviewer 经 widget 稳定 key 跨 rerun 保留；页面不得手动对 widget key 赋值。
+
+    真实 Streamlit 禁止在 widget 实例化后对同名 session key 赋值
+    （StreamlitAPIException）。FakeSessionState 复刻该保护：如果页面在
+    text_input(key="feature_review_reviewer") 之后又写
+    st.session_state["feature_review_reviewer"]，本测试会直接抛异常。
+    （验收 16）
+    """
     from core.feature_registry_ui import render_feature_registry_page
 
-    # 第一次渲染：reviewer 有输入
+    # 预置 reviewer（首次渲染前的 session 状态，等价于用户上一次输入）
     fake_st.session_state["feature_review_reviewer"] = "reviewer-bob"
+    # 不抛 StreamlitAPIException 即通过（widget key 保护语义生效）
     render_feature_registry_page(registry=_registry(), profile_id="p", manifest={"status": "draft", "feature_bindings": []})
     assert fake_st.session_state["feature_review_reviewer"] == "reviewer-bob"
-    # 第二次渲染（rerun）：text_input 用 session 值初始化
+    # widget 以稳定 key 渲染（Streamlit 自动持久化其值）
     text_input_calls = [c for c in fake_st.calls if c[0] == "text_input" and c[2].get("key") == "feature_review_reviewer"]
     assert text_input_calls
-    assert text_input_calls[-1][2].get("value") == "reviewer-bob"
 
 
 def test_selection_persists_across_reruns(fake_st):
