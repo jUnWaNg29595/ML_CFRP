@@ -717,12 +717,55 @@ def _response_payload(value: object) -> object:
 
 
 def _direct_opener() -> urllib.request.OpenerDirector:
-    """AI requests always bypass proxies (direct connection policy).
-
-    AI 服务全程不使用代理：显式传入空 ProxyHandler，
-    避免 urllib 读取 HTTP_PROXY/HTTPS_PROXY 环境变量。
-    """
+    """Explicitly bypass proxies by supplying an empty ProxyHandler."""
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _system_proxy_opener() -> urllib.request.OpenerDirector:
+    """Use environment / OS system proxies."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler())
+
+
+def _build_opener_for_mode(network_mode: str = "auto") -> urllib.request.OpenerDirector:
+    mode = str(network_mode or "auto").strip().lower()
+    if mode == "direct":
+        return _direct_opener()
+    if mode == "proxy":
+        return _system_proxy_opener()
+    # auto: use default environment proxies if present, else standard direct
+    return urllib.request.build_opener()
+
+
+def _parse_sse_stream_to_text(stream_body: str) -> str:
+    """Extract and aggregate text from Server-Sent Events (SSE) chat completion chunks."""
+    content_chunks: list[str] = []
+    lines = stream_body.splitlines()
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            data_str = line[len("data:"):].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk_obj = json_module.loads(data_str)
+                if isinstance(chunk_obj, dict):
+                    # OpenAI chunk: choices[0].delta.content
+                    choices = chunk_obj.get("choices") or []
+                    if isinstance(choices, list) and choices:
+                        delta = choices[0].get("delta") or {}
+                        chunk_text = delta.get("content") or delta.get("text") or ""
+                        if chunk_text:
+                            content_chunks.append(str(chunk_text))
+                    # Anthropic SSE: delta.text
+                    elif "delta" in chunk_obj and isinstance(chunk_obj["delta"], dict):
+                        txt = chunk_obj["delta"].get("text")
+                        if txt:
+                            content_chunks.append(str(txt))
+            except Exception:
+                continue
+    return "".join(content_chunks)
 
 
 def _http_transport(
@@ -732,17 +775,24 @@ def _http_transport(
     headers: Mapping[str, str],
     json: Mapping[str, object],
     timeout: int,
+    network_mode: str = "auto",
+    stream: bool = False,
 ) -> object:
-    """AI 请求全程直连：不读取任何代理环境变量。"""
+    """HTTP transport respecting network_mode (auto/direct/proxy) and optional SSE streaming."""
+    request_headers = dict(headers)
+    if stream:
+        request_headers["Accept"] = "text/event-stream"
     request = urllib.request.Request(
         url,
         data=json_module.dumps(json, ensure_ascii=False).encode("utf-8"),
-        headers=dict(headers),
+        headers=request_headers,
         method=method,
     )
+    opener = _build_opener_for_mode(network_mode)
     try:
-        with _direct_opener().open(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
+        with opener.open(request, timeout=timeout) as response:
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as exc:
         status_code = exc.code
         err_body = ""
@@ -760,10 +810,16 @@ def _http_transport(
     except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError) as exc:
         reason = str(getattr(exc, "reason", exc))
         if "proxy" in reason.lower() or "tunnel" in reason.lower():
-            raise PortalAITransientError("代理连接失败（AI 请求应为直连，请检查系统代理是否劫持了请求）", stage="proxy_connection") from exc
+            raise PortalAITransientError(f"代理连接失败（network_mode={network_mode}）", stage="proxy_connection") from exc
         if "name or service not known" in reason.lower() or "getaddrinfo" in reason.lower() or "nodename" in reason.lower():
             raise PortalAITransientError("DNS 解析失败，请检查 base_url 域名是否正确", stage="dns_failure") from exc
         raise PortalAITransientError(stage="network_connection") from exc
+
+    if stream or "text/event-stream" in content_type:
+        aggregated_text = _parse_sse_stream_to_text(body)
+        if aggregated_text:
+            return {"choices": [{"message": {"content": aggregated_text}}]}
+
     try:
         return json_module.loads(body)
     except json_module.JSONDecodeError as exc:
@@ -843,12 +899,17 @@ class PortalAIClient:
             req_json = dict(request_body)
             if use_json_mode and provider_kind == "openai":
                 req_json["response_format"] = {"type": "json_object"}
+            stream_flag = bool(getattr(self.config, "stream", False))
+            if stream_flag and provider_kind in {"openai", "anthropic"}:
+                req_json["stream"] = True
             kwargs = {
                 "method": "POST",
                 "url": spec["url"],
                 "headers": dict(spec["headers"]),
                 "json": req_json,
                 "timeout": _bounded_timeout(self.config.timeout_seconds),
+                "network_mode": getattr(self.config, "network_mode", "auto"),
+                "stream": stream_flag,
             }
             pending_error = None
             retry = False
@@ -899,7 +960,9 @@ class PortalAIClient:
             except Exception as exc:
                 pending_error = _safe_error(PortalAIError, stage="unexpected", service_id=self.config.service_id, detail=str(exc)[:100])
             if retry:
-                self.sleep(0.25)
+                # 指数退避：1.0s, 2.0s, 4.0s... 遇到网关限流或繁忙适度退避
+                backoff_delay = min(10.0, 1.0 * (2 ** (attempted - 1)))
+                self.sleep(backoff_delay)
                 continue
             if pending_error is not None:
                 raise pending_error from None

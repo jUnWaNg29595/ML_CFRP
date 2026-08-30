@@ -595,7 +595,7 @@ TABNET_DEFAULTS = {
 }
 
 REGRESSION_BALANCE_DEFAULTS = {
-    "enabled": True,
+    "enabled": False,
     "n_bins": 10,
     "max_weight": 3.0,
     "unsupported_model_strategy": "训练集内分层加权抽样",

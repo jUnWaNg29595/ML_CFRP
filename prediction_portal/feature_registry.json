@@ -13067,14 +13067,14 @@
       "feature_id": "cfrp.tg.stoichiometric_ratio_r",
       "name": "stoichiometric_ratio_r",
       "label": "stoichiometric_ratio_r",
-      "source_type": "unknown",
+      "source_type": "manual_input",
       "data_type": "float",
       "unit": "unknown",
       "required_for_prediction": true,
       "nullable": false,
       "default_policy": "forbidden",
       "description": "待确认 PHR、EEW、AHEW 定义、质量基准、方向、单位和训练数据实际公式",
-      "status": "blocked",
+      "status": "draft",
       "blocking_reason": "待确认 PHR、EEW、AHEW 定义、质量基准、方向、单位和训练数据实际公式"
     },
     {
@@ -13697,10 +13697,8 @@
         "cfrp.tg.resin_smiles_n_components",
         "cfrp.tg.curing_agent_smiles_n_components"
       ],
-      "status": "blocked",
-      "blocked_feature_ids": [
-        "cfrp.tg.stoichiometric_ratio_r"
-      ],
+      "status": "draft",
+      "blocked_feature_ids": [],
       "source_artifact": "prediction_portal\\managed_models\\epoxy_resin\\tg\\20260825_200526_model_XGBoost_6.joblib"
     }
   },

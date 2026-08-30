@@ -133,7 +133,7 @@ def test_transient_status_is_retried_twice_then_fails():
     else:
         raise AssertionError("transient error was not raised")
     assert len(calls) == 3
-    assert sleeps == [0.25, 0.25]
+    assert sleeps == [1.0, 2.0]
 
 
 def test_transport_exception_does_not_retain_secret_context():
@@ -175,6 +175,36 @@ def test_falsey_transport_is_preserved_as_injected_seam():
     client = PortalAIClient(_config(), transport=transport)
 
     assert client.transport is transport
+
+
+def test_portal_ai_stream_flag_and_sse_aggregation():
+    from core.portal_ai import _parse_sse_stream_to_text, PortalAIClient
+    from core.portal_ai_config import AIServiceConfig
+
+    sse_data = (
+        'data: {"choices": [{"delta": {"content": "{\\"suggestions\\": "}}]}\n\n'
+        'data: {"choices": [{"delta": {"content": "[]}"}}]}\n\n'
+        'data: [DONE]\n\n'
+    )
+    aggregated = _parse_sse_stream_to_text(sse_data)
+    assert aggregated == '{"suggestions": []}'
+
+    cfg = AIServiceConfig(
+        service_id="stream_test",
+        base_url="https://api.example.com/v1",
+        model="test",
+        stream=True,
+        api_key="sk-test",
+    )
+    calls = []
+    def fake_transport(**kwargs):
+        calls.append(kwargs)
+        return {"choices": [{"message": {"content": '{"recognized_fields": {}}'}}]}
+
+    client = PortalAIClient(cfg, transport=fake_transport)
+    client.parse_input({"user_text": "hello"})
+    assert calls[0]["stream"] is True
+    assert calls[0]["json"].get("stream") is True
 
 
 def test_malformed_json_and_prose_are_rejected():

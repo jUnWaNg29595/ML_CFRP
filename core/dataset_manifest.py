@@ -6,16 +6,30 @@ import hashlib
 import json
 from typing import Any, Mapping
 
-_REVIEW_KEYS = {"approved_hash", "approved_at", "approved_by", "reviewer", "reviewed_at", "review_note", "review_notes", "review_metadata"}
+_REVIEW_KEYS = {
+    "approved_hash", "approved_at", "approved_by", "reviewer", "reviewed_at", "review_note", "review_notes", "review_metadata",
+    "updated_at", "created_at", "mapped_at", "manifest_hash_before", "manifest_hash_after", "manifest_hash", "record_hash",
+}
 
 
 def normalize_dataset_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
     value = copy.deepcopy(dict(payload))
     value.pop("manifest_hash", None)
+    for key in ("updated_at", "created_at", "mapped_at", "approved_at", "approved_by"):
+        value.pop(key, None)
     approval = value.get("approval")
     if isinstance(approval, dict):
         for key in _REVIEW_KEYS:
             approval.pop(key, None)
+    records = value.get("review_records")
+    if isinstance(records, list):
+        normalized_records = []
+        for record in records:
+            if isinstance(record, dict):
+                normalized_records.append({key: item for key, item in record.items() if key not in _REVIEW_KEYS})
+            else:
+                normalized_records.append(record)
+        value["review_records"] = normalized_records
     return value
 
 

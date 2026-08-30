@@ -376,8 +376,10 @@ def test_batch_accept_upgrades_manifest_only_when_registry_and_profile_approved(
         manifest, [_safe_suggestion("f_safe1", confidence=0.95)], registry, "p", "reviewer-alice",
         selected_feature_ids=["f_safe1"],
     )
-    assert updated["status"] == "approved"
-    assert updated["approval"]["status"] == "approved"
+    # Registry/Profile 已批准，但 profile 仍缺少其他必需绑定，因此只能等待补齐。
+    assert updated["status"] == "mapped"
+    assert updated["approval"]["status"] == "mapped"
+    assert updated["approval"]["mapped_by"] == "reviewer-alice"
     # Registry 特征状态保持原样（批量接受不修改 Registry）
     assert registry["features"][0]["status"] == "draft"
 
@@ -413,18 +415,165 @@ def test_batch_accept_atomic_when_selected_contains_invalid(monkeypatch):
     assert manifest["feature_bindings"] == []
 
 
-def test_batch_accept_requires_reviewer():
+def test_batch_accept_defaults_to_local_user_when_reviewer_empty():
     from core.feature_mapping_review import batch_accept_feature_bindings
 
-    with pytest.raises(ValueError, match="审核人"):
-        batch_accept_feature_bindings(
-            {"status": "draft", "feature_bindings": []},
-            [_safe_suggestion()],
-            _batch_registry(),
-            "p",
-            "",
-            selected_feature_ids=["f_safe1"],
-        )
+    result = batch_accept_feature_bindings(
+        {"status": "draft", "feature_bindings": []},
+        [_safe_suggestion()],
+        _batch_registry(),
+        "p",
+        "",
+        selected_feature_ids=["f_safe1"],
+    )
+    assert len(result["feature_bindings"]) == 1
+    assert result["feature_bindings"][0]["approved_by"] == "local_user"
+    assert result["review_records"][0]["reviewer"] == "local_user"
+
+
+
+def test_manifest_status_helper_distinguishes_mapping_and_approval_states():
+    from core.feature_mapping_review import compute_feature_manifest_status
+
+    registry = {
+        "approval": {"status": "draft"},
+        "features": [{"feature_id": "f1", "status": "draft", "source_type": "manual_input"},
+                      {"feature_id": "f2", "status": "draft", "source_type": "manual_input"}],
+        "model_profiles": {"p": {"feature_ids": ["f1", "f2"], "status": "draft"}},
+    }
+    empty = {"feature_bindings": []}
+    partial = {"feature_bindings": [{"feature_id": "f1", "raw_columns": ["a"], "source_role": "manual_input", "review_status": "approved"}]}
+    complete = {"feature_bindings": partial["feature_bindings"] + [{"feature_id": "f2", "raw_columns": ["b"], "source_role": "manual_input", "review_status": "approved"}]}
+    assert compute_feature_manifest_status(empty, registry, "p") == "draft"
+    assert compute_feature_manifest_status(partial, registry, "p") == "mapped"
+    assert compute_feature_manifest_status(complete, registry, "p") == "pending_approval"
+    registry["approval"]["status"] = "approved"
+    registry["model_profiles"]["p"]["status"] = "approved"
+    registry["features"][0]["status"] = "approved"
+    registry["features"][1]["status"] = "approved"
+    assert compute_feature_manifest_status(complete, registry, "p") == "approved"
+
+
+def test_batch_accept_is_idempotent_for_same_binding():
+    from core.feature_mapping_review import batch_accept_feature_bindings
+
+    manifest = {"status": "draft", "feature_bindings": []}
+    suggestion = _safe_suggestion("f_safe1", confidence=0.95)
+    first = batch_accept_feature_bindings(manifest, [suggestion], _batch_registry(), "p", "local_user", selected_feature_ids=["f_safe1"])
+    second = batch_accept_feature_bindings(first, [suggestion], _batch_registry(), "p", "local_user", selected_feature_ids=["f_safe1"])
+    assert len(first["feature_bindings"]) == len(second["feature_bindings"]) == 1
+    assert len(first["review_records"]) == len(second["review_records"]) == 1
+    assert second["manifest_hash"] == first["manifest_hash"]
+
+
+def test_aliases_and_process_fields_are_classified_with_diagnostics():
+    from core.feature_mapping_review import classify_suggestions_with_diagnostics
+
+    registry = {"approval": {"status": "draft"}, "features": [{"feature_id": "cure_temp", "name": "固化温度", "source_type": "manual_input", "status": "draft"}], "model_profiles": {"p": {"feature_ids": ["cure_temp"], "status": "draft"}}}
+    result = classify_suggestions_with_diagnostics([{"feature_id": "cure_temp", "raw_column": "温度", "source_type": "derived", "status": "pending_review", "confidence": 0.99}], registry, "p")
+    assert result["attention"][0]["raw_columns"] == ["温度"]
+    assert result["attention"][0]["source_role"] == "manual_input"
+    assert result["attention"][0]["source_role_raw"] == "derived"
+    assert any("工艺/测试" in reason for reason in result["attention"][0]["_review_reasons"])
+
+
+def test_registry_source_role_mismatch_never_enters_safe_classification():
+    from core.feature_mapping_review import classify_suggestions_with_diagnostics
+
+    registry = {"features": [{"feature_id": "f1", "name": "分子量", "source_type": "molecular_workflow", "status": "approved"}], "model_profiles": {"p": {"feature_ids": ["f1"], "status": "draft"}}}
+    result = classify_suggestions_with_diagnostics([_safe_suggestion("f1", source_role="manual_input")], registry, "p")
+    assert result["safe"] == []
+    assert any("source_type" in reason or "来源类型" in reason for reason in result["attention"][0]["_review_reasons"])
+
+
+
+def test_edit_accept_fixes_unknown_source_role_and_approves():
+    from core.feature_mapping_review import apply_feature_review_decision
+
+    # AI 建议最初为非法/unknown 来源类型
+    bad_suggestion = {
+        "feature_id": "f_safe1",
+        "raw_columns": ["col_f_safe1"],
+        "source_role": "unknown_or_weird_role",
+        "status": "pending_review",
+    }
+    manifest = {"schema_version": 1, "status": "draft", "feature_bindings": []}
+    registry = _batch_registry()
+
+    # 用户在人工工作区修改为 manual_input 后点击“接受修改后结果”
+    updated = apply_feature_review_decision(
+        manifest,
+        bad_suggestion,
+        action="edit_accept",
+        reviewer="local_user",
+        registry=registry,
+        profile_id="p",
+        edited={
+            "source_role": "manual_input",
+            "raw_columns": ["col_f_safe1"],
+            "status": "pending_review",
+        },
+    )
+
+    assert len(updated["feature_bindings"]) == 1
+    assert updated["feature_bindings"][0]["feature_id"] == "f_safe1"
+    assert updated["feature_bindings"][0]["source_role"] == "manual_input"
+    assert updated["feature_bindings"][0]["review_status"] == "approved"
+
+
+def test_edit_accept_auto_aligns_unknown_registry_feature_and_unblocks_profile():
+    from core.feature_mapping_review import apply_feature_review_decision
+
+    # 模拟目标特征在 Registry 中为 unknown/blocked，所属 profile 也处于 blocked
+    registry = {
+        "features": [
+            {"feature_id": "f_blocked_item", "name": "r_val", "source_type": "unknown", "status": "blocked"},
+        ],
+        "model_profiles": {
+            "p": {
+                "feature_ids": ["f_blocked_item"],
+                "status": "blocked",
+                "blocked_feature_ids": ["f_blocked_item"],
+            }
+        },
+        "approval": {"status": "draft"},
+    }
+    manifest = {"schema_version": 1, "status": "draft", "feature_bindings": []}
+    bad_suggestion = {
+        "feature_id": "f_blocked_item",
+        "raw_columns": ["formulation_r_value"],
+        "source_role": "unknown",
+        "status": "pending_review",
+    }
+
+    # 用户在界面上修改为 manual_input 并点击接受
+    updated = apply_feature_review_decision(
+        manifest,
+        bad_suggestion,
+        action="edit_accept",
+        reviewer="local_user",
+        registry=registry,
+        profile_id="p",
+        edited={
+            "source_role": "manual_input",
+            "raw_columns": ["formulation_r_value"],
+            "status": "pending_review",
+        },
+    )
+
+    # 验证：1) 绑定成功写入
+    assert len(updated["feature_bindings"]) == 1
+    assert updated["feature_bindings"][0]["source_role"] == "manual_input"
+    assert updated["feature_bindings"][0]["review_status"] == "approved"
+
+    # 验证：2) Registry 特征的 source_type 和 status 被自动对齐并解除 blocked
+    reg_feat = registry["features"][0]
+    assert reg_feat["source_type"] == "manual_input"
+    assert reg_feat["status"] == "draft"
+
+    # 验证：3) Profile 自动解除 blocked 状态变为正常 draft
+    assert registry["model_profiles"]["p"]["status"] == "draft"
+    assert registry["model_profiles"]["p"]["blocked_feature_ids"] == []
 
 
 def test_batch_accept_requires_at_least_one_selection():
@@ -454,6 +603,79 @@ def test_batch_approve_with_no_safe_suggestions_raises():
         )
 
 
+def test_save_manifest_hash_is_stable_when_only_save_metadata_changes(tmp_path):
+    from core.feature_mapping_review import load_profile_manifest, save_profile_manifest
+
+    payload = {
+        "schema_version": 1,
+        "dataset_id": "d",
+        "model_profile_id": "p",
+        "status": "draft",
+        "feature_bindings": [],
+    }
+    save_profile_manifest("p", payload, tmp_path)
+    first = load_profile_manifest("p", tmp_path)
+    save_profile_manifest("p", first, tmp_path)
+    second = load_profile_manifest("p", tmp_path)
+    assert second["manifest_hash"] == first["manifest_hash"]
+
+
+def test_missing_registry_definition_never_enters_safe_classification():
+    from core.feature_mapping_review import classify_suggestions_with_diagnostics
+
+    registry = {"features": [], "model_profiles": {"p": {"feature_ids": ["missing"], "status": "draft"}}}
+    result = classify_suggestions_with_diagnostics([_safe_suggestion("missing")], registry, "p")
+    assert result["safe"] == []
+    assert any("Registry" in reason or "registry" in reason for reason in result["attention"][0]["_review_reasons"])
+
+
+
+def test_fast_local_feature_mapping_exact_and_alias_matches():
+    from core.feature_mapping_review import fast_local_feature_mapping
+
+    registry = {
+        "features": [
+            {"feature_id": "f_temp", "name": "cure_temperature", "label": "固化温度", "aliases": ["固化温度(℃)", "curing_temp"], "source_type": "manual_input"},
+            {"feature_id": "f_mw", "name": "resin_mw", "label": "树脂分子量", "aliases": ["分子量"], "source_type": "molecular_workflow"},
+        ],
+        "model_profiles": {"p": {"feature_ids": ["f_temp", "f_mw"]}},
+    }
+    cols = ["固化温度(℃)", "分子量", "未知列X"]
+    matched, unmapped = fast_local_feature_mapping(cols, registry, "p")
+    assert len(matched) == 2
+    assert {s["feature_id"] for s in matched} == {"f_temp", "f_mw"}
+    assert unmapped == ["未知列X"]
+    assert matched[0]["confidence"] == 1.0
+
+
+def test_request_feature_mapping_review_auto_chunking(monkeypatch):
+    from core.feature_mapping_review import request_feature_mapping_review
+
+    chunk_calls = []
+
+    class ChunkingMockClient:
+        def review_feature_mapping(self, ctx):
+            chunk_calls.append(list(ctx.get("raw_columns") or []))
+            return {
+                "suggestions": [
+                    {"feature_id": f"feat_{col}", "raw_columns": [col], "source_role": "manual_input", "status": "pending_review", "confidence": 0.95}
+                    for col in ctx.get("raw_columns") or []
+                ],
+                "conflicts": [],
+                "rationale_zh": "分批测试",
+                "confidence": 0.95,
+            }
+
+    cols = [f"col_{i}" for i in range(75)]
+    context = {"profile_id": "p", "raw_columns": cols, "candidate_features": []}
+    resp = request_feature_mapping_review(ChunkingMockClient(), context, batch_size=30)
+    assert len(chunk_calls) == 3
+    assert len(chunk_calls[0]) == 30
+    assert len(chunk_calls[1]) == 30
+    assert len(chunk_calls[2]) == 15
+    assert len(resp["suggestions"]) == 75
+
+
 def test_batch_approve_does_not_modify_registry_feature_status():
     from core.feature_mapping_review import batch_approve_safe_feature_suggestions
 
@@ -474,22 +696,19 @@ def test_batch_approve_does_not_modify_registry_feature_status():
 
 def test_training_manifest_sync_via_session_helper():
     """sync_manifest_to_training_state writes training_dataset_manifest for approved manifests only."""
+    import sys
+    import types
     import core.feature_registry_ui as ui
-
-    class FakeSession(dict):
-        pass
-
-    # We cannot use real streamlit; test via monkeypatched session_state
-    import streamlit
 
     class _FakeState(dict):
         pass
 
-    original = streamlit.session_state
     fake = _FakeState()
+    fake_st = types.ModuleType("streamlit")
+    fake_st.session_state = fake
+    old_st = sys.modules.get("streamlit")
+    sys.modules["streamlit"] = fake_st
     try:
-        # Patch module-level usage: function uses st.session_state internally
-        streamlit.session_state = fake
         approved_manifest = {"schema_version": 1, "status": "approved", "feature_bindings": [{"feature_id": "a"}]}
         ui.sync_manifest_to_training_state(approved_manifest)
         assert fake["training_dataset_manifest"]["status"] == "approved"
@@ -501,7 +720,10 @@ def test_training_manifest_sync_via_session_helper():
         assert "training_dataset_manifest" not in fake
         assert fake["feature_mapping_manifest"]["status"] == "draft"
     finally:
-        streamlit.session_state = original
+        if old_st is not None:
+            sys.modules["streamlit"] = old_st
+        else:
+            sys.modules.pop("streamlit", None)
 
 
 def test_diagnose_training_blockers_reports_missing_manifest():

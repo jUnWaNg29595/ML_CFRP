@@ -11,6 +11,25 @@ from typing import Any, Mapping
 from .portal_ai_schema import parse_feature_mapping_response, sanitize_ai_context
 
 
+LOCAL_REVIEWER_ID = "local_user"
+
+
+def get_local_reviewer_id(config_dir: str | Path | None = None) -> str:
+    """Read configured local reviewer ID from portal config, or return 'local_user' default."""
+    try:
+        from .portal_ai_config import load_ai_config
+        config = load_ai_config(config_dir)
+        if isinstance(config, Mapping):
+            reviewer = config.get("feature_review", {}).get("local_reviewer_id") if isinstance(config.get("feature_review"), Mapping) else None
+            if not reviewer:
+                reviewer = config.get("local_reviewer_id")
+            if isinstance(reviewer, str) and reviewer.strip():
+                return reviewer.strip()
+    except Exception:
+        pass
+    return LOCAL_REVIEWER_ID
+
+
 _REVIEW_FEATURE_FIELDS = (
     "feature_id",
     "name",
@@ -129,30 +148,215 @@ def build_feature_review_context(frame: Any, registry: Mapping[str, Any], profil
     }
 
 
-def request_feature_mapping_review(client: Any, context: Mapping[str, Any]) -> dict[str, Any]:
+def fast_local_feature_mapping(
+    columns: list[str],
+    registry: Mapping[str, Any],
+    profile_id: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Perform fast, zero-network exact/alias mapping for high-confidence columns.
+
+    Returns:
+        (matched_suggestions, remaining_unmapped_columns)
+    """
+    profiles = registry.get("model_profiles", {}) if isinstance(registry, Mapping) else {}
+    profile = profiles.get(profile_id, {}) if isinstance(profiles, Mapping) else {}
+    profile_feature_ids = set(profile.get("feature_ids", []) if isinstance(profile, Mapping) else [])
+    definitions = [
+        item for item in (registry.get("features", []) if isinstance(registry, Mapping) else [])
+        if isinstance(item, Mapping) and item.get("feature_id") and item.get("feature_id") in profile_feature_ids
+    ]
+    matched: list[dict[str, Any]] = []
+    mapped_columns: set[str] = set()
+    used_feature_ids: set[str] = set()
+
+    for col in columns:
+        col_clean = str(col).strip()
+        col_norm = _normalized_column(col_clean)
+        if not col_norm:
+            continue
+        for feat in definitions:
+            fid = str(feat.get("feature_id") or "")
+            if fid in used_feature_ids:
+                continue
+            names = [fid, str(feat.get("name") or ""), str(feat.get("label") or "")]
+            aliases = feat.get("aliases") or []
+            if isinstance(aliases, str):
+                names.append(aliases)
+            elif isinstance(aliases, (list, tuple)):
+                names.extend(str(a) for a in aliases if str(a).strip())
+            acc_aliases = feat.get("accepted_aliases") or []
+            if isinstance(acc_aliases, str):
+                names.append(acc_aliases)
+            elif isinstance(acc_aliases, (list, tuple)):
+                names.extend(str(a) for a in acc_aliases if str(a).strip())
+
+            # 精确或标准化严格相等判定
+            if any(col_norm == _normalized_column(n) for n in names if n):
+                source_role = str(feat.get("source_type") or "manual_input").strip()
+                if source_role not in _APPROVABLE_SOURCE_ROLES:
+                    source_role = "manual_input"
+                # 工艺/测试字段默认 manual_input
+                if _looks_like_process_test_field({"feature_id": fid, "raw_columns": [col_clean]}, feat):
+                    source_role = "manual_input"
+
+                sugg = {
+                    "feature_id": fid,
+                    "raw_columns": [col_clean],
+                    "source_role": source_role,
+                    "unit": str(feat.get("unit") or "").strip() or None,
+                    "confidence": 1.0,
+                    "rationale_zh": "本地精确/别名完全匹配（高置信度预映射）",
+                    "status": "pending_review",
+                    "is_new_proposal": False,
+                }
+                matched.append(sugg)
+                mapped_columns.add(col_clean)
+                used_feature_ids.add(fid)
+                break
+
+    remaining = [c for c in columns if c not in mapped_columns]
+    return matched, remaining
+
+
+def request_feature_mapping_review(
+    client: Any,
+    context: Mapping[str, Any],
+    *,
+    batch_size: int = 30,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> dict[str, Any]:
+    """Request AI review with smart column chunking and progressive fallback.
+
+    If raw_columns exceeds batch_size, it transparently splits into smaller chunks,
+    combines all generated suggestions, preserves successful chunks even if one fails,
+    and returns a unified result dictionary.
+    """
     if client is None or not callable(getattr(client, "review_feature_mapping", None)):
         raise ValueError("AI 特征审核客户端不可用")
-    response = client.review_feature_mapping(dict(context))
-    return parse_feature_mapping_response(response)
+
+    raw_columns = list(context.get("raw_columns") or [])
+    if len(raw_columns) <= batch_size:
+        if progress_callback:
+            progress_callback(1, 1, f"正在分析全部 {len(raw_columns)} 列...")
+        response = client.review_feature_mapping(dict(context))
+        return parse_feature_mapping_response(response)
+
+    # 分批执行
+    chunks = [raw_columns[i:i + batch_size] for i in range(0, len(raw_columns), batch_size)]
+    total_chunks = len(chunks)
+    all_suggestions: list[dict[str, Any]] = []
+    all_conflicts: list[str] = []
+    rationales: list[str] = []
+    confidences: list[float] = []
+    errors: list[str] = []
+
+    dtypes = context.get("column_dtypes") or {}
+    sample_rows = context.get("sample_rows") or []
+    all_candidates = list(context.get("candidate_features") or [])
+
+    for idx, chunk_cols in enumerate(chunks, 1):
+        if progress_callback:
+            progress_callback(idx, total_chunks, f"正在分析第 {idx}/{total_chunks} 批数据列（{len(chunk_cols)} 列）...")
+
+        # 裁剪本批的 context 减小 Payload 负担
+        chunk_dtypes = {c: dtypes[c] for c in chunk_cols if c in dtypes}
+        chunk_sample_rows = []
+        for row in sample_rows:
+            if isinstance(row, dict):
+                chunk_sample_rows.append({c: row[c] for c in chunk_cols if c in row})
+
+        chunk_context = {
+            "profile_id": context.get("profile_id", ""),
+            "raw_columns": chunk_cols,
+            "column_dtypes": chunk_dtypes,
+            "sample_rows": chunk_sample_rows,
+            "candidate_features": all_candidates,
+        }
+        try:
+            resp = client.review_feature_mapping(chunk_context)
+            parsed = parse_feature_mapping_response(resp)
+            all_suggestions.extend(parsed.get("suggestions") or [])
+            all_conflicts.extend(parsed.get("conflicts") or [])
+            if parsed.get("rationale_zh"):
+                rationales.append(str(parsed["rationale_zh"]))
+            if parsed.get("confidence") is not None:
+                try:
+                    confidences.append(float(parsed["confidence"]))
+                except Exception:
+                    pass
+        except Exception as exc:
+            errors.append(f"批次 {idx}/{total_chunks} 分析异常：{exc}")
+
+    if not all_suggestions and errors:
+        # 全部批次失败，抛出汇总错误
+        raise RuntimeError("分批特征审核全部失败：" + "；".join(errors))
+
+    # 去重合并 suggestions（后批次不覆盖已匹配好的 feature_id）
+    seen_fids: set[str] = set()
+    deduped_suggs: list[dict[str, Any]] = []
+    for s in all_suggestions:
+        fid = str(s.get("feature_id") or "")
+        if fid and fid not in seen_fids:
+            seen_fids.add(fid)
+            deduped_suggs.append(s)
+        elif not fid:
+            deduped_suggs.append(s)
+
+    avg_conf = sum(confidences) / len(confidences) if confidences else 0.9
+    combined_rationale = "；".join(rationales) if rationales else "分批分析完成"
+    if errors:
+        combined_rationale += f"（部分批次遇到异常：{'; '.join(errors)}）"
+
+    return {
+        "suggestions": deduped_suggs,
+        "conflicts": all_conflicts,
+        "rationale_zh": combined_rationale[:4000],
+        "confidence": avg_conf,
+    }
 
 
 def apply_feature_review_decision(
-    manifest: Mapping[str, Any], suggestion: Mapping[str, Any], action: str, reviewer: str,
+    manifest: Mapping[str, Any], suggestion: Mapping[str, Any], action: str, reviewer: str | None = None,
     registry: Mapping[str, Any] | None = None, edited: Mapping[str, Any] | None = None,
     profile_id: str | None = None,
 ) -> dict[str, Any]:
+    from .dataset_manifest import compute_dataset_manifest_hash
     updated = copy.deepcopy(dict(manifest))
     action = str(action).strip().lower()
-    reviewer = str(reviewer or "").strip()
-    if not reviewer:
-        raise ValueError("reviewer is required for feature review decisions")
+    reviewer = str(reviewer or "").strip() or get_local_reviewer_id()
     now = datetime.now(timezone.utc).isoformat()
-    record = {"action": action, "reviewer": reviewer, "feature_id": suggestion.get("feature_id"), "recorded_at": now}
+    manifest_hash_before = compute_dataset_manifest_hash(manifest)
+    record = {
+        "action": action,
+        "reviewer": reviewer,
+        "approved_by": reviewer,
+        "approved_at": now,
+        "feature_id": suggestion.get("feature_id"),
+        "raw_columns": suggestion.get("raw_columns"),
+        "source_role": suggestion.get("source_role"),
+        "recorded_at": now,
+        "manifest_hash_before": manifest_hash_before,
+    }
     if action == "reject":
+        manifest_hash_after = compute_dataset_manifest_hash(updated)
+        record["manifest_hash_after"] = manifest_hash_after
         updated.setdefault("review_records", []).append(record)
         return updated
     if action not in {"accept", "edit_accept"}:
         raise ValueError("unsupported feature review action")
+    if action == "edit_accept":
+        if not isinstance(edited, Mapping):
+            raise ValueError("edit_accept 必须提供编辑后的字段")
+        if "status" in edited and str(edited.get("status") or "").strip().lower() != "pending_review":
+            raise ValueError("编辑后的 status 必须为 pending_review")
+        suggestion = {**dict(suggestion), **dict(edited)}
+        raw_columns = suggestion.get("raw_columns")
+        if isinstance(raw_columns, str):
+            raw_columns = [item.strip() for item in raw_columns.split(",") if item.strip()]
+        if not isinstance(raw_columns, list) or not raw_columns:
+            raise ValueError("编辑后的 raw_columns 不能为空")
+        suggestion["raw_columns"] = raw_columns
+
     suggestion_status = suggestion.get("status")
     if suggestion_status is None or str(suggestion_status).strip().lower() != "pending_review":
         raise ValueError("只能批准 status=pending_review 的特征审核建议")
@@ -175,27 +379,21 @@ def apply_feature_review_decision(
         raise ValueError("approved binding requires feature_id and raw_columns")
     if "source_role" not in suggestion or not str(suggestion.get("source_role") or "").strip():
         raise ValueError("source_role 必须显式提供")
-    source_role = str(suggestion.get("source_role") or "").strip()
+    from .portal_ai_schema import normalize_feature_source_role
+    source_role_raw = str(suggestion.get("source_role") or "").strip()
+    source_role = normalize_feature_source_role(source_role_raw) or source_role_raw
     if source_role not in {"manual_input", "molecular_workflow", "derived_workflow"}:
         raise ValueError("source_role 必须是允许的输入/工作流来源")
-    if action == "edit_accept":
-        if not isinstance(edited, Mapping):
-            raise ValueError("edit_accept 必须提供编辑后的字段")
-        if "status" in edited and str(edited.get("status") or "").strip().lower() != "pending_review":
-            raise ValueError("编辑后的 status 必须为 pending_review")
-        suggestion = {**dict(suggestion), **dict(edited)}
-        raw_columns = suggestion.get("raw_columns")
-        if isinstance(raw_columns, str):
-            raw_columns = [item.strip() for item in raw_columns.split(",") if item.strip()]
-        if not isinstance(raw_columns, list) or not raw_columns:
-            raise ValueError("编辑后的 raw_columns 不能为空")
-        source_role = str(suggestion.get("source_role") or "").strip()
-        if source_role not in {"manual_input", "molecular_workflow", "derived_workflow"}:
-            raise ValueError("编辑后的 source_role 无效")
     if isinstance(registry_feature, Mapping):
         source_type = str(registry_feature.get("source_type") or "").strip()
         if source_type != source_role:
-            raise ValueError("source_role 必须与 registry feature.source_type 对齐")
+            if action == "edit_accept":
+                # 人工明确指定了合法来源类型，自动对齐并更新 Registry 特征定义
+                registry_feature["source_type"] = source_role
+                if str(registry_feature.get("status") or "").strip().lower() in {"unknown", "blocked", "deprecated"}:
+                    registry_feature["status"] = "draft"
+            else:
+                raise ValueError("source_role 必须与 registry feature.source_type 对齐")
     if isinstance(registry, Mapping):
         if not isinstance(profile_id, str) or not profile_id.strip():
             raise ValueError("registry 审核必须提供 model profile_id")
@@ -209,7 +407,23 @@ def apply_feature_review_decision(
     if isinstance(registry_feature, Mapping):
         registry_status = str(registry_feature.get("status") or "unknown").strip().lower()
         if registry_status not in {"draft", "approved"}:
-            raise ValueError("registry feature status 不允许批准：" + registry_status)
+            if action == "edit_accept":
+                # 人工审核接受后将被阻断/历史未知状态自动解除为 draft 允许状态
+                registry_feature["status"] = "draft"
+                registry_status = "draft"
+            else:
+                raise ValueError("registry feature status 不允许批准：" + registry_status)
+    if isinstance(registry, Mapping) and profile_id and action == "edit_accept":
+        # 检查并解除当前 profile 的 blocked 状态（若所有包含的特征均已处于 draft/approved）
+        profiles = registry.get("model_profiles", {})
+        curr_profile = profiles.get(profile_id, {})
+        if isinstance(curr_profile, dict) and curr_profile.get("status") == "blocked":
+            blocked_fids = curr_profile.get("blocked_feature_ids") or []
+            if isinstance(blocked_fids, list) and feature_id in blocked_fids:
+                curr_profile["blocked_feature_ids"] = [fid for fid in blocked_fids if fid != feature_id]
+            # 如果没有其他 blocked 特征，自动解除 profile 的 blocked 状态为 draft
+            if not curr_profile.get("blocked_feature_ids"):
+                curr_profile["status"] = "draft"
     binding = {
         "feature_id": feature_id.strip(),
         "raw_columns": [str(column).strip() for column in raw_columns],
@@ -222,9 +436,24 @@ def apply_feature_review_decision(
     bindings = [item for item in (updated.get("feature_bindings") or []) if isinstance(item, Mapping) and item.get("feature_id") != feature_id]
     bindings.append(binding)
     updated["feature_bindings"] = bindings
-    updated.setdefault("approval", {})
-    updated["approval"].update({"status": "approved", "approved_by": reviewer, "approved_at": binding["approved_at"]})
-    record.update({"feature_id": feature_id.strip(), "raw_columns": list(binding["raw_columns"])})
+    if isinstance(registry, Mapping):
+        updated["status"] = compute_feature_manifest_status(updated, registry, str(profile_id or ""))
+        approval_status = updated["status"]
+        updated.setdefault("approval", {}).update({"status": approval_status})
+        if approval_status == "approved":
+            updated["approval"].update({"approved_by": reviewer, "approved_at": binding["approved_at"]})
+        else:
+            updated["approval"].update({"mapped_by": reviewer, "mapped_at": binding["approved_at"]})
+    else:
+        updated.setdefault("approval", {})
+        updated["approval"].update({"status": "approved", "approved_by": reviewer, "approved_at": binding["approved_at"]})
+    manifest_hash_after = compute_dataset_manifest_hash(updated)
+    record.update({
+        "feature_id": feature_id.strip(),
+        "raw_columns": list(binding["raw_columns"]),
+        "source_role": source_role,
+        "manifest_hash_after": manifest_hash_after,
+    })
     updated.setdefault("review_records", []).append(record)
     return updated
 
@@ -328,6 +557,62 @@ def save_profile_suggestions(profile_id: str, suggestions: list[Mapping[str, Any
 
 _APPROVABLE_SOURCE_ROLES = {"manual_input", "molecular_workflow", "derived_workflow"}
 _MIN_SAFE_CONFIDENCE = 0.85
+
+
+def compute_feature_manifest_status(
+    manifest: Mapping[str, Any],
+    registry: Mapping[str, Any],
+    profile_id: str,
+) -> str:
+    """Derive the manifest lifecycle state from bindings and governance state.
+
+    ``draft`` means no valid approved binding exists; ``mapped`` means a valid
+    subset exists; ``pending_approval`` means all profile features are mapped
+    but Registry/Profile approval is still missing; ``approved`` requires the
+    complete binding set and approved Registry, profile, and feature entries.
+    """
+    if not isinstance(manifest, Mapping) or not isinstance(registry, Mapping):
+        return "draft"
+    profiles = registry.get("model_profiles")
+    profile = profiles.get(profile_id) if isinstance(profiles, Mapping) else None
+    if not isinstance(profile, Mapping):
+        return "draft"
+    required_ids = {str(fid) for fid in (profile.get("feature_ids") or []) if str(fid).strip()}
+    definitions = {
+        str(item.get("feature_id")): item
+        for item in (registry.get("features") or [])
+        if isinstance(item, Mapping) and str(item.get("feature_id") or "").strip()
+    }
+    valid_ids: set[str] = set()
+    seen: set[str] = set()
+    for binding in (manifest.get("feature_bindings") or []):
+        if not isinstance(binding, Mapping):
+            continue
+        fid = str(binding.get("feature_id") or "").strip()
+        raw_columns = binding.get("raw_columns")
+        source_role = str(binding.get("source_role") or "").strip()
+        feature = definitions.get(fid)
+        if (
+            fid and fid not in seen and fid in required_ids
+            and isinstance(raw_columns, list) and raw_columns
+            and all(str(raw).strip() for raw in raw_columns)
+            and source_role in _APPROVABLE_SOURCE_ROLES
+            and str(binding.get("review_status") or "").strip().lower() == "approved"
+            and isinstance(feature, Mapping)
+            and str(feature.get("source_type") or "").strip() == source_role
+            and str(feature.get("status") or "").strip().lower() in {"draft", "approved"}
+        ):
+            valid_ids.add(fid)
+        seen.add(fid)
+    if not valid_ids:
+        return "draft"
+    if valid_ids != required_ids:
+        return "mapped"
+    registry_approved = str((registry.get("approval") or {}).get("status") or "").strip().lower() == "approved"
+    profile_approved = str(profile.get("status") or "").strip().lower() == "approved"
+    features_approved = all(str(definitions[fid].get("status") or "").strip().lower() == "approved" for fid in required_ids if fid in definitions)
+    return "approved" if registry_approved and profile_approved and features_approved and required_ids <= valid_ids else "pending_approval"
+
 
 # 工艺/测试/人工记录字段默认必须为 manual_input（业务硬规则）。
 # AI 若把这类字段标为 workflow/derived，必须转入人工处理而不是进入安全建议。
@@ -445,6 +730,7 @@ def classify_suggestions_with_diagnostics(
         copy_sugg = _normalized_suggestion(suggestion)
         feature_id = str(copy_sugg.get("feature_id") or "").strip()
         source_role = str(copy_sugg.get("source_role") or "unknown").strip()
+        source_role_original = str(suggestion.get("source_role") or suggestion.get("source_type") or source_role).strip()
         status = str(copy_sugg.get("status") or "unknown").strip().lower()
         raw_columns = [str(col).strip() for col in (copy_sugg.get("raw_columns") or []) if str(col).strip()]
         confidence = copy_sugg.get("confidence")
@@ -453,7 +739,16 @@ def classify_suggestions_with_diagnostics(
         except (TypeError, ValueError):
             confidence_val = 0.0
         is_new_proposal = bool(copy_sugg.get("is_new_proposal") or feature_id not in profile_feature_ids)
-
+        registry_feature = definitions.get(feature_id)
+        is_process_test_field = _looks_like_process_test_field(copy_sugg, registry_feature)
+        original_source_role = source_role
+        if is_process_test_field and source_role in {"molecular_workflow", "derived_workflow"}:
+            # Process/test inputs default to manual entry. Keep the AI value for
+            # audit and force human attention so this is never auto-accepted.
+            copy_sugg["source_role"] = "manual_input"
+            copy_sugg["source_role_raw"] = source_role_original
+            copy_sugg["source_role_defaulted"] = True
+            source_role = "manual_input"
         reasons: list[str] = []
         repair_actions: list[str] = []
         if status != "pending_review":
@@ -465,11 +760,21 @@ def classify_suggestions_with_diagnostics(
         if feature_id not in profile_feature_ids:
             reasons.append(f"feature_id {feature_id} 不属于当前 profile")
             repair_actions.append("选择当前 profile 内的规范特征，或转为新特征提案")
+        elif feature_id not in definitions:
+            reasons.append(f"feature_id {feature_id} 不存在于 Registry")
+            repair_actions.append("在 Registry 中登记该特征并加入当前 profile 后再接受")
         elif feature_id in definitions:
             reg_status = str(definitions[feature_id].get("status") or "unknown").strip().lower()
             if reg_status not in {"draft", "approved"}:
                 reasons.append(f"registry 状态 {reg_status} 不允许批准")
                 repair_actions.append("先人工审核 Registry 特征状态（legacy_observed/deprecated/blocked 不能自动批准）")
+            registry_source_role = str(definitions[feature_id].get("source_type") or "").strip()
+            if registry_source_role not in _APPROVABLE_SOURCE_ROLES:
+                reasons.append(f"Registry source_type {registry_source_role or 'unknown'} 无法批准")
+                repair_actions.append("先修正 Registry 特征的 source_type")
+            elif registry_source_role != source_role:
+                reasons.append(f"来源类型 {source_role} 与 Registry source_type {registry_source_role} 不一致")
+                repair_actions.append(f"把来源类型修改为 {registry_source_role}，与 Registry 定义保持一致")
         if not raw_columns:
             reasons.append("缺少原始列")
             repair_actions.append("在逐项审核中补全原始列")
@@ -482,8 +787,8 @@ def classify_suggestions_with_diagnostics(
         if is_new_proposal:
             reasons.append("新特征提案需要人工登记")
             repair_actions.append("使用【批准并登记新特征】单独登记，不进入批量接受")
-        # 工艺/测试字段被 AI 标为 workflow/derived → 必须人工确认
-        if source_role in {"molecular_workflow", "derived_workflow"} and _looks_like_process_test_field(copy_sugg, definitions.get(feature_id)):
+        # 工艺/测试字段被 AI 标为 workflow/derived → 默认改为 manual_input，且必须人工确认
+        if is_process_test_field and original_source_role in {"molecular_workflow", "derived_workflow"}:
             reasons.append("该字段属于工艺/测试输入，默认应为 manual_input，请人工确认")
             repair_actions.append("把来源类型修改为 manual_input（工艺/测试字段默认人工输入）")
         for raw in raw_columns:
@@ -538,7 +843,7 @@ def batch_accept_feature_bindings(
     suggestions: list[Mapping[str, Any]],
     registry: Mapping[str, Any],
     profile_id: str,
-    reviewer: str,
+    reviewer: str | None = None,
     *,
     selected_feature_ids: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -556,12 +861,10 @@ def batch_accept_feature_bindings(
 
     原子性：先校验全部选中建议；任何一条失败则整个批次不写入，原 manifest 不变。
     """
-    reviewer_name = str(reviewer or "").strip()
-    if not reviewer_name:
-        raise ValueError("审核人（reviewer）必填：批量接受特征映射建议需要本地审核人")
+    reviewer_name = str(reviewer or "").strip() or get_local_reviewer_id()
     classification = classify_suggestions_with_diagnostics(suggestions, registry, profile_id)
     safe_by_id = {str(item.get("feature_id")): item for item in classification["safe"]}
-    selected = [str(fid) for fid in (selected_feature_ids or []) if str(fid).strip()]
+    selected = list(dict.fromkeys(str(fid).strip() for fid in (selected_feature_ids or []) if str(fid).strip()))
     if not selected:
         raise ValueError("请至少选择一条建议")
 
@@ -589,8 +892,12 @@ def batch_accept_feature_bindings(
         raise ValueError("批量接受中止（未写入任何数据）：" + " | ".join(validations[:10]))
 
     # 2) 结构校验通过后一次性写入
+    from .dataset_manifest import compute_dataset_manifest_hash
     updated = copy.deepcopy(dict(manifest))
+    manifest_hash_before = compute_dataset_manifest_hash(manifest)
     now = datetime.now(timezone.utc).isoformat()
+    existing_bindings = [b for b in (updated.get("feature_bindings") or []) if isinstance(b, Mapping)]
+    existing_by_id = {str(b.get("feature_id")): b for b in existing_bindings if str(b.get("feature_id") or "").strip()}
     new_bindings: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
     for item in chosen_items:
@@ -608,49 +915,60 @@ def batch_accept_feature_bindings(
             "approved_by": reviewer_name,
             "approved_at": now,
         }
+        previous = existing_by_id.get(feature_id)
+        same_binding = isinstance(previous, Mapping) and all(
+            previous.get(key) == binding.get(key)
+            for key in ("feature_id", "raw_columns", "source_role", "unit", "confidence", "rationale_zh", "review_status")
+        )
+        if same_binding:
+            continue
         new_bindings.append(binding)
         records.append({
-            "action": "accept",
+            "action": "batch_accept",
             "reviewer": reviewer_name,
+            "approved_by": reviewer_name,
+            "approved_at": now,
             "feature_id": feature_id,
             "raw_columns": raw_columns,
             "source_role": source_role,
             "recorded_at": now,
             "batch": True,
-            "manifest_hash": "",  # 写入后统一计算
+            "manifest_hash_before": manifest_hash_before,
+            "manifest_hash_after": "",  # 写入后统一计算
         })
 
-    existing_bindings = [b for b in (updated.get("feature_bindings") or []) if isinstance(b, Mapping)]
-    new_fids = {b["feature_id"] for b in new_bindings}
-    merged_bindings = [b for b in existing_bindings if b.get("feature_id") not in new_fids] + new_bindings
+    merged_bindings = [b for b in existing_bindings if str(b.get("feature_id")) not in {item["feature_id"] for item in new_bindings}] + new_bindings
     updated["feature_bindings"] = merged_bindings
 
-    # 3) manifest 状态升级规则：只有 Registry/profile/manifest 全部满足正式条件才 approved
-    profile = ((registry.get("model_profiles") or {}).get(profile_id) or {}) if isinstance(registry, Mapping) else {}
-    registry_ok = isinstance(registry, Mapping) and str((registry.get("approval") or {}).get("status") or "").strip().lower() == "approved"
-    profile_ok = str(profile.get("status") or "").strip().lower() == "approved" if isinstance(profile, Mapping) else False
-    if registry_ok and profile_ok:
-        updated["status"] = "approved"
-        updated.setdefault("approval", {}).update({
-            "status": "approved", "approved_by": reviewer_name, "approved_at": now, "batch_approved": True,
-        })
-        updated["approved_at"] = now
-        updated["approved_by"] = reviewer_name
-    else:
-        # 仅接受映射：manifest 保持 mapped（已接受但未正式批准，不能训练）
-        updated["status"] = "mapped"
-        updated.setdefault("approval", {}).update({
-            "status": "mapped", "mapped_by": reviewer_name, "mapped_at": now, "batch_approved": True,
-        })
-        updated["mapped_at"] = now
-        updated["mapped_by"] = reviewer_name
+    # 3) manifest 状态升级规则：状态由实际绑定完整度和治理审批共同决定。
+    computed_status = compute_feature_manifest_status(updated, registry, profile_id)
+    previous_status = str(updated.get("status") or "").strip().lower()
+    status_changed = previous_status != computed_status
+    if status_changed:
+        updated["status"] = computed_status
+        approval = updated.setdefault("approval", {})
+        if computed_status == "approved":
+            approval.update({"status": "approved", "approved_by": reviewer_name, "approved_at": now, "batch_approved": True})
+            updated["approved_at"] = now
+            updated["approved_by"] = reviewer_name
+        elif computed_status == "pending_approval":
+            approval.update({"status": "pending_approval", "mapped_by": reviewer_name, "mapped_at": now, "batch_approved": True})
+            updated["mapped_at"] = now
+            updated["mapped_by"] = reviewer_name
+        else:
+            approval.update({"status": computed_status, "mapped_by": reviewer_name, "mapped_at": now, "batch_approved": True})
+            updated["mapped_at"] = now
+            updated["mapped_by"] = reviewer_name
+    elif not isinstance(updated.get("approval"), Mapping):
+        updated["approval"] = {"status": computed_status}
 
-    # 4) 重新计算 manifest_hash（含 review_records，保证审计可追溯）
-    from .dataset_manifest import compute_dataset_manifest_hash
+    # 4) 重新计算 manifest_hash（含审计记录，但排除审计 hash 元数据）。
     updated.setdefault("review_records", []).extend(records)
+    current_hash = compute_dataset_manifest_hash(updated)
     for record in updated["review_records"]:
-        if isinstance(record, Mapping) and record.get("batch") and not record.get("manifest_hash"):
-            record["manifest_hash"] = compute_dataset_manifest_hash(updated)
+        if isinstance(record, Mapping) and record.get("batch") and not record.get("manifest_hash_after"):
+            record["manifest_hash_after"] = current_hash
+            record["manifest_hash"] = current_hash
     updated["manifest_hash"] = compute_dataset_manifest_hash(updated)
     return updated
 
@@ -660,22 +978,26 @@ def batch_approve_safe_feature_suggestions(
     suggestions: list[Mapping[str, Any]],
     registry: Mapping[str, Any],
     profile_id: str,
-    reviewer: str,
+    reviewer: str | None = None,
 ) -> dict[str, Any]:
     """兼容旧接口：等价于 batch_accept_feature_bindings 全选安全建议。
 
     保留为兼容模式（旧调用方/旧测试仍可用），但内部走新的原子化实现，
     且不再无条件把 manifest.status 升级为 approved（遵循状态规则）。
     """
+    reviewer_name = str(reviewer or "").strip() or get_local_reviewer_id()
     classification = classify_suggestions_with_diagnostics(suggestions, registry, profile_id)
     safe_ids = [str(item.get("feature_id")) for item in classification["safe"]]
     return batch_accept_feature_bindings(
-        manifest, suggestions, registry, profile_id, reviewer, selected_feature_ids=safe_ids,
+        manifest, suggestions, registry, profile_id, reviewer_name, selected_feature_ids=safe_ids,
     )
 
 
 __all__ = [
+    "LOCAL_REVIEWER_ID",
+    "get_local_reviewer_id",
     "build_feature_review_context",
+    "fast_local_feature_mapping",
     "request_feature_mapping_review",
     "apply_feature_review_decision",
     "save_feature_review_record",
@@ -686,6 +1008,7 @@ __all__ = [
     "save_profile_suggestions",
     "classify_feature_suggestions",
     "classify_suggestions_with_diagnostics",
+    "compute_feature_manifest_status",
     "batch_accept_feature_bindings",
     "batch_approve_safe_feature_suggestions",
 ]

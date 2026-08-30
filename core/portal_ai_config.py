@@ -76,6 +76,7 @@ class AIServiceConfig:
     request_template: dict | None = None
     response_json_path: str | None = None
     anthropic_version: str = "2023-06-01"
+    stream: bool = False
 
 
 def normalize_endpoint_path(endpoint: str) -> str:
@@ -384,6 +385,10 @@ def _service_mapping(value: object, *, index: int) -> dict[str, Any]:
     if api_key is not None and not isinstance(api_key, str):
         raise ValueError(f"services[{index}].api_key must be a string")
 
+    stream = service.get("stream", False)
+    if not isinstance(stream, bool):
+        stream = False
+
     json_mode = str(service.get("json_mode") or DEFAULT_JSON_MODE).strip().lower()
     if json_mode not in SUPPORTED_JSON_MODES:
         json_mode = DEFAULT_JSON_MODE
@@ -468,6 +473,8 @@ def _service_mapping(value: object, *, index: int) -> dict[str, Any]:
         normalized["anthropic_version"] = (
             str(anthropic_version_raw).strip() if isinstance(anthropic_version_raw, str) and str(anthropic_version_raw).strip() else "2023-06-01"
         )
+    if "stream" in service:
+        normalized["stream"] = stream
     return normalized
 
 

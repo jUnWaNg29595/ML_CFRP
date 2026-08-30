@@ -1,3 +1,4 @@
+# Fix SciPy/NumPy compatibility and optional xgboost artifacts in test environments.
 from __future__ import annotations
 
 import json
@@ -5,7 +6,41 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as _np
 import pytest
+
+if not hasattr(_np, "long"):
+    _np.long = int
+if not hasattr(_np, "ulong"):
+    _np.ulong = int
+
+# Mock xgboost if not installed so joblib unpickler doesn't fail on XGBRegressor.
+try:
+    import xgboost.sklearn
+except ImportError:
+    import types
+    xgb_mod = types.ModuleType("xgboost")
+    xgb_mod.__path__ = []
+    xgb_sk = types.ModuleType("xgboost.sklearn")
+    xgb_callback = types.ModuleType("xgboost.callback")
+    xgb_core = types.ModuleType("xgboost.core")
+    class _MockXGB:
+        pass
+    class _MockEarlyStopping:
+        pass
+    class _MockBooster:
+        pass
+    xgb_sk.XGBRegressor = _MockXGB
+    xgb_sk.XGBClassifier = _MockXGB
+    xgb_callback.EarlyStopping = _MockEarlyStopping
+    xgb_core.Booster = _MockBooster
+    xgb_mod.sklearn = xgb_sk
+    xgb_mod.callback = xgb_callback
+    xgb_mod.core = xgb_core
+    sys.modules["xgboost"] = xgb_mod
+    sys.modules["xgboost.sklearn"] = xgb_sk
+    sys.modules["xgboost.callback"] = xgb_callback
+    sys.modules["xgboost.core"] = xgb_core
 
 
 ROOT = Path(__file__).resolve().parents[1]

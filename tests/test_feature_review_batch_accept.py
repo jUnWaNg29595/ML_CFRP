@@ -147,7 +147,7 @@ def make_fake_st(button_results: dict[str, bool] | None = None, checkbox_values:
             key = kwargs.get("key")
             if key and name in ("button", "checkbox", "text_input", "text_area", "selectbox", "radio", "multiselect", "download_button"):
                 fake.session_state.register_widget(key)
-            if name in ("container", "expander", "sidebar"):
+            if name in ("container", "expander", "sidebar", "form"):
                 return FakeCtx(fake, name)
             if name == "columns":
                 n = args[0] if args else 1
@@ -188,7 +188,7 @@ def make_fake_st(button_results: dict[str, bool] | None = None, checkbox_values:
         "container", "expander", "sidebar", "columns", "tabs", "button", "checkbox",
         "text_input", "text_area", "selectbox", "radio", "multiselect", "metric",
         "dataframe", "json", "markdown", "caption", "info", "warning", "error",
-        "success", "spinner", "download_button", "write", "title",
+        "success", "spinner", "download_button", "write", "title", "form", "form_submit_button",
     ):
         setattr(fake, name, _any(name))
     return fake
@@ -366,6 +366,8 @@ def test_manifest_status_approved_only_when_registry_and_profile_approved():
     from core.feature_mapping_review import batch_accept_feature_bindings
 
     registry = _registry(profile_status="approved", approval="approved")
+    registry["model_profiles"]["p"]["feature_ids"] = ["f_temp"]
+    next(feature for feature in registry["features"] if feature["feature_id"] == "f_temp")["status"] = "approved"
     updated = batch_accept_feature_bindings(
         {"schema_version": 1, "status": "draft", "feature_bindings": []},
         [_suggestion("f_temp")], registry, "p", "reviewer-alice",
@@ -468,34 +470,28 @@ def test_empty_safe_still_shows_action_area(fake_st):
     assert "修复建议" in infos or "manual_input" in infos
 
 
-def test_reviewer_empty_shows_warning(fake_st):
-    """reviewer 为空时显示“请先填写审核人”（验收 3）。"""
+def test_local_identity_replaces_reviewer_input_and_confirmation(fake_st):
     calls = _render_page(fake_st, suggestions=[_suggestion("f_temp")])
-    warnings = " ".join(str(c[1]) for c in calls if c[0] == "warning")
-    assert "请先填写审核人" in warnings
+    assert not any(c[0] == "text_input" and c[2].get("key") == "feature_review_reviewer" for c in calls)
+    assert not any(c[0] == "checkbox" and c[2].get("key") == "feature_review_batch_confirm" for c in calls)
+    button = next(c for c in calls if c[0] == "button" and c[2].get("key") == "feature_review_batch_approve_btn")
+    assert button[1][0] == "✅ 一键审核并接受安全映射"
+    assert button[2].get("disabled") is False
 
 
-def test_batch_confirm_checkbox_disabled_without_reviewer(fake_st):
-    """reviewer 为空 → 确认框 disabled（验收 4 的条件侧）。"""
+def test_empty_state_does_not_require_reviewer(fake_st):
     calls = _render_page(fake_st, suggestions=[_suggestion("f_temp")])
-    checkbox_calls = [c for c in calls if c[0] == "checkbox"]
-    batch_confirm = next(c for c in checkbox_calls if c[2].get("key") == "feature_review_batch_confirm")
-    assert batch_confirm[2].get("disabled") is True
+    captions = " ".join(str(c[1]) for c in calls if c[0] == "caption")
+    assert "local_user" in captions
 
 
 def test_selected_count_and_button_text_update(fake_st):
-    """选择建议后按钮文字显示数量（验收 6）。"""
-    # 未勾选任何 checkbox → fake checkbox 返回 False → 保持默认全选（2 条）
-    fake = make_fake_st()
-    import sys as _sys
-    _sys.modules["streamlit"] = fake
-    calls = _render_page(fake, suggestions=[_suggestion("f_temp"), _suggestion("f_time")])
+    """安全映射默认全部纳入一次性审核，按钮文案固定且可执行。"""
+    calls = _render_page(fake_st, suggestions=[_suggestion("f_temp"), _suggestion("f_time")])
     button_calls = [c for c in calls if c[0] == "button" and c[2].get("key") == "feature_review_batch_approve_btn"]
     assert button_calls
-    label = str(button_calls[0][1][0])
-    assert "2" in label  # 默认全选 2 条
-    captions = " ".join(str(c[1]) for c in calls if c[0] == "caption")
-    assert "已选择 2 条建议" in captions
+    assert button_calls[0][1][0] == "✅ 一键审核并接受安全映射"
+    assert button_calls[0][2].get("disabled") is False
 
 
 def test_profile_blocked_shows_block_reason(fake_st):
@@ -535,39 +531,33 @@ def test_sync_manifest_only_approved_writes_training_key(fake_st):
 # 6. session state 保留（验收 16）
 # ---------------------------------------------------------------------------
 
-def test_reviewer_persists_across_reruns(fake_st):
-    """reviewer 经 widget 稳定 key 跨 rerun 保留；页面不得手动对 widget key 赋值。
-
-    真实 Streamlit 禁止在 widget 实例化后对同名 session key 赋值
-    （StreamlitAPIException）。FakeSessionState 复刻该保护：如果页面在
-    text_input(key="feature_review_reviewer") 之后又写
-    st.session_state["feature_review_reviewer"]，本测试会直接抛异常。
-    （验收 16）
-    """
+def test_local_identity_does_not_use_reviewer_widget_key(fake_st):
+    """本地身份由配置提供，不渲染 reviewer widget。"""
     from core.feature_registry_ui import render_feature_registry_page
 
-    # 预置 reviewer（首次渲染前的 session 状态，等价于用户上一次输入）
-    fake_st.session_state["feature_review_reviewer"] = "reviewer-bob"
-    # 不抛 StreamlitAPIException 即通过（widget key 保护语义生效）
+    fake_st.session_state["feature_review_reviewer"] = "legacy-value"
     render_feature_registry_page(registry=_registry(), profile_id="p", manifest={"status": "draft", "feature_bindings": []})
-    assert fake_st.session_state["feature_review_reviewer"] == "reviewer-bob"
-    # widget 以稳定 key 渲染（Streamlit 自动持久化其值）
-    text_input_calls = [c for c in fake_st.calls if c[0] == "text_input" and c[2].get("key") == "feature_review_reviewer"]
-    assert text_input_calls
+    assert fake_st.session_state["feature_review_reviewer"] == "legacy-value"
+    assert not any(c[0] == "text_input" and c[2].get("key") == "feature_review_reviewer" for c in fake_st.calls)
+
+
+def test_selection_state_is_no_longer_used_for_one_click_review(fake_st):
+    """一键审核使用当前全部 safe 建议，不依赖旧的选择状态或确认框。"""
+    from core.feature_registry_ui import render_feature_registry_page
+
+    fake_st.session_state["feature_review_batch_selection"] = {"f_temp"}
+    fake_st.session_state["feature_review_suggestions"] = [_suggestion("f_temp"), _suggestion("f_time")]
+    fake_st.session_state["suggestions_loaded_profile"] = "p"
+    render_feature_registry_page(registry=_registry(), profile_id="p", manifest={"status": "draft", "feature_bindings": []})
+    assert not any(c[0] == "checkbox" and c[2].get("key") == "feature_review_batch_confirm" for c in fake_st.calls)
 
 
 def test_selection_persists_across_reruns(fake_st):
-    """选择状态保存在 session state；rerun 后保留（验收 16）。"""
+    """旧选择状态不影响一键审核的全量 safe 语义。"""
     from core.feature_registry_ui import render_feature_registry_page
 
-    fake_st.session_state["feature_review_reviewer"] = "reviewer-bob"
     fake_st.session_state["feature_review_batch_selection"] = {"f_temp"}
     fake_st.session_state["feature_review_suggestions"] = [_suggestion("f_temp")]
     fake_st.session_state["suggestions_loaded_profile"] = "p"
-    fake_st.calls = []
-    render_feature_registry_page(
-        registry=_registry(), profile_id="p",
-        manifest={"status": "draft", "feature_bindings": []},
-    )
-    # 选择状态 key 被重新写入 session（保留 f_temp）
-    assert fake_st.session_state.get("feature_review_batch_selection") == {"f_temp"}
+    render_feature_registry_page(registry=_registry(), profile_id="p", manifest={"status": "draft", "feature_bindings": []})
+    assert not any(c[0] == "checkbox" and c[2].get("key") == "feature_review_batch_confirm" for c in fake_st.calls)
