@@ -75,6 +75,7 @@ class AIServiceConfig:
     headers: dict = field(default_factory=dict)
     request_template: dict | None = None
     response_json_path: str | None = None
+    anthropic_version: str = "2023-06-01"
 
 
 def normalize_endpoint_path(endpoint: str) -> str:
@@ -462,6 +463,11 @@ def _service_mapping(value: object, *, index: int) -> dict[str, Any]:
         normalized["request_template"] = request_template
     if "response_json_path" in service:
         normalized["response_json_path"] = response_json_path
+    if "anthropic_version" in service:
+        anthropic_version_raw = service.get("anthropic_version")
+        normalized["anthropic_version"] = (
+            str(anthropic_version_raw).strip() if isinstance(anthropic_version_raw, str) and str(anthropic_version_raw).strip() else "2023-06-01"
+        )
     return normalized
 
 
@@ -495,37 +501,100 @@ def _auth_headers(auth_mode: str, api_key: str | None) -> dict[str, str]:
     return {}
 
 
-def get_request_spec(config: object) -> dict[str, Any]:
-    """Resolve provider-specific request spec: {url, headers, body_kind, endpoint}.
+def _resolve_provider_kind(provider: str, model: str, base_url: str, has_template: bool) -> str:
+    """Resolve the wire-protocol family for a service config.
 
-    provider 含 'gemini' → generateContent 协议；provider == 'custom' 且配置了
-    request_template → 模板协议；其余走 OpenAI-compatible /chat/completions。
-    headers = 认证头 + 配置中的额外头（额外头不覆盖认证头以外的默认）。
+    优先级：provider 显式声明 > URL/模型名启发式。支持
+    openai-compatible / gemini / anthropic / custom(template)。
     """
-    provider = str(getattr(config, "provider", "") or "").strip().lower()
+    provider_l = provider.strip().lower()
+    model_l = model.strip().lower()
+    base_l = base_url.strip().lower()
+    if provider_l == "custom" and has_template:
+        return "template"
+    if "gemini" in provider_l:
+        return "gemini"
+    if "anthropic" in provider_l or "claude" in provider_l:
+        return "anthropic"
+    if "openai" in provider_l:
+        return "openai"
+    # 启发式兜底：provider 自由文本时按模型/URL 猜协议族
+    if "gemini" in model_l or "generativelanguage" in base_l:
+        return "gemini"
+    if "claude" in model_l or "anthropic" in base_l:
+        return "anthropic"
+    return "openai"
+
+
+def get_request_spec(config: object) -> dict[str, Any]:
+    """Resolve provider-specific request spec: {url, headers, body_kind, endpoint, provider_kind}.
+
+    支持四种协议：openai（/chat/completions，Bearer）、gemini（/v1beta/models/
+    {model}:generateContent，x-goog-api-key 头）、anthropic（/v1/messages，
+    x-api-key + anthropic-version 头）、custom（request_template）。
+    headers = 协议默认认证头 + 配置中的额外头（额外头不覆盖协议默认）。
+    """
+    provider = str(getattr(config, "provider", "") or "").strip()
+    provider_l = provider.lower()
     model = str(getattr(config, "model", "") or "").strip()
     base_url = str(getattr(config, "base_url", "") or "").strip()
     api_key = getattr(config, "api_key", None)
     auth_mode = str(getattr(config, "auth_mode", DEFAULT_AUTH_MODE) or DEFAULT_AUTH_MODE).strip().lower()
     if auth_mode not in SUPPORTED_AUTH_MODES:
         auth_mode = DEFAULT_AUTH_MODE
+    has_template = bool(getattr(config, "request_template", None))
+    kind = _resolve_provider_kind(provider, model, base_url, has_template)
 
-    if "gemini" in provider:
-        endpoint = (
-            f"/models/{model}:generateContent"
-            if "/v1beta" in base_url
-            else f"/v1beta/models/{model}:generateContent"
-        )
+    if kind == "gemini":
+        # 官方 generativelanguage 或兼容中转：/v1beta/models/{model}:generateContent
+        # base 已带 /v1beta → 直接拼；带 /v1（OpenAI 风格中转）→ 去掉 /v1 再拼 /v1beta；
+        # 其他 → 前缀 /v1beta。
+        base_lower = base_url.lower().rstrip("/")
+        if "/v1beta" in base_lower:
+            endpoint = f"/models/{model}:generateContent"
+        elif base_lower.endswith("/v1"):
+            trimmed = base_url.rstrip("/")[:-3]
+            endpoint = f"/v1beta/models/{model}:generateContent"
+            base_url = trimmed
+        else:
+            endpoint = f"/v1beta/models/{model}:generateContent"
         body_kind = "gemini"
-    elif provider == "custom" and getattr(config, "request_template", None):
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        # Gemini 原生认证用 x-goog-api-key；中转站多用 OpenAI 兼容 Bearer，
+        # auth_mode=bearer 时两者都带，保证两种网关都能通。
+        if isinstance(api_key, str) and api_key.strip():
+            headers["x-goog-api-key"] = api_key.strip()
+            if auth_mode == "bearer":
+                headers["Authorization"] = f"Bearer {api_key.strip()}"
+        elif auth_mode == "bearer" and isinstance(api_key, str) and api_key.strip():
+            headers["Authorization"] = f"Bearer {api_key.strip()}"
+    elif kind == "anthropic":
+        # endpoint 留空或为 OpenAI 默认值时改用 Anthropic 原生路径
+        endpoint_raw = str(getattr(config, "endpoint", "") or "").strip()
+        if not endpoint_raw or normalize_endpoint_path(endpoint_raw) == DEFAULT_ENDPOINT:
+            endpoint = "/v1/messages"
+        else:
+            endpoint = normalize_endpoint_path(endpoint_raw)
+        body_kind = "anthropic"
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-version": str(getattr(config, "anthropic_version", "") or "2023-06-01"),
+        }
+        if isinstance(api_key, str) and api_key.strip():
+            headers["x-api-key"] = api_key.strip()
+            if auth_mode == "bearer":
+                headers["Authorization"] = f"Bearer {api_key.strip()}"
+    elif kind == "template":
         endpoint = normalize_endpoint_path(str(getattr(config, "endpoint", "") or DEFAULT_ENDPOINT))
         body_kind = "template"
+        headers = {"Content-Type": "application/json"}
+        headers.update(_auth_headers(auth_mode, api_key if isinstance(api_key, str) else None))
     else:
         endpoint = normalize_endpoint_path(str(getattr(config, "endpoint", "") or DEFAULT_ENDPOINT))
         body_kind = "openai"
+        headers = {"Content-Type": "application/json"}
+        headers.update(_auth_headers(auth_mode, api_key if isinstance(api_key, str) else None))
 
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    headers.update(_auth_headers(auth_mode, api_key if isinstance(api_key, str) else None))
     extra_headers = getattr(config, "headers", None)
     if isinstance(extra_headers, Mapping):
         for key, value in extra_headers.items():
@@ -537,7 +606,78 @@ def get_request_spec(config: object) -> dict[str, Any]:
         "headers": headers,
         "body_kind": body_kind,
         "endpoint": endpoint,
+        "provider_kind": kind,
     }
+
+
+def build_request_body(config: object, messages: list[dict[str, str]], *, json_mode: bool = False) -> dict[str, Any]:
+    """Build the protocol-specific request body for a chat completion.
+
+    openai: {model, messages, temperature, max_tokens[, response_format]}
+    gemini: {contents:[{role, parts:[{text}]}], generationConfig{...}[, responseMimeType]}
+    anthropic: {model, max_tokens, system, messages:[{role, content}], temperature}
+    template: request_template 原样（调用方自行处理占位符替换）。
+    """
+    kind = _resolve_provider_kind(
+        str(getattr(config, "provider", "") or ""),
+        str(getattr(config, "model", "") or ""),
+        str(getattr(config, "base_url", "") or ""),
+        bool(getattr(config, "request_template", None)),
+    )
+    temperature = getattr(config, "temperature", 0.2)
+    try:
+        temperature = max(0.0, min(2.0, float(temperature)))
+    except (TypeError, ValueError):
+        temperature = 0.2
+    if kind == "gemini":
+        contents = []
+        system_text = ""
+        for message in messages:
+            role = str(message.get("role") or "user").lower()
+            text = str(message.get("content") or "")
+            if role == "system":
+                system_text = (system_text + "\n" + text).strip()
+                continue
+            contents.append({"role": "user" if role != "assistant" else "model", "parts": [{"text": text}]})
+        generation: dict[str, Any] = {"temperature": temperature}
+        max_tokens = getattr(config, "max_tokens", None)
+        if max_tokens is not None:
+            generation["maxOutputTokens"] = max_tokens
+        if json_mode:
+            generation["responseMimeType"] = "application/json"
+        body: dict[str, Any] = {"contents": contents, "generationConfig": generation}
+        if system_text:
+            body["systemInstruction"] = {"parts": [{"text": system_text}]}
+        return body
+    if kind == "anthropic":
+        system_text = ""
+        rest: list[dict[str, Any]] = []
+        for message in messages:
+            role = str(message.get("role") or "user").lower()
+            text = str(message.get("content") or "")
+            if role == "system":
+                system_text = (system_text + "\n" + text).strip()
+                continue
+            rest.append({"role": "user" if role != "assistant" else "assistant", "content": text})
+        body = {
+            "model": str(getattr(config, "model", "") or ""),
+            "max_tokens": int(getattr(config, "max_tokens", 2048) or 2048),
+            "temperature": temperature,
+            "messages": rest,
+        }
+        if system_text:
+            body["system"] = system_text
+        return body
+    # openai（默认）
+    body = {
+        "model": str(getattr(config, "model", "") or ""),
+        "messages": list(messages),
+        "temperature": temperature,
+        "max_tokens": int(getattr(config, "max_tokens", 2048) or 2048),
+    }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    return body
 
 
 def _sanitize_url_for_output(value: str, *, secret_values: set[str]) -> str:
@@ -707,6 +847,8 @@ __all__ = [
     "normalize_endpoint_path",
     "build_request_url",
     "get_request_spec",
+    "build_request_body",
+    "_resolve_provider_kind",
     "key_fingerprint",
     "get_feature_review_ai_client",
 ]

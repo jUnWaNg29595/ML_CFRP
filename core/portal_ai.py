@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .portal_ai_config import AIServiceConfig
+from .portal_ai_config import AIServiceConfig, get_request_spec
 from .portal_ai_schema import (
     AIExplanationResponse,
     AIParseResponse,
@@ -273,6 +273,44 @@ def _parse_gemini_candidates(payload: object) -> str:
     )
 
 
+def _parse_anthropic_content(payload: object) -> str:
+    """解析 Anthropic Messages 响应：content[*].text 拼接（text 块）。"""
+    if not isinstance(payload, Mapping):
+        raise PortalAIParseError(
+            "Anthropic 响应不是有效的 JSON 对象",
+            stage="anthropic_parsing",
+            raw_excerpt=str(payload)[:200],
+        )
+    if payload.get("type") == "error" or isinstance(payload.get("error"), Mapping):
+        error = payload.get("error") or {}
+        message = error.get("message") if isinstance(error, Mapping) else str(error)
+        raise PortalAIParseError(
+            f"Anthropic 返回错误响应：{str(message)[:160]}",
+            stage="anthropic_parsing",
+            raw_excerpt=str(payload)[:200],
+        )
+    content = payload.get("content")
+    text_parts: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, Mapping) and block.get("type") in {"text", None} and isinstance(block.get("text"), str):
+                text_parts.append(block["text"])
+            elif isinstance(block, str):
+                text_parts.append(block)
+    elif isinstance(content, str):
+        text_parts.append(content)
+    combined = "".join(text_parts).strip()
+    if combined:
+        return combined
+    stop_reason = payload.get("stop_reason")
+    raise PortalAIParseError(
+        "Anthropic 响应的 content 中没有文本内容" + (f"（stop_reason={stop_reason}）" if stop_reason else ""),
+        stage="anthropic_parsing",
+        raw_excerpt=str(payload)[:200],
+        suggestion="请检查 max_tokens 是否过小（stop_reason=max_tokens 表示输出被截断）",
+    )
+
+
 def parse_chat_completion(payload: object, *, response_json_path: str | None = None, provider: str | None = None) -> str:
     """Extract assistant text from an OpenAI-compatible / Gemini / custom payload.
 
@@ -302,6 +340,11 @@ def parse_chat_completion(payload: object, *, response_json_path: str | None = N
     )
     if is_gemini:
         return _parse_gemini_candidates(payload)
+    is_anthropic = "anthropic" in provider_text or "claude" in provider_text or (
+        isinstance(payload, Mapping) and "content" in payload and "choices" not in payload and "candidates" not in payload
+    )
+    if is_anthropic:
+        return _parse_anthropic_content(payload)
 
     if not isinstance(payload, Mapping):
         raise PortalAIParseError(
@@ -494,7 +537,13 @@ def _bounded_temperature(value: object) -> float:
 
 
 def list_models(config: AIServiceConfig, *, timeout: int | None = None) -> list[dict[str, object]]:
-    """Fetch selectable models from an OpenAI-compatible endpoint (direct, no proxy)."""
+    """Fetch selectable models from a protocol-appropriate models endpoint (direct, no proxy).
+
+    openai: GET {base_url}/models + Bearer；gemini: GET {base_url}/v1beta/models +
+    x-goog-api-key；anthropic: GET {base_url}/v1/models + x-api-key。
+    """
+    from .portal_ai_config import get_request_spec
+
     api_key = config.api_key
     if not isinstance(api_key, str) or not api_key.strip():
         raise PortalAIAuthError(
@@ -502,13 +551,25 @@ def list_models(config: AIServiceConfig, *, timeout: int | None = None) -> list[
             stage="list_models_auth",
             service_id=config.service_id,
         )
-    request_url = config.base_url.rstrip("/") + "/models"
+    kind = str(get_request_spec(config).get("provider_kind") or "openai")
+    key = api_key.strip()
+    if kind == "gemini":
+        base = config.base_url.rstrip("/")
+        request_url = base + ("/models" if "/v1beta" in base.lower() else "/v1beta/models")
+        request_headers = {"x-goog-api-key": key, "Accept": "application/json"}
+    elif kind == "anthropic":
+        request_url = config.base_url.rstrip("/") + "/v1/models"
+        request_headers = {
+            "x-api-key": key,
+            "anthropic-version": str(getattr(config, "anthropic_version", "") or "2023-06-01"),
+            "Accept": "application/json",
+        }
+    else:
+        request_url = config.base_url.rstrip("/") + "/models"
+        request_headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
     request = urllib.request.Request(
         request_url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json",
-        },
+        headers=request_headers,
         method="GET",
     )
     try:
@@ -767,28 +828,25 @@ class PortalAIClient:
         downgraded_once = False
 
         use_json_mode = try_json_mode and self._json_mode_effective()
-        request_body: dict[str, Any] = {
-            "model": self.config.model,
-            "messages": messages,
-            "temperature": _bounded_temperature(self.config.temperature),
-            "max_tokens": _bounded_tokens(self.config.max_tokens),
-        }
+        # 协议路由：openai / gemini / anthropic / custom(template) 各自的
+        # URL、认证头和请求体由 portal_ai_config 统一解析。
+        from .portal_ai_config import get_request_spec, build_request_body
+        spec = get_request_spec(self.config)
+        provider_kind = str(spec.get("provider_kind") or "openai")
+        request_body: dict[str, Any] = build_request_body(self.config, messages)
+        response_json_path = getattr(self.config, "response_json_path", None)
 
-        auth_header = f"Bearer {api_key}"
         total_attempts = max_retries + 1 + 1  # retries + final + potential downgrade attempt
         attempted = 0
         while attempted <= total_attempts:
             attempted += 1
             req_json = dict(request_body)
-            if use_json_mode:
+            if use_json_mode and provider_kind == "openai":
                 req_json["response_format"] = {"type": "json_object"}
             kwargs = {
                 "method": "POST",
-                "url": self.request_url,
-                "headers": {
-                    "Authorization": auth_header,
-                    "Content-Type": "application/json",
-                },
+                "url": spec["url"],
+                "headers": dict(spec["headers"]),
                 "json": req_json,
                 "timeout": _bounded_timeout(self.config.timeout_seconds),
             }
@@ -857,7 +915,12 @@ class PortalAIClient:
         used_mode = False
         try:
             payload, used_mode = self._request(messages, try_json_mode=True)
-            content_text = parse_chat_completion(payload)
+            spec = get_request_spec(self.config)
+            content_text = parse_chat_completion(
+                payload,
+                response_json_path=getattr(self.config, "response_json_path", None),
+                provider=str(spec.get("provider_kind") or ""),
+            )
         except PortalAIAuthError as exc:
             return HealthCheckResult(
                 ok=False, stage="认证失败", service_id=self.config.service_id, status_code=exc.status_code,
@@ -931,7 +994,12 @@ class PortalAIClient:
             {"role": "user", "content": instruction + "\n" + json_module.dumps(content, ensure_ascii=False)},
         ]
         payload, _ = self._request(messages, try_json_mode=True)
-        response_text = parse_chat_completion(payload)
+        spec = get_request_spec(self.config)
+        response_text = parse_chat_completion(
+            payload,
+            response_json_path=getattr(self.config, "response_json_path", None),
+            provider=str(spec.get("provider_kind") or ""),
+        )
         return parse_json_or_markdown_json(response_text)
 
     def parse_input(self, context: object) -> AIParseResponse:

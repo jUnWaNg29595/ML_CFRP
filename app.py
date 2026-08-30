@@ -4136,10 +4136,13 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
                 })
             st.dataframe(overview_rows, hide_index=True, width='stretch')
 
-            # Select service to edit
+            # Select service to edit：默认锚定当前审核默认服务（⭐），避免
+            # 重启后编辑目标漂移到列表第一个服务。
+            _edit_index = service_ids.index(preferred_review_id) if preferred_review_id in service_ids else 0
             selected_edit_id = st.selectbox(
                 '选择要编辑的服务',
                 service_ids,
+                index=_edit_index,
                 key='portal_ai_edit_service_selector',
                 disabled=active_task_lock,
             )
@@ -4163,13 +4166,24 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
         btn_c1, btn_c2, btn_c3 = st.columns(3)
         with btn_c1:
             if st.button('➕ 新建服务', key='portal_ai_btn_new_svc', disabled=active_task_lock, width='stretch'):
-                new_id = f"service_{len(services) + 1}"
+                # 唯一 ID：基于时间戳，避免 len+1 在删除后撞车
+                from datetime import datetime as _dt
+                new_id = f"service_{_dt.now().strftime('%Y%m%d%H%M%S')}"
+                # 新服务模板：复制当前审核默认服务的协议/网关配置（避免重启后
+                # 默认接口漂移到无关厂商），只清空 Key 和模型名
+                base_template = next((s for s in services if s.get('service_id') == preferred_review_id), None) or {}
                 new_svc = {
-                    'service_id': new_id, 'label': f'新建服务 {len(services) + 1}',
-                    'provider': 'openai-compatible', 'base_url': 'https://api.openai.com/v1',
-                    'endpoint': '/chat/completions', 'model': 'gpt-4o-mini',
-                    'purpose': 'both', 'timeout_seconds': 30, 'max_tokens': 2048,
-                    'temperature': 0.2, 'enabled': True, 'api_key': '',
+                    'service_id': new_id, 'label': f'新建服务 {_dt.now().strftime("%m-%d %H:%M")}',
+                    'provider': str(base_template.get('provider') or 'openai-compatible'),
+                    'base_url': str(base_template.get('base_url') or 'https://api.openai.com/v1'),
+                    'endpoint': str(base_template.get('endpoint') or ''),
+                    'model': '',
+                    'purpose': 'both', 'timeout_seconds': int(base_template.get('timeout_seconds') or 30),
+                    'max_tokens': int(base_template.get('max_tokens') or 2048),
+                    'temperature': float(base_template.get('temperature') or 0.2),
+                    'enabled': False, 'api_key': '',
+                    'auth_mode': str(base_template.get('auth_mode') or 'bearer'),
+                    'headers': dict(base_template.get('headers') or {}),
                 }
                 services.append(new_svc)
                 save_ai_config(config_root, {'services': services})
@@ -4200,10 +4214,15 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
         # Target item to edit (keyed specifically by selected_edit_id to prevent state bleeding)
         current = next((s for s in services if s.get('service_id') == selected_edit_id), {}) if selected_edit_id else {}
         if not current:
+            # 无可编辑对象时的占位模板：沿用当前审核默认服务的网关（或开放占位），
+            # 不再硬编码具体厂商（避免重启后默认接口漂移的观感）
+            fallback_base = next((s for s in services if s.get('service_id') == preferred_review_id), None) or {}
             current = {
-                'service_id': 'deepseek', 'label': 'DeepSeek', 'provider': 'openai-compatible',
-                'base_url': 'https://api.deepseek.com/v1', 'endpoint': '/chat/completions',
-                'model': 'deepseek-chat', 'purpose': 'both', 'timeout_seconds': 30,
+                'service_id': '', 'label': '',
+                'provider': str(fallback_base.get('provider') or 'openai-compatible'),
+                'base_url': str(fallback_base.get('base_url') or ''),
+                'endpoint': str(fallback_base.get('endpoint') or ''),
+                'model': '', 'purpose': 'both', 'timeout_seconds': 30,
                 'max_tokens': 2048, 'temperature': 0.2, 'enabled': False,
             }
 
@@ -4218,9 +4237,42 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
         with col1:
             service_id = st.text_input('服务 ID (唯一标识)', value=str(current.get('service_id') or ''), key=f'{svc_key_prefix}id', disabled=active_task_lock)
             label = st.text_input('显示名称', value=str(current.get('label') or service_id), key=f'{svc_key_prefix}label', disabled=active_task_lock)
-            provider = st.text_input('提供方', value=str(current.get('provider') or 'openai-compatible'), key=f'{svc_key_prefix}provider', disabled=active_task_lock)
+            # 协议选择：固定三协议 + 自定义，替代旧自由文本（避免拼写漂移导致协议路由失效）
+            provider_options = ['openai-compatible', 'gemini', 'anthropic', 'custom']
+            cur_provider = str(current.get('provider') or 'openai-compatible').strip().lower()
+            # 旧自由文本值归一：包含 gemini/claude 关键词时映射到对应协议
+            if 'gemini' in cur_provider:
+                cur_provider_norm = 'gemini'
+            elif 'anthropic' in cur_provider or 'claude' in cur_provider:
+                cur_provider_norm = 'anthropic'
+            elif cur_provider == 'custom':
+                cur_provider_norm = 'custom'
+            else:
+                cur_provider_norm = 'openai-compatible'
+            provider_idx = provider_options.index(cur_provider_norm) if cur_provider_norm in provider_options else 0
+            provider = st.selectbox(
+                '接口协议 (provider)',
+                provider_options,
+                index=provider_idx,
+                format_func=lambda v: {
+                    'openai-compatible': 'OpenAI 兼容 (chat/completions)',
+                    'gemini': 'Google Gemini (generateContent)',
+                    'anthropic': 'Anthropic Claude (messages)',
+                    'custom': '自定义 (request_template)',
+                }[v],
+                key=f'{svc_key_prefix}provider',
+                disabled=active_task_lock,
+                help='选择服务的请求协议；响应解析与认证头会自动适配。',
+            )
             base_url = st.text_input('兼容 API Base URL', value=str(current.get('base_url') or ''), key=f'{svc_key_prefix}base_url', disabled=active_task_lock, help='如 https://api.openai.com/v1')
-            endpoint = st.text_input('Endpoint 路径', value=str(current.get('endpoint') or '/chat/completions'), key=f'{svc_key_prefix}endpoint', disabled=active_task_lock, help='默认 /chat/completions')
+            endpoint = st.text_input(
+                'Endpoint 路径',
+                value=str(current.get('endpoint') or ''),
+                key=f'{svc_key_prefix}endpoint',
+                disabled=active_task_lock,
+                help='留空使用协议默认：OpenAI=/chat/completions，Gemini=/v1beta/models/{model}:generateContent，Anthropic=/v1/messages',
+                placeholder='（留空 = 协议默认）',
+            )
             model = st.text_input('模型名称', value=str(current.get('model') or ''), key=f'{svc_key_prefix}model', disabled=active_task_lock)
         with col2:
             purpose_options = ['both', 'input_parsing', 'result_explanation']
@@ -4304,7 +4356,7 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
         proto_c1, proto_c2 = st.columns(2)
         with proto_c1:
             auth_modes = ['bearer', 'api_key_header', 'none']
-            cur_auth = str(current.get('auth_mode', 'bearer')).lower()
+            cur_auth = str(current.get('auth_mode') or 'bearer').lower()
             auth_idx = auth_modes.index(cur_auth) if cur_auth in auth_modes else 0
             auth_mode = st.selectbox(
                 '认证模式 (auth_mode)',
@@ -4313,6 +4365,7 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
                 format_func=lambda v: {'bearer': 'Bearer Token (Authorization 头)', 'api_key_header': 'X-API-Key 头', 'none': '无认证'}[v],
                 key=f'{svc_key_prefix}auth_mode',
                 disabled=active_task_lock,
+                help='Gemini 协议会自动附加 x-goog-api-key；Anthropic 自动附加 x-api-key + anthropic-version。',
             )
             response_json_path = st.text_input(
                 '自定义响应 JSON 路径 (response_json_path)',
@@ -4320,35 +4373,53 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
                 key=f'{svc_key_prefix}response_json_path',
                 disabled=active_task_lock,
                 help="例如 choices.0.message.content 或 candidates.0.content.parts.0.text；留空使用协议默认解析。",
-                placeholder='choices.0.message.content',
+                placeholder='（留空 = 协议默认解析）',
             )
         with proto_c2:
-            provider_lower = provider.strip().lower()
-            if provider_lower == 'gemini':
-                st.info('Gemini 协议：请求将使用 models/{model}:generateContent 格式，响应按 candidates[0].content.parts 解析。')
-            elif provider_lower == 'custom':
-                st.info('自定义协议：请在请求体模板中配置；JSON 路径可用上面的 response_json_path。')
-            headers_text = st.text_area(
-                '额外请求头 (headers, JSON)',
-                value=json.dumps(current.get('headers') or {}, ensure_ascii=False) if current.get('headers') else '',
-                key=f'{svc_key_prefix}headers',
-                disabled=active_task_lock,
-                height=68,
-                help='JSON 对象，例如 {"X-Custom": "value"}；禁止填入 API Key。',
-            )
-            try:
-                extra_headers = json.loads(headers_text) if headers_text.strip() else {}
-                if not isinstance(extra_headers, dict):
-                    st.error('额外请求头必须是 JSON 对象（键值对）。')
-                    extra_headers = {}
-            except json.JSONDecodeError:
-                st.error('额外请求头不是合法 JSON，保存时将被忽略。')
-                extra_headers = {}
+            if provider == 'gemini':
+                st.info('🟦 **Gemini 协议**：请求 `models/{model}:generateContent`，认证头 `x-goog-api-key`，响应按 `candidates[0].content.parts` 解析。')
+            elif provider == 'anthropic':
+                st.info('🟧 **Anthropic 协议**：请求 `/v1/messages`，认证头 `x-api-key` + `anthropic-version`，响应按 `content[*].text` 解析。')
+            elif provider == 'custom':
+                st.info('⚙️ **自定义协议**：需配置 request_template；响应可用 response_json_path 提取。')
+            else:
+                st.info('🟩 **OpenAI 兼容协议**：请求 `/chat/completions`，认证头 `Authorization: Bearer`，响应按 `choices[0].message.content` 解析。')
 
-        # Normalized request preview
+        # 额外请求头：独占一行，避免与协议提示挤在同一列造成错行
+        headers_text = st.text_area(
+            '额外请求头 (headers, JSON，可选)',
+            value=json.dumps(current.get('headers') or {}, ensure_ascii=False) if current.get('headers') else '',
+            key=f'{svc_key_prefix}headers',
+            disabled=active_task_lock,
+            height=68,
+            help='JSON 对象，例如 {"X-Custom": "value"}；禁止填入 API Key。',
+        )
+        try:
+            extra_headers = json.loads(headers_text) if headers_text.strip() else {}
+            if not isinstance(extra_headers, dict):
+                st.error('额外请求头必须是 JSON 对象（键值对）。')
+                extra_headers = {}
+        except json.JSONDecodeError:
+            st.error('额外请求头不是合法 JSON，保存时将被忽略。')
+            extra_headers = {}
+
+        # 请求预览按协议计算（与实际发送一致）
+        try:
+            from core.portal_ai_config import get_request_spec as _get_request_spec
+            _preview_cfg = AIServiceConfig(
+                service_id=service_id.strip() or 'preview', provider=provider,
+                base_url=base_url.strip(), endpoint=endpoint.strip(),
+                model=model.strip(), auth_mode=auth_mode,
+                request_template=None,
+            )
+            _preview_spec = _get_request_spec(_preview_cfg)
+            st.caption(f"**最终请求 URL 预览（{_preview_spec['provider_kind']} 协议）**：`{_preview_spec['url']}`")
+        except Exception:
+            norm_endpoint = normalize_endpoint_path(endpoint)
+            final_url = build_request_url(base_url, norm_endpoint)
+            st.caption(f"**最终请求 URL 预览**：`{final_url}`")
+        # endpoint 持久化：留空保存为空字符串（运行时按协议取默认）
         norm_endpoint = normalize_endpoint_path(endpoint)
-        final_url = build_request_url(base_url, norm_endpoint)
-        st.caption(f"**最终请求 URL 预览**：`{final_url}`")
 
         # Payload construction for save and testing
         final_key = current.get('api_key') or ''
