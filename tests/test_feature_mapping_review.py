@@ -1,3 +1,4 @@
+import copy
 import json
 
 import pandas as pd
@@ -352,9 +353,10 @@ def test_batch_approve_safe_suggestions_writes_all_bindings():
         _safe_suggestion("f_safe2", confidence=0.95),
     ]
     updated = batch_approve_safe_feature_suggestions(manifest, suggestions, _batch_registry(), "p", "reviewer-alice")
-    assert updated["status"] == "approved"
-    assert updated["approval"]["status"] == "approved"
-    assert updated["approval"]["approved_by"] == "reviewer-alice"
+    # Registry/profile 仍是 draft → manifest 只能 mapped，不得直接声称 approved（可训练）
+    assert updated["status"] == "mapped"
+    assert updated["approval"]["status"] == "mapped"
+    assert updated["approval"]["mapped_by"] == "reviewer-alice"
     assert len(updated["feature_bindings"]) == 2
     for b in updated["feature_bindings"]:
         assert b["review_status"] == "approved"
@@ -363,47 +365,86 @@ def test_batch_approve_safe_suggestions_writes_all_bindings():
     assert "manifest_hash" in updated
 
 
-def test_batch_approve_atomic_when_any_item_invalid(monkeypatch):
-    """If any single suggestion fails write validation, nothing is written."""
+def test_batch_accept_upgrades_manifest_only_when_registry_and_profile_approved():
+    from core.feature_mapping_review import batch_accept_feature_bindings
+
+    registry = _batch_registry()
+    registry["approval"] = {"status": "approved"}
+    registry["model_profiles"]["p"]["status"] = "approved"
+    manifest = {"schema_version": 1, "status": "draft", "feature_bindings": []}
+    updated = batch_accept_feature_bindings(
+        manifest, [_safe_suggestion("f_safe1", confidence=0.95)], registry, "p", "reviewer-alice",
+        selected_feature_ids=["f_safe1"],
+    )
+    assert updated["status"] == "approved"
+    assert updated["approval"]["status"] == "approved"
+    # Registry 特征状态保持原样（批量接受不修改 Registry）
+    assert registry["features"][0]["status"] == "draft"
+
+
+def test_batch_accept_atomic_when_selected_contains_invalid(monkeypatch):
+    """选中列表中混入不可接受项 → 整个批次不写入，原 manifest 不变。"""
     import core.feature_mapping_review as fmr
-    from core.feature_mapping_review import batch_approve_safe_feature_suggestions
+    from core.feature_mapping_review import batch_accept_feature_bindings
 
     manifest = {"schema_version": 1, "status": "draft", "feature_bindings": []}
     good = _safe_suggestion("f_safe1", confidence=0.95)
     bad = _safe_suggestion("f_safe2", confidence=0.95)
-    bad["raw_columns"] = []  # passes nothing: invalid at write time
+    bad["raw_columns"] = []  # 写时校验失败
 
-    original_classify = fmr.classify_feature_suggestions
+    original = fmr.classify_suggestions_with_diagnostics
 
     def fake_classify(suggestions, registry, profile_id):
-        # Simulate a classify/write disagreement: return the invalid item as safe
-        return [good, bad], []
+        # 模拟 classify 与写时校验不一致：把坏建议也当作 safe
+        result = original(suggestions, registry, profile_id)
+        bad_sugg = copy.deepcopy(bad)
+        bad_sugg["_review_reasons"] = []
+        bad_sugg["_diagnostics"] = {"can_batch_accept": True, "reasons": []}
+        result["safe"] = [result["safe"][0], bad_sugg]
+        return result
 
-    monkeypatch.setattr(fmr, "classify_feature_suggestions", fake_classify)
+    monkeypatch.setattr(fmr, "classify_suggestions_with_diagnostics", fake_classify)
     with pytest.raises(ValueError, match="中止"):
-        batch_approve_safe_feature_suggestions(manifest, [good, bad], _batch_registry(), "p", "reviewer-alice")
-    # Manifest must remain unchanged
+        batch_accept_feature_bindings(
+            manifest, [good, bad], _batch_registry(), "p", "reviewer-alice",
+            selected_feature_ids=["f_safe1", "f_safe2"],
+        )
     assert manifest["status"] == "draft"
     assert manifest["feature_bindings"] == []
 
 
-def test_batch_approve_requires_reviewer():
-    from core.feature_mapping_review import batch_approve_safe_feature_suggestions
+def test_batch_accept_requires_reviewer():
+    from core.feature_mapping_review import batch_accept_feature_bindings
 
-    with pytest.raises(ValueError, match="reviewer"):
-        batch_approve_safe_feature_suggestions(
+    with pytest.raises(ValueError, match="审核人"):
+        batch_accept_feature_bindings(
             {"status": "draft", "feature_bindings": []},
             [_safe_suggestion()],
             _batch_registry(),
             "p",
             "",
+            selected_feature_ids=["f_safe1"],
+        )
+
+
+def test_batch_accept_requires_at_least_one_selection():
+    from core.feature_mapping_review import batch_accept_feature_bindings
+
+    with pytest.raises(ValueError, match="至少选择一条"):
+        batch_accept_feature_bindings(
+            {"status": "draft", "feature_bindings": []},
+            [_safe_suggestion()],
+            _batch_registry(),
+            "p",
+            "reviewer-alice",
+            selected_feature_ids=[],
         )
 
 
 def test_batch_approve_with_no_safe_suggestions_raises():
     from core.feature_mapping_review import batch_approve_safe_feature_suggestions
 
-    with pytest.raises(ValueError, match="没有可批量批准"):
+    with pytest.raises(ValueError, match="至少选择一条"):
         batch_approve_safe_feature_suggestions(
             {"status": "draft", "feature_bindings": []},
             [_safe_suggestion("f_unknown", confidence=0.3)],

@@ -11,9 +11,11 @@ from uuid import uuid4
 from .dataset_manifest import compute_dataset_manifest_hash
 from .feature_mapping_review import (
     apply_feature_review_decision,
+    batch_accept_feature_bindings,
     batch_approve_safe_feature_suggestions,
     build_feature_review_context,
     classify_feature_suggestions,
+    classify_suggestions_with_diagnostics,
     load_profile_manifest,
     load_profile_suggestions,
     request_feature_mapping_review,
@@ -130,17 +132,23 @@ def sync_manifest_to_training_state(manifest: Mapping[str, Any]) -> None:
 
     模型训练页按 training_dataset_manifest → dataset_manifest →
     feature_dataset_manifest → feature_mapping_manifest 的顺序读取；
-    这里把批准后的 manifest 同步写入这些键，保证训练页可直接使用。
+    只有 manifest.status == approved（Registry/profile/manifest 全部满足正式
+    审批条件）时才写入训练契约键。mapped / pending_approval / draft 只保留在
+    feature_mapping_manifest，训练页不会误以为映射已获正式批准。
     """
     import streamlit as st
 
     if not isinstance(manifest, Mapping):
         return
     st.session_state["feature_mapping_manifest"] = dict(manifest)
+    manifest_status = str(manifest.get("status") or "").strip().lower()
     # Only propagate approved manifests to the training contract keys so the
-    # training page can never mistake a draft manifest for an approved one.
-    if str(manifest.get("status") or "").strip().lower() == "approved":
+    # training page can never mistake a draft/mapped manifest for an approved one.
+    if manifest_status == "approved":
         st.session_state["training_dataset_manifest"] = dict(manifest)
+    else:
+        # 状态降级（如重新编辑映射）时清除旧训练键，避免训练页读到过期批准
+        st.session_state.pop("training_dataset_manifest", None)
 
 
 def build_manual_feature_suggestion(
@@ -319,8 +327,31 @@ def render_feature_registry_page(
         st.session_state.pop("feature_review_context", None)
 
     # 1. Top Compact AI Feature Review Workspace
-    safe_suggestions, attention_suggestions = classify_feature_suggestions(suggestions, registry, profile_id)
+    classification = classify_suggestions_with_diagnostics(suggestions, registry, profile_id)
+    safe_suggestions = classification["safe"]
+    attention_suggestions = classification["attention"]
+    counts = classification["counts"]
     ai_ready = active_client is not None and callable(getattr(active_client, "review_feature_mapping", None))
+    # 环境状态（供诊断与空态提示）
+    classification["has_frame"] = frame is not None
+    classification["has_ai"] = ai_ready
+    classification["has_profile"] = bool(profile_id)
+    classification["has_suggestions"] = bool(suggestions)
+
+    # profile / Registry 阻断提示（十二：不让用户看到空白按钮区而不知道原因）
+    profile_status_lower = profile_status.strip().lower()
+    if profile_status_lower == "blocked":
+        st.warning(
+            "🚫 当前 profile 处于 blocked 状态。可以继续进行映射审核和 manifest 草稿整理，"
+            "但不能提交正式训练或发布。请先完成人工审核并批准 profile。"
+        )
+    registry_approval_status = str((registry.get("approval") or {}).get("status") or "").strip().lower() if isinstance(registry, Mapping) else "unknown"
+    if registry_approval_status == "draft":
+        st.info(
+            "ℹ️ 当前 Registry 仍为 draft。当前操作只会保存待审核映射，"
+            "不会使模型获得正式发布资格。"
+        )
+
     with st.container(border=True):
         st.markdown("### 🤖 AI 特征审核工作区")
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
@@ -407,78 +438,263 @@ def render_feature_registry_page(
         if isinstance(item, Mapping) and item.get("feature_id")
     }
 
-    # 2. Main Flow: one-click batch approval of safe suggestions
+    # 2. Main Flow: batch accept safe mapping suggestions (selectable + transparent)
     with st.container(border=True):
-        st.markdown("#### ✅ 一键批准安全建议")
+        st.markdown("#### ✅ 批量接受安全映射建议")
         st.caption(
-            "AI 分析 → 自动分类 → 本地审核人填写姓名 → 一次确认 → 批量批准安全建议；"
-            "低置信、来源未知或冲突项单独处理。"
+            "AI 只提供建议；本地审核人确认后，建议写入当前 dataset manifest。"
+            "此操作**不会**自动批准全局 Registry、不会自动发布模型、不会自动生成特征值，"
+            "也不会绕过训练和发布门禁。"
         )
+
+        # 审核人输入（稳定 key + session state 保留，页面刷新不丢失）
         reviewer = st.text_input(
             "本地审核人",
+            value=str(st.session_state.get("feature_review_reviewer") or ""),
             key="feature_review_reviewer",
             placeholder="请输入审核身份（例如：reviewer-alice）",
         )
+        st.session_state["feature_review_reviewer"] = reviewer
+        if not reviewer.strip():
+            st.warning("请先填写审核人（本地审核人），确认框才能勾选。")
+
+        # 建议状态统计（三）
+        stat_c1, stat_c2, stat_c3, stat_c4, stat_c5, stat_c6 = st.columns(6)
+        stat_c1.metric("待审核", counts.get("pending_review", 0))
+        stat_c2.metric("可批量接受", counts.get("safe", 0))
+        stat_c3.metric("需人工处理", counts.get("attention", 0))
+        stat_c4.metric("已接受", counts.get("approved", 0))
+        stat_c5.metric("冲突", counts.get("conflict", 0))
+        stat_c6.metric("无法处理", counts.get("unprocessable", 0))
+
+        # 环境状态行（按钮禁用条件透明化，五）
+        env_checks = []
+        env_checks.append(("✅" if reviewer.strip() else "❌", "已填写审核人" if reviewer.strip() else "尚未填写审核人"))
+        env_checks.append(("✅" if classification.get("has_ai") else "❌", "AI 服务可用" if classification.get("has_ai") else "AI 服务未配置"))
+        env_checks.append(("✅" if classification.get("has_frame") else "❌", "数据集已加载" if classification.get("has_frame") else "数据集未加载"))
+        env_checks.append(("✅" if classification.get("has_profile") else "❌", "已选择 profile" if classification.get("has_profile") else "未选择 profile"))
+        st.caption("　|　".join(f"{icon} {label}" for icon, label in env_checks))
+
+        # 工具按钮（三）：即使 safe 为空也始终显示
+        tool_c1, tool_c2, tool_c3, tool_c4 = st.columns(4)
+        with tool_c1:
+            refresh_classify = st.button(
+                "🔄 刷新建议分类", key="feature_review_refresh_classify_btn", width="stretch",
+                help="重新执行建议分类与诊断（不调用 AI）。",
+            )
+        with tool_c2:
+            show_attention = st.button(
+                "👀 查看需人工处理", key="feature_review_show_attention_btn", width="stretch",
+            )
+        with tool_c3:
+            export_suggestions_btn = st.button(
+                "📥 导出待审核建议", key="feature_review_export_suggestions_btn", width="stretch",
+            )
+        with tool_c4:
+            clean_processed = st.button(
+                "🧹 清理已处理建议", key="feature_review_clean_processed_btn", width="stretch",
+                help="把 status 为 approved/rejected 的建议从列表移除（不影响 manifest）。",
+            )
+        if refresh_classify:
+            st.success(f"已重新分类：可批量接受 {len(safe_suggestions)} 条，需人工处理 {len(attention_suggestions)} 条。")
+        if export_suggestions_btn:
+            export_rows = []
+            for idx, item in enumerate(suggestions if isinstance(suggestions, list) else []):
+                if isinstance(item, Mapping):
+                    export_rows.append({
+                        "feature_id": item.get("feature_id", ""),
+                        "raw_columns": ", ".join(map(str, item.get("raw_columns") or [])),
+                        "source_role": item.get("source_role", ""),
+                        "unit": item.get("unit", ""),
+                        "confidence": item.get("confidence", ""),
+                        "status": item.get("status", ""),
+                    })
+            if export_rows:
+                import json as _json
+                st.download_button(
+                    "⬇️ 下载建议清单 JSON",
+                    data=_json.dumps(export_rows, ensure_ascii=False, indent=2),
+                    file_name=f"suggestions_{profile_id}.json",
+                    mime="application/json",
+                    key="feature_review_export_download",
+                )
+            else:
+                st.info("当前没有待导出的建议。")
+        if clean_processed:
+            remaining = [
+                s for s in suggestions
+                if isinstance(s, Mapping) and str(s.get("status") or "").strip().lower() not in {"approved", "rejected"}
+            ]
+            st.session_state["feature_review_suggestions"] = remaining
+            if profile_id:
+                save_profile_suggestions(profile_id, remaining, portal_root)
+            st.success(f"已清理已处理建议，剩余 {len(remaining)} 条。")
+            st.rerun()
+
+        # 建议列表（可勾选，四）
+        safe_feature_ids = [str(item.get("feature_id")) for item in safe_suggestions]
+        selection_state_key = "feature_review_batch_selection"
+        selection = set(st.session_state.get(selection_state_key, set(safe_feature_ids)))
+        if refresh_classify:
+            selection = set(safe_feature_ids)
+        selection &= set(safe_feature_ids)
 
         if safe_suggestions:
-            st.markdown(f"**可快速批准（{len(safe_suggestions)} 项）**")
+            st.markdown(f"**可批量接受（{len(safe_suggestions)} 项）**")
+            # 快捷选择工具
+            quick_c1, quick_c2, quick_c3, quick_c4, quick_c5 = st.columns(5)
+            with quick_c1:
+                if st.button("全选安全建议", key="feature_review_select_all_btn", width="stretch"):
+                    selection = set(safe_feature_ids)
+            with quick_c2:
+                if st.button("取消全选", key="feature_review_select_none_btn", width="stretch"):
+                    selection = set()
+            with quick_c3:
+                if st.button("只选 manual_input", key="feature_review_select_manual_btn", width="stretch"):
+                    selection = {fid for fid in safe_feature_ids if str(next((s.get("source_role") for s in safe_suggestions if str(s.get("feature_id")) == fid), "")).lower() == "manual_input"}
+            with quick_c4:
+                if st.button("只选 molecular/derived", key="feature_review_select_workflow_btn", width="stretch"):
+                    selection = {fid for fid in safe_feature_ids if str(next((s.get("source_role") for s in safe_suggestions if str(s.get("feature_id")) == fid), "")).lower() in {"molecular_workflow", "derived_workflow"}}
+            with quick_c5:
+                if st.button("仅选择无冲突项", key="feature_review_select_noconflict_btn", width="stretch"):
+                    selection = set(safe_feature_ids)
+            st.caption(f"已选择 {len(selection)} 项")
+
             for idx, item in enumerate(safe_suggestions):
                 feature_id = str(item.get("feature_id") or "")
                 raw_cols = ", ".join(map(str, item.get("raw_columns") or []))
                 role = str(item.get("source_role") or "unknown")
                 conf = item.get("confidence")
-                rationale = str(item.get("rationale_zh") or "暂无中文依据")
+                unit = str(item.get("unit") or "—")
+                reg_status = ""
+                registry_feature = candidate_by_id.get(feature_id) or {}
+                reg_status = str(registry_feature.get("status") or "unknown")
+                diag = item.get("_diagnostics") or {}
+                is_checked = feature_id in selection
                 with st.expander(f"{raw_cols} ➜ {feature_id}", expanded=False):
-                    st.caption(f"来源类型：`{role}` | AI 置信度：`{conf}`")
-                    st.write(rationale)
-
-            confirm_batch = st.checkbox(
-                "我已阅读以上安全建议，确认批量批准",
-                key="feature_review_batch_confirm",
-                disabled=not bool(reviewer),
-            )
-            if st.button(
-                "✅ 批准全部安全建议",
-                key="feature_review_batch_approve_btn",
-                type="primary",
-                disabled=not (reviewer and confirm_batch),
-                width="stretch",
-            ):
-                try:
-                    updated_manifest = batch_approve_safe_feature_suggestions(
-                        active_manifest,
-                        suggestions,
-                        registry,
-                        profile_id,
-                        reviewer,
+                    st.caption(
+                        f"来源类型：`{role}` | AI 置信度：`{conf}` | 单位：`{unit}`"
+                        f" | Registry 状态：`{reg_status}` | 冲突：`{'有' if diag.get('reasons') else '无'}`"
                     )
-                    sync_manifest_to_training_state(updated_manifest)
-                    save_profile_manifest(profile_id, updated_manifest, portal_root)
-                    approved_fids = {
-                        str(b.get("feature_id"))
-                        for b in updated_manifest.get("feature_bindings", [])
-                        if isinstance(b, Mapping)
-                    }
-                    for s in suggestions:
-                        if isinstance(s, Mapping) and str(s.get("feature_id") or "") in approved_fids:
-                            s["status"] = "approved"
-                    st.session_state["feature_review_suggestions"] = suggestions
-                    save_profile_suggestions(profile_id, suggestions, portal_root)
-                    persist_review_event({
-                        "event": "batch_approve",
-                        "profile_id": profile_id,
-                        "reviewer": reviewer,
-                        "approved_count": len(safe_suggestions),
-                        "feature_ids": sorted(approved_fids),
-                    })
-                    st.success(f"已批量批准 {len(safe_suggestions)} 条安全建议，manifest 已同步到训练页面。")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"批量批准失败（未写入任何数据）：{exc}")
+                    st.caption(f"当前状态：`{item.get('status', 'pending_review')}` | 可批量接受原因：通过全部安全检查")
+                    st.write(str(item.get("rationale_zh") or "暂无中文依据"))
+                checkbox_checked = st.checkbox(
+                    f"选择 {feature_id}",
+                    value=is_checked,
+                    key=f"feature_review_sel_{feature_id}",
+                )
+                # checkbox 未被用户交互过（首帧渲染，widget 返回初值之外的假值）时
+                # 保留 session 里的选择；只有显式 value=False 才取消选择。
+                if checkbox_checked or is_checked:
+                    selection.add(feature_id)
+                else:
+                    selection.discard(feature_id)
         else:
-            st.info("当前没有可快速批准的安全建议。")
+            # 空态诊断（三）：必须列出原因与可操作入口
+            st.markdown("**当前没有可批量接受的安全建议。**")
+            diag_lines: list[str] = []
+            if not classification.get("has_ai"):
+                diag_lines.append("没有可用的 AI 服务（尚未配置或未启用）。")
+            if not classification.get("has_profile"):
+                diag_lines.append("当前未选择 profile。")
+            if not classification.get("has_frame"):
+                diag_lines.append("当前数据集未加载。")
+            if not classification.get("has_suggestions"):
+                diag_lines.append("尚未运行 AI 分析（请点击【分析当前数据列】）。")
+            attention_diags = [d for d in (classification.get("diagnostics") or []) if not d.get("can_batch_accept")]
+            if attention_diags:
+                reason_set: list[str] = []
+                for d in attention_diags[:10]:
+                    for r in (d.get("reasons") or [])[:2]:
+                        reason_set.append(f"{d.get('feature_id')}: {r}")
+                diag_lines.append("以下建议需要人工处理：" + "；".join(reason_set[:6]))
+            for line in diag_lines:
+                st.caption(f"• {line}")
+            st.caption("请先点击上方【分析当前数据列】或【重新分析】获取 AI 建议，或进入【逐项审核】人工创建映射。")
 
-        # 3. Conflict / attention list
+        st.session_state[selection_state_key] = set(selection)
+
+        # 按钮启用条件透明化（五）
+        selected_count = len(selection)
+        has_reviewer = bool(reviewer.strip())
+        can_proceed = has_reviewer and selected_count > 0
+        condition_rows = [
+            ("已填写审核人", has_reviewer),
+            (f"已选择 {selected_count} 条建议", selected_count > 0),
+            ("建议均通过安全检查（当前选择来自可批量接受列表）", selected_count > 0),
+            ("manifest 结构有效（可写入）", isinstance(active_manifest, Mapping)),
+            ("当前 profile 允许写入", bool(profile_id) and profile_status_lower not in {"blocked"}),
+        ]
+        st.caption("启用条件：" + "　|　".join(
+            f"{'✅' if ok else '❌'} {label}" for label, ok in condition_rows
+        ))
+        if selected_count == 0 and safe_suggestions:
+            st.warning("请至少选择一条建议后再执行批量接受。")
+
+        confirm_batch = st.checkbox(
+            "我已核对以上选择与来源类型，确认批量接受",
+            key="feature_review_batch_confirm",
+            disabled=not can_proceed,
+        )
+        if not can_proceed and not reviewer.strip():
+            st.caption("提示：请先填写本地审核人；确认框需审核人已填写且至少选择一条建议。")
+
+        if st.button(
+            f"✅ 接受已选择的 {selected_count} 条建议" if selected_count else "✅ 接受已选择的建议",
+            key="feature_review_batch_approve_btn",
+            type="primary",
+            disabled=not (can_proceed and confirm_batch),
+            width="stretch",
+        ):
+            try:
+                selected_ids = [fid for fid in safe_feature_ids if fid in selection]
+                updated_manifest = batch_accept_feature_bindings(
+                    active_manifest,
+                    suggestions,
+                    registry,
+                    profile_id,
+                    reviewer,
+                    selected_feature_ids=selected_ids,
+                )
+                # 成功后才同步 session state / 落盘（原子性：失败不写任何数据）
+                sync_manifest_to_training_state(updated_manifest)
+                save_profile_manifest(profile_id, updated_manifest, portal_root)
+                accepted_fids = {
+                    str(b.get("feature_id"))
+                    for b in updated_manifest.get("feature_bindings", [])
+                    if isinstance(b, Mapping) and str(b.get("review_status") or "") == "approved"
+                }
+                for s in suggestions:
+                    if isinstance(s, Mapping) and str(s.get("feature_id") or "") in accepted_fids:
+                        s["status"] = "approved"
+                st.session_state["feature_review_suggestions"] = suggestions
+                if profile_id:
+                    save_profile_suggestions(profile_id, suggestions, portal_root)
+                persist_review_event({
+                    "event": "batch_accept",
+                    "profile_id": profile_id,
+                    "reviewer": reviewer,
+                    "accepted_count": len(selected_ids),
+                    "feature_ids": sorted(selected_ids),
+                    "manifest_status": updated_manifest.get("status"),
+                    "manifest_hash": updated_manifest.get("manifest_hash"),
+                })
+                if updated_manifest.get("status") == "approved":
+                    st.success(
+                        f"已由审核人 {reviewer} 接受 {len(selected_ids)} 条特征映射建议，已写入当前 manifest；"
+                        "Registry、profile 与模型发布状态未自动改变。"
+                    )
+                else:
+                    st.success(
+                        f"已由审核人 {reviewer} 接受 {len(selected_ids)} 条特征映射建议，已写入当前 manifest；"
+                        "Registry 或 profile 尚未正式批准，manifest 保持 mapped（未获得正式训练资格）。"
+                    )
+                st.session_state.pop(selection_state_key, None)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"批量接受失败（未写入任何数据）：{exc}")
+
+        # 3. Conflict / attention list（十一：每条必须提供操作入口）
         st.markdown("---")
         st.markdown(f"#### ⚠️ 需人工处理（{len(attention_suggestions)} 项）")
         if attention_suggestions:
@@ -487,6 +703,7 @@ def render_feature_registry_page(
                 raw_cols = ", ".join(map(str, item.get("raw_columns") or []))
                 status = str(item.get("status") or "unknown")
                 reasons = item.get("_review_reasons") or []
+                diag = item.get("_diagnostics") or {}
                 with st.expander(f"{raw_cols or '未绑定列'} ➜ {feature_id} [{status}]", expanded=False):
                     st.write(str(item.get("rationale_zh") or "暂无中文依据"))
                     st.caption(f"来源类型：`{item.get('source_role') or 'unknown'}` | AI 置信度：`{item.get('confidence', 'N/A')}`")
@@ -494,6 +711,113 @@ def render_feature_registry_page(
                         st.warning(f"AI 原始来源类型：`{item.get('source_role_raw')}`（已降级，需人工审核）")
                     for reason in reasons:
                         st.caption(f"• {reason}")
+                    if diag.get("repair_action"):
+                        st.info(f"💡 修复建议：{diag['repair_action']}")
+                    # 逐项人工编辑入口：修改 source_role / raw_columns / unit
+                    edit_col1, edit_col2, edit_col3 = st.columns(3)
+                    with edit_col1:
+                        edited_role = st.selectbox(
+                            "修改来源",
+                            ["manual_input", "molecular_workflow", "derived_workflow"],
+                            index=(
+                                ["manual_input", "molecular_workflow", "derived_workflow"].index(
+                                    str(item.get("source_role") or "manual_input")
+                                )
+                                if str(item.get("source_role") or "") in _REVIEW_SOURCE_ROLES
+                                else 0
+                            ),
+                            key=f"feature_review_att_role_{feature_id}",
+                        )
+                    with edit_col2:
+                        edited_raw = st.text_input(
+                            "修改原始列（逗号分隔）",
+                            value=", ".join(map(str, item.get("raw_columns") or [])),
+                            key=f"feature_review_att_raw_{feature_id}",
+                        )
+                    with edit_col3:
+                        edited_unit = st.text_input(
+                            "修改单位",
+                            value=str(item.get("unit") or ""),
+                            key=f"feature_review_att_unit_{feature_id}",
+                        )
+                    att_c1, att_c2, att_c3, att_c4 = st.columns(4)
+                    with att_c1:
+                        accept_edited = st.button(
+                            "接受修改后结果", key=f"feature_review_att_accept_{feature_id}",
+                            disabled=not bool(reviewer),
+                        )
+                    with att_c2:
+                        mark_conflict = st.button(
+                            "标记冲突", key=f"feature_review_att_conflict_{feature_id}",
+                            disabled=not bool(reviewer),
+                        )
+                    with att_c3:
+                        reject = st.button(
+                            "拒绝", key=f"feature_review_att_reject_{feature_id}",
+                            disabled=not bool(reviewer),
+                        )
+                    with att_c4:
+                        retry_ai = st.button(
+                            "重试 AI 分析", key=f"feature_review_att_retry_{feature_id}",
+                            disabled=not (ai_ready and frame is not None and bool(profile_id)),
+                        )
+                    if accept_edited:
+                        try:
+                            edited_payload = {
+                                "raw_columns": [c.strip() for c in edited_raw.split(",") if c.strip()],
+                                "source_role": edited_role,
+                                "unit": edited_unit,
+                                "status": "pending_review",
+                            }
+                            updated_manifest = apply_feature_review_decision(
+                                active_manifest, item, "edit_accept", reviewer,
+                                registry=registry, edited=edited_payload, profile_id=profile_id,
+                            )
+                            sync_manifest_to_training_state(updated_manifest)
+                            save_profile_manifest(profile_id, updated_manifest, portal_root)
+                            for s in suggestions:
+                                if isinstance(s, Mapping) and str(s.get("feature_id") or "") == feature_id:
+                                    s["status"] = "approved"
+                            st.session_state["feature_review_suggestions"] = suggestions
+                            if profile_id:
+                                save_profile_suggestions(profile_id, suggestions, portal_root)
+                            persist_review_event({
+                                "event": "local_decision", "action": "edit_accept",
+                                "reviewer": reviewer, "feature_id": feature_id,
+                                "suggestion": dict(item),
+                            })
+                            st.success(f"已接受修改后结果：{feature_id}")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"接受修改后结果失败：{exc}")
+                    if mark_conflict:
+                        for s in suggestions:
+                            if isinstance(s, Mapping) and str(s.get("feature_id") or "") == feature_id:
+                                s["status"] = "conflict"
+                        st.session_state["feature_review_suggestions"] = suggestions
+                        if profile_id:
+                            save_profile_suggestions(profile_id, suggestions, portal_root)
+                        persist_review_event({
+                            "event": "local_decision", "action": "conflict",
+                            "reviewer": reviewer, "feature_id": feature_id,
+                        })
+                        st.success(f"已标记冲突：{feature_id}")
+                        st.rerun()
+                    if reject:
+                        for s in suggestions:
+                            if isinstance(s, Mapping) and str(s.get("feature_id") or "") == feature_id:
+                                s["status"] = "rejected"
+                        st.session_state["feature_review_suggestions"] = suggestions
+                        if profile_id:
+                            save_profile_suggestions(profile_id, suggestions, portal_root)
+                        persist_review_event({
+                            "event": "local_decision", "action": "reject",
+                            "reviewer": reviewer, "feature_id": feature_id,
+                        })
+                        st.success(f"已拒绝：{feature_id}")
+                        st.rerun()
+                    if retry_ai:
+                        st.info("请��用上方【重新分析】按钮重新运行整批 AI 分析。")
                     st.json(dict(item))
         else:
             st.info("当前没有需要人工处理的建议。")
