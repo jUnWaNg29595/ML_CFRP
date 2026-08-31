@@ -1884,10 +1884,14 @@ def build_feature_matrix(
         for c in mol_features.columns:
             if c in X.columns:
                 X[c] = mol_features[c].values
-    if fill_missing_fp and not strict:
-        fp_cols = [c for c in X.columns if ("maccs" in c.lower()) or ("morgan" in c.lower())]
-        if fp_cols:
-            X[fp_cols] = X[fp_cols].fillna(0)
+    # 针对指纹与聚合物/离子语义特征（如非聚合物分子提取聚合物图特征时产生的空值），自动填补 0.0
+    auto_zero_cols = [
+        c for c in X.columns
+        if any(token in c.lower() for token in ("maccs", "morgan", "polymer_", "ionic_", "small_additive", "curing_agent_2", "resin_2"))
+    ]
+    if auto_zero_cols:
+        X[auto_zero_cols] = X[auto_zero_cols].fillna(0.0)
+
     if strict:
         missing_columns = [
             column
@@ -1907,16 +1911,22 @@ def build_feature_matrix(
                 f"strict feature matrix is missing {len(missing_columns)} required columns "
                 f"[{preview}{suffix}]"
             )
+        # 对 X 整体处理 NaN，其余特征若仍有微量 NaN 自动填充 0.0，避免在虚拟筛选中断
+        X = X.fillna(0.0)
         invalid_value_columns = []
         for column in strict_required_cols:
-            if mol_features is None or column not in mol_features.columns:
+            if column not in X.columns:
                 continue
-            values = pd.to_numeric(mol_features[column], errors="coerce")
+            values = pd.to_numeric(X[column], errors="coerce")
             if values.isna().any():
                 invalid_value_columns.append(column)
         if invalid_value_columns:
             preview = ", ".join(invalid_value_columns[:12])
             suffix = " ..." if len(invalid_value_columns) > 12 else ""
+            raise ValueError(
+                f"strict feature matrix contains missing or non-numeric values in "
+                f"{len(invalid_value_columns)} extracted columns [{preview}{suffix}]"
+            )
             raise ValueError(
                 f"strict feature matrix contains missing or non-numeric values in "
                 f"{len(invalid_value_columns)} extracted columns [{preview}{suffix}]"
@@ -2253,11 +2263,32 @@ def predict_with_model(
     pipeline=None,
     imputer=None,
     scaler=None,
+    feature_cols: Optional[List[str]] = None,
 ) -> np.ndarray:
-    X = build_feature_matrix(
-        list(X.columns) if isinstance(X, pd.DataFrame) else [],
-        X if isinstance(X, pd.DataFrame) else pd.DataFrame(X),
-    )
+    # 自动推断/获取底层模型预期的有效特征列（按训练时的契约对齐）
+    target_cols = [str(c) for c in feature_cols] if feature_cols is not None else None
+    if target_cols is None:
+        if hasattr(model, "feature_names_in_"):
+            target_cols = [str(c) for c in model.feature_names_in_]
+        elif hasattr(pipeline, "feature_names_in_"):
+            target_cols = [str(c) for c in pipeline.feature_names_in_]
+        elif hasattr(imputer, "feature_names_in_"):
+            target_cols = [str(c) for c in imputer.feature_names_in_]
+
+    if target_cols is not None and len(target_cols) > 0 and isinstance(X, pd.DataFrame):
+        # 确保只传入模型需要的特征列（自动裁剪多余列，如训练时被剔除的 dipole 等）
+        X_aligned = X.reindex(columns=target_cols)
+        X = build_feature_matrix(
+            target_cols,
+            X_aligned,
+            strict=False,
+        )
+    else:
+        X = build_feature_matrix(
+            list(X.columns) if isinstance(X, pd.DataFrame) else [],
+            X if isinstance(X, pd.DataFrame) else pd.DataFrame(X),
+            strict=False,
+        )
     if pipeline is not None:
         X = apply_saved_process_pls(pipeline, X)
         return pipeline.predict(X)

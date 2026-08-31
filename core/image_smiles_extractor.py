@@ -86,10 +86,6 @@ def _get_decimer_module():
     """Import DECIMER once per process (Streamlit reruns won't re-download models)."""
     _ensure_decimer_on_path()
 
-    # If previous downloads were interrupted, models.zip might be corrupt.
-    _repair_corrupt_decimer_zip()
-    _clear_decimer_cache_dir()
-
     # Import tensorflow first (DECIMER relies on it)
     import tensorflow as tf  # noqa: F401
 
@@ -101,6 +97,7 @@ def _get_decimer_module():
 # Optional imports
 # ------------------------------------------------------------
 _DECIMER_IMPORT_ERROR: Optional[Exception] = None
+_DECIMER_READY_CACHE: Optional[Tuple[bool, str]] = None
 
 
 def _ensure_decimer_on_path():
@@ -132,26 +129,33 @@ def decimer_is_available() -> Tuple[bool, str]:
     Check whether DECIMER + TensorFlow deps are available.
 
     Returns (available, message).
+    结果进程级缓存：首次调用做 TF import 就绪检查（实测 ~5 秒），之后毫秒级返回。
+    注意：本函数不再触发 DECIMER 模型权重加载（两个 SavedModel 已改为在
+    DECIMER.decimer 内部懒加载，首次 predict_SMILES 时才加载并缓存）。
     """
-    global _DECIMER_IMPORT_ERROR
+    global _DECIMER_IMPORT_ERROR, _DECIMER_READY_CACHE
+    if _DECIMER_READY_CACHE is not None:
+        return _DECIMER_READY_CACHE
+
+    # 快速检查：如果当前环境根本没有 tensorflow 或 DECIMER，直接返回 False，绝不在主线程卡住尝试自动修复或反复扫描解压
+    try:
+        import tensorflow  # noqa: F401
+    except ImportError as e:
+        _DECIMER_IMPORT_ERROR = e
+        result = (False, f"未检测到 tensorflow 依赖: {e}")
+        _DECIMER_READY_CACHE = result
+        return result
+
     try:
         _get_decimer_module()
-        return True, "DECIMER is available."
+        result = (True, "DECIMER is available.")
     except Exception as e:
-        # Auto-repair: if cached zip is corrupted, remove and retry once
-        msg = str(e)
-        if "zip" in msg.lower() and "not a zip" in msg.lower():
-            try:
-                _repair_corrupt_decimer_zip()
-                _clear_decimer_cache_dir()
-                _get_decimer_module.cache_clear()
-                _get_decimer_module()
-                return True, "DECIMER is available."
-            except Exception as e2:
-                _DECIMER_IMPORT_ERROR = e2
-                return False, f"DECIMER not available: {e2}"
         _DECIMER_IMPORT_ERROR = e
-        return False, f"DECIMER not available: {e}"
+        result = (False, f"DECIMER not available: {e}")
+    # 只有成功才缓存，失败时允许用户装好依赖后重试
+    if result[0]:
+        _DECIMER_READY_CACHE = result
+    return result
 
 
 

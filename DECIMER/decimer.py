@@ -131,7 +131,38 @@ def get_models(model_urls: dict):
     return tokenizer, DECIMER_V2, DECIMER_Hand_drawn
 
 
-tokenizer, DECIMER_V2, DECIMER_Hand_drawn = get_models(model_urls)
+# ----------------------------------------------------------------------------
+# 性能修复（2026-08-31）：模型改为懒加载。
+# 原实现在本模块顶层直接执行 get_models(model_urls)，导致 import 本模块
+# 就同步加载两个 ~332MB 的 SavedModel（实测 60~68 秒），任何首次进入
+# "图像转SMILES"子页的 Streamlit 会话都会被阻塞卡住。
+# 现改为：模块导入轻量完成（仅 TF import ~6 秒）；两个 SavedModel 在首次
+# 调用 predict_SMILES 时才加载，并缓存进程级单例（_MODEL_STATE）。
+# 可选：应用启动后用后台线程调用 warmup_models() 预热，让首次识别也快。
+# ----------------------------------------------------------------------------
+_MODEL_STATE = {"tokenizer": None, "decimer": None, "hand_drawn": None, "loaded": False}
+
+
+def _ensure_models_loaded():
+    """Ensure tokenizer + SavedModels are loaded exactly once per process."""
+    if _MODEL_STATE["loaded"]:
+        return _MODEL_STATE
+    tokenizer, decimer_v2, hand_drawn = get_models(model_urls)
+    _MODEL_STATE["tokenizer"] = tokenizer
+    _MODEL_STATE["decimer"] = decimer_v2
+    _MODEL_STATE["hand_drawn"] = hand_drawn
+    _MODEL_STATE["loaded"] = True
+    return _MODEL_STATE
+
+
+def warmup_models():
+    """Eagerly load models (e.g. from a background thread at app startup)."""
+    return _ensure_models_loaded()
+
+
+def models_are_loaded() -> bool:
+    """True once the heavy SavedModels are resident in this process."""
+    return bool(_MODEL_STATE["loaded"])
 
 
 def detokenize_output(predicted_array: int) -> str:
@@ -144,7 +175,7 @@ def detokenize_output(predicted_array: int) -> str:
     Returns:
         (str): SMILES representation of the molecule
     """
-    outputs = [tokenizer.index_word[i] for i in predicted_array[0].numpy()]
+    outputs = [_MODEL_STATE["tokenizer"].index_word[i] for i in predicted_array[0].numpy()]
     prediction = (
         "".join([str(elem) for elem in outputs])
         .replace("<start>", "")
@@ -170,7 +201,7 @@ def detokenize_output_add_confidence(
     """
     prediction_with_confidence = [
         (
-            tokenizer.index_word[predicted_array[0].numpy()[i]],
+            _MODEL_STATE["tokenizer"].index_word[predicted_array[0].numpy()[i]],
             confidence_array[i].numpy(),
         )
         for i in range(len(confidence_array))
@@ -200,11 +231,16 @@ def predict_SMILES(
     """
     chemical_structure = pre_process.decode_image(image_input)
 
-    if hand_drawn and DECIMER_Hand_drawn is None:
+    state = _ensure_models_loaded()
+    tokenizer = state["tokenizer"]
+    hand_drawn_model = state["hand_drawn"]
+    decimer_v2_model = state["decimer"]
+
+    if hand_drawn and hand_drawn_model is None:
         print("⚠️ HandDrawn model not available; falling back to standard DECIMER-V2 model. "
               "If you need hand-drawn recognition, please manually download the HandDrawn model zip from Zenodo "
               "and place it under ~/.data/DECIMER-V2/ then restart.")
-    model = (DECIMER_Hand_drawn if (hand_drawn and DECIMER_Hand_drawn is not None) else DECIMER_V2)
+    model = (hand_drawn_model if (hand_drawn and hand_drawn_model is not None) else decimer_v2_model)
     predicted_tokens, confidence_values = model(tf.constant(chemical_structure))
 
     predicted_SMILES = utils.decoder(detokenize_output(predicted_tokens))

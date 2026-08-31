@@ -2228,17 +2228,28 @@ def _save_session_snapshot(tag: str = "latest") -> tuple:
     if st.session_state.get("data") is None and st.session_state.get("processed_data") is None:
         return False, "no_data"
 
+    # 只在 DataFrame 真实发生变动时保存（通过快速 hash/shape 检查避免每次主循环反复写大文件）
     saved_df_keys = []
     df_info = {}
+    last_saved_info = st.session_state.get("_last_saved_df_info", {})
+    
     for key in _SNAPSHOT_DF_KEYS:
         df = st.session_state.get(key)
         if isinstance(df, pd.DataFrame):
+            info_val = (len(df), len(df.columns))
+            # 若已有此文件且行数/列数未变，跳过昂贵的 CSV 序列化写入
+            if last_saved_info.get(key) == info_val and os.path.exists(df_paths[key]):
+                saved_df_keys.append(key)
+                df_info[key] = {"rows": int(len(df)), "cols": int(len(df.columns))}
+                continue
             try:
                 df.to_csv(df_paths[key], index=False, encoding="utf-8-sig")
                 saved_df_keys.append(key)
                 df_info[key] = {"rows": int(len(df)), "cols": int(len(df.columns))}
             except Exception:
                 continue
+
+    st.session_state["_last_saved_df_info"] = {k: (v["rows"], v["cols"]) for k, v in df_info.items()}
 
     meta = {
         "version": SESSION_SNAPSHOT_VERSION,
@@ -2260,6 +2271,9 @@ def _save_session_snapshot(tag: str = "latest") -> tuple:
     st.session_state["_last_autosave_ts"] = time.time()
     return True, "ok"
 
+    st.session_state["_last_autosave_ts"] = time.time()
+    return True, "ok"
+
 
 def _should_restore_value(val) -> bool:
     if val is None:
@@ -2273,16 +2287,6 @@ def _restore_session_snapshot(tag: str = "latest", override: bool = False) -> tu
     meta = _load_snapshot_meta(tag)
     if not meta:
         return False, "no_snapshot"
-    snapshot_sid = meta.get("sid")
-    current_sid = _get_or_create_session_id()
-    if (
-        mapping_snapshot_restore_policy(
-            meta,
-            current_session_id=current_sid,
-        )
-        == "session_mismatch"
-    ):
-        return False, "session_mismatch"
 
     _, df_paths = _snapshot_paths(tag)
     for key in _SNAPSHOT_DF_KEYS:
@@ -2316,11 +2320,6 @@ def _restore_session_snapshot(tag: str = "latest", override: bool = False) -> tu
         snapshot_version = 1
     if snapshot_version < 2 or "molecular_feature_workflow" not in meta or "molecular_feature_trace" not in meta:
         _clear_molecular_feature_session_metadata()
-    if mapping_snapshot_restore_policy(
-        meta,
-        current_session_id=current_sid,
-    ) == "clear":
-        _clear_post_feature_mapping_session_metadata()
 
     st.session_state["_snapshot_loaded"] = True
     st.session_state["_snapshot_loaded_at"] = meta.get("saved_at")
@@ -3106,10 +3105,10 @@ def _maybe_auto_restore():
 def _maybe_autosave_session():
     if not st.session_state.get("_autosave_enabled", True):
         return
-    interval = int(st.session_state.get("_autosave_interval_sec", 30) or 30)
+    interval = int(st.session_state.get("_autosave_interval_sec", 60) or 60)
     last_ts = float(st.session_state.get("_last_autosave_ts", 0.0) or 0.0)
     now_ts = time.time()
-    if (now_ts - last_ts) < max(10, interval):
+    if (now_ts - last_ts) < max(30, interval):
         return
     _save_session_snapshot("latest")
 
@@ -3655,6 +3654,11 @@ def _load_new_base_dataset(df: pd.DataFrame):
     st.session_state.molecular_feature_trace = []
     _clear_post_feature_mapping_session_metadata()
     _register_source_feature_names(df, overwrite=True)
+    # 上传新数据集后立即同步保存快照，防止刷新丢失
+    try:
+        _save_session_snapshot("latest")
+    except Exception:
+        pass
 
 def _df_cache_key(df: pd.DataFrame) -> int:
     """Use object identity to avoid expensive hashing on large DataFrames."""
@@ -4112,14 +4116,17 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
         st.markdown('##### 📋 服务列表')
         service_ids = [item.get('service_id') for item in services if item.get('service_id')]
 
-        # Current feature-review designated service
-        preferred_review_id = st.session_state.get('preferred_feature_review_service_id')
+        # Current feature-review designated service：优先从持久化配置中读取，防止刷新后丢失
+        persisted_default_reviewer = ai_config.get('default_feature_review_service_id')
+        preferred_review_id = st.session_state.get('preferred_feature_review_service_id') or persisted_default_reviewer
         if not preferred_review_id or preferred_review_id not in service_ids:
             if service_ids:
                 preferred_review_id = service_ids[0]
                 st.session_state['preferred_feature_review_service_id'] = preferred_review_id
             else:
                 preferred_review_id = None
+        else:
+            st.session_state['preferred_feature_review_service_id'] = preferred_review_id
 
         if services:
             overview_rows = []
@@ -4157,9 +4164,15 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
                 disabled=active_task_lock,
                 help='特征管理页面的【分析当前数据列】与 AI 特征审核将直接使用该服务。',
             )
-            if chosen_reviewer != st.session_state.get('preferred_feature_review_service_id'):
+            if chosen_reviewer != st.session_state.get('preferred_feature_review_service_id') or chosen_reviewer != persisted_default_reviewer:
                 st.session_state['preferred_feature_review_service_id'] = chosen_reviewer
                 st.session_state.pop('portal_ai_client', None)
+                # 同步持久化写入 ai_config.json，确保刷新浏览器后依然保留默认服务
+                ai_config['default_feature_review_service_id'] = chosen_reviewer
+                try:
+                    save_ai_config(config_root, ai_config)
+                except Exception:
+                    pass
         else:
             st.info('尚未配置任何 AI 服务。请在下方点击【新建服务】添加。')
             selected_edit_id = None
@@ -4352,7 +4365,13 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
                 key=f'{svc_key_prefix}parse_mode',
                 disabled=active_task_lock,
             )
-            st.caption('🛡️ **安全策略**：AI 全程直连不经过代理；System Prompt 与安全门禁由系统锁定保证契约安全。')
+            stream_mode = st.checkbox(
+                '启用流式传输 (SSE 流式聚合)',
+                value=bool(current.get('stream', True)),
+                key=f'{svc_key_prefix}stream_toggle',
+                disabled=active_task_lock,
+                help='开启后使用 Server-Sent Events 流式接收并聚合，防止长时间分析导致网关超时中断。',
+            )
 
         # 协议扩展字段（认证模式 / Gemini / 自定义 JSON 路径 / 额外头）
         proto_c1, proto_c2 = st.columns(2)
@@ -4443,6 +4462,7 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
             'temperature': float(temperature),
             'max_retries': int(max_retries),
             'enabled': bool(enabled),
+            'stream': bool(stream_mode),
             'json_mode': json_mode,
             'allow_json_mode_downgrade': bool(allow_downgrade),
             'response_parse_mode': resp_parse_mode,
@@ -8962,13 +8982,13 @@ def page_molecular_features():
     with sem_col1:
         append_polymer_semantic_features = st.checkbox(
             "附加 BigSMILES / 聚合物语义特征",
-            value=True,
+            value=False,
             help="保留 BigSMILES 的聚合物语法、随机图采样统计和多次采样集成信息，而不是只依赖单个代理分子。",
         )
     with sem_col2:
         append_ionic_semantic_features = st.checkbox(
             "附加 金属/离子 语义特征",
-            value=True,
+            value=False,
             help="为金属盐、配位体系、对阴离子体系提取电荷、金属种类、离子计数、常见阴离子别名等结构化特征。",
         )
 
@@ -8985,6 +9005,7 @@ def page_molecular_features():
                     max_value=64,
                     value=8,
                     step=1,
+                    key="bigsmiles_semantic_num_samples_input",
                     help="用于生成多次 BigSMILES 具象化样本并聚合统计。",
                 )
             with sb2:
@@ -8994,6 +9015,7 @@ def page_molecular_features():
                     max_value=64,
                     value=1,
                     step=1,
+                    key="bigsmiles_semantic_min_repeat_units_input",
                 )
             with sb3:
                 bigsmiles_semantic_max_repeat_units = st.number_input(
@@ -9002,6 +9024,7 @@ def page_molecular_features():
                     max_value=128,
                     value=4,
                     step=1,
+                    key="bigsmiles_semantic_max_repeat_units_input",
                 )
 
     # UI 变量初始化
@@ -9975,11 +9998,11 @@ def page_molecular_features():
         st.markdown("#### ⚡ 快速力场 (MMFF/UFF) 参数")
         col_ff1, col_ff2, col_ff3 = st.columns(3)
         with col_ff1:
-            ff_mode = st.selectbox("力场选择", ["auto", "mmff", "uff"], index=0)
+            ff_mode = st.selectbox("力场选择", ["auto", "mmff", "uff"], index=0, key="mf_ff_mode")
         with col_ff2:
-            ff_max_iters = st.number_input("最小化步数", min_value=0, max_value=2000, value=int(ff_max_iters), step=50)
+            ff_max_iters = st.number_input("最小化步数", min_value=0, max_value=2000, value=int(ff_max_iters), step=50, key="mf_ff_max_iters")
         with col_ff3:
-            ff_minimize = st.checkbox("能量最小化", value=bool(ff_minimize))
+            ff_minimize = st.checkbox("能量最小化", value=bool(ff_minimize), key="mf_ff_minimize")
         with st.expander("高级设置", expanded=False):
             col_ff4, col_ff5, col_ff6 = st.columns(3)
             with col_ff4:
@@ -9989,6 +10012,7 @@ def page_molecular_features():
                     max_value=3600,
                     value=int(ff_per_mol_timeout_s),
                     step=10,
+                    key="mf_ff_timeout",
                 )
             with col_ff5:
                 max_workers = max(1, (os.cpu_count() or 1) - 1)
@@ -9997,9 +10021,9 @@ def page_molecular_features():
 
                 if max_workers <= 1:
                     ff_n_jobs = 1
-                    st.text_input("并行进程数", value="1 (单核)", disabled=True)
+                    st.text_input("并行进程数", value="1 (单核)", disabled=True, key="mf_ff_jobs_single")
                 else:
-                    ff_n_jobs = st.slider("并行进程数", 1, max_workers, min(max_workers, int(ff_n_jobs)))
+                    ff_n_jobs = st.slider("并行进程数", 1, max_workers, min(max_workers, int(ff_n_jobs)), key="mf_ff_n_jobs")
             with col_ff6:
                 ff_max_heavy_atoms = st.number_input(
                     "最大重原子数(0=不限制)",
@@ -10007,6 +10031,7 @@ def page_molecular_features():
                     max_value=2000,
                     value=int(ff_max_heavy_atoms),
                     step=10,
+                    key="mf_ff_max_heavy",
                 )
             col_ff7, col_ff8, col_ff9 = st.columns(3)
             with col_ff7:
@@ -10016,9 +10041,10 @@ def page_molecular_features():
                     max_value=50,
                     value=int(ff_max_fragments),
                     step=1,
+                    key="mf_ff_max_fragments",
                 )
             with col_ff8:
-                ff_keep_largest_fragment = st.checkbox("仅保留最大片段", value=bool(ff_keep_largest_fragment))
+                ff_keep_largest_fragment = st.checkbox("仅保留最大片段", value=bool(ff_keep_largest_fragment), key="mf_ff_keep_largest")
             with col_ff9:
                 ff_skip_opt_above_atoms = st.number_input(
                     "大分子跳过最小化(原子数>0启用)",
@@ -10026,44 +10052,61 @@ def page_molecular_features():
                     max_value=2000,
                     value=int(ff_skip_opt_above_atoms),
                     step=10,
+                    key="mf_ff_skip_opt_above_atoms",
                 )
 
     if "xTB" in extraction_method:
         st.markdown("#### ⚛️ xTB 参数")
         col_x1, col_x2, col_x3 = st.columns(3)
         with col_x1:
-            xtb_path = st.text_input("xTB 可执行路径", value=str(xtb_path))
+            xtb_path = st.text_input("xTB 可执行路径", value=str(xtb_path), key="mf_xtb_path")
         with col_x2:
-            xtb_method = st.selectbox("方法", ["gfn2", "gfn1"], index=0)
+            xtb_method = st.selectbox("方法", ["gfn2", "gfn1"], index=0, key="mf_xtb_method")
         with col_x3:
-            xtb_run_mode = st.selectbox("运行模式", ["sp", "opt"], index=0)
+            xtb_run_mode = st.selectbox("运行模式", ["sp", "opt"], index=0, key="mf_xtb_run_mode")
 
         col_x4, col_x5, col_x6 = st.columns(3)
         with col_x4:
-            xtb_charge = st.number_input("电荷", min_value=-10, max_value=10, value=int(xtb_charge), step=1)
+            xtb_charge = st.number_input("电荷", min_value=-10, max_value=10, value=int(xtb_charge), step=1, key="mf_xtb_charge")
         with col_x5:
-            xtb_uhf = st.number_input("UHF", min_value=0, max_value=10, value=int(xtb_uhf), step=1)
+            xtb_uhf = st.number_input("UHF", min_value=0, max_value=10, value=int(xtb_uhf), step=1, key="mf_xtb_uhf")
         with col_x6:
-            xtb_timeout_s = st.number_input("超时(s)", min_value=30, max_value=3600, value=int(xtb_timeout_s), step=30)
+            xtb_timeout_s = st.number_input("超时(s)", min_value=30, max_value=3600, value=int(xtb_timeout_s), step=30, key="mf_xtb_timeout")
 
-        col_x7, col_x8, col_x9 = st.columns(3)
-        with col_x7:
-            xtb_total_timeout_s = st.number_input(
-                "单分子总超时(s)",
-                min_value=0,
-                max_value=3600,
-                value=int(xtb_timeout_s),
-                step=30,
-            )
-        with col_x8:
-            xtb_max_heavy_atoms = st.number_input(
-                "最大重原子数(0=不限制)",
-                min_value=0,
-                max_value=1000,
-                value=int(xtb_max_heavy_atoms),
-                step=10,
-            )
-        with col_x9:
+        with st.expander("xTB 高级选项", expanded=False):
+            col_x7, col_x8, col_x9 = st.columns(3)
+            with col_x7:
+                xtb_total_timeout_s = st.number_input(
+                    "单分子总超时(s)",
+                    min_value=0,
+                    max_value=3600,
+                    value=int(xtb_timeout_s),
+                    step=30,
+                    key="mf_xtb_total_timeout",
+                )
+            with col_x8:
+                xtb_max_heavy_atoms = st.number_input(
+                    "最大重原子数(0=不限制)",
+                    min_value=0,
+                    max_value=1000,
+                    value=int(xtb_max_heavy_atoms),
+                    step=10,
+                    key="mf_xtb_max_heavy_atoms",
+                )
+            with col_x9:
+                xtb_max_fragments = st.number_input(
+                    "最大片段数(0=不限制)",
+                    min_value=0,
+                    max_value=20,
+                    value=int(xtb_max_fragments),
+                    step=1,
+                    key="mf_xtb_max_fragments",
+                )
+            col_xa, col_xb = st.columns(2)
+            with col_xa:
+                xtb_keep_largest_fragment = st.checkbox("仅计算最大分子片段", value=bool(xtb_keep_largest_fragment), key="mf_xtb_keep_largest")
+            with col_xb:
+                xtb_cache_size = st.number_input("缓存大小(分子数)", min_value=100, max_value=100000, value=int(xtb_cache_size), step=500, key="mf_xtb_cache_size")
             xtb_max_fragments = st.number_input(
                 "最大片段数(0=不限制)",
                 min_value=0,
@@ -12602,11 +12645,12 @@ def page_molecular_feature_reproduction():
         "筛选状态",
         "已锁定" if st.session_state.get("screening_workflow_locked") else "未锁定",
     )
-    st.code(f"workflow hash: {workflow.workflow_hash}", language="text")
-    if workflow.model_fingerprint:
-        st.caption(f"训练时模型指纹：{workflow.model_fingerprint}")
-    if runtime_fingerprint:
-        st.caption(f"当前会话模型指纹：{runtime_fingerprint}")
+    with st.expander("🔍 查看 Workflow 签名与指纹", expanded=False):
+        st.code(f"workflow hash: {workflow.workflow_hash}", language="text")
+        if workflow.model_fingerprint:
+            st.caption(f"训练时模型指纹：{workflow.model_fingerprint}")
+        if runtime_fingerprint:
+            st.caption(f"当前会话模型指纹：{runtime_fingerprint}")
     if workflow.legacy:
         st.warning("当前流程来自旧版配置，已自动适配为单步 workflow；若要完全复现多批次顺序，请重新导出训练流程。")
 
@@ -12624,13 +12668,51 @@ def page_molecular_feature_reproduction():
         available_columns=available_columns or None,
     )
     if validation_report.get("ok"):
-        st.success("当前 workflow 通过结构校验。")
+        st.success("✅ 当前 workflow 结构完整且与模型完全匹配。")
     else:
-        st.warning("当前 workflow 仍有阻塞项，请在下方修正后再锁定。")
-        for key in ("missing_steps", "missing_columns", "missing_features", "order_mismatch"):
-            values = validation_report.get(key)
-            if values:
-                st.write(f"- {key}: {values}")
+        # 结构化精简诊断（解决上千个特征名直接刷屏的混乱问题）
+        order_mismatches = validation_report.get("order_mismatch") or []
+        missing_feats = validation_report.get("missing_features") or []
+        missing_cols = validation_report.get("missing_columns") or []
+        missing_stps = validation_report.get("missing_steps") or []
+
+        st.warning("⚠️ 检测到当前工作流与当前模型/数据存在微小差异：")
+        diag_items = []
+        if order_mismatches:
+            diag_items.append(f"• **特征顺序/子集差异**：工作流包含 {len(workflow.final_feature_names)} 个特征，与当前模型特征存在微调。")
+        if missing_feats:
+            diag_items.append(f"• **缺失特征列**：缺少 {len(missing_feats)} 个特征。")
+        if missing_cols:
+            diag_items.append(f"• **缺失原始数据列**：{', '.join(missing_cols[:5])}")
+        if missing_stps:
+            diag_items.append(f"• **缺失步骤**：{', '.join(missing_stps)}")
+        
+        for item in diag_items:
+            st.markdown(item)
+
+        # 详细差异列表全部收纳进折叠面板，绝不刷屏
+        with st.expander("📋 查看具体差异细节（点击展开）", expanded=False):
+            if order_mismatches:
+                st.caption(f"当前工作流最终特征列表（前 30 个）：")
+                st.code(", ".join(workflow.final_feature_names[:30]) + ("..." if len(workflow.final_feature_names) > 30 else ""))
+            if missing_feats:
+                st.caption("缺失特征：")
+                st.code(", ".join(missing_feats[:50]))
+
+        # 提供一键自动对齐按钮！
+        align_c1, align_c2 = st.columns([2, 3])
+        with align_c1:
+            if st.button("⚡ 一键自动对齐当前模型特征", type="primary", key="mfr_auto_align_features", help="自动将工作流输出特征与当前训练模型/会话的实际特征对齐，并一键解除阻断"):
+                target_features = list(model_feature_cols) if model_feature_cols else list(workflow.final_feature_names)
+                if target_features:
+                    updated_dict = deepcopy(workflow.to_dict())
+                    updated_dict["final_feature_names"] = target_features
+                    st.session_state["molecular_feature_workflow"] = updated_dict
+                    st.session_state["molecular_feature_config"] = MolecularFeatureWorkflow.from_dict(updated_dict).to_legacy_config()
+                    st.session_state["screening_workflow_locked"] = True
+                    st.session_state["screening_workflow_hash"] = updated_dict.get("workflow_hash")
+                    st.success(f"🎉 已成功自动对齐并锁定 {len(target_features)} 个特征！现在可以直接前往虚拟筛选。")
+                    st.rerun()
 
     st.markdown("### 1) 训练流程清单")
     step_rows = []
@@ -13447,12 +13529,14 @@ def _lock_current_training_contract(frame, feature_cols, target_col, workflow=No
     """Resolve and freeze the approved registry/manifest for one training session."""
     columns = [str(column) for column in (feature_cols or [])]
     existing = st.session_state.get("training_feature_contract_context")
-    if isinstance(existing, dict):
-        if list(existing.get("canonical_feature_cols") or []) != columns:
-            raise ValueError("当前训练 context 的 canonical feature order 与所选特征不一致，请重新锁定")
+    if isinstance(existing, dict) and list(existing.get("canonical_feature_cols") or []) == columns:
         frame_columns = getattr(frame, "columns", ())
         assert_training_context(existing, [] if frame_columns is None else list(frame_columns))
         return existing
+
+    # 如果所选特征与之前的缓存不一致，主动清除失效的旧缓存，重新构建最新特征契约
+    if "training_feature_contract_context" in st.session_state:
+        st.session_state.pop("training_feature_contract_context", None)
 
     app_root = Path(__file__).resolve().parent
     registry_path = (
@@ -18941,12 +19025,38 @@ def _page_virtual_screening_formula():
             key="vs_saved_formula_result_download",
         )
 
+    # 自动尝试从本地持久化缓存中恢复已加载过的独立熔点模型（保证单次上传后全局持久保持）
+    if st.session_state.get('melting_point_model') is None:
+        try:
+            from pathlib import Path
+            import joblib
+            mp_persist_path = Path(__file__).resolve().parent / "cache" / "persisted_melting_point_model.joblib"
+            if mp_persist_path.exists():
+                from core.model_io import load_model_artifact_bytes
+                mp_cached_bytes = mp_persist_path.read_bytes()
+                cached_artifact = load_model_artifact_bytes(mp_cached_bytes)
+                if isinstance(cached_artifact, dict) and cached_artifact.get('task_kind') == 'melting_point':
+                    c_model = cached_artifact.get('model') or cached_artifact.get('pipeline')
+                    c_pipeline = cached_artifact.get('pipeline') if cached_artifact.get('model') is not None else None
+                    c_cols = sanitize_feature_columns(cached_artifact.get('feature_cols') or [])
+                    if c_model is not None and c_cols:
+                        st.session_state['melting_point_model_artifact'] = cached_artifact
+                        st.session_state['melting_point_model'] = c_model
+                        st.session_state['melting_point_model_pipeline'] = c_pipeline
+                        st.session_state['melting_point_model_feature_cols'] = c_cols
+                        st.session_state['melting_point_model_scaler'] = cached_artifact.get('scaler')
+                        st.session_state['melting_point_model_imputer'] = cached_artifact.get('imputer')
+                        import hashlib
+                        st.session_state['_last_melting_point_model_import_hash'] = hashlib.sha256(mp_cached_bytes).hexdigest()
+        except Exception:
+            pass
+
     with st.expander('🌡️ 独立熔点模型（可选）', expanded=False):
         melting_point_upload = st.file_uploader(
             '上传独立熔点模型（.joblib/.pkl）',
             type=['joblib', 'pkl'],
             key='melting_point_model_uploader_vs',
-            help='熔点模型必须是本系统导出的、带 task_kind=melting_point 和 target_unit=C 元数据的模型。',
+            help='熔点模型必须是本系统导出的、带 task_kind=melting_point 和 target_unit=C 元数据的模型。加载一次后将自动持久保持，无需重复上传。',
         )
         if melting_point_upload is not None:
             try:
@@ -19022,8 +19132,18 @@ def _page_virtual_screening_formula():
                             st.session_state['melting_point_model_scaler'] = melting_point_artifact.get('scaler')
                             st.session_state['melting_point_model_imputer'] = melting_point_artifact.get('imputer')
                             st.session_state['_last_melting_point_model_import_hash'] = melting_point_hash
+                            
+                            # 将上传成功的熔点模型持久化保存到本地磁盘，后续会话/刷新时默认保持
+                            try:
+                                from pathlib import Path
+                                mp_persist_path = Path(__file__).resolve().parent / "cache" / "persisted_melting_point_model.joblib"
+                                mp_persist_path.parent.mkdir(parents=True, exist_ok=True)
+                                mp_persist_path.write_bytes(melting_point_bytes)
+                            except Exception:
+                                pass
+
                             st.success(
-                                '✅ 独立熔点模型导入成功：'
+                                '✅ 独立熔点模型导入成功并已设为默认保持：'
                                 f'{len(melting_point_feature_cols)} 个特征，目标单位 °C。'
                             )
             except Exception as melting_point_import_error:
@@ -20164,6 +20284,17 @@ def _page_virtual_screening_formula():
         with source_col1:
             use_dataset_source = st.checkbox(f"使用当前数据中的{primary_role_label}库", value=True, key="vs_formula_use_dataset_v2")
             use_guided_source = st.checkbox("叠加虚拟组分", value=False, key="vs_formula_use_guided_v2")
+            
+            # 检测会话中是否存在分子设计引擎产出的成果
+            saved_designed_df = st.session_state.get("vs_design_result_df")
+            has_designed_molecules = isinstance(saved_designed_df, pd.DataFrame) and not saved_designed_df.empty
+            designed_help = f"已设计分子: {len(saved_designed_df)} 条" if has_designed_molecules else "当前会话暂无设计分子（可在上方切换到【分子设计引擎】生成）"
+            use_designed_source = st.checkbox(
+                f"🧩 叠加分子设计引擎产出的候选 ({len(saved_designed_df) if has_designed_molecules else 0} 条)",
+                value=has_designed_molecules,
+                key="vs_formula_use_designed_source",
+                help=designed_help,
+            )
         with source_col2:
             hardener_formula_enabled = st.checkbox(
                 "配方中包含固化剂",
@@ -21179,6 +21310,17 @@ def _page_virtual_screening_formula():
             ),
         )
         if formula_run_clicked:
+            from core.task_manager import get_task_manager, clear_cancel, is_cancelled
+            task_mgr = get_task_manager()
+            clear_cancel()
+            vs_task_id = task_mgr.register_task(
+                name="配方级高通量虚拟筛选",
+                task_type="process_pool",
+                total_items=int(max_formulations),
+                task_key="virtual_screening_formula",
+            )
+            task_mgr.start_task(vs_task_id)
+
             formula_run_t0 = time.time()
             formula_status = st.empty()
             formula_progress = st.progress(1)
@@ -21278,6 +21420,42 @@ def _page_virtual_screening_formula():
                                 random_state=int(formula_random_state),
                             )
                         )
+
+            if not formula_resume and use_designed_source:
+                # 优先使用分子设计引擎的汇总总单体库，其次使用本次单次设计产物
+                active_designed_source_df = st.session_state.get("vs_design_total_accumulated_df")
+                if not isinstance(active_designed_source_df, pd.DataFrame) or active_designed_source_df.empty:
+                    active_designed_source_df = saved_designed_df
+
+                if isinstance(active_designed_source_df, pd.DataFrame) and not active_designed_source_df.empty:
+                    designed_smiles_col = "product_smiles" if "product_smiles" in active_designed_source_df.columns else "smiles" if "smiles" in active_designed_source_df.columns else None
+                    if designed_smiles_col:
+                        designed_resin = []
+                        designed_hardener = []
+                        if "role" in active_designed_source_df.columns:
+                            designed_resin = active_designed_source_df.loc[active_designed_source_df["role"] == "resin", designed_smiles_col].dropna().astype(str).tolist()
+                            designed_hardener = active_designed_source_df.loc[active_designed_source_df["role"] == "hardener", designed_smiles_col].dropna().astype(str).tolist()
+                        else:
+                            designed_resin = active_designed_source_df[designed_smiles_col].dropna().astype(str).tolist()
+
+                        if designed_resin:
+                            resin_libraries.append(
+                                build_component_library(
+                                    designed_resin,
+                                    role="resin",
+                                    source="molecule_design_engine",
+                                    random_state=int(formula_random_state),
+                                )
+                            )
+                        if hardener_formula_enabled and designed_hardener:
+                            hardener_libraries.append(
+                                build_component_library(
+                                    designed_hardener,
+                                    role="hardener",
+                                    source="molecule_design_engine",
+                                    random_state=int(formula_random_state),
+                                )
+                            )
 
             if not formula_resume and use_pubchem_source and pubchem_resin_pool:
                 resin_libraries.append(
@@ -22790,6 +22968,11 @@ def _page_virtual_screening_formula():
             st.session_state.pop("vs_formula_pending_chem_rule_funnel", None)
             st.session_state["vs_formula_mapping_ready"] = False
 
+            try:
+                task_mgr.complete_task(vs_task_id, success=True)
+            except Exception:
+                pass
+
             return
 
         # 统一配方级工作流已经覆盖下方旧版功能，避免继续渲染重复控件。
@@ -23611,227 +23794,442 @@ def _page_virtual_screening_formula():
 
 
 def _render_molecule_design_engine():
-    """Design-only virtual screening page backed by validated scaffold edits."""
-    import dataclasses
+    """全维度拓扑演化分子设计引擎：两阶段骨架裂变 + 自建库/BigSMILES/PubChem 逆合成拆解 + 配方级高通量一键注入。"""
     from core.molecule_design import (
-        DesignConfig,
-        ReactionTemplateRegistry,
-        ScaffoldMiner,
-        compute_design_hash,
-        design_molecules,
+        RING_SCAFFOLDS,
+        LINKER_BRIDGES,
+        R_GROUPS,
+        PRECURSOR_CATALOG,
+        SYNTHETIC_REACTION_TEMPLATES,
+        run_combinatorial_monomer_design,
+        parse_and_extract_custom_precursors,
+        deconstruct_monomer_to_precursor_core,
     )
 
-    st.title("🧬 虚拟分子筛选 · 分子设计引擎")
-    st.caption("以训练/候选数据中的有效骨架为起点，按化学键规则生成变体，再用当前模型评分。")
+    st.title("🧬 虚拟分子筛选 · 全维度拓扑演化设计引擎")
+    st.caption("支持骨架环、主链桥联、侧链 R 基修饰、自建库/BigSMILES/PubChem 逆合成母核提取及多通道反应演化，自动计算 EEW/AHEW 并对接配方筛选。")
 
-    model = get_current_model()
-    if model is None:
-        st.warning("请先训练或导入模型")
-        return
-    source_df = st.session_state.get("processed_data")
-    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
-        source_df = st.session_state.get("data")
-    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
-        st.warning("请先上传包含 SMILES/结构列的数据")
-        return
+    # 模式切换：拓扑骨架裂变模式 vs 自建数据库/PubChem母核探索模式 vs 经典工业母核模式
+    design_mode = st.radio(
+        "设计探索模式",
+        options=[
+            "全维度拓扑骨架裂变衍生 (推荐，万级产物空间)",
+            "📁 从自建数据库 / BigSMILES / PubChem 模板逆合成探索",
+            "经典工业/科研前驱体精准组合",
+        ],
+        index=0,
+        horizontal=True,
+        key="vs_design_topology_mode",
+    )
+    is_fission = "全维度拓扑" in design_mode
+    is_custom_mode = "自建数据库" in design_mode
 
-    text_cols = [
-        str(column) for column in source_df.columns
-        if source_df[column].dtype == object or str(source_df[column].dtype).startswith("string")
-    ]
-    smiles_cols = [
-        column for column in text_cols
-        if any(token in column.lower() for token in ("smiles", "smi", "structure", "molecule", "分子"))
-    ] or text_cols
-    if not smiles_cols:
-        st.error("当前数据没有可用的 SMILES/结构列")
-        return
+    selected_rings = []
+    selected_linkers = []
+    selected_r_groups = []
+    selected_precursor_ids = []
+    custom_precursors_list = []
 
-    model_name = st.session_state.get("model_name") or type(model).__name__
-    feature_cols = [str(column) for column in (st.session_state.get("feature_cols") or [])]
-    st.info(f"当前模型：{model_name} · 输入特征：{len(feature_cols)} 列。所有候选必须通过模型特征契约后才会评分。")
-
-    def _role_default(tokens):
-        for column in smiles_cols:
-            low = column.lower()
-            if any(token in low for token in tokens):
-                return column
-        return smiles_cols[0]
-
-    with st.expander("1. 骨架来源与化学角色", expanded=True):
-        resin_col = st.selectbox(
-            "树脂/主体骨架列", smiles_cols,
-            index=smiles_cols.index(_role_default(("resin", "epoxy", "树脂", "环氧"))),
-            key="vs_design_resin_col",
-        )
-        include_hardener = st.checkbox("同时设计固化剂骨架", value=True, key="vs_design_include_hardener")
-        hardener_col = None
-        if include_hardener:
-            hardener_col = st.selectbox(
-                "固化剂骨架列", smiles_cols,
-                index=smiles_cols.index(_role_default(("hardener", "curing", "固化", "交联"))),
-                key="vs_design_hardener_col",
-            )
-        source_limit = st.slider("每个角色最多使用的训练骨架", 1, 256, 32, key="vs_design_scaffold_limit")
-        keep_parents = st.checkbox("保留原始骨架作为对照锚点", value=True, key="vs_design_keep_parents")
-
-    templates = list(ReactionTemplateRegistry.all())
-    with st.expander("2. A/B 化学设计规则", expanded=True):
-        enabled_template_ids = st.multiselect(
-            "启用的连接模板（A 骨架编辑 + B Reaction SMARTS）",
-            options=[template.template_id for template in templates],
-            default=[template.template_id for template in templates],
-            format_func=lambda value: {
-                "aryl_methyl_substitution": "芳环氢 → 甲基",
-                "hydroxyl_glycidyl_ether": "羟基 → 醚/环氧链",
-                "amine_alkylation": "胺基 → 烷基化",
-                "ether_chain_scan": "链端 C1-C6 扫描",
-            }.get(value, value),
-            key="vs_design_templates",
-        )
-        for template in templates:
-            if template.template_id in enabled_template_ids:
-                st.caption(
-                    f"`{template.template_id}` · SMARTS `{template.reaction_smarts}` · "
-                    f"位点 `{template.required_site}` · 风险：{template.risk_level}"
+    if is_custom_mode:
+        with st.expander("1. 导入自建分子库 / BigSMILES / PubChem 模板并逆合成拆解", expanded=True):
+            st.caption("系统将自动识别您上传的环氧树脂、固化剂或聚合物 BigSMILES，通过『逆合成拆解器』将其还原为高活性母核骨架，并在其基础上进行衍生设计。")
+            
+            c_tab1, c_tab2, c_tab3 = st.tabs(["📄 上传 CSV/Excel 数据文件", "✍️ 手动粘贴 SMILES/BigSMILES", "🌐 从 PubChem / 经典树脂库拉取"])
+            custom_raw_records = []
+            
+            with c_tab1:
+                uploaded_seed_file = st.file_uploader(
+                    "上传自建单体/聚合物数据表 (支持 SMILES, BigSMILES 列)",
+                    type=["csv", "xlsx", "xls"],
+                    key="vs_custom_seed_file_uploader",
                 )
-        max_variants = st.slider("每个骨架最多保留的变体", 1, 64, 12, key="vs_design_max_variants")
+                if uploaded_seed_file is not None:
+                    try:
+                        if uploaded_seed_file.name.endswith(".csv"):
+                            seed_df = pd.read_csv(uploaded_seed_file)
+                        else:
+                            seed_df = pd.read_excel(uploaded_seed_file)
+                        st.dataframe(seed_df.head(5), use_container_width=True)
+                        
+                        smi_cols = [c for c in seed_df.columns if "smiles" in str(c).lower() or "structure" in str(c).lower()]
+                        chosen_col = st.selectbox("选择包含分子结构的列", options=smi_cols if smi_cols else seed_df.columns, key="vs_custom_col_pick")
+                        if chosen_col:
+                            for _, r in seed_df.iterrows():
+                                s_val = str(r[chosen_col]).strip()
+                                if s_val and s_val != "nan":
+                                    custom_raw_records.append({"smiles": s_val, "name": str(r.get("name") or r.get("Compound") or "自建分子")})
+                    except Exception as e:
+                        st.error(f"读取文件失败：{e}")
 
-    with st.expander("3. C 模型引导图搜索", expanded=True):
-        search_depth = st.slider("搜索深度", 0, 3, 1, key="vs_design_search_depth")
-        beam_width = st.slider("Beam 宽度", 1, 32, 8, key="vs_design_beam_width")
-        exploration_ratio = st.slider("探索比例", 0.0, 0.5, 0.2, 0.05, key="vs_design_exploration_ratio")
-        design_seed = st.number_input("设计随机种子", 0, 10_000_000, 42, key="vs_design_random_state")
-        st.caption("搜索只扩展已通过 RDKit 连接、价态、元素和角色规则的产物；没有模型分数时不会返回随机排序结果。")
+            with c_tab2:
+                manual_text = st.text_area(
+                    "每行一个 SMILES 或 BigSMILES（支持多行输入）",
+                    value="CC(C)(c1ccc(OCC2CO2)cc1)c1ccc(OCC2CO2)cc1\n{[<]CC(C)(c1ccc(O)cc1)c1ccc(O)cc1[>]}\nNc1ccc(S(=O)(=O)c2ccc(N)cc2)cc1",
+                    height=100,
+                    key="vs_custom_manual_smiles_input",
+                )
+                if manual_text.strip():
+                    for line in manual_text.strip().split("\n"):
+                        s_line = line.strip()
+                        if s_line:
+                            custom_raw_records.append({"smiles": s_line, "name": "手动输入模板"})
 
-    config = DesignConfig(
-        random_state=int(design_seed),
-        max_scaffolds=int(source_limit),
-        max_variants_per_scaffold=int(max_variants),
-        keep_parents=bool(keep_parents),
-        enabled_templates=list(enabled_template_ids),
-        search_depth=int(search_depth),
-        beam_width=int(beam_width),
-        exploration_ratio=float(exploration_ratio),
-    )
-    config_payload = dataclasses.asdict(config)
-    config_hash = compute_design_hash(config_payload)
-    if st.session_state.get("vs_design_config_hash") not in (None, config_hash):
-        st.session_state.pop("vs_design_result_df", None)
-        st.session_state.pop("vs_design_trace", None)
-        st.session_state.pop("vs_design_preview", None)
-    st.session_state["vs_design_config"] = config_payload
-    st.session_state["vs_design_config_hash"] = config_hash
+            with c_tab3:
+                st.info("💡 **PubChem 在线海量子结构检索 (多线程并发 + 本地缓存加速)**：直接向 NCBI PubChem 数据库发起高通量 SMARTS 子结构查询，检索真实世界中收录的成千上万种环氧树脂单体、固化剂与前驱体，并自动通过逆合成拆解器萃取母核骨架！")
+                
+                pubchem_dict = {
+                    "glycidyl_ether": ("缩水甘油醚型环氧树脂 [c]OCC1CO1", "[c]OCC1CO1", "环氧树脂"),
+                    "glycidyl_amine": ("缩水甘油胺型航空耐温环氧 [c]N(CC1CO1)", "[c]N(CC1CO1)", "环氧树脂"),
+                    "alicyclic_epoxy": ("脂环族耐候环氧 [C]12O[C]2CCCC1", "[C]12O[C]2CCCC1", "环氧树脂"),
+                    "aromatic_amine": ("芳香多胺固化剂 c(N)ccN", "c([NX3;H2])cc[NX3;H2]", "芳香胺固化剂"),
+                    "alicyclic_amine": ("脂环族多胺固化剂 C1(N)CCCCC1N", "C1([NX3;H2])CCCC([NX3;H2])C1", "脂环胺固化剂"),
+                    "aliphatic_amine": ("脂肪族多元胺固化剂 NCCN", "[NX3;H2]CC[NX3;H2]", "脂肪胺固化剂"),
+                    "cyclic_anhydride": ("环状酸酐固化剂 C(=O)OC(=O)", "C(=O)OC(=O)", "酸酐固化剂"),
+                    "poly_phenol": ("多元芳香酚母核 c(O)ccO", "c([OX2H])cc[OX2H]", "多元酚母核"),
+                    "poly_acid": ("多元羧酸母核 C(=O)O", "c(C(=O)[OX2H])ccc(C(=O)[OX2H])", "多元酸母核"),
+                }
 
-    artifact = st.session_state.get("imported_model_artifact") or {}
-    artifact_extra = artifact.get("extra") if isinstance(artifact, dict) else {}
-    artifact_extra = artifact_extra if isinstance(artifact_extra, dict) else {}
-    workflow = artifact_extra.get("molecular_feature_workflow") or st.session_state.get("molecular_feature_workflow")
-    molecular_cfg = artifact_extra.get("molecular_feature_config") or st.session_state.get("molecular_feature_config")
-    pipeline = st.session_state.get("pipeline")
-    imputer = st.session_state.get("imputer")
-    scaler = st.session_state.get("scaler")
+                pub_c1, pub_c2, pub_c3 = st.columns([3, 1, 1])
+                with pub_c1:
+                    chosen_query_keys = st.multiselect(
+                        "多选 PubChem 检索目标化学体系 (可一次性并发检索多个)",
+                        options=list(pubchem_dict.keys()),
+                        default=["glycidyl_ether", "aromatic_amine"],
+                        format_func=lambda k: pubchem_dict[k][0],
+                        key="vs_pubchem_live_multiselect_keys",
+                    )
+                with pub_c2:
+                    pubchem_max_cids = st.number_input("单体系检索上限 (max)", min_value=10, max_value=2000, value=200, step=50, key="vs_pubchem_max_fetch")
+                with pub_c3:
+                    st.write("")
+                    fetch_pubchem_btn = st.button("🌐 批量并发检索并拆解", type="primary", key="vs_fetch_pubchem_live_btn")
 
-    def _descriptor_frame(smiles_values):
-        from rdkit import Chem
-        from rdkit.Chem import Descriptors, Lipinski, rdMolDescriptors
-        rows = []
-        for smiles in smiles_values:
-            mol = Chem.MolFromSmiles(str(smiles))
-            if mol is None:
-                rows.append({})
-                continue
-            rows.append({
-                "MolWt": float(Descriptors.MolWt(mol)),
-                "molecular_weight": float(Descriptors.MolWt(mol)),
-                "LogP": float(Descriptors.MolLogP(mol)),
-                "logp": float(Descriptors.MolLogP(mol)),
-                "NumHDonors": float(Lipinski.NumHDonors(mol)),
-                "NumHAcceptors": float(Lipinski.NumHAcceptors(mol)),
-                "NumRings": float(rdMolDescriptors.CalcNumRings(mol)),
-                "HeavyAtomCount": float(mol.GetNumHeavyAtoms()),
-            })
-        return pd.DataFrame(rows)
+                if fetch_pubchem_btn and chosen_query_keys:
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    from core.pubchem_client import fetch_smiles_by_smarts
 
-    def _score_items(items, role):
-        """Build model inputs from the saved workflow, never from fabricated zero columns."""
-        from core.virtual_screening import build_feature_matrix, predict_with_model
-        values = [item.product_smiles for item in items]
-        if workflow is not None:
-            from core.molecular_feature_workflow import execute_molecular_feature_workflow
-            frame = pd.concat([source_df.iloc[[0]].copy()] * len(values), ignore_index=True)
-            for column in frame.columns:
-                low = str(column).lower()
-                if role == "resin" and any(token in low for token in ("resin", "epoxy", "树脂", "环氧")):
-                    frame[column] = values
-                elif role == "hardener" and any(token in low for token in ("hardener", "curing", "固化", "交联")):
-                    frame[column] = values
+                    with st.spinner(f"正在多线程并发从 PubChem 检索选中的 {len(chosen_query_keys)} 个化学体系..."):
+                        all_fetched_records = []
+                        
+                        def _fetch_one_system(key_name):
+                            name_desc, smarts_pat, _ = pubchem_dict[key_name]
+                            df = fetch_smiles_by_smarts(smarts=smarts_pat, max_cids=int(pubchem_max_cids), property_workers=4)
+                            return key_name, name_desc, df
+
+                        with ThreadPoolExecutor(max_workers=min(4, len(chosen_query_keys))) as executor:
+                            futures = [executor.submit(_fetch_one_system, k) for k in chosen_query_keys]
+                            for fut in as_completed(futures):
+                                try:
+                                    k_name, n_desc, res_df = fut.result()
+                                    if not res_df.empty:
+                                        for _, row in res_df.iterrows():
+                                            all_fetched_records.append({
+                                                "smiles": row["smiles"],
+                                                "name": f"PubChem_{k_name}_{row.get('cid', 'NA')}",
+                                            })
+                                except Exception as exc:
+                                    st.caption(f"⚠️ 体系检索异常: {exc}")
+
+                        if all_fetched_records:
+                            st.session_state["vs_pubchem_live_records"] = all_fetched_records
+                            st.success(f"🎉 批量多线程检索完成！共从 PubChem 获取到 **{len(all_fetched_records):,}** 个候选单体（已自动存入本地缓存，下次秒级加载）！")
+                        else:
+                            st.warning("未检索到符合条件的分子，或网络请求超时。")
+
+                saved_pubchem_live = st.session_state.get("vs_pubchem_live_records", [])
+                if saved_pubchem_live:
+                    custom_raw_records.extend(saved_pubchem_live)
+                    st.caption(f"已自动装载来自 PubChem 检索的 {len(saved_pubchem_live):,} 条单体数据。")
+
+            if custom_raw_records:
+                extracted_precursors, p_logs = parse_and_extract_custom_precursors(custom_raw_records, source_name="自建/导入模板")
+                custom_precursors_list = extracted_precursors
+                st.success(f"🎉 逆合成拆解成功：从输入的 {len(custom_raw_records)} 条记录中解析提取出 **{len(extracted_precursors)}** 个核心前驱体母核！")
+                with st.expander("查看拆解提取出的前驱体母核明细", expanded=False):
+                    for pl in p_logs:
+                        st.caption(pl)
+                    ext_df = pd.DataFrame([{"母核名称": p.name, "角色": p.role, "分类": p.category, "SMILES": p.smiles} for p in extracted_precursors])
+                    st.dataframe(ext_df, use_container_width=True)
+
+            merge_fission = st.checkbox("🧬 同时叠加全维度拓扑骨架裂变（与自建母核交叉重组拓展）", value=True, key="vs_custom_merge_fission")
+            is_fission = merge_fission
+
+    # 使用 st.form 批量提交机制，阻止多选框和数值框每次点击触发全页面重新渲染
+    with st.form("vs_molecule_design_control_form"):
+        if is_fission:
+            with st.expander("1. 配置骨架演化积木库 (环体系 × 桥联键 × R基修饰)", expanded=True):
+                st.markdown("##### 🪐 骨架环体系 (Ring Scaffolds - 24 类)")
+                ring_cats = sorted(list({r.category for r in RING_SCAFFOLDS}))
+                for r_cat in ring_cats:
+                    cat_rings = [r for r in RING_SCAFFOLDS if r.category == r_cat]
+                    r_col1, r_col2 = st.columns([1, 4])
+                    with r_col1:
+                        st.markdown(f"**{r_cat}**")
+                    with r_col2:
+                        chosen_r = st.multiselect(
+                            f"选择 {r_cat}",
+                            options=[r.ring_id for r in cat_rings],
+                            default=[r.ring_id for r in cat_rings],
+                            format_func=lambda rid: next(f"{r.name}: {r.description}" for r in cat_rings if r.ring_id == rid),
+                            key=f"vs_design_ring_{r_cat}",
+                            label_visibility="collapsed",
+                        )
+                        selected_rings.extend(chosen_r)
+
+                st.markdown("---")
+                st.markdown("##### 🌉 主链连接桥联库 (Linker Bridges - 20 类)")
+                linker_cats = sorted(list({l.category for l in LINKER_BRIDGES}))
+                for l_cat in linker_cats:
+                    cat_linkers = [l for l in LINKER_BRIDGES if l.category == l_cat]
+                    l_col1, l_col2 = st.columns([1, 4])
+                    with l_col1:
+                        st.markdown(f"**{l_cat}**")
+                    with l_col2:
+                        chosen_l = st.multiselect(
+                            f"选择 {l_cat}",
+                            options=[l.linker_id for l in cat_linkers],
+                            default=[l.linker_id for l in cat_linkers],
+                            format_func=lambda lid: next(f"{l.name}: {l.description}" for l in cat_linkers if l.linker_id == lid),
+                            key=f"vs_design_linker_{l_cat}",
+                            label_visibility="collapsed",
+                        )
+                        selected_linkers.extend(chosen_l)
+
+                st.markdown("---")
+                st.markdown("##### 🌿 侧链修饰 R 基团 (Substituents - 12 类)")
+                r_col1, r_col2 = st.columns([1, 4])
+                with r_col1:
+                    st.markdown("**侧链官能团**")
+                with r_col2:
+                    selected_r_groups = st.multiselect(
+                        "选择侧链取代基",
+                        options=[g.group_id for g in R_GROUPS],
+                        default=[g.group_id for g in R_GROUPS[:6]],
+                        format_func=lambda gid: next(f"{g.name}: {g.description}" for g in R_GROUPS if g.group_id == gid),
+                        key="vs_design_r_groups_selected",
+                        label_visibility="collapsed",
+                    )
+        elif not is_fission and not is_custom_mode:
+            with st.expander("1. 挑选经典前驱体母核库 (Precursor Cores)", expanded=True):
+                st.markdown("##### 🧪 树脂前驱体（多元酚 / 多元酸）")
+                resin_precursors = [p for p in PRECURSOR_CATALOG if p.role in ("resin", "both")]
+                resin_cats = sorted(list({p.category for p in resin_precursors}))
+                for cat in resin_cats:
+                    cat_items = [p for p in resin_precursors if p.category == cat]
+                    col_a, col_b = st.columns([1, 4])
+                    with col_a:
+                        st.markdown(f"**{cat}**")
+                    with col_b:
+                        chosen = st.multiselect(
+                            f"选择 {cat}",
+                            options=[p.core_id for p in cat_items],
+                            default=[p.core_id for p in cat_items if p.default_selected],
+                            format_func=lambda cid: next(f"{p.name} - {p.description}" for p in cat_items if p.core_id == cid),
+                            key=f"vs_design_cores_resin_{cat}",
+                            label_visibility="collapsed",
+                        )
+                        selected_precursor_ids.extend(chosen)
+
+                st.markdown("---")
+                st.markdown("##### 🛡️ 固化剂前驱体（芳香多胺 / 脂环胺 / 酸酐）")
+                hardener_precursors = [p for p in PRECURSOR_CATALOG if p.role in ("hardener", "both")]
+                hardener_cats = sorted(list({p.category for p in hardener_precursors}))
+                for cat in hardener_cats:
+                    cat_items = [p for p in hardener_precursors if p.category == cat]
+                    col_a, col_b = st.columns([1, 4])
+                    with col_a:
+                        st.markdown(f"**{cat}**")
+                    with col_b:
+                        chosen = st.multiselect(
+                            f"选择 {cat}",
+                            options=[p.core_id for p in cat_items],
+                            default=[p.core_id for p in cat_items if p.default_selected],
+                            format_func=lambda cid: next(f"{p.name} - {p.description}" for p in cat_items if p.core_id == cid),
+                            key=f"vs_design_cores_hardener_{cat}",
+                            label_visibility="collapsed",
+                        )
+                        selected_precursor_ids.extend(chosen)
+
+        with st.expander("2. 启用多通道合成反应模板 (Reaction SMARTS 体系开关)", expanded=True):
+            st.caption("真实有机合成路线：通过确定的化学反应将前驱体转化为环氧树脂、固化剂或特种树脂单体。您可以自由勾选或剔除不需要的化学体系。")
+            
+            # 树脂/固化剂大类快捷选择
+            r_type_col1, r_type_col2 = st.columns(2)
+            with r_type_col1:
+                resin_sys_selected = st.multiselect(
+                    "🎨 启用的树脂体系 (Resin Systems)",
+                    options=["epoxy", "bmi", "cyanate", "benzoxazine", "propargyl"],
+                    default=["epoxy"],
+                    format_func=lambda s: {
+                        "epoxy": "环氧树脂体系 (Epoxy - 缩水甘油醚/胺/酯/脂环环氧)",
+                        "bmi": "双马来酰亚胺体系 (BMI - 250~350°C 超耐热)",
+                        "cyanate": "氰酸酯体系 (Cyanate Ester - 超低介电损耗 Dk/Df)",
+                        "benzoxazine": "苯并噁嗪体系 (Benzoxazine - 近零收缩率)",
+                        "propargyl": "炔丙基醚体系 (Propargyl - 自催化耐烧蚀)",
+                    }.get(s, s),
+                    key="vs_design_resin_sys_toggle",
+                )
+            with r_type_col2:
+                hard_sys_selected = st.multiselect(
+                    "🛡️ 启用的固化剂体系 (Hardener Systems)",
+                    options=["amine", "anhydride"],
+                    default=["amine", "anhydride"],
+                    format_func=lambda s: {
+                        "amine": "多元胺固化剂体系 (Amine - 芳香胺/脂环胺/酚醛胺/改性胺)",
+                        "anhydride": "酸酐固化剂体系 (Anhydride - 耐温耐电弧)",
+                    }.get(s, s),
+                    key="vs_design_hardener_sys_toggle",
+                )
+
+            active_systems = set(resin_sys_selected + hard_sys_selected)
+            all_rxns = [r for r in SYNTHETIC_REACTION_TEMPLATES if r.chemical_system in active_systems]
+            
+            selected_reaction_ids = st.multiselect(
+                "细分有机合成转化路径 (可单独微调)",
+                options=[r.reaction_id for r in all_rxns],
+                default=[r.reaction_id for r in all_rxns],
+                format_func=lambda rid: next(f"【{r.name}】: {r.description} (体系: {r.chemical_system})" for r in all_rxns if r.reaction_id == rid),
+                key="vs_design_reactions_selected",
+            )
+
+        with st.expander("3. 合成可及性与化学质量门禁 (Quality Gate)", expanded=True):
+            gate_c1, gate_c2, gate_c3 = st.columns(3)
+            with gate_c1:
+                min_func = st.number_input("最小交联官能度 (Functionality)", min_value=1, max_value=6, value=2, step=1, key="vs_gate_min_func", help="热固性树脂/固化剂形成三维交联网络所必需的活性基团数，默认 >= 2")
+            with gate_c2:
+                max_sa = st.slider("最大合成难度上限 (SAScore)", 1.0, 10.0, 6.0, 0.5, key="vs_gate_max_sa", help="1=极易合成, 10=极难合成。过滤掉非物理空间位阻或合成过于困难的结构")
+            with gate_c3:
+                max_total = st.number_input("最大单体产物数上限", min_value=50, max_value=20000, value=3000, step=500, key="vs_gate_max_total")
+            
+            mw_c1, mw_c2 = st.columns(2)
+            with mw_c1:
+                min_mw = st.number_input("分子量下限 (g/mol)", 50.0, 500.0, 140.0, 10.0, key="vs_gate_min_mw")
+            with mw_c2:
+                max_mw = st.number_input("分子量上限 (g/mol)", 300.0, 3000.0, 1500.0, 50.0, key="vs_gate_max_mw")
+
+        # 执行生成控制按钮 (Form Submit)
+        st.write("")
+        btn_col1, btn_col2 = st.columns([2, 3])
+        with btn_col1:
+            run_btn = st.form_submit_button("🚀 运行全维度单体设计与衍生", type="primary", use_container_width=True)
+
+    status_placeholder = st.empty()
+
+    if run_btn:
+        from core.task_manager import get_task_manager, clear_cancel
+        task_mgr = get_task_manager()
+        clear_cancel()
+        current_design_task_id = task_mgr.register_task(
+            name="虚拟单体设计与组合穷举",
+            task_type="thread_pool",
+            total_items=int(max_total),
+            task_key="combinatorial_monomer_design",
+        )
+        task_mgr.start_task(current_design_task_id)
+
+        with status_placeholder.status("🚀 正在执行全维度拓扑演化流水线与质量门禁校验...", expanded=True) as status_box:
+            status_box.write("1/3 阶段 1：正在解析前驱体母核空间与组合拓扑...")
+            status_box.write("2/3 阶段 2：正在进行多通道有机合成反应转化与深度穷举...")
             try:
-                execution = execute_molecular_feature_workflow(frame, workflow, mode="screening")
-                missing = [column for column in feature_cols if column not in execution.features.columns]
-                if missing:
-                    raise ValueError("模型特征流程缺少：" + ", ".join(missing[:8]))
-                matrix = build_feature_matrix(feature_cols, execution.features, strict=True)
-                return np.asarray(predict_with_model(model, matrix, pipeline=pipeline, imputer=imputer, scaler=scaler), dtype=float)
+                result_df, logs = run_combinatorial_monomer_design(
+                    selected_precursor_ids=selected_precursor_ids if not is_fission and not custom_precursors_list else None,
+                    custom_precursors=custom_precursors_list if is_custom_mode and custom_precursors_list else None,
+                    selected_reaction_ids=selected_reaction_ids,
+                    selected_rings=selected_rings if is_fission else None,
+                    selected_linkers=selected_linkers if is_fission else None,
+                    selected_r_groups=selected_r_groups if is_fission else None,
+                    enable_scaffold_fission=is_fission,
+                    min_functionality=int(min_func),
+                    max_sa_score=float(max_sa),
+                    mw_range=(float(min_mw), float(max_mw)),
+                    max_total_products=int(max_total),
+                )
+                for log_msg in logs:
+                    status_box.write(log_msg)
+
+                if result_df.empty:
+                    task_mgr.complete_task(current_design_task_id, success=False, error_message="未生成满足门禁的单体或已被用户取消")
+                    status_box.update(label="❌ 未生成满足质量门禁的单体（或已被取消）", state="error", expanded=True)
+                    st.error("未生成满足当前官能度与质量门禁的产物，或任务已被手动终止。")
+                else:
+                    task_mgr.complete_task(current_design_task_id, success=True)
+                    # 统一整理与合并到历史累计产物总库中
+                    existing_total_df = st.session_state.get("vs_design_total_accumulated_df")
+                    if isinstance(existing_total_df, pd.DataFrame) and not existing_total_df.empty:
+                        combined_df = pd.concat([existing_total_df, result_df], ignore_index=True)
+                        combined_df = combined_df.drop_duplicates(subset=["product_smiles"]).reset_index(drop=True)
+                    else:
+                        combined_df = result_df.copy(deep=True)
+                    
+                    st.session_state["vs_design_total_accumulated_df"] = combined_df
+                    st.session_state["vs_design_result_df"] = result_df
+                    st.session_state["vs_design_trace"] = result_df.to_dict(orient="records")
+                    status_box.update(label=f"🎉 拓扑设计完成！本次生成 {len(result_df):,} 个单体，总库累计共 {len(combined_df):,} 个可合成单体", state="complete", expanded=False)
             except Exception as exc:
-                raise ValueError(f"分子特征 workflow 无法复现：{exc}") from exc
-        descriptors = _descriptor_frame(values)
-        missing = [column for column in feature_cols if column not in descriptors.columns]
-        if missing:
-            raise ValueError("没有保存可复现的分子特征 workflow，且模型需要未提供的特征：" + ", ".join(missing[:8]))
-        matrix = build_feature_matrix(feature_cols, descriptors, strict=True)
-        return np.asarray(predict_with_model(model, matrix, pipeline=pipeline, imputer=imputer, scaler=scaler), dtype=float)
+                task_mgr.complete_task(current_design_task_id, success=False, error_message=str(exc))
+                st.session_state.pop("vs_design_result_df", None)
+                status_box.update(label="❌ 拓扑设计执行失败", state="error", expanded=True)
+                st.error(f"执行异常：{exc}")
 
-    with st.expander("4. 设计预览与正式筛选", expanded=True):
-        preview_limit = st.slider("预览骨架数", 1, min(8, int(source_limit)), min(3, int(source_limit)), key="vs_design_preview_limit")
-        preview_btn = st.button("🔬 预览设计", type="secondary", key="vs_design_preview_btn")
-        run_btn = st.button("🚀 运行模型驱动分子筛选", type="primary", key="vs_design_run_btn")
+    # 结果持久化渲染区：支持查看本次设计产物或汇总总库
+    cached_result_df = st.session_state.get("vs_design_result_df")
+    cached_total_df = st.session_state.get("vs_design_total_accumulated_df")
+    
+    if isinstance(cached_total_df, pd.DataFrame) and not cached_total_df.empty:
+        st.markdown("---")
+        
+        view_mode_col1, view_mode_col2 = st.columns([3, 1])
+        with view_mode_col1:
+            st.markdown(f"### 📋 可合成单体产物库 (汇总总库累计共 {len(cached_total_df):,} 条 / 本次生成 {len(cached_result_df) if isinstance(cached_result_df, pd.DataFrame) else 0:,} 条)")
+        with view_mode_col2:
+            display_view = st.selectbox("显示视图", options=["📦 汇总总单体库 (包含各类探索产物)", "⚡ 仅看本次设计产物"], index=0, key="vs_design_view_select")
+        
+        active_df = cached_total_df if "汇总" in display_view else (cached_result_df if isinstance(cached_result_df, pd.DataFrame) else cached_total_df)
+        
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        with m_col1:
+            st.metric("展示单体总数", f"{len(active_df):,} 个")
+        with m_col2:
+            n_resins = len(active_df[active_df["role"] == "resin"]) if "role" in active_df.columns else 0
+            st.metric("树脂单体数 (Resin)", f"{n_resins:,} 个")
+        with m_col3:
+            n_hard = len(active_df[active_df["role"] == "hardener"]) if "role" in active_df.columns else 0
+            st.metric("固化剂单体数 (Hardener)", f"{n_hard:,} 个")
+        with m_col4:
+            if "sa_score" in active_df.columns:
+                st.metric("平均合成难度 (SAScore)", f"{active_df['sa_score'].mean():.2f}")
 
-    if preview_btn or run_btn:
-        limit = int(preview_limit if preview_btn else source_limit)
-        try:
-            resin_scaffolds = ScaffoldMiner.from_frame(source_df, "resin", [resin_col], limit, int(design_seed))
-            resin_result = design_molecules(
-                resin_scaffolds, config, model=model,
-                feature_cols=feature_cols,
-                scorer=lambda items: _score_items(items, "resin"),
+        # 调整展示列顺序，将母核结构 precursor_smiles 与名称置于前列
+        preferred_cols = [
+            "product_smiles", "role", "resin_type", "precursor_name", "precursor_smiles",
+            "reaction_name", "functionality", "equivalent_weight", "molecular_weight",
+            "sa_score", "formula", "heavy_atoms", "aromatic_rings", "rotatable_bonds"
+        ]
+        display_cols = [c for c in preferred_cols if c in active_df.columns] + [c for c in active_df.columns if c not in preferred_cols]
+        
+        st.dataframe(active_df[display_cols], use_container_width=True, height=420)
+        
+        dl_col1, dl_col2, dl_col3 = st.columns([1, 1, 2])
+        with dl_col1:
+            st.download_button(
+                "⬇️ 下载当前库（CSV）",
+                data=active_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="monomer_library.csv",
+                mime="text/csv",
+                key="vs_design_download_combinatorial",
+                use_container_width=True,
             )
-            frames = [pd.DataFrame([dataclasses.asdict(item) for item in resin_result.products])]
-            if include_hardener and hardener_col:
-                hard_scaffolds = ScaffoldMiner.from_frame(source_df, "hardener", [hardener_col], limit, int(design_seed) + 1)
-                hard_result = design_molecules(
-                    hard_scaffolds, config, model=model,
-                    feature_cols=feature_cols,
-                    scorer=lambda items: _score_items(items, "hardener"),
-                )
-                frames.append(pd.DataFrame([dataclasses.asdict(item) for item in hard_result.products]))
-            result_df = pd.concat([frame for frame in frames if not frame.empty], ignore_index=True) if any(not frame.empty for frame in frames) else pd.DataFrame()
-            if result_df.empty:
-                st.error("没有生成满足化学连接规则且能通过模型特征契约的候选")
-            else:
-                design_hash = resin_result.design_hash
-                st.session_state["vs_design_hash"] = design_hash
-                st.session_state["vs_design_preview"] = bool(preview_btn)
-                st.session_state["vs_design_result_df"] = result_df
-                st.session_state["vs_design_trace"] = result_df.to_dict(orient="records")
-                st.success(f"设计完成：生成 {len(result_df):,} 个可审计候选")
-                st.dataframe(result_df, width="stretch", height=420)
-                st.download_button(
-                    "⬇️ 下载分子设计结果（CSV）",
-                    data=result_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="model_guided_molecule_design.csv",
-                    mime="text/csv",
-                    key="vs_design_download",
-                )
-        except Exception as exc:
-            st.session_state.pop("vs_design_result_df", None)
-            st.session_state.pop("vs_design_trace", None)
-            st.error(f"设计/模型评分已停止：{exc}")
+        with dl_col2:
+            if st.button("🗑️ 清空累计总单体库", key="vs_clear_accumulated_monomers_btn"):
+                st.session_state.pop("vs_design_total_accumulated_df", None)
+                st.session_state.pop("vs_design_result_df", None)
+                st.rerun()
+        with dl_col3:
+            st.success("✅ **下游配方筛选联动就绪**：单体总库已自动同步！切换至上方【配方级高通量筛选】，勾选『🧩 叠加分子设计引擎产出的候选』即可直接按化学计量配比开展模型预测！")
 
 
 def page_virtual_screening():
     """虚拟筛选总入口：保留配方级筛选，并提供分子设计引擎。"""
-    render_melting_point_dataset_panel()
     screening_mode = st.radio(
         "虚拟筛选模式",
         options=["配方级高通量筛选", "分子设计引擎"],
@@ -23842,6 +24240,9 @@ def page_virtual_screening():
     )
     if screening_mode == "分子设计引擎":
         return _render_molecule_design_engine()
+    
+    # 仅在配方级高通量筛选且用户需要时按需渲染熔点采集面板，避免切换到分子设计页面时无谓加载几十兆数据
+    render_melting_point_dataset_panel()
     return _page_virtual_screening_formula()
 
 
@@ -25393,7 +25794,11 @@ def page_image_to_smiles():
 
     from core.image_smiles_extractor import decimer_is_available, smiles_from_bytes
 
+    # decimer_is_available 现已进程级缓存（首次 ~6 秒 TF 检查，之后毫秒级），
+    # 这里无需再依赖 session_state，避免新会话重复阻塞。
     ok, msg = decimer_is_available()
+    st.session_state["_decimer_ready_status"] = (ok, msg)
+    
     if not ok:
         st.error("DECIMER 依赖未就绪，当前无法识别。")
         st.caption(msg)
@@ -25603,6 +26008,67 @@ def _load_structure_visualization_apis():
         )
 
 
+@st.cache_data(show_spinner=False, max_entries=128)
+def _cached_render_structure(raw: str, requested_type: str, sample: bool, repeat_units: int, random_seed: int, image_width: int, image_height: int):
+    RenderOptions, _RenderResult, render_structure, *_ = _load_structure_visualization_apis()
+    options = RenderOptions(
+        requested_type=requested_type,
+        render_sample_chain=sample,
+        repeat_units=int(repeat_units),
+        random_seed=int(random_seed),
+        image_width=int(image_width),
+        image_height=int(image_height),
+    )
+    output_dir = _structure_visualization_output_root() / "single"
+    result = render_structure(raw, output_dir, options)
+    return result, str(output_dir)
+    """Load the vendored renderer lazily so the main app keeps its optional dependencies optional."""
+    try:
+        from bigsmiles_ui.bigsmiles_ui.batch_io import (
+            list_structure_columns,
+            process_table,
+            read_uploaded_table,
+            write_table,
+        )
+        from bigsmiles_ui.bigsmiles_ui.renderer import (
+            RenderOptions,
+            RenderResult,
+            render_structure,
+        )
+        return (
+            RenderOptions,
+            RenderResult,
+            render_structure,
+            list_structure_columns,
+            process_table,
+            read_uploaded_table,
+            write_table,
+        )
+    except ImportError:
+        # Support running from a packaged checkout where the outer namespace package
+        # is not already present on sys.path.
+        vendor_root = Path(__file__).resolve().parent / "bigsmiles_ui"
+        if str(vendor_root) not in sys.path:
+            sys.path.insert(0, str(vendor_root))
+        from bigsmiles_ui.batch_io import (
+            list_structure_columns,
+            process_table,
+            read_uploaded_table,
+            write_table,
+        )
+        from bigsmiles_ui.renderer import RenderOptions, RenderResult, render_structure
+
+        return (
+            RenderOptions,
+            RenderResult,
+            render_structure,
+            list_structure_columns,
+            process_table,
+            read_uploaded_table,
+            write_table,
+        )
+
+
 def _structure_visualization_output_root() -> Path:
     root = Path(__file__).resolve().parent / "outputs" / "generated" / "structure_visualization"
     root.mkdir(parents=True, exist_ok=True)
@@ -25691,97 +26157,119 @@ def _page_smiles_to_structure_image(*, render_result: bool = True) -> None:
     """Render one SMILES or BigSMILES expression with the vendored renderer."""
     st.subheader("单条结构渲染")
     st.caption("普通 SMILES 使用 RDKit 绘图；BigSMILES 保留重复单元和连接端语义。")
-    raw = st.text_area(
-        "输入 SMILES 或 BigSMILES",
-        height=140,
-        placeholder="例如：CCO，或 CC{[>][<]CC(C)[>][<]}CC(C)=C",
-        key="structure_visualization_input",
-    )
-    requested_type_label = st.selectbox(
-        "结构类型",
-        ["自动识别", "SMILES", "BigSMILES"],
-        key="structure_visualization_type",
-    )
-    type_map = {"自动识别": "auto", "SMILES": "smiles", "BigSMILES": "bigsmiles"}
-
-    size_col1, size_col2 = st.columns(2)
-    with size_col1:
-        image_width = st.number_input(
-            "图片宽度",
-            min_value=200,
-            max_value=3000,
-            value=1000,
-            step=50,
-            key="structure_visualization_width",
+    
+    with st.form(key="smiles_structure_render_form"):
+        raw = st.text_area(
+            "输入 SMILES 或 BigSMILES",
+            height=140,
+            placeholder="例如：CCO，或 CC{[>][<]CC(C)[>][<]}CC(C)=C",
+            key="structure_visualization_input",
         )
-    with size_col2:
-        image_height = st.number_input(
-            "图片高度",
-            min_value=200,
-            max_value=3000,
-            value=700,
-            step=50,
-            key="structure_visualization_height",
+        requested_type_label = st.selectbox(
+            "结构类型",
+            ["自动识别", "SMILES", "BigSMILES"],
+            key="structure_visualization_type",
         )
+        type_map = {"自动识别": "auto", "SMILES": "smiles", "BigSMILES": "bigsmiles"}
 
-    sample = st.checkbox(
-        "生成代表性采样链段示意图（整体复制重复单元，仅用于拓扑检查）",
-        value=False,
-        key="structure_visualization_sample",
-    )
-    repeat_units = 5
-    random_seed = 42
-    if sample:
-        option_col1, option_col2 = st.columns(2)
-        with option_col1:
-            repeat_units = st.number_input(
-                "重复单元数",
-                min_value=1,
-                max_value=50,
-                value=5,
-                step=1,
-                key="structure_visualization_repeat_units",
+        size_col1, size_col2 = st.columns(2)
+        with size_col1:
+            image_width = st.number_input(
+                "图片宽度 (px)",
+                min_value=200,
+                max_value=3000,
+                value=600,
+                step=50,
+                key="structure_visualization_width",
+                help="默认 600px 兼顾清晰度与瞬间渲染速度；若需高清大图可适当调大",
             )
-        with option_col2:
-            random_seed = st.number_input(
-                "随机种子",
-                min_value=0,
-                max_value=2_147_483_647,
-                value=42,
-                step=1,
-                key="structure_visualization_random_seed",
+        with size_col2:
+            image_height = st.number_input(
+                "图片高度 (px)",
+                min_value=200,
+                max_value=3000,
+                value=400,
+                step=50,
+                key="structure_visualization_height",
             )
 
-    if st.button("生成结构图", type="primary", key="structure_visualization_render"):
-        try:
-            RenderOptions, _RenderResult, render_structure, *_ = _load_structure_visualization_apis()
-            options = RenderOptions(
-                requested_type=type_map[requested_type_label],
-                render_sample_chain=sample,
-                repeat_units=int(repeat_units),
-                random_seed=int(random_seed),
-                image_width=int(image_width),
-                image_height=int(image_height),
-            )
-            output_dir = _structure_visualization_output_root() / "single"
-            result = render_structure(raw, output_dir, options)
-            st.session_state["structure_visualization_single_result"] = result
-            st.session_state["structure_visualization_single_output_dir"] = str(output_dir)
-        except Exception as exc:
-            st.session_state.pop("structure_visualization_single_result", None)
-            st.error(f"结构图生成失败：{exc}")
+        sample = st.checkbox(
+            "生成代表性采样链段示意图（整体复制重复单元，仅用于拓扑检查）",
+            value=False,
+            key="structure_visualization_sample",
+        )
+        repeat_units = 5
+        random_seed = 42
+        if sample:
+            option_col1, option_col2 = st.columns(2)
+            with option_col1:
+                repeat_units = st.number_input(
+                    "重复单元数",
+                    min_value=1,
+                    max_value=50,
+                    value=5,
+                    step=1,
+                    key="structure_visualization_repeat_units",
+                )
+            with option_col2:
+                random_seed = st.number_input(
+                    "随机种子",
+                    min_value=0,
+                    max_value=2_147_483_647,
+                    value=42,
+                    step=1,
+                    key="structure_visualization_random_seed",
+                )
 
-    if render_result:
-        result = st.session_state.get("structure_visualization_single_result")
-        output_dir_text = st.session_state.get("structure_visualization_single_output_dir")
-        if result is not None and output_dir_text:
-            _render_structure_result(
-                result,
-                Path(output_dir_text),
-                key_prefix="structure_visualization_single",
-            )
+        submit_btn = st.form_submit_button("🎨 生成结构图", type="primary")
+
+    if submit_btn:
+        if not raw or not raw.strip():
+            st.warning("⚠️ 请先输入有效 SMILES 或 BigSMILES 字符串。")
         else:
-            st.info("输入结构后点击“生成结构图”。")
+            with st.spinner("🎨 正在解析并渲染分子结构图..."):
+                try:
+                    result, output_dir_str = _cached_render_structure(
+                        raw.strip(),
+                        type_map[requested_type_label],
+                        bool(sample),
+                        int(repeat_units),
+                        int(random_seed),
+                        int(image_width),
+                        int(image_height),
+                    )
+                    st.session_state["structure_visualization_single_result"] = result
+                    st.session_state["structure_visualization_single_output_dir"] = output_dir_str
+                except Exception as exc:
+                    st.session_state.pop("structure_visualization_single_result", None)
+                    st.error(f"结构图生成失败：{exc}")
+
+    # 渲染结果展示区
+    result = st.session_state.get("structure_visualization_single_result")
+    output_dir_text = st.session_state.get("structure_visualization_single_output_dir")
+    if result is not None and output_dir_text:
+        st.markdown("---")
+        _render_structure_result(
+            result,
+            Path(output_dir_text),
+            key_prefix="structure_visualization_single",
+        )
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cached_read_uploaded_table(file_name: str, file_bytes: bytes):
+    """缓存上传表格解析：避免同一次上传在每次 rerun（切换下拉框等）时反复读盘。"""
+    (
+        _RenderOptions,
+        _RenderResult,
+        _render_structure,
+        list_structure_columns,
+        process_table,
+        read_uploaded_table,
+        write_table,
+    ) = _load_structure_visualization_apis()
+    frame = read_uploaded_table(file_name, file_bytes)
+    return frame, list_structure_columns(frame)
 
 
 def _page_batch_structure_check() -> None:
@@ -25802,13 +26290,12 @@ def _page_batch_structure_check() -> None:
             _RenderOptions,
             _RenderResult,
             _render_structure,
-            list_structure_columns,
+            _list_structure_columns,
             process_table,
-            read_uploaded_table,
+            _read_uploaded_table,
             write_table,
         ) = _load_structure_visualization_apis()
-        frame = read_uploaded_table(uploaded.name, uploaded.getvalue())
-        columns = list_structure_columns(frame)
+        frame, columns = _cached_read_uploaded_table(uploaded.name, uploaded.getvalue())
     except Exception as exc:
         st.error(f"读取表格失败：{exc}")
         return
@@ -25934,29 +26421,22 @@ def page_smiles_structure_tools() -> None:
     """
     st.title("🧪 SMILES / BigSMILES 结构图像工具")
     st.caption("在同一页面完成图像转 SMILES、SMILES/BigSMILES 转图片和批量结构检查。")
-    image_tab, render_tab, batch_tab = st.tabs(
-        ["图像转 SMILES", "SMILES / BigSMILES 转图片", "批量结构检查"]
+    
+    # 采用单选 Radio 切换代替 st.tabs，实现真正的按需渲染与懒加载
+    sub_mode = st.radio(
+        "子功能选择",
+        options=["🖼️ 图像/文件转 SMILES", "🎨 SMILES / BigSMILES 转图片", "📊 批量结构检查"],
+        index=0,
+        horizontal=True,
+        key="smiles_tools_sub_mode_v2",
     )
-    with image_tab:
+    
+    if sub_mode == "🖼️ 图像/文件转 SMILES":
         page_image_to_smiles()
-    with render_tab:
-        _page_smiles_to_structure_image(render_result=False)
-    with batch_tab:
+    elif sub_mode == "🎨 SMILES / BigSMILES 转图片":
+        _page_smiles_to_structure_image(render_result=True)
+    elif sub_mode == "📊 批量结构检查":
         _page_batch_structure_check()
-
-    # Streamlit resets the selected tab to the first tab after a widget-triggered
-    # rerun. Keep the latest render below the tabs so it remains visible immediately
-    # after the user clicks "生成结构图".
-    single_result = st.session_state.get("structure_visualization_single_result")
-    single_output_dir = st.session_state.get("structure_visualization_single_output_dir")
-    if single_result is not None and single_output_dir:
-        st.markdown("---")
-        st.subheader("最近生成的结构图")
-        _render_structure_result(
-            single_result,
-            Path(single_output_dir),
-            key_prefix="structure_visualization_latest",
-        )
 
 
 def page_structure_recognition() -> None:

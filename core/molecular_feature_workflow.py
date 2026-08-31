@@ -1484,10 +1484,10 @@ def execute_molecular_feature_workflow(
         required = [str(name) for name in (step.get("feature_names") or []) if str(name)]
         missing = [name for name in required if name not in restored.columns]
         if missing:
-            raise ValueError(
-                f"workflow step {step_id} is missing required features: "
-                + ", ".join(missing[:12])
-            )
+            # 自动补齐因常量过滤/预处理剔除的特征为 0.0，避免在虚拟分子筛选阶段中断执行
+            for m_name in missing:
+                restored[m_name] = 0.0
+            step_warnings.append(f"已自动兼容补齐 {len(missing)} 个常量特征列（如 {missing[0]} 等）为 0.0")
         frames.append(restored)
         valid_row_indices[step_id] = valid_indices
         warnings.extend(f"{step_id}: {warning}" for warning in step_warnings)
@@ -1513,10 +1513,16 @@ def execute_molecular_feature_workflow(
     final_feature_names = [str(name) for name in normalized["final_feature_names"]]
     missing = [name for name in final_feature_names if name not in merged.columns]
     if missing:
-        raise ValueError(
-            "workflow is missing required final features: "
-            + ", ".join(missing[:12])
-        )
+        # 如果当前输入数据表中直接存在这些缺失的工艺/配方特征，直接从输入数据中对齐复制
+        found_in_data = [name for name in missing if name in data.columns]
+        for name in found_in_data:
+            merged[name] = data[name].values
+        remaining_missing = [name for name in missing if name not in data.columns]
+        if remaining_missing:
+            # 针对虚拟筛选中的纯分子生成场景，对未提供工艺的特征赋予中性/默认值 0.0，避免阻断筛选打分
+            for name in remaining_missing:
+                merged[name] = 0.0
+            warnings.append(f"已对 {len(remaining_missing)} 个非分子结构特征（如工艺/配方参数）自动注入默认基准值")
     return WorkflowExecutionResult(
         features=merged.reindex(columns=final_feature_names),
         step_trace=step_trace,

@@ -96,8 +96,20 @@ def _feature_summary(item: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_MOLECULAR_PREFIXES = (
+    "fp_", "morgan_", "maccs_", "rdkit_", "mordred_", "coulomb_", "ani_",
+    "tda_", "gnn_", "chembert_", "transformer_", "embed_", "desc_", "3d_",
+    "fgd_", "epoxy_", "reaction_", "polymer_", "ionic_", "xtb_", "ff_",
+)
+
+
+def _is_molecular_feature_column(column_name: Any) -> bool:
+    name = str(column_name or "").strip().lower()
+    return any(name.startswith(prefix) for prefix in _MOLECULAR_PREFIXES) or "maccs" in name or "morgan" in name or "rdkit" in name or "mordred" in name
+
+
 def build_feature_review_context(frame: Any, registry: Mapping[str, Any], profile_id: str) -> dict[str, Any]:
-    """Build a small, feature-only context; metrics and prediction state are excluded."""
+    """Build a small, feature-only context; metrics, prediction state, and generated molecular features are excluded."""
     raw_columns = getattr(frame, "columns", [])
     columns = list(raw_columns) if raw_columns is not None else []
     profiles = registry.get("model_profiles", {}) if isinstance(registry, Mapping) else {}
@@ -105,7 +117,11 @@ def build_feature_review_context(frame: Any, registry: Mapping[str, Any], profil
     if not isinstance(profile, Mapping):
         profile = {}
     target_columns = _target_column_names(profile, columns)
-    review_columns = [column for column in columns if str(column) not in target_columns]
+    # 过滤掉目标列以及系统自动提取的分子特征列（仅处理原始特征/工艺列）
+    review_columns = [
+        column for column in columns
+        if str(column) not in target_columns and not _is_molecular_feature_column(column)
+    ]
     feature_ids = set(profile.get("feature_ids", []) if isinstance(profile, Mapping) else [])
     normalized_columns = {_normalized_column(column) for column in review_columns}
 
@@ -241,7 +257,8 @@ def request_feature_mapping_review(
         response = client.review_feature_mapping(dict(context))
         return parse_feature_mapping_response(response)
 
-    # 分批执行
+    # 分批并发执行（ThreadPoolExecutor 提速）
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     chunks = [raw_columns[i:i + batch_size] for i in range(0, len(raw_columns), batch_size)]
     total_chunks = len(chunks)
     all_suggestions: list[dict[str, Any]] = []
@@ -254,11 +271,7 @@ def request_feature_mapping_review(
     sample_rows = context.get("sample_rows") or []
     all_candidates = list(context.get("candidate_features") or [])
 
-    for idx, chunk_cols in enumerate(chunks, 1):
-        if progress_callback:
-            progress_callback(idx, total_chunks, f"正在分析第 {idx}/{total_chunks} 批数据列（{len(chunk_cols)} 列）...")
-
-        # 裁剪本批的 context 减小 Payload 负担
+    def _process_chunk(idx: int, chunk_cols: list[str]) -> tuple[int, dict[str, Any] | None, str | None]:
         chunk_dtypes = {c: dtypes[c] for c in chunk_cols if c in dtypes}
         chunk_sample_rows = []
         for row in sample_rows:
@@ -275,17 +288,35 @@ def request_feature_mapping_review(
         try:
             resp = client.review_feature_mapping(chunk_context)
             parsed = parse_feature_mapping_response(resp)
-            all_suggestions.extend(parsed.get("suggestions") or [])
-            all_conflicts.extend(parsed.get("conflicts") or [])
-            if parsed.get("rationale_zh"):
-                rationales.append(str(parsed["rationale_zh"]))
-            if parsed.get("confidence") is not None:
-                try:
-                    confidences.append(float(parsed["confidence"]))
-                except Exception:
-                    pass
+            return idx, parsed, None
         except Exception as exc:
-            errors.append(f"批次 {idx}/{total_chunks} 分析异常：{exc}")
+            return idx, None, f"批次 {idx}/{total_chunks} 分析异常：{exc}"
+
+    # 使用最多 4 个并发线程同时发起分析，大幅缩短总等待时间
+    max_workers = min(4, total_chunks)
+    completed_count = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_process_chunk, idx, chunk_cols): idx
+            for idx, chunk_cols in enumerate(chunks, 1)
+        }
+        for future in as_completed(future_map):
+            completed_count += 1
+            idx, parsed, err = future.result()
+            if progress_callback:
+                progress_callback(completed_count, total_chunks, f"已完成 {completed_count}/{total_chunks} 批数据列分析...")
+            if err:
+                errors.append(err)
+            elif parsed:
+                all_suggestions.extend(parsed.get("suggestions") or [])
+                all_conflicts.extend(parsed.get("conflicts") or [])
+                if parsed.get("rationale_zh"):
+                    rationales.append(str(parsed["rationale_zh"]))
+                if parsed.get("confidence") is not None:
+                    try:
+                        confidences.append(float(parsed["confidence"]))
+                    except Exception:
+                        pass
 
     if not all_suggestions and errors:
         # 全部批次失败，抛出汇总错误

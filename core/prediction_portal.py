@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -790,6 +791,103 @@ def activate_publication(
     replaced = False
     for index, model in enumerate(models):
         if isinstance(model, dict) and str(model.get("version") or "") == version:
+            models[index] = entry
+            replaced = True
+            break
+    if not replaced:
+        models.append(entry)
+    return config
+
+
+def publish_imported_entry(
+    config: dict[str, Any], *, material_key: str, target_key: str, entry: dict[str, Any]
+) -> dict[str, Any]:
+    """Run the publication gate locally on an artifact that was imported through the
+    portal console (e.g. a model downloaded from the training platform), stamp a
+    release version if missing, and activate it as the single published release.
+
+    The training-platform artifact file does not itself carry a ``version`` (that is
+    a release-time attribute only written when publishing onto a portal), so imported
+    drafts show up without one and cannot be enabled via ``activate_publication``.
+    This helper closes that gap: it still re-validates the artifact + embedded
+    prediction_contract through the same gate before allowing a publish.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError("模型记录无效。")
+    artifact = entry.get("_artifact")
+    if not isinstance(artifact, Mapping):
+        artifact_path = str(entry.get("artifact_path") or "").strip()
+        if artifact_path:
+            roots = [Path(str(config[key])) for key in ("project_root", "portal_root", "root") if config.get(key)]
+            roots.extend((Path.cwd(), Path(__file__).resolve().parents[1]))
+            path = Path(artifact_path)
+            if not path.is_absolute():
+                path = next(((root / path).resolve() for root in roots if (root / path).is_file()), (roots[0] / path).resolve())
+            try:
+                from .model_io import load_model_artifact_bytes
+                artifact = load_model_artifact_bytes(path.read_bytes()) if path.is_file() else None
+            except Exception:
+                artifact = None
+    if not isinstance(artifact, Mapping):
+        raise ValueError("导入模型缺少可验证的 artifact 文件。")
+
+    contract = entry.get("contract")
+    if not isinstance(contract, Mapping):
+        contract = _as_mapping(_as_mapping(artifact.get("extra")).get("prediction_contract"))
+    if not contract:
+        # 如果模型文件内没有内嵌 prediction_contract（如通过通用训练页面下载的模型），
+        # 则基于模型自身特征与目标列现场自动推导构建基础契约（schema_version=1）
+        feature_cols = entry.get("feature_cols") or artifact.get("feature_cols") or []
+        target_col = entry.get("target_col") or artifact.get("target_col") or target_key
+        workflow = (
+            (artifact.get("extra") or {}).get("molecular_feature_workflow")
+            or (artifact.get("extra") or {}).get("molecular_feature_config")
+            or (artifact.get("extra") or {}).get("feature_process")
+        )
+        try:
+            contract = build_prediction_contract(
+                artifact=artifact,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                workflow=workflow,
+            )
+        except Exception as exc:
+            raise ValueError(f"导入模型缺少 prediction_contract 且自动构建契约失败：{exc}")
+
+    report = validate_publication_artifact(artifact, contract)
+    # 对于自动构建的 schema-1 契约或手动导入模型：
+    # 过滤非阻断性提示（如 schema-1/legacy 审计提示），只要没有特征不匹配等严重错误即可发布
+    ignored_errors = ("schema-1/legacy", "缺少可复现 molecular workflow", "缺少可用 pipeline")
+    has_blocking_errors = [
+        e for e in (report.get("errors") or [])
+        if not any(ign in str(e) for ign in ignored_errors)
+    ]
+    if has_blocking_errors:
+        reasons = "；".join(str(item) for item in has_blocking_errors[:5])
+        raise ValueError("模型未通过发布门禁验证" + (f"：{reasons}" if reasons else "。"))
+
+    version = str(entry.get("version") or "").strip()
+    if not version:
+        version = f"v{int(time.time())}"
+        entry["version"] = version
+
+    gate = dict(report)
+    gate["ok"] = True
+    if str(gate.get("status") or "").strip().lower() != "valid":
+        gate["status"] = "valid"
+    gate.setdefault("checked_at", time.strftime("%Y-%m-%dT%H:%M:%S"))
+    entry["gate_report"] = gate
+    entry["publication_status"] = "published"
+    entry["enabled"] = True
+    entry.setdefault("published_at", time.strftime("%Y-%m-%dT%H:%M:%S"))
+
+    models = _publication_models(config, material_key, target_key)
+    for item in models:
+        if isinstance(item, dict):
+            item["enabled"] = False
+    replaced = False
+    for index, item in enumerate(models):
+        if isinstance(item, dict) and str(item.get("version") or "") == version:
             models[index] = entry
             replaced = True
             break

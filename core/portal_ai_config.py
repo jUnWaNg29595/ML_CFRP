@@ -76,7 +76,7 @@ class AIServiceConfig:
     request_template: dict | None = None
     response_json_path: str | None = None
     anthropic_version: str = "2023-06-01"
-    stream: bool = False
+    stream: bool = True
 
 
 def normalize_endpoint_path(endpoint: str) -> str:
@@ -385,7 +385,7 @@ def _service_mapping(value: object, *, index: int) -> dict[str, Any]:
     if api_key is not None and not isinstance(api_key, str):
         raise ValueError(f"services[{index}].api_key must be a string")
 
-    stream = service.get("stream", False)
+    stream = service.get("stream", True)
     if not isinstance(stream, bool):
         stream = False
 

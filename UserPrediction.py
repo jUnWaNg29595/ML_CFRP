@@ -193,6 +193,13 @@ def toggle_model_enabled(
         return config
     candidate = copy.deepcopy(model)
     candidate["enabled"] = True
+    if not candidate.get("version"):
+        # 导入型模型（如从训练平台下载后重新上传）本身没有发布版本号：
+        # 走本地发布门禁，验证通过后补打版本号并正式上线。
+        from core.prediction_portal import publish_imported_entry
+        return publish_imported_entry(
+            config, material_key=material_key, target_key=target_key, entry=candidate
+        )
     return activate_publication(
         config, material_key=material_key, target_key=target_key, entry=candidate
     )
@@ -255,18 +262,33 @@ def render_ai_assistant_tab(
                 st.session_state[state_key] = reject_ai_field(state, field)
                 st.rerun()
     if can_submit_ai_prediction(state):
-        if st.button('创建 AI 辅助预测任务', key=f'ai_submit_{material_key}_{target_key}', type='primary'):
-            confirmed_inputs = {
-                field: detail.get('value')
-                for field, detail in state.get('fields', {}).items()
-                if field not in set(state.get('rejected_fields') or set()) and detail.get('value') not in (None, '')
-            }
-            if confirmed_inputs:
-                task_key = f'portal_task_ai_{material_key}_{target_key}'
-                st.session_state[task_key] = submit_prediction_task(config, material_key, target_key, pd.DataFrame([confirmed_inputs]), explain=True)
+        c_sub1, c_sub2 = st.columns([1, 1.2])
+        with c_sub1:
+            if st.button('🚀 创建 AI 辅助预测任务', key=f'ai_submit_{material_key}_{target_key}', type='primary', width="stretch"):
+                confirmed_inputs = {
+                    field: detail.get('value')
+                    for field, detail in state.get('fields', {}).items()
+                    if field not in set(state.get('rejected_fields') or set()) and detail.get('value') not in (None, '')
+                }
+                if confirmed_inputs:
+                    task_key = f'portal_task_ai_{material_key}_{target_key}'
+                    st.session_state[task_key] = submit_prediction_task(config, material_key, target_key, pd.DataFrame([confirmed_inputs]), explain=True)
+                    st.rerun()
+                else:
+                    st.warning('没有被确认的有效输入，无法创建任务。')
+        with c_sub2:
+            if st.button('📋 一键采纳并同步填入单组手动输入表单', key=f'ai_sync_to_manual_{material_key}_{target_key}', width="stretch", help="将 AI 确认后的参数一键同步回填到手动输入表单中，方便继续微调与结构图复核"):
+                for field_name, detail in state.get('fields', {}).items():
+                    if field_name not in set(state.get('rejected_fields') or set()) and detail.get('value') not in (None, ''):
+                        val_str = str(detail.get('value'))
+                        # 同步到各分区的 session_state 键
+                        for prefix in ("manual", f"manual_{material_key}_{target_key}_molecular", f"manual_{material_key}_{target_key}_required_manual", f"manual_{material_key}_{target_key}_optional_manual"):
+                            st.session_state[f"{prefix}_{field_name}"] = val_str
+                            st.session_state[f"{prefix}_{field_name}_number"] = default_number(val_str, 0.0)
+                            st.session_state[f"{prefix}_{field_name}_integer"] = default_integer(val_str, 0)
+                            st.session_state[f"{prefix}_{field_name}_text"] = val_str
+                st.success("🎉 已成功将 AI 提取的参数同步填入手动输入表单！请在上方切换到【手动输入】标签页查看与预测。")
                 st.rerun()
-            else:
-                st.warning('没有被确认的有效输入，无法创建任务。')
     render_portal_task_panel(st.session_state.get(f'portal_task_ai_{material_key}_{target_key}'), session_key=f'ai_{material_key}_{target_key}')
 
 
@@ -1099,66 +1121,229 @@ def material_card_html(material_key: str, material_cfg: Dict[str, Any]) -> str:
     </article>
     """
 
-def init_smiles_field_state(state_key: str, default_value: Any) -> None:
-    if state_key not in st.session_state:
-        st.session_state[state_key] = "" if default_value is None else str(default_value)
+# ==============================================================================
+# 课题组经典常用树脂与固化剂预设库 (Portal Preset Libraries)
+# ==============================================================================
+PORTAL_PRESET_RESINS = {
+    "双酚A二缩水甘油醚 (E-51 / DGEBA)": "CC(C)(c1ccc(OCC2CO2)cc1)c1ccc(OCC2CO2)cc1",
+    "双酚F环氧树脂 (DGEBF)": "C1OC1COc1ccc(Cc2ccc(OCC3CO3)cc2)cc1",
+    "双酚S环氧树脂 (DGEBS / 耐温极性)": "C1OC1COc1ccc(S(=O)(=O)c2ccc(OCC3CO3)cc2)cc1",
+    "四缩水甘油基二氨基二苯甲烷 (AG-80 / TGDDM / 航空承力)": "C1OC1CN(CC2CO2)c3ccc(Cc4ccc(N(CC5CO5)CC6CO6)cc4)cc3",
+    "三缩水甘油基对氨基苯酚 (AFG-90 / TGDAP)": "C1OC1CN(CC2CO2)c3ccc(OCC4CO4)cc3",
+    "酚醛环氧树脂 (EPN)": "C1OC1COc1cccc(Cc2cccc(OCC3CO3)c2)c1",
+    "芴基双酚环氧树脂 (BHPF-EP / 卡基耐热)": "C1OC1COc2ccc3c(c2)C4(c5ccccc5-c3c4)c6ccc(OCC7CO7)cc6",
+    "间苯二甲酸二缩水甘油酯 (DGEP)": "O=C(OCC1CO1)c2cccc(C(=O)OCC3CO3)c2",
+    "六氟双酚A二缩水甘油醚 (BPAF-EP / 低介电)": "FC(F)(F)C(c1ccc(OCC2CO2)cc1)(c1ccc(OCC2CO2)cc1)C(F)(F)F",
+}
+
+PORTAL_PRESET_HARDENERS = {
+    "4,4'-二氨基二苯砜 (4,4'-DDS / 标杆耐高温)": "Nc1ccc(S(=O)(=O)c2ccc(N)cc2)cc1",
+    "3,3'-二氨基二苯砜 (3,3'-DDS / 宽工艺窗口)": "Nc1cccc(S(=O)(=O)c2cccc(N)c2)c1",
+    "4,4'-二氨基二苯甲烷 (DDM)": "Nc1ccc(Cc2ccc(N)cc2)cc1",
+    "4,4'-二氨基二苯醚 (ODA)": "Nc1ccc(Oc2ccc(N)cc2)cc1",
+    "异佛尔酮二胺 (IPDA / 脂环高韧)": "CC1(C)CC(C)(CN)CC(N)C1",
+    "甲基四氢苯酐 (MTHPA / 电绝缘)": "CC1=CCC2C(=O)OC(=O)C2C1",
+    "甲基六氢苯酐 (MHHPA / 耐候)": "CC1CCC2C(=O)OC(=O)C2C1",
+    "间苯二胺 (m-PDA)": "Nc1cccc(N)c1",
+    "4,4'-二氨基联苯 (DAB / 液晶刚性)": "Nc1ccc(-c2ccc(N)cc2)cc1",
+    "9,9-双(4-氨基苯基)芴 (FDA / 芴二胺)": "Nc1ccc(C2(c3ccccc3-c3ccccc32)c2ccc(N)cc2)cc1",
+}
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def _render_2d_molecule_png_b64(smiles: str, width: int = 360, height: int = 180) -> Tuple[bool, str, str]:
+    """Render 2D structure image and return (is_valid, base64_png_or_error, formula)."""
+    if not smiles or not str(smiles).strip():
+        return False, "empty", ""
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Draw, rdMolDescriptors
+        import io
+        import base64
+        
+        mol = Chem.MolFromSmiles(str(smiles).strip())
+        if mol is None:
+            return False, "SMILES 语法无效（无法构建分子图）", ""
+        Chem.SanitizeMol(mol)
+        formula = rdMolDescriptors.CalcMolFormula(mol)
+        img = Draw.MolToImage(mol, size=(int(width), int(height)), kekulize=True)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64_str = base64.b64encode(buf.getvalue()).decode("ascii")
+        return True, b64_str, formula
+    except Exception as e:
+        return False, f"化学解析异常: {e}", ""
+
+
+def render_jsme_editor(field_key: str, current_smiles: str = "") -> None:
+    """Render an embedded lightweight JSME 2D chemical structure editor."""
+    jsme_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script type="text/javascript" src="https://jsme-editor.github.io/dist/jsme/jsme.nocache.js"></script>
+        <script type="text/javascript">
+            function jsmeOnLoad() {{
+                var startingSmiles = "{current_smiles}";
+                jsmeApplet = new JSApplet.JSME("jsme_container", "100%", "280px", {{
+                    "options": "query,hydrogens,autoez"
+                }});
+                if (startingSmiles && startingSmiles.trim() !== "") {{
+                    jsmeApplet.readGenericMolecularInput(startingSmiles);
+                }}
+            }}
+            function copyJsmeSmiles() {{
+                var smiles = jsmeApplet.smiles();
+                if (navigator.clipboard) {{
+                    navigator.clipboard.writeText(smiles).then(function() {{
+                        alert("已将画板 SMILES 复制到剪贴板:\\n" + smiles + "\\n\\n请直接粘贴到上方文本框即可！");
+                    }});
+                }} else {{
+                    prompt("请复制生成的 SMILES:", smiles);
+                }}
+            }}
+        </script>
+        <style>
+            body {{ margin: 0; padding: 0; font-family: sans-serif; background: transparent; }}
+            #jsme_container {{ width: 100%; height: 280px; }}
+            .jsme-btn {{
+                margin-top: 6px;
+                padding: 6px 14px;
+                background: #2563eb;
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-weight: 500;
+            }}
+            .jsme-btn:hover {{ background: #1d4ed8; }}
+        </style>
+    </head>
+    <body>
+        <div id="jsme_container"></div>
+        <button class="jsme-btn" type="button" onclick="copyJsmeSmiles()">📋 复制画板 SMILES 到剪贴板</button>
+    </body>
+    </html>
+    """
+    st.components.v1.html(jsme_html, height=330, scrolling=False)
 
 
 def render_smiles_field(field: Dict[str, Any], scope_key: str) -> str:
+    """多模态分子结构输入复合组件：包含经典预设、手动粘贴、截图识别、2D在线画板与即时拓扑图看板。"""
     label = field.get("label") or field["name"]
+    name_low = str(field.get("name") or "").lower()
     state_key = f"{scope_key}_{field['name']}"
-    result_key = f"{state_key}_results"
     init_smiles_field_state(state_key, field.get("default", ""))
 
-    st.text_area(
-        label,
-        key=state_key,
-        placeholder=field.get("placeholder") or "直接输入 SMILES，或在下方上传结构图识别",
-        help=field.get("help") or None,
-        height=100,
-    )
+    is_hardener = any(token in name_low for token in ("hardener", "curing", "固化", "交联", "amine"))
+    preset_dict = PORTAL_PRESET_HARDENERS if is_hardener else PORTAL_PRESET_RESINS
+    role_label = "固化剂" if is_hardener else "树脂/主体"
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        uploaded = st.file_uploader(
-            f"{label} 结构图 / PDF",
-            type=SMILES_UPLOAD_TYPES,
-            key=f"{state_key}_upload",
+    st.markdown(f"##### 🧪 {label}")
+    
+    # 左右双栏布局：左侧多模态输入，右侧即时 2D 分子图看板
+    left_col, right_col = st.columns([1.35, 1.0], gap="medium")
+    
+    with left_col:
+        mode_tab1, mode_tab2, mode_tab3, mode_tab4 = st.tabs(
+            ["🏷️ 常用预设", "✏️ 手动粘贴", "📷 截图识别", "🎨 2D画板"]
         )
-    with col2:
-        hand_drawn = st.checkbox("手绘结构", key=f"{state_key}_handdrawn")
-
-    if uploaded is not None and st.button("识别为 SMILES", key=f"{state_key}_recognize"):
-        try:
-            from core.image_smiles_extractor import decimer_is_available, smiles_from_bytes
-
-            ok, msg = decimer_is_available()
-            if not ok:
-                st.error(msg)
-            else:
-                preds = smiles_from_bytes(
-                    uploaded.getvalue(),
-                    uploaded.name,
-                    confidence=False,
-                    hand_drawn=bool(hand_drawn),
-                )
-                if preds:
-                    st.session_state[state_key] = preds[0].smiles
-                    st.session_state[result_key] = [
-                        {
-                            "filename": pred.filename,
-                            "page": "" if pred.page_index is None else pred.page_index + 1,
-                            "smiles": pred.smiles,
-                        }
-                        for pred in preds
-                    ]
+        
+        # 1. 经典预设
+        with mode_tab1:
+            st.caption(f"一键载入课题组常用经典 {role_label} 单体：")
+            preset_options = ["(自定义 / 保持当前输入)"] + list(preset_dict.keys())
+            selected_preset = st.selectbox(
+                f"选择经典 {role_label}",
+                options=preset_options,
+                key=f"{state_key}_preset_select",
+                label_visibility="collapsed",
+            )
+            if selected_preset != "(自定义 / 保持当前输入)":
+                chosen_smi = preset_dict[selected_preset]
+                if st.session_state.get(state_key) != chosen_smi:
+                    st.session_state[state_key] = chosen_smi
                     st.rerun()
-        except Exception as exc:
-            st.error(f"SMILES 识别失败: {exc}")
 
-    if st.session_state.get(result_key):
-        st.caption("最近一次结构图识别结果")
-        st.dataframe(pd.DataFrame(st.session_state[result_key]), width="stretch", hide_index=True)
+        # 2. 手动粘贴
+        with mode_tab2:
+            st.caption("直接输入或粘贴分子标准 SMILES 字符串：")
+            st.text_area(
+                "SMILES 字符串",
+                key=state_key,
+                placeholder=field.get("placeholder") or "例如: CC(C)(c1ccc(OCC2CO2)cc1)c1ccc(OCC2CO2)cc1",
+                height=95,
+                label_visibility="collapsed",
+            )
+
+        # 3. 截图 OCR 识别
+        with mode_tab3:
+            st.caption("拖入分子结构图或从文献截图中识别 SMILES：")
+            img_c1, img_c2 = st.columns([2, 1])
+            with img_c1:
+                uploaded = st.file_uploader(
+                    "上传图片",
+                    type=SMILES_UPLOAD_TYPES,
+                    key=f"{state_key}_upload",
+                    label_visibility="collapsed",
+                )
+            with img_c2:
+                hand_drawn = st.checkbox("手绘结构", key=f"{state_key}_handdrawn")
+
+            if uploaded is not None and st.button("🚀 识别并填入", key=f"{state_key}_recognize"):
+                try:
+                    from core.image_smiles_extractor import decimer_is_available, smiles_from_bytes
+                    ok, msg = decimer_is_available()
+                    if not ok:
+                        st.error(msg)
+                    else:
+                        with st.spinner("正在通过 DECIMER 识别分子图像..."):
+                            preds = smiles_from_bytes(
+                                uploaded.getvalue(),
+                                uploaded.name,
+                                confidence=False,
+                                hand_drawn=bool(hand_drawn),
+                            )
+                            if preds:
+                                st.session_state[state_key] = preds[0].smiles
+                                st.success(f"识别成功: `{preds[0].smiles}`")
+                                st.rerun()
+                except Exception as exc:
+                    st.error(f"SMILES 识别失败: {exc}")
+
+        # 4. 2D 在线分子画板
+        with mode_tab4:
+            st.caption("在下方画板中绘制分子，点击复制按钮后粘贴到文本框：")
+            render_jsme_editor(state_key, current_smiles=st.session_state.get(state_key, ""))
+
+    # 右侧：即时 2D 分子拓扑结构看板
+    with right_col:
+        current_smiles = str(st.session_state.get(state_key, "")).strip()
+        st.markdown(f"**🔬 实时 2D 拓扑结构预览**")
+        if current_smiles:
+            is_valid, content, formula = _render_2d_molecule_png_b64(current_smiles)
+            if is_valid:
+                st.markdown(
+                    f'<div style="background:#ffffff; border:1px solid #e2e8f0; border-radius:8px; padding:6px; text-align:center;">'
+                    f'<img src="data:image/png;base64,{content}" style="max-width:100%; height:auto; display:block; margin:0 auto;" />'
+                    f'<div style="font-size:12px; color:#475569; margin-top:4px;"><strong>分子式:</strong> {formula}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div style="background:#fef2f2; border:1px dashed #ef4444; border-radius:8px; padding:24px 12px; text-align:center; color:#991b1b; font-size:13px;">'
+                    f'⚠️ <strong>化学语法有误</strong><br/><span style="font-size:11px; color:#b91c1c;">{content}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.markdown(
+                '<div style="background:#f8fafc; border:1px dashed #cbd5e1; border-radius:8px; padding:45px 12px; text-align:center; color:#64748b; font-size:12px;">'
+                '👈 请在左侧选择预设、粘贴 SMILES 或画板绘制，结构图将在此即时呈现'
+                '</div>',
+                unsafe_allow_html=True,
+            )
 
     return st.session_state.get(state_key, "")
 
@@ -1188,61 +1373,90 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str) ->
 
     values: Dict[str, Any] = {}
     errors: List[str] = []
-    columns = st.columns(2)
+    
+    # 针对分子结构字段（smiles 类型），采用单列独占全宽渲染以提供最佳视觉预览体验
+    smiles_fields = [f for f in parameters if str(f.get("kind") or "text").strip().lower() == "smiles"]
+    other_fields = [f for f in parameters if str(f.get("kind") or "text").strip().lower() != "smiles"]
 
-    for index, field in enumerate(parameters):
+    # 1. 渲染分子结构复合字段
+    for field in smiles_fields:
         label = field.get("label") or field["name"]
-        kind = str(field.get("kind") or "text").strip()
         required = bool(field.get("required", False))
-        key_base = f"{scope_key}_{field['name']}"
+        val = render_smiles_field(field, scope_key)
+        if required and not str(val).strip():
+            errors.append(f"【{label}】不能为空，请在上方输入合法分子结构。")
+        values[field["name"]] = val
 
-        with columns[index % 2]:
-            if kind == "number":
-                value = st.number_input(
-                    label,
-                    key=f"{key_base}_number",
-                    value=None if field.get("default") is None else default_number(field.get("default"), 0.0),
-                    help=field.get("help") or None,
-                    format="%.6f",
-                )
-            elif kind == "integer":
-                value = st.number_input(
-                    label,
-                    key=f"{key_base}_integer",
-                    value=None if field.get("default") is None else default_integer(field.get("default"), 0),
-                    help=field.get("help") or None,
-                    step=1,
-                )
-                value = None if value is None else int(value)
-            elif kind == "select":
-                options = parse_options(field.get("options"))
-                default_value = str(field.get("default", "") or "")
-                if not options:
-                    options = [""]
-                elif not default_value:
-                    options = [""] + options
-                default_index = options.index(default_value) if default_value in options else 0
-                value = st.selectbox(
-                    label,
-                    options=options,
-                    index=default_index,
-                    key=f"{key_base}_select",
-                    help=field.get("help") or None,
-                )
-            elif kind == "smiles":
-                value = render_smiles_field(field, scope_key)
-            else:
-                value = st.text_input(
-                    label,
-                    key=f"{key_base}_text",
-                    value="" if field.get("default") is None else str(field.get("default")),
-                    placeholder=field.get("placeholder") or "",
-                    help=field.get("help") or None,
-                )
+    # 2. 渲染数值/工艺/选择参数字段（双栏栅格）
+    if other_fields:
+        columns = st.columns(2)
+        for index, field in enumerate(other_fields):
+            label = field.get("label") or field["name"]
+            kind = str(field.get("kind") or "text").strip()
+            required = bool(field.get("required", False))
+            key_base = f"{scope_key}_{field['name']}"
+            name_low = str(field["name"]).lower()
 
-        if required and (kind in {"text", "select", "smiles"} and str(value).strip() == "" or kind in {"number", "integer"} and value is None):
-            errors.append(f"{label} 不能为空")
-        values[field["name"]] = value
+            # 智能推断常用物理单位与占位提示
+            unit_suffix = ""
+            if "temp" in name_low or "温度" in label:
+                unit_suffix = " (°C)"
+            elif "time" in name_low or "时间" in label:
+                unit_suffix = " (h)"
+            elif "phr" in name_low or "份数" in label:
+                unit_suffix = " (phr)"
+            elif "ratio" in name_low or "比" in label:
+                unit_suffix = " (比值)"
+            elif "ahew" in name_low or "eew" in name_low or "当量" in label:
+                unit_suffix = " (g/eq)"
+
+            display_label = f"{label}{unit_suffix}" if not label.endswith(")") else label
+
+            with columns[index % 2]:
+                if kind == "number":
+                    value = st.number_input(
+                        display_label,
+                        key=f"{key_base}_number",
+                        value=None if field.get("default") is None else default_number(field.get("default"), 0.0),
+                        help=field.get("help") or None,
+                        format="%.4f",
+                    )
+                elif kind == "integer":
+                    value = st.number_input(
+                        display_label,
+                        key=f"{key_base}_integer",
+                        value=None if field.get("default") is None else default_integer(field.get("default"), 0),
+                        help=field.get("help") or None,
+                        step=1,
+                    )
+                    value = None if value is None else int(value)
+                elif kind == "select":
+                    options = parse_options(field.get("options"))
+                    default_value = str(field.get("default", "") or "")
+                    if not options:
+                        options = [""]
+                    elif not default_value:
+                        options = [""] + options
+                    default_index = options.index(default_value) if default_value in options else 0
+                    value = st.selectbox(
+                        display_label,
+                        options=options,
+                        index=default_index,
+                        key=f"{key_base}_select",
+                        help=field.get("help") or None,
+                    )
+                else:
+                    value = st.text_input(
+                        display_label,
+                        key=f"{key_base}_text",
+                        value="" if field.get("default") is None else str(field.get("default")),
+                        placeholder=field.get("placeholder") or "",
+                        help=field.get("help") or None,
+                    )
+
+            if required and (kind in {"text", "select"} and str(value).strip() == "" or kind in {"number", "integer"} and value is None):
+                errors.append(f"【{display_label}】为必填项，不能为空")
+            values[field["name"]] = value
 
     return pd.DataFrame([values]), errors
 
@@ -1547,14 +1761,40 @@ def render_user_page(config: Dict[str, Any]) -> None:
         validation_errors = []
         if not manual_fields and not workflow_fields:
             validation_errors = ["当前模型契约未声明任何输入字段，无法手动预测。"]
+        
+        # 预测前健康检查与就绪指示条 (Pre-flight Health Check)
+        st.markdown("---")
+        st.markdown("##### 🩺 预测输入就绪检查")
+        check_cols = st.columns(3)
+        with check_cols[0]:
+            mol_ready = all(str(merged_values.get(f["name"], "")).strip() != "" for f in workflow_fields if f.get("required"))
+            if mol_ready:
+                st.markdown("✅ **分子结构**：就绪")
+            else:
+                st.markdown("⚠️ **分子结构**：待完善必填项")
+        with check_cols[1]:
+            proc_ready = all(merged_values.get(f["name"]) is not None and str(merged_values.get(f["name"])).strip() != "" for f in manual_fields if f.get("required"))
+            if proc_ready:
+                st.markdown("✅ **配方/工艺**：就绪")
+            else:
+                st.markdown("⚠️ **配方/工艺**：待完善必填项")
+        with check_cols[2]:
+            if confirmed_by_user:
+                st.markdown("✅ **安全授权**：已确认")
+            else:
+                st.markdown("⚠️ **安全授权**：待勾选上方授权框")
+
         if validation_errors:
             for err in validation_errors:
                 st.warning(err)
-        if st.button("开始手动预测", type="primary", key=f"predict_manual_{selected_material}_{selected_target}"):
+
+        if st.button("🚀 开始可复现模型预测", type="primary", key=f"predict_manual_{selected_material}_{selected_target}", use_container_width=True):
             if validation_errors:
                 st.error("请先补全必填项后再预测。")
             elif not confirmed_by_user:
-                st.error("请先确认已检查输入结构和配方/工艺参数。")
+                st.error("请先勾选上方的『我确认已检查输入结构、配方/工艺参数...』授权复选框。")
+            elif not mol_ready or not proc_ready:
+                st.error("输入未通过就绪检查，请检查是否有遗漏的必填分子结构或工艺参数。")
             else:
                 task_key = f"portal_task_manual_{selected_material}_{selected_target}"
                 st.session_state[task_key] = submit_prediction_task(config, selected_material, selected_target, manual_df, explain=False)

@@ -19,6 +19,7 @@ from core.prediction_portal import (
     select_active_publication,
     should_show_publication,
     validate_publication_artifact,
+    publish_imported_entry,
 )
 
 
@@ -258,7 +259,59 @@ def test_rollback_rejects_unknown_version():
         rollback_publication(config, material_key="epoxy_resin", target_key="tg", version="v9")
 
 
-def test_portal_health_and_active_release_selection():
+def test_publish_imported_entry_stamps_version_and_activates(monkeypatch):
+    """Imported artifacts (e.g. downloaded from the training platform) carry no
+    release version; publish_imported_entry must re-run the local gate, stamp a
+    version, and make it the single active published release."""
+    cfg = {"project_root": "."}
+    artifact = {
+        "model_name": "tg_import",
+        "target_col": "tg",
+        "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+        "model": object(),
+        "extra": {"prediction_contract": {"schema_version": 2}},
+    }
+    entry = {
+        "id": "tg_1",
+        "label": "tg_import",
+        "enabled": False,
+        "publication_status": "needs_validation",
+        "gate_report": {},
+        "artifact_path": "path/to.tgz",
+        "artifact_hash": "abc",
+        "_artifact": artifact,
+    }
+    import core.prediction_portal as pp
+    monkeypatch.setattr(pp, "validate_publication_artifact",
+                        lambda a, c: {"ok": True, "status": "valid", "errors": [], "diagnostics": []})
+
+    pp.publish_imported_entry(cfg, material_key="epoxy", target_key="tg", entry=entry)
+
+    assert entry.get("version"), "导入模型应被补打版本号"
+    assert entry["publication_status"] == "published"
+    assert entry["enabled"] is True
+    assert entry["gate_report"].get("ok") is True
+
+    active = pp.select_active_publication([entry])
+    assert active is not None and active is entry
+
+
+def test_publish_imported_entry_rejects_invalid_gate(monkeypatch):
+    import core.prediction_portal as pp
+    monkeypatch.setattr(pp, "validate_publication_artifact",
+                        lambda a, c: {"ok": False, "status": "invalid",
+                                      "errors": ["特征删减无法发布"], "diagnostics": []})
+    entry = {
+        "id": "tg_1", "enabled": False,
+        "publication_status": "needs_validation", "gate_report": {},
+        "artifact_path": "path/to.tgz", "artifact_hash": "abc",
+        "_artifact": {"extra": {"prediction_contract": {"schema_version": 2}}},
+    }
+    with pytest.raises(ValueError, match="未通过发布门禁验证"):
+        pp.publish_imported_entry({"project_root": "."}, material_key="epoxy",
+                                    target_key="tg", entry=entry)
+    assert entry.get("version") in (None, "") or entry["publication_status"] != "published"
+
     assert portal_health_label(True) == "可访问"
     assert portal_health_label(False) == "未启动"
     assert select_active_publication(
