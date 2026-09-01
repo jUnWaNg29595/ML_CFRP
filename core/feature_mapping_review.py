@@ -763,6 +763,10 @@ def classify_suggestions_with_diagnostics(
         source_role = str(copy_sugg.get("source_role") or "unknown").strip()
         source_role_original = str(suggestion.get("source_role") or suggestion.get("source_type") or source_role).strip()
         status = str(copy_sugg.get("status") or "unknown").strip().lower()
+        # 已经批准（approved）或已拒绝（rejected）的条目属于已归档处理完毕，不再计入待处理的 attention / safe 队列
+        if status in {"approved", "accepted", "rejected"}:
+            continue
+
         raw_columns = [str(col).strip() for col in (copy_sugg.get("raw_columns") or []) if str(col).strip()]
         confidence = copy_sugg.get("confidence")
         try:

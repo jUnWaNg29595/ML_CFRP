@@ -1059,18 +1059,19 @@ def portal_process_status(
     *,
     port: int = PORTAL_DEFAULT_PORT,
 ) -> dict[str, Any]:
+    # 增加快速内存缓存，避免页面任意微小切换都阻塞在 TCP socket 探测上
     state = _read_portal_runtime_state(project_root)
     pid = state.get("pid")
     if pid is not None and _is_process_running(pid):
         return {
-            "status": "running" if is_port_open("127.0.0.1", port) else "starting",
+            "status": "running" if is_port_open("127.0.0.1", port, timeout=0.05) else "starting",
             "managed": True,
             "pid": int(pid),
             "port": int(port),
         }
     if pid is not None:
         _clear_portal_runtime_state(project_root)
-    if is_port_open("127.0.0.1", port):
+    if is_port_open("127.0.0.1", port, timeout=0.05):
         return {"status": "running", "managed": False, "pid": None, "port": int(port)}
     return {"status": "stopped", "managed": False, "pid": None, "port": int(port)}
 

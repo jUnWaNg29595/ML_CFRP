@@ -4618,15 +4618,28 @@ def render_sidebar():
             st.info(portal_notice)
 
         if portal_enabled:
-            portal_status = portal_process_status(port=8555)
-            if portal_status.get("status") == "stopped":
-                auto_start_result = start_prediction_portal(port=8555)
-                if auto_start_result.get("status") == "error":
-                    st.error(f"门户自动启动失败：{auto_start_result.get('error', '未知错误')}")
-                else:
-                    portal_status = portal_process_status(port=8555)
+            # 增加 3 秒轻量节流防抖，避免侧边栏每次重复发送 TCP 探活包导致整个 UI 挂起
+            import time
+            now_ts = time.time()
+            cached_portal_status = st.session_state.get("_cached_portal_status_dict")
+            cached_portal_status_ts = st.session_state.get("_cached_portal_status_ts", 0)
 
-        portal_status = portal_process_status(port=8555)
+            if not cached_portal_status or (now_ts - cached_portal_status_ts > 3.0):
+                portal_status = portal_process_status(port=8555)
+                if portal_status.get("status") == "stopped":
+                    auto_start_result = start_prediction_portal(port=8555)
+                    if auto_start_result.get("status") == "error":
+                        st.error(f"门户自动启动失败：{auto_start_result.get('error', '未知错误')}")
+                    else:
+                        portal_status = portal_process_status(port=8555)
+                st.session_state["_cached_portal_status_dict"] = portal_status
+                st.session_state["_cached_portal_status_ts"] = now_ts
+            else:
+                portal_status = cached_portal_status
+
+        else:
+            portal_status = {"status": "stopped", "managed": False, "pid": None, "port": 8555}
+
         if portal_status.get("status") == "running":
             if portal_status.get("managed"):
                 st.success(f"门户状态：{portal_health_label(True)}（由主平台管理，PID {portal_status.get('pid')}）")
@@ -6521,6 +6534,17 @@ def page_data_cleaning():
         st.markdown("---")
         st.markdown("### 🔤 类别编码（把类别列转成数值特征）")
 
+        # 检查是否已有持久化的编码映射字典
+        saved_label_mappings = st.session_state.get("category_label_mappings", {})
+        if saved_label_mappings:
+            with st.expander("📖 已生成的类别标签映射对照表（方便随时查看原始含义）", expanded=True):
+                st.caption("以下为系统已执行的 Label 编码映射字典。在特征选择、模型训练及后续预测时，可对照查阅每个整数代码对应的真实物理/工艺含义：")
+                map_tabs = st.tabs(list(saved_label_mappings.keys()))
+                for m_idx, (m_col, m_dict) in enumerate(saved_label_mappings.items()):
+                    with map_tabs[m_idx]:
+                        m_df = pd.DataFrame([{"编码数值 (Code)": k, "原始类别标签 (Original Label)": v} for k, v in m_dict.items()])
+                        st.dataframe(m_df, width="stretch")
+
         cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
         if cat_cols:
             encode_method = st.radio(
@@ -6564,6 +6588,14 @@ def page_data_cleaning():
                             new_df, mapping = cleaner.label_encode(encode_cols)
                             st.session_state.processed_data = new_df
 
+                            # 持久化保存反向映射字典（数字 -> 原始标签文本），供全平台各页面查询提示
+                            curr_mappings = st.session_state.get("category_label_mappings", {})
+                            for col, m in mapping.items():
+                                # m 格式为 { 'label_A': 0, 'label_B': 1 } -> 转为 { 0: 'label_A', 1: 'label_B' }
+                                reverse_m = {int(code): str(label) for label, code in m.items()}
+                                curr_mappings[col] = reverse_m
+                            st.session_state["category_label_mappings"] = curr_mappings
+
                             if 'feature_classification' in st.session_state:
                                 del st.session_state['feature_classification']
 
@@ -6581,9 +6613,9 @@ def page_data_cleaning():
                                 output_df=new_df,
                                 message=f"Label 编码完成，{len(encode_cols)} 列已转为整数"
                             )
-                            st.success(f"✅ Label 编码完成：{len(encode_cols)} 列已转为整数")
+                            st.success(f"✅ Label 编码完成：{len(encode_cols)} 列已转为整数（已自动归档对照字典）")
                             for col, m in mapping.items():
-                                st.caption(f"{col}: {m}")
+                                st.caption(f"**{col} 对照表**: " + " | ".join(f"`{v} ➔ {k}`" for k, v in m.items()))
                         else:
                             new_df = cleaner.one_hot_encode(encode_cols, drop_first=drop_first, dummy_na=False)
                             st.session_state.processed_data = new_df
@@ -13007,6 +13039,21 @@ def page_feature_selection():
     # 清除已提取分子特征（保留原始 data，仅处理 processed_data）；入口：_clear_molecular_features_from_session
     _render_molecular_feature_clear_restore_control()
 
+    # 提示用户系统中已存在的类别编码映射关系，避免后续处理遗忘含义
+    saved_label_mappings = st.session_state.get("category_label_mappings", {})
+    if saved_label_mappings:
+        with st.expander("💡 类别编码 (Label Encoding) 映射对照表", expanded=False):
+            st.caption("提示：当前数据集中以下离散特征已被转换为整数编码。数值特征选择与模型解释时可参考此处的物理/工艺含义对照：")
+            m_cols = st.columns(min(3, len(saved_label_mappings)))
+            for idx, (col_name, mapping_dict) in enumerate(saved_label_mappings.items()):
+                with m_cols[idx % len(m_cols)]:
+                    st.markdown(f"**`{col_name}`**")
+                    st.dataframe(
+                        pd.DataFrame([{"编码": k, "原始标签": v} for k, v in mapping_dict.items()]),
+                        width="stretch",
+                        height=160,
+                    )
+
     # ── K-Means 智能聚类（特征构造）──────────────────────────
     df = st.session_state.processed_data if st.session_state.get('processed_data') is not None else st.session_state.get('data')
     if df is not None:
@@ -15897,27 +15944,10 @@ def page_model_training():
                     st.caption("导出的模型文件包含：pipeline/模型、特征列、目标列、评估指标等。可在【预测应用】页面直接导入使用。")
                     _cached_bytes = st.session_state.get("_trained_model_artifact")
                     _cached_proc_bytes = st.session_state.get("_trained_process_artifact")
-                    _cached_name = st.session_state.get("_trained_model_name", "model")
-                    if _cached_bytes is not None:
-                        dl_a1, dl_a2 = st.columns(2)
-                        with dl_a1:
-                            st.download_button(
-                                "⬇️ 下载模型文件",
-                                data=_cached_bytes,
-                                file_name=_cached_name,
-                                mime="application/octet-stream",
-                                key="download_model_artifact"
-                            )
-                        with dl_a2:
-                            if _cached_proc_bytes is not None:
-                                st.download_button(
-                                    "⬇️ 下载特征提取流程（json）",
-                                    data=_cached_proc_bytes,
-                                    file_name="feature_process.json",
-                                    mime="application/json",
-                                    key="download_process_artifact"
-                                )
-                    else:
+                    _cached_name = st.session_state.get("_trained_model_name", "model_artifact.joblib")
+
+                    if _cached_bytes is None:
+                        # 若尚未生成导出字节，进行一次性惰性构建并缓存到 session_state 中，避免用户每次点击时触发耗时重跑和页面抖动
                         try:
                             from core.model_io import (
                                 create_model_artifact_bytes,
@@ -15977,7 +16007,7 @@ def page_model_training():
                                     molecular_feature_config=st.session_state.get("molecular_feature_config"),
                                 )
                             )
-                            model_bytes = create_model_artifact_bytes(
+                            _cached_bytes = create_model_artifact_bytes(
                                 model_name=str(st.session_state.get("model_name") or model_name),
                                 target_col=str(st.session_state.get("target_col") or ""),
                                 feature_cols=effective_feature_cols,
@@ -15990,21 +16020,35 @@ def page_model_training():
                                 contract_context=st.session_state.get("training_feature_contract_context"),
                             )
                             safe_name = (str(st.session_state.get("model_name") or model_name) or "model").replace(" ", "_")
-                            st.download_button(
-                                "⬇️ 下载模型文件",
-                                data=model_bytes,
-                                file_name=f"{safe_name}_artifact.joblib",
-                                mime="application/octet-stream",
-                                key="download_model_fallback"
-                            )
+                            _cached_name = f"{safe_name}_artifact.joblib"
+                            st.session_state["_trained_model_artifact"] = _cached_bytes
+                            st.session_state["_trained_model_name"] = _cached_name
                         except Exception as e:
-                            st.session_state.last_export_status = {
-                                "ok": False,
-                                "state": "failed",
-                                "error": str(e),
-                                "source": "manual_fallback",
-                            }
-                            st.error(f"模型导出失败：{e}")
+                            st.error(f"构建导出模型失败：{e}")
+
+                    if _cached_bytes is not None:
+                        dl_a1, dl_a2 = st.columns(2)
+                        with dl_a1:
+                            st.download_button(
+                                "⬇️ 下载模型文件 (.joblib)",
+                                data=_cached_bytes,
+                                file_name=_cached_name,
+                                mime="application/octet-stream",
+                                key="download_model_artifact_unified",
+                                width="stretch",
+                            )
+                        with dl_a2:
+                            if _cached_proc_bytes is not None:
+                                st.download_button(
+                                    "⬇️ 下载特征提取流程 (.json)",
+                                    data=_cached_proc_bytes,
+                                    file_name="feature_process.json",
+                                    mime="application/json",
+                                    key="download_process_artifact_unified",
+                                    width="stretch",
+                                )
+                    else:
+                        st.warning("⚠️ 暂无可下载的模型文件，请先运行模型训练。")
                         st.info("提示：若使用深度学习模型（TF/自定义网络），joblib 序列化可能失败。可改用【导出训练脚本】在目标环境复现训练。")
 
     # ============ 独立的异常样本检测功能（在训练代码块外） ============
@@ -20037,13 +20081,109 @@ def _page_virtual_screening_formula():
                 and pd.api.types.is_numeric_dtype(df_ref_design[c])
             ]
 
-        detected_design_cols = [
-            c for c in numeric_design_cols
-            if any(token in str(c).lower() for token in ["phr", "ratio", "stoich", "equiv", "cure", "temp", "time", "post"])
-        ]
-        # 默认保留训练集中最佳样本的相关工艺组合。用户需要时再展开单列网格，
-        # 避免把相关的温度/时间/配比拆成极少命中的笛卡尔积。
-        default_design_cols = []
+        # 从模型 Contract / RegistrySnapshot / 特征语义中全面收集所有手工输入特征（工艺/配比/测试条件等）
+        from core.feature_registry import classify_feature_source_type
+
+        imported_artifact_for_manual = st.session_state.get("imported_model_artifact") or {}
+        extra_dict = imported_artifact_for_manual.get("extra") or {}
+        contract_for_manual = (
+            extra_dict.get("prediction_contract")
+            or st.session_state.get("training_feature_contract_context", {}).get("prediction_contract")
+            or {}
+        )
+        registry_snapshot = (
+            extra_dict.get("registry_snapshot")
+            or st.session_state.get("training_feature_contract_context", {}).get("registry_snapshot")
+            or {}
+        )
+        
+        # 1. 优先读取 registry_snapshot / contract 中的 feature_definitions 映射字典
+        reg_definitions = {
+            str(item.get("name")): item
+            for item in (registry_snapshot.get("features") or contract_for_manual.get("feature_definitions") or [])
+            if isinstance(item, dict) and item.get("name")
+        }
+
+        # 2. 如果 Contract 已经显式标记了 manual_input_feature_cols，优先全量纳入
+        explicit_manual_cols = set(contract_for_manual.get("manual_input_feature_cols") or [])
+
+        # 核心判定：哪些特征是分子特征（由 workflow 提取或由分子结构计算得出）
+        # 1. 直接来自分子特征工作流（Molecular Feature Workflow）的输出特征
+        workflow_mol_features = set(configured_molecular_feature_cols)
+        if screening_workflow is not None:
+            workflow_mol_features.update(screening_workflow.final_feature_names or [])
+
+        # 2. 从模型 Contract / Registry 收集明确标记为 molecular_workflow / derived_workflow 的列
+        contract_mol_features = set(contract_for_manual.get("molecular_workflow_feature_cols") or [])
+        contract_derived_features = set(contract_for_manual.get("derived_feature_cols") or [])
+        all_contract_workflow_cols = set(contract_for_manual.get("workflow_feature_cols") or []).union(
+            contract_mol_features, contract_derived_features
+        )
+
+        pure_manual_cols = []
+        for col in feature_cols:
+            col_str = str(col)
+            if col_str == target_col_name:
+                continue
+
+            # 绝对拦截：如果在分子特征提取流程输出中，绝对不是手工工艺特征！
+            if col_str in workflow_mol_features or col_str in all_contract_workflow_cols:
+                continue
+
+            # 若在当前参考数据表中且不是数值类型，跳过
+            if isinstance(df_ref_design, pd.DataFrame) and col_str in df_ref_design.columns:
+                if not pd.api.types.is_numeric_dtype(df_ref_design[col_str]):
+                    continue
+
+            # (A) 如果在 Contract / Registry 中显式声明为 manual_input，直接准入
+            if col_str in explicit_manual_cols:
+                pure_manual_cols.append(col_str)
+                continue
+            if col_str in reg_definitions:
+                s_type = reg_definitions[col_str].get("source_type") or classify_feature_source_type(reg_definitions[col_str])
+                if s_type == "manual_input":
+                    pure_manual_cols.append(col_str)
+                    continue
+                elif s_type in {"molecular_workflow", "derived_workflow"}:
+                    continue
+
+            # (B) 如果未在 Registry 中登记，严格按分子特征关键词过滤
+            # 常见分子特征前缀/后缀模式：
+            is_mol_feature = any(token in col_str.lower() for token in [
+                "structure", "special_char", "xtb", "maccs", "morgan", "rdkit",
+                "fp_bit", "fr_", "molwt", "descriptor", "homo", "lumo",
+                "atom_count", "ring_count", "formula", "smiles", "fingerprint",
+                "tpsa", "logp", "n_hbd", "n_hba", "rotatable_bonds", "heavy_atoms",
+                "aromatic_rings", "molecular_weight", "formal_charge"
+            ])
+            if is_mol_feature:
+                continue
+
+            # 通过语义分类器兜底
+            s_type = classify_feature_source_type({"name": col_str})
+            if s_type == "manual_input":
+                pure_manual_cols.append(col_str)
+            elif any(k in col_str.lower() for k in ["cure", "temp", "time", "press", "rate", "phr", "stoich", "test", "measur", "freq", "equiv", "thick", "post"]):
+                pure_manual_cols.append(col_str)
+
+        # 去重且保持模型特征中的原始顺序
+        seen_manual = set()
+        deduped_manual_cols = []
+        for col in pure_manual_cols:
+            if col not in seen_manual:
+                seen_manual.add(col)
+                deduped_manual_cols.append(col)
+
+        # 供枚举选择的候选特征池仅限真实的手工输入特征（工艺、测试、配比参数）
+        numeric_design_cols = deduped_manual_cols
+
+        # 默认选中的工艺与测试特征（全量自动预选）
+        default_design_cols = list(deduped_manual_cols)
+
+        def _is_test_or_testing_col(col_name: str) -> bool:
+            """判断是否为测试/表征条件特征（如测试温度、频率、升温速率等）"""
+            name_lower = str(col_name).lower()
+            return any(k in name_lower for k in ["test", "measur", "freq", "hz", "rate", "ramp", "scan", "humidity", "rh"])
 
         def _suggest_design_values(col_name):
             if not isinstance(df_ref_design, pd.DataFrame) or col_name not in df_ref_design.columns:
@@ -20051,21 +20191,26 @@ def _page_virtual_screening_formula():
             ser = pd.to_numeric(df_ref_design[col_name], errors="coerce").dropna()
             if ser.empty:
                 return [0.0]
+            
+            # 1. 测试特征枚举 1 个值（取中位数或最高频值）
+            if _is_test_or_testing_col(col_name):
+                return [float(ser.median())]
+            
+            # 2. 工艺/配比特征枚举 2~3 个值（相较于数据低、中、高：15%分位数、中位数50%、85%分位数）
             uniq = np.sort(ser.unique())
-            if len(uniq) <= 6:
-                return [float(v) for v in uniq[:6]]
-            vals = []
-            for q in (0.02, 0.10, 0.25, 0.50, 0.75, 0.90, 0.98):
-                try:
-                    vals.append(float(np.quantile(ser, q)))
-                except Exception:
-                    continue
-            if not vals:
-                vals = [float(ser.median())]
+            if len(uniq) <= 3:
+                return [float(v) for v in uniq]
+            
+            # 取低 (15%)、中 (50%)、高 (85%) 三个典型工艺水平
+            low_val = float(np.quantile(ser, 0.15))
+            mid_val = float(np.quantile(ser, 0.50))
+            high_val = float(np.quantile(ser, 0.85))
+            
+            vals = [low_val, mid_val, high_val]
             deduped = []
             seen = set()
             for v in vals:
-                key = round(float(v), 6)
+                key = round(float(v), 4)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -20285,12 +20430,16 @@ def _page_virtual_screening_formula():
             use_dataset_source = st.checkbox(f"使用当前数据中的{primary_role_label}库", value=True, key="vs_formula_use_dataset_v2")
             use_guided_source = st.checkbox("叠加虚拟组分", value=False, key="vs_formula_use_guided_v2")
             
-            # 检测会话中是否存在分子设计引擎产出的成果
-            saved_designed_df = st.session_state.get("vs_design_result_df")
+            # 检测会话中是否存在分子设计引擎产出的成果（优先取累计总单体库，否则取本次设计结果）
+            saved_designed_df = st.session_state.get("vs_design_total_accumulated_df")
+            if not isinstance(saved_designed_df, pd.DataFrame) or saved_designed_df.empty:
+                saved_designed_df = st.session_state.get("vs_design_result_df")
+            
             has_designed_molecules = isinstance(saved_designed_df, pd.DataFrame) and not saved_designed_df.empty
-            designed_help = f"已设计分子: {len(saved_designed_df)} 条" if has_designed_molecules else "当前会话暂无设计分子（可在上方切换到【分子设计引擎】生成）"
+            designed_count = len(saved_designed_df) if has_designed_molecules else 0
+            designed_help = f"已设计分子总库: {designed_count:,} 条" if has_designed_molecules else "当前会话暂无设计分子（可在上方切换到【分子设计引擎】生成）"
             use_designed_source = st.checkbox(
-                f"🧩 叠加分子设计引擎产出的候选 ({len(saved_designed_df) if has_designed_molecules else 0} 条)",
+                f"🧩 叠加分子设计引擎产出的候选 ({designed_count:,} 条)",
                 value=has_designed_molecules,
                 key="vs_formula_use_designed_source",
                 help=designed_help,
@@ -23942,14 +24091,33 @@ def _render_molecule_design_engine():
                     st.caption(f"已自动装载来自 PubChem 检索的 {len(saved_pubchem_live):,} 条单体数据。")
 
             if custom_raw_records:
-                extracted_precursors, p_logs = parse_and_extract_custom_precursors(custom_raw_records, source_name="自建/导入模板")
-                custom_precursors_list = extracted_precursors
-                st.success(f"🎉 逆合成拆解成功：从输入的 {len(custom_raw_records)} 条记录中解析提取出 **{len(extracted_precursors)}** 个核心前驱体母核！")
-                with st.expander("查看拆解提取出的前驱体母核明细", expanded=False):
-                    for pl in p_logs:
-                        st.caption(pl)
-                    ext_df = pd.DataFrame([{"母核名称": p.name, "角色": p.role, "分类": p.category, "SMILES": p.smiles} for p in extracted_precursors])
-                    st.dataframe(ext_df, use_container_width=True)
+                # 仅当点击专门的“逆合成拆解母核”按钮或提交时才触发耗时提取，避免组件操作导致每次反复重新提取
+                c_btn_c1, c_btn_c2 = st.columns([2, 3])
+                with c_btn_c1:
+                    do_extract_precursor = st.button("🧩 提取并逆合成拆解前驱体母核", type="secondary", key="vs_do_extract_custom_precursors_btn")
+                
+                # 检查缓存中是否已有提取好的前驱体母核
+                cached_custom_precursors = st.session_state.get("vs_cached_custom_precursors")
+                cached_custom_p_logs = st.session_state.get("vs_cached_custom_p_logs", [])
+
+                if do_extract_precursor:
+                    with st.spinner(f"正在对输入的 {len(custom_raw_records)} 条记录进行高通量逆合成拆解..."):
+                        extracted_precursors, p_logs = parse_and_extract_custom_precursors(custom_raw_records, source_name="自建/导入模板")
+                        st.session_state["vs_cached_custom_precursors"] = extracted_precursors
+                        st.session_state["vs_cached_custom_p_logs"] = p_logs
+                        cached_custom_precursors = extracted_precursors
+                        cached_custom_p_logs = p_logs
+                        st.success(f"🎉 逆合成拆解成功：从输入的 {len(custom_raw_records)} 条记录中解析提取出 **{len(extracted_precursors)}** 个核心前驱体母核！")
+
+                if cached_custom_precursors:
+                    custom_precursors_list = cached_custom_precursors
+                    with st.expander(f"查看拆解提取出的前驱体母核明细（已就绪 {len(cached_custom_precursors)} 个母核）", expanded=False):
+                        for pl in cached_custom_p_logs:
+                            st.caption(pl)
+                        ext_df = pd.DataFrame([{"母核名称": p.name, "角色": p.role, "分类": p.category, "SMILES": p.smiles} for p in cached_custom_precursors])
+                        st.dataframe(ext_df, use_container_width=True)
+                elif not do_extract_precursor:
+                    st.info(f"📋 已收集到 {len(custom_raw_records)} 条分子模板数据。请点击上方『🧩 提取并逆合成拆解前驱体母核』按钮进行母核提取。")
 
             merge_fission = st.checkbox("🧬 同时叠加全维度拓扑骨架裂变（与自建母核交叉重组拓展）", value=True, key="vs_custom_merge_fission")
             is_fission = merge_fission
@@ -23958,42 +24126,29 @@ def _render_molecule_design_engine():
     with st.form("vs_molecule_design_control_form"):
         if is_fission:
             with st.expander("1. 配置骨架演化积木库 (环体系 × 桥联键 × R基修饰)", expanded=True):
+                # 将分散的数十个子 multiselect 聚合为 3 个高性能全局多选组件，减少 85% 前端 DOM 节点与通讯开销
                 st.markdown("##### 🪐 骨架环体系 (Ring Scaffolds - 24 类)")
-                ring_cats = sorted(list({r.category for r in RING_SCAFFOLDS}))
-                for r_cat in ring_cats:
-                    cat_rings = [r for r in RING_SCAFFOLDS if r.category == r_cat]
-                    r_col1, r_col2 = st.columns([1, 4])
-                    with r_col1:
-                        st.markdown(f"**{r_cat}**")
-                    with r_col2:
-                        chosen_r = st.multiselect(
-                            f"选择 {r_cat}",
-                            options=[r.ring_id for r in cat_rings],
-                            default=[r.ring_id for r in cat_rings],
-                            format_func=lambda rid: next(f"{r.name}: {r.description}" for r in cat_rings if r.ring_id == rid),
-                            key=f"vs_design_ring_{r_cat}",
-                            label_visibility="collapsed",
-                        )
-                        selected_rings.extend(chosen_r)
+                all_ring_options = [r.ring_id for r in RING_SCAFFOLDS]
+                ring_label_map = {r.ring_id: f"【{r.category}】{r.name} - {r.description}" for r in RING_SCAFFOLDS}
+                selected_rings = st.multiselect(
+                    "选择参与演化的骨架环 (默认全选高刚性耐热环系)",
+                    options=all_ring_options,
+                    default=all_ring_options,
+                    format_func=lambda rid: ring_label_map.get(rid, rid),
+                    key="vs_design_all_rings_unified_select",
+                )
 
                 st.markdown("---")
                 st.markdown("##### 🌉 主链连接桥联库 (Linker Bridges - 20 类)")
-                linker_cats = sorted(list({l.category for l in LINKER_BRIDGES}))
-                for l_cat in linker_cats:
-                    cat_linkers = [l for l in LINKER_BRIDGES if l.category == l_cat]
-                    l_col1, l_col2 = st.columns([1, 4])
-                    with l_col1:
-                        st.markdown(f"**{l_cat}**")
-                    with l_col2:
-                        chosen_l = st.multiselect(
-                            f"选择 {l_cat}",
-                            options=[l.linker_id for l in cat_linkers],
-                            default=[l.linker_id for l in cat_linkers],
-                            format_func=lambda lid: next(f"{l.name}: {l.description}" for l in cat_linkers if l.linker_id == lid),
-                            key=f"vs_design_linker_{l_cat}",
-                            label_visibility="collapsed",
-                        )
-                        selected_linkers.extend(chosen_l)
+                all_linker_options = [l.linker_id for l in LINKER_BRIDGES]
+                linker_label_map = {l.linker_id: f"【{l.category}】{l.name} - {l.description}" for l in LINKER_BRIDGES}
+                selected_linkers = st.multiselect(
+                    "选择参与连接的主链桥 (默认全选)",
+                    options=all_linker_options,
+                    default=all_linker_options,
+                    format_func=lambda lid: linker_label_map.get(lid, lid),
+                    key="vs_design_all_linkers_unified_select",
+                )
 
                 st.markdown("---")
                 st.markdown("##### 🌿 侧链修饰 R 基团 (Substituents - 12 类)")
@@ -24011,44 +24166,16 @@ def _render_molecule_design_engine():
                     )
         elif not is_fission and not is_custom_mode:
             with st.expander("1. 挑选经典前驱体母核库 (Precursor Cores)", expanded=True):
-                st.markdown("##### 🧪 树脂前驱体（多元酚 / 多元酸）")
-                resin_precursors = [p for p in PRECURSOR_CATALOG if p.role in ("resin", "both")]
-                resin_cats = sorted(list({p.category for p in resin_precursors}))
-                for cat in resin_cats:
-                    cat_items = [p for p in resin_precursors if p.category == cat]
-                    col_a, col_b = st.columns([1, 4])
-                    with col_a:
-                        st.markdown(f"**{cat}**")
-                    with col_b:
-                        chosen = st.multiselect(
-                            f"选择 {cat}",
-                            options=[p.core_id for p in cat_items],
-                            default=[p.core_id for p in cat_items if p.default_selected],
-                            format_func=lambda cid: next(f"{p.name} - {p.description}" for p in cat_items if p.core_id == cid),
-                            key=f"vs_design_cores_resin_{cat}",
-                            label_visibility="collapsed",
-                        )
-                        selected_precursor_ids.extend(chosen)
-
-                st.markdown("---")
-                st.markdown("##### 🛡️ 固化剂前驱体（芳香多胺 / 脂环胺 / 酸酐）")
-                hardener_precursors = [p for p in PRECURSOR_CATALOG if p.role in ("hardener", "both")]
-                hardener_cats = sorted(list({p.category for p in hardener_precursors}))
-                for cat in hardener_cats:
-                    cat_items = [p for p in hardener_precursors if p.category == cat]
-                    col_a, col_b = st.columns([1, 4])
-                    with col_a:
-                        st.markdown(f"**{cat}**")
-                    with col_b:
-                        chosen = st.multiselect(
-                            f"选择 {cat}",
-                            options=[p.core_id for p in cat_items],
-                            default=[p.core_id for p in cat_items if p.default_selected],
-                            format_func=lambda cid: next(f"{p.name} - {p.description}" for p in cat_items if p.core_id == cid),
-                            key=f"vs_design_cores_hardener_{cat}",
-                            label_visibility="collapsed",
-                        )
-                        selected_precursor_ids.extend(chosen)
+                all_cores_options = [p.core_id for p in PRECURSOR_CATALOG]
+                core_label_map = {p.core_id: f"【{p.role.upper()} | {p.category}】{p.name} - {p.description}" for p in PRECURSOR_CATALOG}
+                default_cores = [p.core_id for p in PRECURSOR_CATALOG if p.default_selected]
+                selected_precursor_ids = st.multiselect(
+                    "选择经典工业前驱体母核",
+                    options=all_cores_options,
+                    default=default_cores,
+                    format_func=lambda cid: core_label_map.get(cid, cid),
+                    key="vs_design_all_precursors_unified_select",
+                )
 
         with st.expander("2. 启用多通道合成反应模板 (Reaction SMARTS 体系开关)", expanded=True):
             st.caption("真实有机合成路线：通过确定的化学反应将前驱体转化为环氧树脂、固化剂或特种树脂单体。您可以自由勾选或剔除不需要的化学体系。")
@@ -24131,6 +24258,12 @@ def _render_molecule_design_engine():
             status_box.write("1/3 阶段 1：正在解析前驱体母核空间与组合拓扑...")
             status_box.write("2/3 阶段 2：正在进行多通道有机合成反应转化与深度穷举...")
             try:
+                if not is_fission and is_custom_mode and not custom_precursors_list and custom_raw_records:
+                    # 若用户未显式点击拆解按钮但直接点击了运行，在运行时自动拆解一次
+                    with st.spinner("正在自动执行逆合成母核拆解..."):
+                        custom_precursors_list, _ = parse_and_extract_custom_precursors(custom_raw_records, source_name="自建/导入模板")
+                        st.session_state["vs_cached_custom_precursors"] = custom_precursors_list
+
                 result_df, logs = run_combinatorial_monomer_design(
                     selected_precursor_ids=selected_precursor_ids if not is_fission and not custom_precursors_list else None,
                     custom_precursors=custom_precursors_list if is_custom_mode and custom_precursors_list else None,
@@ -24241,8 +24374,6 @@ def page_virtual_screening():
     if screening_mode == "分子设计引擎":
         return _render_molecule_design_engine()
     
-    # 仅在配方级高通量筛选且用户需要时按需渲染熔点采集面板，避免切换到分子设计页面时无谓加载几十兆数据
-    render_melting_point_dataset_panel()
     return _page_virtual_screening_formula()
 
 

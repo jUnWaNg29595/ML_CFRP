@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: transparent; }
+    .paste-zone {
+      min-height: 118px;
+      border: 1px dashed #98a2b3;
+      border-radius: 8px;
+      padding: 18px 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      color: #344054;
+      background: #f8fafc;
+      outline: none;
+      cursor: pointer;
+      text-align: center;
+      transition: border-color 120ms ease, background 120ms ease;
+    }
+    .paste-zone:hover, .paste-zone:focus-visible, .paste-zone.dragging {
+      border-color: #2563eb;
+      background: #eff6ff;
+    }
+    .paste-zone strong { font-size: 14px; font-weight: 650; }
+    .paste-zone span { font-size: 12px; color: #667085; line-height: 1.4; }
+    .paste-zone[data-state="success"] { border-color: #12b76a; background: #ecfdf3; }
+    .paste-zone[data-state="error"] { border-color: #f04438; background: #fef3f2; }
+    .choose-button {
+      display: block;
+      margin: 8px auto 0;
+      border: 1px solid #98a2b3;
+      border-radius: 6px;
+      padding: 6px 12px;
+      color: #344054;
+      background: #ffffff;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .choose-button:hover, .choose-button:focus-visible {
+      border-color: #2563eb;
+      color: #1d4ed8;
+      outline: none;
+    }
+    #file-input { display: none; }
+  </style>
+</head>
+<body>
+  <div id="paste-zone" class="paste-zone" tabindex="0" role="button" aria-label="粘贴或选择结构图片">
+    <strong>点击此处后按 Ctrl+V 粘贴图片</strong>
+    <span>也可以将图片拖到这里，或使用下方按钮选择图片</span>
+  </div>
+  <button id="choose-button" class="choose-button" type="button">选择图片</button>
+  <input id="file-input" type="file" accept="image/*">
+
+  <script>
+    // Minimal Streamlit component protocol. Keeping it local avoids a CDN dependency.
+    const Streamlit = (() => {
+      const events = new EventTarget();
+      const post = (type, extra = {}) => {
+        window.parent.postMessage({ isStreamlitMessage: true, type, ...extra }, "*");
+      };
+      window.addEventListener("message", (event) => {
+        const data = event.data || {};
+        if (data.type === "streamlit:render") {
+          events.dispatchEvent(new CustomEvent("streamlit:render", { detail: data }));
+        }
+      });
+      return {
+        RENDER_EVENT: "streamlit:render",
+        events,
+        setComponentReady: () => post("streamlit:componentReady", { apiVersion: 1 }),
+        setFrameHeight: (height) => post("streamlit:setFrameHeight", { height }),
+        setComponentValue: (value) => post("streamlit:setComponentValue", { value, dataType: "json" }),
+      };
+    })();
+
+    const zone = document.getElementById("paste-zone");
+    const chooseButton = document.getElementById("choose-button");
+    const picker = document.getElementById("file-input");
+    let args = { maxWidth: 1600, maxBytes: 8 * 1024 * 1024 };
+
+    function setStatus(message, state = "") {
+      zone.dataset.state = state;
+      const detail = zone.querySelector("span");
+      if (detail) detail.textContent = message;
+      Streamlit.setFrameHeight(document.body.scrollHeight);
+    }
+
+    function dataUrlPayload(dataUrl, file, width, height) {
+      const comma = String(dataUrl).indexOf(",");
+      if (comma < 0) throw new Error("图片数据格式无效");
+      const dataB64 = String(dataUrl).slice(comma + 1);
+      return {
+        data_b64: dataB64,
+        mime: file.type || "image/png",
+        name: file.name || "pasted-image.png",
+        size: file.size,
+        width: width || null,
+        height: height || null,
+      };
+    }
+
+    function readAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("读取图片失败"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function loadImage(file) {
+      return new Promise((resolve, reject) => {
+        const objectUrl = URL.createObjectURL(file);
+        const image = new Image();
+        image.onload = () => {
+          URL.revokeObjectURL(objectUrl);
+          resolve(image);
+        };
+        image.onerror = () => {
+          URL.revokeObjectURL(objectUrl);
+          reject(new Error("图片无法解析"));
+        };
+        image.src = objectUrl;
+      });
+    }
+
+    function canvasBlob(image, width, height, type, quality) {
+      return new Promise((resolve) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext("2d");
+        context.fillStyle = "#ffffff";
+        context.fillRect(0, 0, width, height);
+        context.drawImage(image, 0, 0, width, height);
+        canvas.toBlob(resolve, type, quality);
+      });
+    }
+
+    function outputNameForType(name, type) {
+      const sourceName = name || "pasted-image.png";
+      const withoutExtension = sourceName.replace(/\.[^.]+$/, "");
+      const extension = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+      }[type] || "png";
+      return `${withoutExtension || "pasted-image"}.${extension}`;
+    }
+
+    async function normalizeImage(file) {
+      if (!file || !String(file.type || "").startsWith("image/")) {
+        throw new Error("剪贴板中没有图片");
+      }
+      const image = await loadImage(file);
+      const sourceWidth = image.naturalWidth || image.width;
+      const sourceHeight = image.naturalHeight || image.height;
+      const scale = Math.min(1, Number(args.maxWidth || 1600) / Math.max(1, sourceWidth));
+      let width = Math.max(1, Math.round(sourceWidth * scale));
+      let height = Math.max(1, Math.round(sourceHeight * scale));
+      let output = file;
+
+      if (scale < 1 || file.size > Number(args.maxBytes || 8 * 1024 * 1024)) {
+        let blob = await canvasBlob(image, width, height, "image/png");
+        if (!blob || blob.size > Number(args.maxBytes || 8 * 1024 * 1024)) {
+          blob = await canvasBlob(image, width, height, "image/jpeg", 0.9);
+        }
+        if (!blob || blob.size > Number(args.maxBytes || 8 * 1024 * 1024)) {
+          throw new Error("图片过大，请先裁剪或压缩后再粘贴");
+        }
+        const outputType = blob.type || "image/png";
+        output = new File(
+          [blob],
+          outputNameForType(file.name, outputType),
+          { type: outputType }
+        );
+      }
+
+      const dataUrl = await readAsDataUrl(output);
+      return dataUrlPayload(dataUrl, output, width, height);
+    }
+
+    async function emitFile(file) {
+      try {
+        const payload = await normalizeImage(file);
+        Streamlit.setComponentValue(payload);
+        setStatus(`已接收 ${payload.name}，可以点击识别`, "success");
+      } catch (error) {
+        setStatus(error && error.message ? error.message : "图片读取失败", "error");
+        Streamlit.setComponentValue({ error: error && error.message ? error.message : "图片读取失败" });
+      }
+    }
+
+    function findClipboardImage(event) {
+      const files = Array.from(event.clipboardData && event.clipboardData.files || []);
+      const fromFiles = files.find((file) => String(file.type || "").startsWith("image/"));
+      if (fromFiles) return fromFiles;
+      const items = Array.from(event.clipboardData && event.clipboardData.items || []);
+      const imageItem = items.find((item) => String(item.type || "").startsWith("image/"));
+      return imageItem ? imageItem.getAsFile() : null;
+    }
+
+    function handlePaste(event) {
+      if (event.defaultPrevented) return;
+      const file = findClipboardImage(event);
+      if (!file) return;
+      event.preventDefault();
+      emitFile(file);
+    }
+
+    zone.addEventListener("paste", handlePaste);
+    document.addEventListener("paste", handlePaste);
+    zone.addEventListener("click", () => zone.focus());
+    chooseButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      picker.click();
+    });
+    zone.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        picker.click();
+      }
+    });
+    zone.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      zone.classList.add("dragging");
+    });
+    zone.addEventListener("dragleave", () => zone.classList.remove("dragging"));
+    zone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      zone.classList.remove("dragging");
+      const file = Array.from(event.dataTransfer && event.dataTransfer.files || [])[0];
+      emitFile(file);
+    });
+    picker.addEventListener("change", () => {
+      if (picker.files && picker.files[0]) emitFile(picker.files[0]);
+      picker.value = "";
+    });
+
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
+      args = { ...args, ...(event.detail && event.detail.args || {}) };
+      Streamlit.setFrameHeight(document.body.scrollHeight);
+    });
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(document.body.scrollHeight);
+  </script>
+</body>
+</html>

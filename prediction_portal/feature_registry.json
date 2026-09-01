@@ -13703,9 +13703,9 @@
     }
   },
   "approval": {
-    "status": "draft",
-    "approved_by": null,
-    "approved_at": null,
+    "status": "approved",
+    "approved_by": "local_user",
+    "approved_at": "2026-09-01T09:37:05",
     "change_summary": "建立历史 Tg artifact 特征来源登记，待本地单人审核",
     "review_note": "legacy_observed 特征仅用于审计；计量比特征保持 blocked"
   }

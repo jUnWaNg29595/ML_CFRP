@@ -296,7 +296,7 @@ SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
         description="保留芳香多胺、脂环胺、多元酸酐母核本身，并自动计算活性氢/酸酐当量",
         expected_warhead="活性胺氢/酸酐基",
         chemical_system="amine",
-        default_enabled=True,
+        default_enabled=False,
     ),
 ]
 
@@ -1177,6 +1177,10 @@ def run_combinatorial_monomer_design(
                     logs.append("🛑 检测到用户后台终止指令，正在安全退出计算...")
                     break
                 if len(results) >= max_total_products:
+                    # 立即取消尚未执行的线程任务，防止后台无限占用计算资源
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
                     break
                 try:
                     p_res = fut.result()
@@ -1188,6 +1192,11 @@ def run_combinatorial_monomer_design(
                         if item.product_smiles not in seen_smiles:
                             seen_smiles.add(item.product_smiles)
                             results.append(item)
+                            if len(results) >= max_total_products:
+                                for f in futures:
+                                    if not f.done():
+                                        f.cancel()
+                                break
                 except Exception:
                     pass
     else:
@@ -1214,16 +1223,14 @@ def run_combinatorial_monomer_design(
                 if item.product_smiles not in seen_smiles:
                     seen_smiles.add(item.product_smiles)
                     results.append(item)
+                    if len(results) >= max_total_products:
+                        break
 
-    logs.append(f"🎉 阶段 3：多核并发校验完成！成功产出 {len(results):,} 个高性能单体")
+    # 严格截断保证绝对不超过上限
+    if len(results) > max_total_products:
+        results = results[:max_total_products]
 
-    if not results:
-        return pd.DataFrame(), logs
-
-    df = pd.DataFrame([asdict(r) for r in results])
-    return df, logs
-
-    logs.append(f"🎉 阶段 3：完成质量门禁校验与化学计量特征计算，成功产出 {len(results):,} 个高性能单体")
+    logs.append(f"🎉 阶段 3：质量门禁校验完成！成功产出 {len(results):,} 个高性能单体")
 
     if not results:
         return pd.DataFrame(), logs

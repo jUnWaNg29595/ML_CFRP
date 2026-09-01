@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 from datetime import datetime, timezone
+import time
 from pathlib import Path
 from typing import Any, Mapping
 from uuid import uuid4
@@ -267,10 +268,28 @@ def render_feature_registry_page(
 
     st.title("🧩 特征管理")
 
-    # Profile resolution
+    # Profile resolution：优先根据当前上传数据集的目标列（Target Column）智能推导匹配，避免无 Tg 数据仍死锁在 Tg 模板
     profiles = registry.get("model_profiles", {}) if isinstance(registry, Mapping) else {}
     profile_ids = list(profiles.keys()) if isinstance(profiles, Mapping) else []
-    requested_profile_id = str(profile_id or st.session_state.get("model_profile_id") or "")
+    
+    current_target_col = str(st.session_state.get("target_col") or "").strip()
+    # 尝试从目标变量名反推最匹配的 profile_id
+    matched_profile_id = ""
+    if current_target_col and profile_ids:
+        for p_id in profile_ids:
+            p_obj = profiles.get(p_id, {})
+            p_target = str(p_obj.get("target") or p_id.split(".")[-1] or "").lower()
+            if p_target and (p_target in current_target_col.lower() or current_target_col.lower() in p_target):
+                matched_profile_id = p_id
+                break
+
+    requested_profile_id = str(
+        matched_profile_id
+        or profile_id
+        or st.session_state.get("model_profile_id")
+        or st.session_state.get("training_model_profile_id")
+        or ""
+    )
     if not profile_ids:
         st.error("特征登记库中没有可用的 model profile，暂时无法建立映射。")
         requested_profile_id = ""
@@ -279,10 +298,11 @@ def render_feature_registry_page(
 
     if profile_ids:
         selected_profile_id = st.selectbox(
-            "模型 profile",
+            "模型 profile (根据当前数据目标变量自动匹配)",
             profile_ids,
             index=profile_ids.index(requested_profile_id),
             key="feature_review_profile_id",
+            help="系统已根据您在数据选择/特征页设定的目标变量自动推荐匹配的 Profile；您也可以在此手动切换到其他材料与性能体系。"
         )
         profile_id = str(selected_profile_id)
         st.session_state["model_profile_id"] = profile_id
@@ -359,10 +379,25 @@ def render_feature_registry_page(
         )
     registry_approval_status = str((registry.get("approval") or {}).get("status") or "").strip().lower() if isinstance(registry, Mapping) else "unknown"
     if registry_approval_status == "draft":
-        st.info(
-            "ℹ️ 当前 Registry 仍为 draft。当前操作只会保存待审核映射，"
-            "不会使模型获得正式发布资格。"
-        )
+        r_col1, r_col2 = st.columns([4, 1])
+        with r_col1:
+            st.info(
+                "ℹ️ 当前 Registry 为 draft。若所有特征与映射已审核确认无误，可点击右侧按钮批准为正式版（approved），以获得模型正式发布资格。"
+            )
+        with r_col2:
+            if st.button("✅ 批准当前 Registry", key="btn_approve_registry_draft", type="primary", width="stretch"):
+                if isinstance(registry, dict):
+                    approval = registry.setdefault("approval", {})
+                    approval["status"] = "approved"
+                    approval["approved_by"] = reviewer
+                    approval["approved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    if reg_file:
+                        try:
+                            save_registry_atomic(reg_file, registry)
+                        except Exception:
+                            pass
+                    st.success("🎉 Registry 已成功批准为 approved 状态！")
+                    st.rerun()
 
     with st.container(border=True):
         st.markdown("### 🤖 AI 特征审核工作区")
@@ -554,6 +589,11 @@ def render_feature_registry_page(
                 s for s in suggestions
                 if isinstance(s, Mapping) and str(s.get("status") or "").strip().lower() not in {"approved", "rejected"}
             ]
+            if reg_file and isinstance(registry, Mapping):
+                try:
+                    save_registry_atomic(reg_file, registry)
+                except Exception:
+                    pass
             st.session_state["feature_review_suggestions"] = remaining
             if profile_id:
                 save_profile_suggestions(profile_id, remaining, portal_root)
@@ -776,9 +816,9 @@ def render_feature_registry_page(
                             for s in suggestions:
                                 if isinstance(s, Mapping) and str(s.get("feature_id") or "") == feature_id:
                                     s["status"] = "approved"
-                            st.session_state["feature_review_suggestions"] = suggestions
                             if profile_id:
                                 save_profile_suggestions(profile_id, suggestions, portal_root)
+                            st.session_state["feature_review_suggestions"] = suggestions
                             persist_review_event({
                                 "event": "local_decision", "action": "edit_accept",
                                 "reviewer": reviewer, "feature_id": feature_id,
