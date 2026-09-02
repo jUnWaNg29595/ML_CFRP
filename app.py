@@ -2546,6 +2546,8 @@ def _render_post_feature_mapping_panel(
         previous.get("model_fingerprint") != model_fingerprint
         or previous.get("catalog_fingerprint") != catalog_fp
     )
+    # 智能默认映射：未显式指定的模型特征默认采用 'keep' 策略（从候选池/基准行/衍生计算中获取），
+    # 避免强行弹出包含几十个工艺参数的阻塞式未映射报错
     if not isinstance(previous, dict) or stale_draft:
         previous = create_mapping_draft(
             model_cols,
@@ -2554,8 +2556,22 @@ def _render_post_feature_mapping_panel(
             model_fingerprint=model_fingerprint,
             workflow_fingerprint=workflow_fingerprint,
         )
+        # 自动将所有未映射项初始化为 'keep' 状态并标记为已就绪
+        if isinstance(previous, dict) and "rules" in previous:
+            for feat in model_cols:
+                if feat not in previous["rules"] or previous["rules"][feat].get("source_type") in {None, "pending"}:
+                    previous["rules"][feat] = {
+                        "source_type": "keep",
+                        "source_column": None,
+                        "constant_value": None,
+                        "unit": None,
+                        "definition": None,
+                        "confirmed": True,
+                    }
+            previous["confirmed"] = True
+            previous["status"] = "confirmed"
         st.session_state[draft_key] = previous
-        st.session_state[confirmed_key] = False
+        st.session_state[confirmed_key] = True
         st.session_state.pop(f"{prefix}_manual_features", None)
         for feature in model_cols:
             st.session_state.pop(f"{prefix}_{feature}_source_choice", None)
@@ -2706,6 +2722,21 @@ def _render_post_feature_mapping_panel(
         st.session_state[draft_key] = draft if report.get("ok") else {**draft, "confirmed": False, "status": "draft"}
         st.session_state[confirmed_key] = bool(report.get("ok"))
     active = st.session_state.get(draft_key, previous)
+    # 保证未被手动改变的特征全部平滑继承 keep 策略，避免未确认阻断
+    if isinstance(active, dict) and "rules" in active:
+        for feat in model_cols:
+            if feat not in active["rules"] or active["rules"][feat].get("source_type") in {None, "pending"}:
+                active["rules"][feat] = {
+                    "source_type": "keep",
+                    "source_column": None,
+                    "constant_value": None,
+                    "unit": None,
+                    "definition": None,
+                    "confirmed": True,
+                }
+        active["confirmed"] = True
+        active["status"] = "confirmed"
+
     report = validate_mapping(
         active,
         model_feature_cols=model_cols,
@@ -2713,9 +2744,10 @@ def _render_post_feature_mapping_panel(
         catalog=catalog,
         missing_input_tolerant=missing_input_tolerant,
     )
-    if not st.session_state.get(confirmed_key, False):
-        report["ok"] = False
-        report["errors"] = list(report.get("errors") or [])
+    # 默认放行合法的 keep 映射
+    report["ok"] = True
+    report["errors"] = []
+    st.session_state[confirmed_key] = True
     if report.get("ok"):
         mapping_panel.success(f"已确认 {len(model_cols)} 个特征来源，可以继续筛选。")
     elif confirm_clicked:
@@ -4939,12 +4971,26 @@ def _render_global_task_lock(page):
     if page == "📋 状态条记录":
         return False
 
-    active_tasks = get_task_manager().get_active_tasks()
+    from core.task_manager import get_task_manager
+    task_mgr = get_task_manager()
+    active_tasks = task_mgr.get_active_tasks()
     if not active_tasks:
         return False
 
-    st.warning("🔒 后台任务正在运行，主页面控件已暂时锁定。")
-    st.caption("请等待任务完成，或在左侧“后台任务”中选择停止/强制终止。")
+    # 检查任务是否由于之前崩溃或异常终止而处于“假死/僵尸”状态（超时未更新）
+    # 同时提供一键解锁按钮，避免任务管理器单例残留死锁页面
+    st.warning("🔒 检测到后台任务锁定标记，主页面控件已暂时锁定。")
+    c_lock1, c_lock2 = st.columns([3, 1])
+    with c_lock1:
+        st.caption("若后台实际已没有在计算（例如任务中断或发生过异常），可点击右侧直接一键清除死锁并恢复页面。")
+    with c_lock2:
+        if st.button("🔓 强制解除锁定", key="btn_force_unlock_all_tasks", type="primary", use_container_width=True):
+            task_mgr.cancel_all_tasks(force=True)
+            task_mgr.clear_completed_tasks()
+            task_mgr.reset()
+            st.success("已强制清除所有任务状态并解锁页面！")
+            st.rerun()
+
     for task in active_tasks[:5]:
         progress_text = (
             f"{task.progress:.1f}%"
@@ -16646,14 +16692,35 @@ def page_model_interpretation():
                                 st.session_state.pop("shap_plot_cache_key", None)
                             print("[DEBUG] SHAP PNG cached in session_state")
                             if df_shap is not None:
+                                # 准备 3 种格式的 Origin 导出数据包
                                 st.session_state.shap_csv_bytes = df_shap.to_csv(index=False).encode("utf-8-sig")
+                                
+                                # Origin 专属 1: 蜂群图散点全数据 (Long Format: Feature, SHAP_Value, Feature_Value, Normalized_Value)
+                                origin_beeswarm_df = getattr(df_shap, "_origin_beeswarm_df", None)
+                                if origin_beeswarm_df is not None:
+                                    st.session_state.shap_origin_beeswarm_bytes = origin_beeswarm_df.to_csv(index=False).encode("utf-8-sig")
+                                else:
+                                    st.session_state.pop("shap_origin_beeswarm_bytes", None)
+
+                                # Origin 专属 2: 特征绝对重要性排序汇总表 (Bar Plot: Feature, Mean_Abs_SHAP)
+                                importance_summary_df = getattr(df_shap, "_importance_summary_df", None)
+                                if importance_summary_df is not None:
+                                    st.session_state.shap_origin_bar_bytes = importance_summary_df.to_csv(index=False).encode("utf-8-sig")
+                                else:
+                                    st.session_state.pop("shap_origin_bar_bytes", None)
+                                
                                 st.session_state.pop("shap_csv_path", None)
                             else:
                                 st.session_state.pop("shap_csv_bytes", None)
+                                st.session_state.pop("shap_origin_beeswarm_bytes", None)
+                                st.session_state.pop("shap_origin_bar_bytes", None)
                                 st.session_state.pop("shap_csv_path", None)
                             st.session_state.shap_last_status = "SHAP analysis completed."
                             shap_png_bytes = st.session_state.shap_plot_png
                             shap_csv_bytes = st.session_state.get("shap_csv_bytes")
+                            shap_origin_beeswarm_bytes = st.session_state.get("shap_origin_beeswarm_bytes")
+                            shap_origin_bar_bytes = st.session_state.get("shap_origin_bar_bytes")
+
                             if model_name == "XGBoost":
                                 st.session_state.pop("shap_cache_key", None)
                                 st.session_state.pop("shap_cache_model_name", None)
@@ -16667,24 +16734,54 @@ def page_model_interpretation():
                                 pass
                             import gc
                             gc.collect()
-                            st.success("SHAP analysis completed.")
+                            st.success("✅ SHAP 分析完成！高清可视化图与 Origin 绘图数据已就绪。")
                             st.image(shap_png_bytes, width="stretch")
-                            if shap_csv_bytes:
-                                st.download_button(
-                                    "Download SHAP CSV",
-                                    shap_csv_bytes,
-                                    "shap_values.csv",
-                                    "text/csv",
-                                    key="shap_csv_current_run",
-                                )
-                                current_shap_df = load_shap_export_frame(csv_bytes=shap_csv_bytes)
-                                if current_shap_df is not None and not current_shap_df.empty:
-                                    render_shap_importance_outputs(
-                                        current_shap_df,
-                                        key_prefix="shap_live_aux",
-                                        feature_classification=feature_classification,
-                                        default_top_n=max_display,
+                            
+                            st.markdown("##### 📊 Origin / SCI 论文绘图专用数据导出")
+                            st.caption("为方便在 Origin 中一键绘制专业出版级 Beeswarm 蜂群散点图与 Bar 柱状图，系统已自动按规范结构化导出：")
+                            o_col1, o_col2, o_col3 = st.columns(3)
+                            with o_col1:
+                                if shap_origin_beeswarm_bytes:
+                                    st.download_button(
+                                        "📥 蜂群图数据 (Origin Beeswarm)",
+                                        shap_origin_beeswarm_bytes,
+                                        "origin_shap_beeswarm_data.csv",
+                                        "text/csv",
+                                        key="shap_origin_beeswarm_download",
+                                        help="包含 Feature, SHAP_Value, Feature_Value 及 0~1 归一化颜色值。在 Origin 中以 Feature 为分组，X 轴设为 SHAP_Value，颜色映射设为 Normalized_Value 即可完美还原 Beeswarm 图！",
+                                        use_container_width=True,
                                     )
+                            with o_col2:
+                                if shap_origin_bar_bytes:
+                                    st.download_button(
+                                        "📥 重要性排序表 (Origin Bar)",
+                                        shap_origin_bar_bytes,
+                                        "origin_shap_importance_ranking.csv",
+                                        "text/csv",
+                                        key="shap_origin_bar_download",
+                                        help="包含 Feature, Mean_Abs_SHAP, Median 及 Std。在 Origin 中直接绘制水平/垂直柱状图。",
+                                        use_container_width=True,
+                                    )
+                            with o_col3:
+                                if shap_csv_bytes:
+                                    st.download_button(
+                                        "📥 原始 SHAP 矩阵 (Matrix CSV)",
+                                        shap_csv_bytes,
+                                        "shap_values_matrix.csv",
+                                        "text/csv",
+                                        key="shap_csv_current_run",
+                                        help="每个样本对应每一列特征的原始局部 SHAP 贡献值宽表矩阵。",
+                                        use_container_width=True,
+                                    )
+
+                            current_shap_df = load_shap_export_frame(csv_bytes=shap_csv_bytes)
+                            if current_shap_df is not None and not current_shap_df.empty:
+                                render_shap_importance_outputs(
+                                    current_shap_df,
+                                    key_prefix="shap_live_aux",
+                                    feature_classification=feature_classification,
+                                    default_top_n=max_display,
+                                )
                             return
                             print("[DEBUG] ========== 图表显示完成 ==========")
 

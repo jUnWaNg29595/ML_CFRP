@@ -828,9 +828,43 @@ class EnhancedModelInterpreter:
             plt.close(fig)
             return None, None
 
-        # ✅ 修复：使用筛选后的 vals_plot 而不是完整的 vals
-        # vals_plot 的列数与 feature_names_for_export 匹配
+        # ✅ 修复：为 Origin / SCI 论文作图提供全维度完整数据包
+        # 包含：SHAP值矩阵 + 对应的特征真实值矩阵(用于Origin颜色映射) + 均值绝对重要性汇总表
         export_df = pd.DataFrame(vals_plot, columns=feature_names_for_export)
+
+        # 1. 整理特征真实值表 (Feature Value)，用于 Beeswarm 点的颜色映射 (Color by feature value)
+        feat_val_df = pd.DataFrame(X_plot_for_color.values, columns=[f"{c}_feat_val" for c in feature_names_for_export])
+
+        # 2. 整理蜂群图展开表 (Origin Beeswarm Long Table)，每行一个点：特征名、SHAP值、真实特征值、标准化特征值(0~1)
+        origin_beeswarm_rows = []
+        for i_f, f_name in enumerate(feature_names_plot):
+            shap_arr = vals_plot[:, i_f]
+            real_val_arr = X_plot_for_color[f_name].values
+            # 计算 0~1 归一化值，方便在 Origin 中作为 Color Map (Low=Blue, High=Red)
+            vmin, vmax = np.nanmin(real_val_arr), np.nanmax(real_val_arr)
+            norm_val_arr = (real_val_arr - vmin) / (vmax - vmin + 1e-12) if (vmax > vmin) else np.zeros_like(real_val_arr)
+
+            for s_val, r_val, n_val in zip(shap_arr, real_val_arr, norm_val_arr):
+                origin_beeswarm_rows.append({
+                    "Feature": f_name,
+                    "SHAP_Value": float(s_val),
+                    "Feature_Value": float(r_val),
+                    "Normalized_Value_0_to_1": float(n_val),
+                })
+        origin_beeswarm_df = pd.DataFrame(origin_beeswarm_rows)
+
+        # 3. 整理全局重要性汇总表 (Origin Bar Plot)
+        importance_summary_df = pd.DataFrame({
+            "Feature": feature_names_plot,
+            "Mean_Abs_SHAP": np.abs(vals_plot).mean(axis=0),
+            "Median_SHAP": np.median(vals_plot, axis=0),
+            "Std_SHAP": np.std(vals_plot, axis=0),
+        }).sort_values("Mean_Abs_SHAP", ascending=False).reset_index(drop=True)
+
+        # 将长格式 Origin 专用表与汇总统计附加在 export_df 的元数据属性上
+        export_df._origin_beeswarm_df = origin_beeswarm_df
+        export_df._importance_summary_df = importance_summary_df
+        export_df._feat_val_df = feat_val_df
 
         # 关键修复: 在返回前关闭所有其他图形,避免内存泄漏
         try:
