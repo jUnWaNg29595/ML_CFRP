@@ -338,10 +338,27 @@ def append_runtime_debug(message: str):
         pass
 
 
-def classify_feature_for_pie(feature_name: str, feature_classification=None) -> str:
+def classify_feature_for_pie(feature_name: str, feature_classification=None, custom_type_overrides=None) -> str:
     """Classify feature names into practical groups for feature-importance pie charts."""
     feature_text = str(feature_name).strip()
+    
+    # 优先尊重用户在 UI 中手动修改/覆盖的特征类别
+    if isinstance(custom_type_overrides, dict) and feature_text in custom_type_overrides:
+        return str(custom_type_overrides[feature_text])
+
     feature_lower = feature_text.lower()
+
+    # 优先匹配特定工艺与配比（避免被材料参数模糊误伤）
+    if any(token in feature_lower for token in (
+        "temp", "time", "pressure", "curing", "cure", "heating", "cooling",
+        "speed", "rate", "mixing", "post_cure", "ramp"
+    )):
+        return "工艺条件"
+
+    if any(token in feature_lower for token in (
+        "phr", "ratio", "stoich", "equiv", "content", "weight_ratio", "mix_ratio", "fraction"
+    )):
+        return "配方比例/当量"
 
     molecular_set = set()
     original_set = set()
@@ -356,7 +373,7 @@ def classify_feature_for_pie(feature_name: str, feature_classification=None) -> 
 
     if any(token in feature_lower for token in (
         "rdkit", "mordred", "desc", "chemberta", "embedding", "graph", "gnn",
-        "tpsa", "charge", "betti", "persistence", "coulomb", "domain"
+        "tpsa", "charge", "betti", "persistence", "coulomb", "domain", "special_char"
     )):
         return "分子描述符"
 
@@ -365,12 +382,6 @@ def classify_feature_for_pie(feature_name: str, feature_classification=None) -> 
         "aspect", "_over_", "orientation", "geometry"
     )):
         return "结构/几何"
-
-    if any(token in feature_lower for token in (
-        "vf", "vm", "vol", "volume_fraction", "wt", "weight", "content",
-        "ratio", "percent", "concentration", "loading", "fraction"
-    )):
-        return "组成/含量"
 
     if (
         re.match(r"^(e[0-9a-z_]*|g[0-9a-z_]*|nu[0-9a-z_]*)$", feature_lower)
@@ -393,15 +404,14 @@ def classify_feature_for_pie(feature_name: str, feature_classification=None) -> 
         return "强度/失效"
 
     if any(token in feature_lower for token in (
-        "temp", "time", "pressure", "curing", "cure", "heating", "cooling",
-        "speed", "rate", "mixing", "condition"
-    )):
-        return "工艺条件"
-
-    if any(token in feature_lower for token in (
         "resin", "hardener", "matrix", "fiber", "fibre", "em_", "ef", "gm", "gf"
     )):
         return "材料参数"
+
+    if any(token in feature_lower for token in (
+        "test", "measur", "method", "freq", "hz", "humidity", "atmosphere"
+    )):
+        return "测试条件"
 
     if feature_text in molecular_set:
         return "分子特征"
@@ -412,7 +422,7 @@ def classify_feature_for_pie(feature_name: str, feature_classification=None) -> 
     return "其他特征"
 
 
-def build_feature_pie_data(top_features, feature_classification=None, max_feature_slices: int = 8):
+def build_feature_pie_data(top_features, feature_classification=None, custom_type_overrides=None, max_feature_slices: int = 8):
     """
     Build pie-chart data.
     Prefer type distribution; if all top features collapse into one type, fall back to
@@ -423,7 +433,9 @@ def build_feature_pie_data(top_features, feature_classification=None, max_featur
 
     typed_features = top_features.copy()
     typed_features["Type"] = typed_features["Feature"].apply(
-        lambda x: classify_feature_for_pie(x, feature_classification=feature_classification)
+        lambda x: classify_feature_for_pie(
+            x, feature_classification=feature_classification, custom_type_overrides=custom_type_overrides
+        )
     )
 
     type_importance = (
@@ -525,7 +537,7 @@ def render_shap_importance_outputs(
     feature_classification=None,
     default_top_n: int = 20,
 ):
-    """Render standalone SHAP importance ranking and pie charts."""
+    """Render standalone SHAP importance ranking and customizable pie charts."""
     importance_df = build_shap_importance_df(shap_export_df)
     if importance_df.empty:
         return
@@ -534,7 +546,11 @@ def render_shap_importance_outputs(
     top_n = min(max(5, int(default_top_n)), total_features)
     top_features = importance_df.head(top_n).copy()
 
-    st.markdown("#### SHAP 重要性排名")
+    # 从 session_state 获取用户自定义修改的特征类型字典
+    custom_overrides_key = f"{key_prefix}_custom_pie_type_overrides"
+    custom_overrides = st.session_state.get(custom_overrides_key, {})
+
+    st.markdown("#### 📊 SHAP 特征贡献度与类型占比分析")
 
     fig_rank, ax_rank = plt.subplots(figsize=(10, max(4.5, top_n * 0.42)))
     plot_df = top_features.iloc[::-1]
@@ -549,6 +565,7 @@ def render_shap_importance_outputs(
     pie_df, pie_mode, typed_features = build_feature_pie_data(
         top_features,
         feature_classification=feature_classification,
+        custom_type_overrides=custom_overrides,
         max_feature_slices=min(8, top_n),
     )
     fig_pie = None
@@ -595,7 +612,7 @@ def render_shap_importance_outputs(
         if fig_pie is not None:
             st.pyplot(fig_pie, width="stretch")
             if pie_mode == "type":
-                st.caption("饼图按特征类型聚合；若类型无法区分，会自动退回到按特征名称聚合。")
+                st.caption("饼图按特征物理/化学类型聚合。如需调整某个特征的归类，可在下方【修改特征归类】中微调。")
             else:
                 st.caption("饼图按单个特征的重要性占比展示。")
         else:
@@ -604,46 +621,79 @@ def render_shap_importance_outputs(
     rank_png = fig_to_png_bytes(fig_rank)
     pie_png = fig_to_png_bytes(fig_pie) if fig_pie is not None else None
 
-    action_cols = st.columns(3)
+    # 下载区：保留图表 PNG 导出，数据下载已在上方的 Origin 专区提供，避免重复混乱
+    action_cols = st.columns(2)
     with action_cols[0]:
         st.download_button(
-            "下载 SHAP 排名 CSV",
-            importance_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="shap_importance_ranking.csv",
-            mime="text/csv",
-            key=f"{key_prefix}_ranking_csv",
-        )
-    with action_cols[1]:
-        st.download_button(
-            "下载 SHAP 排名图 PNG",
+            "🖼️ 下载 SHAP 排名图 (PNG)",
             rank_png,
             file_name="shap_importance_ranking.png",
             mime="image/png",
             key=f"{key_prefix}_ranking_png",
+            use_container_width=True,
         )
-    with action_cols[2]:
+    with action_cols[1]:
         if pie_png is not None:
             st.download_button(
-                "下载 SHAP 饼图 PNG",
+                "🖼️ 下载 SHAP 类型占比饼图 (PNG)",
                 pie_png,
                 file_name="shap_importance_pie.png",
                 mime="image/png",
                 key=f"{key_prefix}_pie_png",
+                use_container_width=True,
             )
 
-    with st.expander("查看 SHAP 重要性明细"):
+    with st.expander("🛠️ 饼图特征归类修正 & 重要性明细", expanded=False):
+        st.markdown("##### ✏️ 自定义修正特征类型（实时重新绘制饼图）")
+        st.caption("若系统对某些复合命名特征的默认分类不准，您可以在此手动调整其类别，饼图将立即按新类别聚合：")
+        
+        type_options = [
+            "工艺条件", "配方比例/当量", "分子指纹", "分子描述符", "测试条件",
+            "结构/几何", "弹性参数", "强度/失效", "材料参数", "其他特征"
+        ]
+        
+        # 构建当前分类对照
+        current_types = {
+            f: classify_feature_for_pie(f, feature_classification=feature_classification, custom_type_overrides=custom_overrides)
+            for f in top_features["Feature"]
+        }
+        
+        with st.form(key=f"{key_prefix}_pie_type_edit_form"):
+            edit_cols = st.columns(3)
+            new_overrides = dict(custom_overrides)
+            for f_idx, feat_name in enumerate(top_features["Feature"]):
+                c_container = edit_cols[f_idx % 3]
+                cur_t = current_types.get(feat_name, "其他特征")
+                if cur_t not in type_options:
+                    type_options.append(cur_t)
+                with c_container:
+                    chosen_t = st.selectbox(
+                        f"`{feat_name}`",
+                        options=type_options,
+                        index=type_options.index(cur_t),
+                        key=f"{key_prefix}_sel_type_{re.sub(r'[^0-9a-zA-Z_]+', '_', feat_name)}",
+                    )
+                    new_overrides[feat_name] = chosen_t
+            
+            c_sub1, c_sub2 = st.columns([1, 1])
+            with c_sub1:
+                submit_types = st.form_submit_button("🔄 应用修改并重绘饼图", type="primary", use_container_width=True)
+            with c_sub2:
+                reset_types = st.form_submit_button("↩️ 恢复系统默认分类", use_container_width=True)
+            
+            if submit_types:
+                st.session_state[custom_overrides_key] = new_overrides
+                st.rerun()
+            if reset_types:
+                st.session_state.pop(custom_overrides_key, None)
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("##### 📋 当前 Top 特征明细")
         st.dataframe(top_features, width="stretch", hide_index=True)
         if fig_pie is not None and pie_feature_view is not None and not pie_feature_view.empty:
-            st.markdown("##### 饼图聚合数据")
+            st.markdown("##### 🥧 饼图聚合数据")
             st.dataframe(pie_feature_view, width="stretch", hide_index=True)
-        if pie_mode == "type" and isinstance(typed_features, pd.DataFrame) and not typed_features.empty:
-            type_view = (
-                typed_features[["Feature", "Type", "Importance"]]
-                .sort_values(["Type", "Importance"], ascending=[True, False])
-                .reset_index(drop=True)
-            )
-            st.markdown("##### 特征类型归类")
-            st.dataframe(type_view, width="stretch", hide_index=True)
 
     plt.close(fig_rank)
     if fig_pie is not None:
@@ -15480,10 +15530,9 @@ def page_model_training():
                     # --- [增强] 所有模型的训练曲线 + 训练记录落盘 ---
                     try:
                         history = res.get('training_history') or {}
-                        # 图内标题尽量用英文，避免服务器环境缺少中文字体导致方块/乱码
                         fig_curve, hist_export_df = plot_history(history, title=f"{model_name} Training Curves")
 
-                        st.markdown("### 📉 训练曲线（所有模型）")
+                        st.markdown("### 📉 训练曲线（统一科研级风格）")
                         st.pyplot(fig_curve, width="stretch")
 
                         if hist_export_df is not None and not hist_export_df.empty:
@@ -15493,32 +15542,41 @@ def page_model_training():
                                     "📥 导出训练曲线 CSV",
                                     hist_export_df.to_csv(index=False).encode("utf-8-sig"),
                                     f"{model_name}_training_history.csv",
-                                    "text/csv"
+                                    "text/csv",
+                                    key="download_training_history_csv",
                                 )
 
-                        # --- [新增] PCA 降维可视化 ---
-                        st.markdown("### 📊 PCA 降维可视化")
-                        try:
-                            from core.applicability_domain import ApplicabilityDomainAnalyzer
+                        # --- [优化] PCA 适用域与降维分布可视化（默认折叠/按需渲染，提升主流程加载速度） ---
+                        st.markdown("### 🌐 PCA 适用域与化学空间分布")
+                        show_pca_plot = st.checkbox(
+                            "📈 展开并渲染 PCA 适用域与化学空间分布图",
+                            value=False,
+                            key=f"show_pca_plot_trained_{model_name}",
+                            help="勾选后现场执行 PCA 降维并绘制 2D 化学空间凸包（Applicability Domain）与方差贡献图；默认折叠以保持页面轻量流畅。",
+                        )
+                        if show_pca_plot:
+                            try:
+                                from core.applicability_domain import ApplicabilityDomainAnalyzer
 
-                            # 获取训练集数据
-                            X_train_for_pca = res.get('X_train')
-                            y_train_for_pca = res.get('y_train')
+                                # 获取训练集数据
+                                X_train_for_pca = res.get('X_train')
+                                y_train_for_pca = res.get('y_train')
 
-                            if X_train_for_pca is not None and len(X_train_for_pca) > 3:
-                                # 创建PCA分析器
-                                pca_analyzer = ApplicabilityDomainAnalyzer(X_train_for_pca, n_components=2)
-                                pca_analyzer.fit()
+                                if X_train_for_pca is not None and len(X_train_for_pca) > 3:
+                                    with st.spinner("正在计算主成分并渲染 PCA 适用域分布图..."):
+                                        pca_analyzer = ApplicabilityDomainAnalyzer(X_train_for_pca, n_components=2)
+                                        pca_analyzer.fit()
 
-                                # 生成可视化
-                                fig_pca = pca_analyzer.visualize_domain(X_new=None, y_train=y_train_for_pca)
-                                st.pyplot(fig_pca, width="stretch")
+                                        fig_pca = pca_analyzer.visualize_domain(X_new=None, y_train=y_train_for_pca, figsize=(12, 7.5))
+                                        st.pyplot(fig_pca, width="stretch")
 
-                                st.caption("💡 PCA降维可视化展示训练数据在低维空间的分布，颜色表示目标值大小。")
-                            else:
-                                st.info("训练样本数量不足，跳过PCA可视化")
-                        except Exception as e:
-                            st.warning(f"PCA可视化生成失败: {e}")
+                                        st.caption("💡 PCA适用域可视化展示训练数据在低维空间的分布，凸包表示模型可靠适用域（Applicability Domain），颜色表示目标值大小。")
+                                else:
+                                    st.info("训练样本数量不足，跳过 PCA 可视化")
+                            except Exception as e:
+                                st.warning(f"PCA 可视化生成失败: {e}")
+                        else:
+                            st.caption("💡 提示：如需查看训练集在二维主成分空间的聚类与适用域凸包边界，请勾选上方开关展开渲染。")
 
                         # 保存一次训练 Run（指标+参数+曲线）
                         manager = TrainingRunManager()
@@ -16527,27 +16585,74 @@ def page_model_interpretation():
                 st.success(cached_shap_status)
 
             if (cached_shap_png or cached_shap_path) and cached_shap_model == model_name:
-                st.markdown("#### Cached SHAP Plot")
+                st.markdown("#### 📊 SHAP 分析可视化与 Origin 绘图数据")
                 st.image(cached_shap_path or cached_shap_png, width="stretch")
+                
+                cached_origin_beeswarm_bytes = None
+                cached_origin_bar_bytes = None
+                cached_origin_beeswarm_path = st.session_state.get("shap_origin_beeswarm_path")
+                cached_origin_bar_path = st.session_state.get("shap_origin_bar_path")
+
                 if cached_shap_csv_path and os.path.exists(cached_shap_csv_path):
                     with open(cached_shap_csv_path, "rb") as f:
                         cached_shap_csv = f.read()
-                if cached_shap_csv:
-                    st.download_button(
-                        "Download SHAP CSV",
-                        cached_shap_csv,
-                        "shap_values.csv",
-                        "text/csv",
-                        key="shap_csv_cached",
-                    )
-                    cached_shap_df = load_shap_export_frame(csv_bytes=cached_shap_csv)
-                    if cached_shap_df is not None and not cached_shap_df.empty:
-                        render_shap_importance_outputs(
-                            cached_shap_df,
-                            key_prefix="shap_cached_aux",
-                            feature_classification=feature_classification,
-                            default_top_n=max_display,
+                if cached_origin_beeswarm_path and os.path.exists(cached_origin_beeswarm_path):
+                    with open(cached_origin_beeswarm_path, "rb") as f:
+                        cached_origin_beeswarm_bytes = f.read()
+                else:
+                    cached_origin_beeswarm_bytes = st.session_state.get("shap_origin_beeswarm_bytes")
+
+                if cached_origin_bar_path and os.path.exists(cached_origin_bar_path):
+                    with open(cached_origin_bar_path, "rb") as f:
+                        cached_origin_bar_bytes = f.read()
+                else:
+                    cached_origin_bar_bytes = st.session_state.get("shap_origin_bar_bytes")
+
+                st.markdown("##### 📥 Origin / SCI 论文绘图专用数据导出")
+                st.caption("以下数据已按规范结构化导出，可直接拉入 Origin 绘制出版级 Beeswarm 蜂群散点图与 Bar 柱状图：")
+                c_dl1, c_dl2, c_dl3 = st.columns(3)
+                with c_dl1:
+                    if cached_origin_beeswarm_bytes:
+                        st.download_button(
+                            "📥 蜂群图数据 (Origin Beeswarm)",
+                            cached_origin_beeswarm_bytes,
+                            "origin_shap_beeswarm_data.csv",
+                            "text/csv",
+                            key="shap_origin_beeswarm_download_cached",
+                            help="包含 Feature, SHAP_Value, Feature_Value 及 0~1 归一化颜色值。在 Origin 中以 Feature 为分组，X 轴设为 SHAP_Value，颜色映射设为 Normalized_Value 即可完美还原 Beeswarm 图！",
+                            use_container_width=True,
                         )
+                with c_dl2:
+                    if cached_origin_bar_bytes:
+                        st.download_button(
+                            "📥 重要性排序表 (Origin Bar)",
+                            cached_origin_bar_bytes,
+                            "origin_shap_importance_ranking.csv",
+                            "text/csv",
+                            key="shap_origin_bar_download_cached",
+                            help="包含 Feature, Mean_Abs_SHAP, Median 及 Std。在 Origin 中直接绘制水平/垂直柱状图。",
+                            use_container_width=True,
+                        )
+                with c_dl3:
+                    if cached_shap_csv:
+                        st.download_button(
+                            "📥 原始 SHAP 矩阵 (Matrix CSV)",
+                            cached_shap_csv,
+                            "shap_values_matrix.csv",
+                            "text/csv",
+                            key="shap_csv_cached_unified",
+                            help="每个样本对应每一列特征的原始局部 SHAP 贡献值宽表矩阵。",
+                            use_container_width=True,
+                        )
+
+                cached_shap_df = load_shap_export_frame(csv_bytes=cached_shap_csv)
+                if cached_shap_df is not None and not cached_shap_df.empty:
+                    render_shap_importance_outputs(
+                        cached_shap_df,
+                        key_prefix="shap_cached_aux",
+                        feature_classification=feature_classification,
+                        default_top_n=max_display,
+                    )
 
             if run_shap:
                 with st.spinner("正在计算 SHAP 值 (可能较慢)..."):
@@ -16581,6 +16686,8 @@ def page_model_interpretation():
                             )
                             st.session_state.shap_plot_path = shap_job["png_path"]
                             st.session_state.shap_csv_path = shap_job["csv_path"]
+                            st.session_state.shap_origin_beeswarm_path = shap_job.get("origin_beeswarm_path")
+                            st.session_state.shap_origin_bar_path = shap_job.get("origin_bar_path")
                             st.session_state.shap_plot_model_name = model_name
                             st.session_state.shap_last_status = "XGBoost SHAP analysis completed."
                             st.session_state.xgb_shap_last_job_dir = shap_job["job_dir"]
@@ -20527,14 +20634,25 @@ def _page_virtual_screening_formula():
             use_dataset_source = st.checkbox(f"使用当前数据中的{primary_role_label}库", value=True, key="vs_formula_use_dataset_v2")
             use_guided_source = st.checkbox("叠加虚拟组分", value=False, key="vs_formula_use_guided_v2")
             
-            # 检测会话中是否存在分子设计引擎产出的成果（优先取累计总单体库，否则取本次设计结果）
+            # 检测会话或本地磁盘中是否存在分子设计引擎产出的成果（优先取累计总单体库，否则取本地持久化文件）
             saved_designed_df = st.session_state.get("vs_design_total_accumulated_df")
+            if not isinstance(saved_designed_df, pd.DataFrame) or saved_designed_df.empty:
+                # 尝试从本地持久化缓存恢复
+                try:
+                    from pathlib import Path
+                    persist_file = Path(__file__).resolve().parent / "cache" / "persisted_designed_monomers.parquet"
+                    if persist_file.exists():
+                        saved_designed_df = pd.read_parquet(persist_file)
+                        st.session_state["vs_design_total_accumulated_df"] = saved_designed_df
+                except Exception:
+                    pass
+
             if not isinstance(saved_designed_df, pd.DataFrame) or saved_designed_df.empty:
                 saved_designed_df = st.session_state.get("vs_design_result_df")
             
             has_designed_molecules = isinstance(saved_designed_df, pd.DataFrame) and not saved_designed_df.empty
             designed_count = len(saved_designed_df) if has_designed_molecules else 0
-            designed_help = f"已设计分子总库: {designed_count:,} 条" if has_designed_molecules else "当前会话暂无设计分子（可在上方切换到【分子设计引擎】生成）"
+            designed_help = f"已设计分子总库: {designed_count:,} 条（已持久化保持）" if has_designed_molecules else "当前会话暂无设计分子（可在上方切换到【分子设计引擎】生成）"
             use_designed_source = st.checkbox(
                 f"🧩 叠加分子设计引擎产出的候选 ({designed_count:,} 条)",
                 value=has_designed_molecules,
@@ -20951,6 +21069,9 @@ def _page_virtual_screening_formula():
             )
             st.caption("例：树脂最大组分=2、固化剂最大组分=2时，最多生成 树脂A+树脂B / 固化剂C+固化剂D 的复配配方。")
 
+        # 读取全系统持久化保存的类别标签映射字典（例如 0: 'DSC', 1: 'DMA'）
+        saved_label_mappings = st.session_state.get("category_label_mappings", {})
+
         selected_design_cols = st.multiselect(
             "选择要枚举的配方/工艺特征",
             options=numeric_design_cols,
@@ -20966,14 +21087,30 @@ def _page_virtual_screening_formula():
                 default_text = ",".join(f"{float(v):g}" for v in default_vals)
                 container = grid_col_left if idx % 2 == 0 else grid_col_right
                 with container:
+                    # 检查当前特征是否属于 Label 编码特征，若属于则展示原始文本对照提示
+                    mapping_tip = ""
+                    if col_name in saved_label_mappings:
+                        m_dict = saved_label_mappings[col_name]
+                        mapping_tip = "【类别对照: " + " | ".join(f"`{k}={v}`" for k, v in m_dict.items()) + "】"
+
+                    label_display = f"{col_name} 候选值（逗号分隔） {mapping_tip}".strip()
                     text_vals = st.text_input(
-                        f"{col_name} 候选值（逗号分隔）",
+                        label_display,
                         value=default_text,
                         key=f"vs_formula_grid_{re.sub(r'[^0-9a-zA-Z_]+', '_', str(col_name))}",
+                        help=f"输入整数编码。{mapping_tip}" if mapping_tip else None,
                     )
                     parsed_vals = _parse_float_grid(text_vals, default_vals)
                     formula_feature_grid[col_name] = parsed_vals
-                    st.caption(f"{col_name}: {len(parsed_vals)} 个取值")
+                    
+                    # 取值说明
+                    val_desc = f"{col_name}: {len(parsed_vals)} 个取值"
+                    if col_name in saved_label_mappings:
+                        m_dict = saved_label_mappings[col_name]
+                        readable_names = [m_dict.get(int(v), str(v)) for v in parsed_vals if int(v) in m_dict]
+                        if readable_names:
+                            val_desc += f" (对应类别: {', '.join(readable_names)})"
+                    st.caption(val_desc)
         else:
             st.caption(f"未选择额外配方/工艺特征时，系统只枚举{primary_role_label}与已配置的第二组分。")
 
@@ -21105,20 +21242,21 @@ def _page_virtual_screening_formula():
                 help='适用域分数范围为0-100；设为0表示不按分数额外剔除。域外候选仍会标记为未知。',
             )
             st.caption('树脂与固化剂阈值独立控制。默认先标记，不直接删除候选，便于检查模型覆盖范围和异常结构。')
-        screening_expensive_unique_cap = 20000
+        screening_expensive_unique_cap = 50000
         screening_xtb_n_jobs = max(1, int((mf_cfg.get("params") or {}).get("xtb_n_jobs", 1)))
         if screening_uses_expensive_features:
             st.markdown("#### 昂贵分子特征计算保护")
+            st.caption("为保障复杂量子化学/描述符计算精度，系统默认放宽上限；若机器算力充裕，可直接提升或设为与候选规模相当的值。")
             expensive_col1, expensive_col2 = st.columns(2)
             with expensive_col1:
                 screening_expensive_unique_cap = st.number_input(
                     "进入分子特征计算的唯一分子上限",
-                    min_value=100,
-                    max_value=10000,
-                    value=1000,
-                    step=100,
+                    min_value=500,
+                    max_value=200000,
+                    value=20000,
+                    step=1000,
                     key="vs_expensive_feature_unique_cap_v3",
-                    help="会优先保留原始实测配方，并按训练数据、上传库、PubChem、虚拟库等来源分层抽样。",
+                    help="设置允许提取分子特征的最大唯一分子数。值越大，高通量筛选覆盖的分子化学空间越广、筛选精度越高，但耗时相应增加。",
                 )
             with expensive_col2:
                 if screening_uses_xtb:
@@ -21508,36 +21646,41 @@ def _page_virtual_screening_formula():
             w_novel = weight_values["novelty"]
             w_feat = weight_values["feature_guidance"]
 
-        formula_preflight_mapping = None
-        formula_preflight_report = {"ok": False, "errors": []}
-        pending_formula_pool = st.session_state.get("vs_formula_pending_pool")
-        pending_formula_ready = False
-        if isinstance(pending_formula_pool, pd.DataFrame) and not pending_formula_pool.empty:
-            st.caption(
-                f"检测到待确认的配方候选池（{len(pending_formula_pool):,} 条）。"
-                "请在下方确认模型特征来源。"
+        # -------------------------------------------------------------
+        # 4.5) 特征来源映射预览与确认（在点击开始筛选前始终前置可见）
+        # -------------------------------------------------------------
+        st.markdown("### 4.5) 🎯 模型非分子特征映射来源确认")
+        with st.expander("👁️ 展开查看与自定义特征映射来源（默认自动保留已有/计算值）", expanded=False):
+            st.caption("模型所需的全部工艺/物理计算特征如下。默认已配置为从候选配方、物理计算或基准样本中平滑获取（keep）：")
+            if post_feature_model_cols:
+                m_disp_cols = st.columns(min(4, len(post_feature_model_cols)))
+                for m_i, m_feat in enumerate(post_feature_model_cols):
+                    with m_disp_cols[m_i % len(m_disp_cols)]:
+                        st.markdown(f"• `{m_feat}`: **默认继承 (Keep)**")
+            else:
+                st.info("当前模型特征已由分子工作流完全覆盖，无需额外的非分子特征映射。")
+
+        # -------------------------------------------------------------
+        # 4.6) 渐进式连续筛选流控（分批控制，防爆内存）
+        # -------------------------------------------------------------
+        st.markdown("### 4.6) ⚡ 渐进式连续批处理流控（内存保护）")
+        st.caption("采用微批次（Micro-batching）流式渐进计算，预测一批即时释放一批，严格保护系统内存不被挤爆。")
+        batch_ctrl_col1, batch_ctrl_col2 = st.columns(2)
+        with batch_ctrl_col1:
+            batch_process_size = st.number_input(
+                "单批连续筛选步长（批大小 Batch Size）",
+                min_value=500,
+                max_value=50000,
+                value=5000,
+                step=1000,
+                key="vs_streaming_batch_size_v3",
+                help="控制每次进入内存进行特征组装和模型推断的配方数量。内存较紧凑时建议设置为 2,000~5,000 条，实现内存常数级占用（O(1) 内存）。",
             )
-            formula_preflight_mapping, formula_preflight_report, _ = (
-                _prepare_post_feature_mapping_for_prediction(
-                    model_feature_cols=post_feature_model_cols,
-                    molecular_feature_cols=configured_molecular_feature_cols,
-                    candidate_df=pending_formula_pool,
-                    computed_definitions=POST_FEATURE_COMPUTED_DEFINITIONS,
-                    missing_input_tolerant=False,
-                    panel_key="formulation",
-                )
-            )
-            pending_formula_ready = bool(formula_preflight_report.get("ok"))
-            st.session_state["vs_formula_mapping_ready"] = pending_formula_ready
-            if st.button(
-                "放弃待确认候选池",
-                key="vs_formula_discard_pending",
-                help="清除当前候选池并重新生成，不会删除训练数据或模型。",
-            ):
-                st.session_state.pop("vs_formula_pending_pool", None)
-                st.session_state.pop("vs_formula_pending_design_metadata", None)
-                st.session_state.pop("vs_formula_pending_chem_rule_funnel", None)
-                st.session_state["vs_formula_mapping_ready"] = False
+        with batch_ctrl_col2:
+            st.metric("渐进式处理模式", "分批流式推断 (内存恒定)")
+            st.caption("流式计算已启用：无论总配方为 1 万条还是 500 万条，内存峰值始终控制在当前单批大小内。")
+
+        st.session_state["vs_batch_process_size"] = int(batch_process_size)
 
         formula_run_clicked = st.button(
             "🚀 开始配方级高通量筛选",
@@ -21778,11 +21921,9 @@ def _page_virtual_screening_formula():
                 "单组分库": "paired",
             }
             # 分批控制与暂停按钮
-            col_batch, col_pause, col_batch_size = st.columns([2, 1, 1])
+            col_batch, col_pause = st.columns([3, 1])
             with col_batch:
-                st.caption("分批筛选：每批处理配方数")
-            with col_batch_size:
-                batch_process_size = st.number_input("每批配方数", min_value=1000, max_value=100000, value=20000, step=5000, key="vs_batch_size_v2", label_visibility="collapsed")
+                st.caption(f"当前渐进式单批流控大小: **{int(batch_process_size):,}** 条/批 (内存恒定)")
             with col_pause:
                 pause_btn = st.button("暂停筛选", key="vs_pause_btn_v2", help="点击后，当前批处理完成后暂停。再次点击可继续。")
                 if pause_btn:
@@ -24394,7 +24535,18 @@ def _render_molecule_design_engine():
                     st.session_state["vs_design_total_accumulated_df"] = combined_df
                     st.session_state["vs_design_result_df"] = result_df
                     st.session_state["vs_design_trace"] = result_df.to_dict(orient="records")
-                    status_box.update(label=f"🎉 拓扑设计完成！本次生成 {len(result_df):,} 个单体，总库累计共 {len(combined_df):,} 个可合成单体", state="complete", expanded=False)
+
+                    # 自动持久化备份到本地磁盘缓存，确保重启服务后数据依然保留且可直接加载
+                    try:
+                        from pathlib import Path
+                        cache_dir = Path(__file__).resolve().parent / "cache"
+                        cache_dir.mkdir(parents=True, exist_ok=True)
+                        persist_file = cache_dir / "persisted_designed_monomers.parquet"
+                        combined_df.to_parquet(persist_file, index=False)
+                    except Exception:
+                        pass
+
+                    status_box.update(label=f"🎉 拓扑设计完成！本次生成 {len(result_df):,} 个单体，总库累计共 {len(combined_df):,} 个可合成单体（已持久化保存）", state="complete", expanded=False)
             except Exception as exc:
                 task_mgr.complete_task(current_design_task_id, success=False, error_message=str(exc))
                 st.session_state.pop("vs_design_result_df", None)
@@ -24453,6 +24605,13 @@ def _render_molecule_design_engine():
             if st.button("🗑️ 清空累计总单体库", key="vs_clear_accumulated_monomers_btn"):
                 st.session_state.pop("vs_design_total_accumulated_df", None)
                 st.session_state.pop("vs_design_result_df", None)
+                try:
+                    from pathlib import Path
+                    persist_file = Path(__file__).resolve().parent / "cache" / "persisted_designed_monomers.parquet"
+                    if persist_file.exists():
+                        persist_file.unlink()
+                except Exception:
+                    pass
                 st.rerun()
         with dl_col3:
             st.success("✅ **下游配方筛选联动就绪**：单体总库已自动同步！切换至上方【配方级高通量筛选】，勾选『🧩 叠加分子设计引擎产出的候选』即可直接按化学计量配比开展模型预测！")

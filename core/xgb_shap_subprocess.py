@@ -58,6 +58,20 @@ def main() -> int:
 
         if df_shap is not None:
             df_shap.to_csv(payload["csv_path"], index=False, encoding="utf-8-sig")
+
+            # 同步导出 Origin 专属的 Beeswarm 蜂群散点长表和 Bar 柱状汇总表
+            job_dir = os.path.dirname(payload["csv_path"])
+            origin_beeswarm_df = getattr(df_shap, "_origin_beeswarm_df", None)
+            if origin_beeswarm_df is not None:
+                origin_beeswarm_path = os.path.join(job_dir, "origin_shap_beeswarm_data.csv")
+                origin_beeswarm_df.to_csv(origin_beeswarm_path, index=False, encoding="utf-8-sig")
+                result["origin_beeswarm_path"] = origin_beeswarm_path
+
+            importance_summary_df = getattr(df_shap, "_importance_summary_df", None)
+            if importance_summary_df is not None:
+                origin_bar_path = os.path.join(job_dir, "origin_shap_importance_ranking.csv")
+                importance_summary_df.to_csv(origin_bar_path, index=False, encoding="utf-8-sig")
+                result["origin_bar_path"] = origin_bar_path
         else:
             result["csv_path"] = None
 

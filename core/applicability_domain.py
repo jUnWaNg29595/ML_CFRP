@@ -69,9 +69,9 @@ class ApplicabilityDomainAnalyzer:
 
         return is_in, distance
 
-    def visualize_domain(self, X_new=None, y_train=None, figsize=(14, 10)):
+    def visualize_domain(self, X_new=None, y_train=None, figsize=(12, 7.5)):
         """
-        可视化适用域（增强版）
+        可视化适用域（统一科研级美化版）
 
         Args:
             X_new: 新样本（已标准化），可选
@@ -81,88 +81,69 @@ class ApplicabilityDomainAnalyzer:
         Returns:
             fig: matplotlib figure对象
         """
+        from .plot_style import apply_global_style, style_axes, TRAIN_COLOR, ACCENT_COLOR, GRID_COLOR
+        apply_global_style()
+
         fig = plt.figure(figsize=figsize)
 
-        # 2D可视化
-        ax1 = plt.subplot(2, 2, 1)
+        # 2D主成分散点与凸包边界
+        ax1 = plt.subplot(1, 2, 1)
+        style_axes(ax1, title="PCA 化学空间与适用域 (PC1 vs PC2)")
 
         # 训练数据散点图
         if y_train is not None:
             scatter = ax1.scatter(self.X_train_pca[:, 0], self.X_train_pca[:, 1],
-                                c=y_train, cmap='viridis', alpha=0.6, s=40,
-                                edgecolors='black', linewidths=0.3)
-            plt.colorbar(scatter, ax=ax1, label='Target Value')
+                                c=y_train, cmap='viridis', alpha=0.75, s=45,
+                                edgecolors='white', linewidths=0.6, zorder=3)
+            cbar = plt.colorbar(scatter, ax=ax1, fraction=0.046, pad=0.04)
+            cbar.set_label('Target Value', fontsize=10)
         else:
             ax1.scatter(self.X_train_pca[:, 0], self.X_train_pca[:, 1],
-                       c='steelblue', alpha=0.5, s=40, label='训练数据',
-                       edgecolors='black', linewidths=0.3)
+                       c=TRAIN_COLOR, alpha=0.7, s=45, label='训练样本',
+                       edgecolors='white', linewidths=0.6, zorder=3)
 
         # 绘制凸包边界
         if self.has_hull:
             for simplex in self.hull.simplices:
                 ax1.plot(self.X_train_pca[simplex, 0], self.X_train_pca[simplex, 1],
-                        'k-', linewidth=1.5, alpha=0.7)
+                        color="#DC2626", linestyle="--", linewidth=1.6, alpha=0.85, zorder=4, label="适用域边界" if simplex[0] == self.hull.simplices[0][0] else None)
 
         # 新样本
         if X_new is not None:
             X_new_pca = self.pca.transform(X_new)
             is_in = self._is_in_hull(X_new_pca[0])
-            color = 'green' if is_in else 'red'
+            color = '#059669' if is_in else '#DC2626'
             ax1.scatter(X_new_pca[:, 0], X_new_pca[:, 1],
-                       c=color, s=300, marker='*', label='新样本',
-                       edgecolors='black', linewidth=2, zorder=5)
+                       c=color, s=240, marker='*', label='新样本',
+                       edgecolors='white', linewidth=1.5, zorder=6)
 
             status = "在适用域内 ✓" if is_in else "超出适用域 ✗"
             ax1.annotate(status, xy=(X_new_pca[0, 0], X_new_pca[0, 1]),
-                        xytext=(15, 15), textcoords='offset points',
-                        fontsize=11, color=color, fontweight='bold',
-                        bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8))
+                        xytext=(12, 12), textcoords='offset points',
+                        fontsize=10, color=color, fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.4', facecolor='white', edgecolor=color, alpha=0.9))
 
-        ax1.set_xlabel(f"PC1 ({self.pca.explained_variance_ratio_[0]:.1%})", fontsize=11)
-        ax1.set_ylabel(f"PC2 ({self.pca.explained_variance_ratio_[1]:.1%})", fontsize=11)
-        ax1.set_title("PCA 适用域分析", fontsize=12, fontweight='bold')
-        ax1.legend(loc='best')
-        ax1.grid(True, linestyle='--', alpha=0.4)
+        pc1_ratio = self.pca.explained_variance_ratio_[0] if len(self.pca.explained_variance_ratio_) > 0 else 0
+        pc2_ratio = self.pca.explained_variance_ratio_[1] if len(self.pca.explained_variance_ratio_) > 1 else 0
+        ax1.set_xlabel(f"PC1 ({pc1_ratio:.1%})", fontsize=11, fontweight="bold")
+        ax1.set_ylabel(f"PC2 ({pc2_ratio:.1%})", fontsize=11, fontweight="bold")
+        ax1.legend(loc='best', frameon=True, fontsize=9)
 
-        # 解释方差图
-        ax2 = plt.subplot(2, 2, 2)
+        # 右侧：主成分方差贡献柱状图
+        ax2 = plt.subplot(1, 2, 2)
+        style_axes(ax2, title="主成分解释方差贡献")
         explained_var = self.pca.explained_variance_ratio_
-        ax2.bar(range(1, len(explained_var) + 1), explained_var,
-               alpha=0.7, color='steelblue', edgecolor='black')
-        ax2.set_xlabel('主成分', fontsize=11)
-        ax2.set_ylabel('解释方差比例', fontsize=11)
-        ax2.set_title('主成分解释方差', fontsize=12, fontweight='bold')
-        ax2.grid(axis='y', alpha=0.3)
+        bars = ax2.bar(range(1, len(explained_var) + 1), explained_var,
+               alpha=0.85, color=ACCENT_COLOR, edgecolor="white", width=0.55, zorder=3)
+        ax2.set_xlabel('主成分 (Principal Component)', fontsize=11, fontweight="bold")
+        ax2.set_ylabel('解释方差比例 (Ratio)', fontsize=11, fontweight="bold")
+        ax2.set_xticks(range(1, len(explained_var) + 1))
+        ax2.set_xticklabels([f"PC{i}" for i in range(1, len(explained_var) + 1)])
 
-        for i in range(len(explained_var)):
-            ax2.text(i+1, explained_var[i], f'{explained_var[i]:.1%}',
-                    ha='center', va='bottom', fontsize=9)
-
-        # 密度分布图（PC1）
-        ax3 = plt.subplot(2, 2, 3)
-        ax3.hist(self.X_train_pca[:, 0], bins=30, alpha=0.7,
-                color='steelblue', edgecolor='black', density=True)
-        if X_new is not None:
-            ax3.axvline(X_new_pca[0, 0], color=color, linestyle='--',
-                       linewidth=2, label='新样本')
-        ax3.set_xlabel('PC1 值', fontsize=11)
-        ax3.set_ylabel('密度', fontsize=11)
-        ax3.set_title('PC1 分布', fontsize=12, fontweight='bold')
-        ax3.legend()
-        ax3.grid(axis='y', alpha=0.3)
-
-        # 密度分布图（PC2）
-        ax4 = plt.subplot(2, 2, 4)
-        ax4.hist(self.X_train_pca[:, 1], bins=30, alpha=0.7,
-                color='steelblue', edgecolor='black', density=True)
-        if X_new is not None:
-            ax4.axvline(X_new_pca[0, 1], color=color, linestyle='--',
-                       linewidth=2, label='新样本')
-        ax4.set_xlabel('PC2 值', fontsize=11)
-        ax4.set_ylabel('密度', fontsize=11)
-        ax4.set_title('PC2 分布', fontsize=12, fontweight='bold')
-        ax4.legend()
-        ax4.grid(axis='y', alpha=0.3)
+        for i, b in enumerate(bars):
+            val = explained_var[i]
+            ax2.text(b.get_x() + b.get_width() / 2, val + 0.015, f'{val:.1%}',
+                    ha='center', va='bottom', fontsize=9, fontweight="bold")
 
         plt.tight_layout()
         return fig
