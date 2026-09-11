@@ -655,7 +655,22 @@ def bigsmiles_to_smiles(bigsmiles_str: str) -> Optional[str]:
         try:
             # Common pattern: from bigsmiles import BigSMILES
             from bigsmiles import BigSMILES  # type: ignore
-            bs = BigSMILES(s)
+            # 第三方 bigsmiles 库把解析告警直接打到 root logger
+            # （"Incomplete valence detected" / "Too many bonds trying to be made"），
+            # 失败后本函数有采样兑底，属于非致命噪音，这里临时静音。
+            import logging as _logging
+            _root = _logging.getLogger()
+            _saved_level = _root.level
+            _saved_handlers_level = [(h, h.level) for h in _root.handlers]
+            try:
+                _root.setLevel(_logging.CRITICAL)
+                for h in _root.handlers:
+                    h.setLevel(_logging.CRITICAL)
+                bs = BigSMILES(s)
+            finally:
+                _root.setLevel(_saved_level)
+                for h, lvl in _saved_handlers_level:
+                    h.setLevel(lvl)
             # Try common export hooks
             for attr in ("to_smiles", "smiles", "canonical_smiles"):
                 if hasattr(bs, attr):

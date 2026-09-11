@@ -10,6 +10,7 @@
 
 import os
 import signal
+import atexit
 import threading
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, Future
@@ -26,6 +27,38 @@ import secrets
 # =============================================================================
 # 任务状态枚举
 # =============================================================================
+def _exit_cleanup_parallel_workers():
+    """解释器退出时的最后防线：强制终止残留的并行 worker。
+
+    joblib/loky、multiprocessing 池以及各种 Executor 在 Windows 上退出时
+    可能因非守护线程 join 不掉而卡住 Streamlit 的 "Stopping..."
+    （表现为 Ctrl+C 无法退出）。这里全部不等待、强杀。
+    """
+    try:
+        from joblib.externals import loky
+        try:
+            loky.get_reusable_executor().shutdown(wait=False, kill_workers=True)
+        except Exception:
+            pass
+    except ImportError:
+        pass
+    # 终止本进程直接持有的活跃子进程
+    try:
+        for child in mp.active_children():
+            try:
+                child.terminate()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+try:
+    atexit.register(_exit_cleanup_parallel_workers)
+except Exception:
+    pass
+
+
 class TaskStatus(Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -940,10 +973,35 @@ def emergency_stop() -> Dict[str, Any]:
 # =============================================================================
 # 可取消的执行器包装器
 # =============================================================================
+def safe_worker_count(n, cap_nt: int = 31) -> int:
+    """返回 Windows 安全的工作进程数。
+
+    Windows 的 WaitForMultipleObjects 最多等待 63 个句柄；worker 超过 ~62
+    时 multiprocessing/loky 的等待逻辑会抛
+    "ValueError: need at most 63 handles" 并使整个进程池崩溃。
+    非 Windows 平台不做钳制。
+    """
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 1
+    n = max(1, n)
+    if os.name == "nt":
+        n = min(n, int(cap_nt))
+    return n
+
+
 class CancellableProcessPoolExecutor(ProcessPoolExecutor):
     """支持取消功能的 ProcessPoolExecutor 包装器"""
-    
+
+    # Windows WaitForMultipleObjects 硬限制 63 个句柄；每个 worker 至少占用
+    # 1 个句柄，64+ worker 会在 connection._exhaustive_wait 处抛
+    # "need at most 63 handles" 并崩溃。钳制到 31 保底安全。
+    _MAX_WORKERS_NT = 31
+
     def __init__(self, *args, task_name: str = "并行任务", **kwargs):
+        if os.name == "nt" and "max_workers" in kwargs and kwargs["max_workers"] is not None:
+            kwargs["max_workers"] = max(1, min(int(kwargs["max_workers"]), self._MAX_WORKERS_NT))
         super().__init__(*args, **kwargs)
         self._task_manager = get_task_manager()
         self._task_id = self._task_manager.register_task(

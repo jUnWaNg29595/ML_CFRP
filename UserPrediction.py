@@ -205,12 +205,48 @@ def toggle_model_enabled(
     )
 
 
+def _ai_parse_input(
+    material_key: str, target_key: str, user_text: str,
+    contract: Dict[str, Any] | None, registry_snapshot: Dict[str, Any] | None, service: Dict[str, Any],
+) -> Dict[str, Any]:
+    """调用 AI 输入助手解析用户文本，返回统一的确认状态（供首页全自动流程与手动解析按钮复用）。"""
+    contract = contract if isinstance(contract, dict) else {}
+    registry_snapshot = registry_snapshot if isinstance(registry_snapshot, dict) else {}
+    field_defs = build_manual_input_fields(contract, registry_snapshot) + build_workflow_source_fields(contract, registry_snapshot)
+    response = PortalAIClient(_ai_service_dataclass(service)).parse_input({
+        'material_type': material_key, 'target': target_key,
+        'field_descriptions': [
+            {'name': item.get('name'), 'label': item.get('label'), 'kind': item.get('kind'), 'required': item.get('required', False), 'allow_ai_generation': False}
+            for item in field_defs
+        ], 'user_text': user_text,
+    })
+    return build_ai_confirmation_state(response)
+
+
+def _sync_ai_state_to_manual(material_key: str, target_key: str, state: Dict[str, Any]) -> None:
+    """把 AI 已确认的字段同步写入手动输入各分区的 widget session_state。"""
+    for field_name, detail in state.get('fields', {}).items():
+        if field_name not in set(state.get('rejected_fields') or set()) and detail.get('value') not in (None, ''):
+            val_str = str(detail.get('value'))
+            for prefix in ("manual", f"manual_{material_key}_{target_key}_molecular", f"manual_{material_key}_{target_key}_required_manual", f"manual_{material_key}_{target_key}_optional_manual"):
+                st.session_state[f"{prefix}_{field_name}"] = val_str
+                st.session_state[f"{prefix}_{field_name}_number"] = default_number(val_str, 0.0)
+                st.session_state[f"{prefix}_{field_name}_integer"] = default_integer(val_str, 0)
+                st.session_state[f"{prefix}_{field_name}_text"] = val_str
+
+
 def render_ai_assistant_tab(
     config: Dict[str, Any], material_key: str, target_key: str, target_cfg: Dict[str, Any],
     contract: Dict[str, Any] | None = None, registry_snapshot: Dict[str, Any] | None = None,
 ) -> None:
     st.markdown('### AI 辅助输入')
-    st.caption('AI 只提取和整理你提供的信息；每个字段必须确认、修改后确认或明确拒绝，不能自动生成 EEW、AHEW、PHR、分子特征或工艺参数。')
+    text_key = f'ai_text_{material_key}_{target_key}'
+    state_key = f'ai_state_{material_key}_{target_key}'
+    # 首页「全自动」入口：带着用户粘贴的描述文本跳转过来，这里自动完成 解析→确认→回填→切换到手动输入。
+    home_auto_text = st.session_state.pop('ai_home_pending_text', None)
+    if home_auto_text:
+        st.session_state[text_key] = home_auto_text
+    st.caption('AI 只提取和整理你提供的信息；不能自动生成 EEW、AHEW、PHR、分子特征或工艺参数。首页「全自动解析」会把提取结果直接填入手动输入表单，仍需人工勾选确认后才会计算。')
     try:
         ai_config = load_ai_config(PROJECT_ROOT)
     except Exception as exc:
@@ -218,28 +254,36 @@ def render_ai_assistant_tab(
         return
     services = [item for item in ai_config.get('services', []) if item.get('enabled') and item.get('purpose') in {'both', 'input_parsing'}]
     if not services:
-        st.info('暂无已启用的输入助手服务；请在主平台侧边栏配置，或继续使用手动/批量输入。')
+        if home_auto_text:
+            st.warning('尚未启用 AI 输入助手服务：你粘贴的描述已保留在下方，可在侧边栏配置 AI 后重新解析，或直接使用手动/批量输入。')
+        else:
+            st.info('暂无已启用的输入助手服务；请在主平台侧边栏配置，或继续使用手动/批量输入。')
         return
     service = st.selectbox('AI 服务', services, format_func=lambda item: item.get('label') or item.get('service_id'), key=f'ai_service_{material_key}_{target_key}')
-    text_key = f'ai_text_{material_key}_{target_key}'
     user_text = st.text_area('描述材料、配方和工艺信息', key=text_key, height=150, placeholder='例如：树脂 SMILES 为 CCO；固化温度 80 °C。')
-    state_key = f'ai_state_{material_key}_{target_key}'
+    if home_auto_text:
+        with st.spinner('AI 正在全自动解析你粘贴的描述…'):
+            try:
+                state = _ai_parse_input(material_key, target_key, home_auto_text, contract, registry_snapshot, service)
+            except PortalAIError as exc:
+                st.warning(f'AI 自动解析失败：{exc}；文本已保留，可修改后点击「解析输入」重试，或改用手动输入。')
+                return
+            # 全自动：把提取到的全部字段标记为已确认，再同步回填手动表单。
+            for field_name in list(state.get('fields', {}).keys()):
+                detail = state['fields'][field_name]
+                if detail.get('value') not in (None, ''):
+                    state = confirm_ai_field(state, field_name, detail.get('value'))
+            st.session_state[state_key] = state
+            _sync_ai_state_to_manual(material_key, target_key, state)
+        st.session_state['ai_home_flash'] = '🤖 AI 已自动解析并填入手动输入表单；请核对参数、勾选确认框后即可预测。'
+        st.session_state['predict_tab_intent'] = 'manual'
+        st.rerun()
     if st.button('解析输入', key=f'ai_parse_{material_key}_{target_key}', type='secondary'):
         if not user_text.strip():
             st.warning('请先输入待解析的文本。')
         else:
             try:
-                contract = contract if isinstance(contract, dict) else {}
-                registry_snapshot = registry_snapshot if isinstance(registry_snapshot, dict) else {}
-                field_defs = build_manual_input_fields(contract, registry_snapshot) + build_workflow_source_fields(contract, registry_snapshot)
-                response = PortalAIClient(_ai_service_dataclass(service)).parse_input({
-                    'material_type': material_key, 'target': target_key,
-                    'field_descriptions': [
-                        {'name': item.get('name'), 'label': item.get('label'), 'kind': item.get('kind'), 'required': item.get('required', False), 'allow_ai_generation': False}
-                        for item in field_defs
-                    ], 'user_text': user_text,
-                })
-                st.session_state[state_key] = build_ai_confirmation_state(response)
+                st.session_state[state_key] = _ai_parse_input(material_key, target_key, user_text, contract, registry_snapshot, service)
                 st.success('解析完成，请逐项确认或拒绝。')
             except PortalAIError as exc:
                 st.warning(f'AI 不可用：{exc}；已保留手动输入模式。')
@@ -278,15 +322,7 @@ def render_ai_assistant_tab(
                     st.warning('没有被确认的有效输入，无法创建任务。')
         with c_sub2:
             if st.button('📋 一键采纳并同步填入单组手动输入表单', key=f'ai_sync_to_manual_{material_key}_{target_key}', width="stretch", help="将 AI 确认后的参数一键同步回填到手动输入表单中，方便继续微调与结构图复核"):
-                for field_name, detail in state.get('fields', {}).items():
-                    if field_name not in set(state.get('rejected_fields') or set()) and detail.get('value') not in (None, ''):
-                        val_str = str(detail.get('value'))
-                        # 同步到各分区的 session_state 键
-                        for prefix in ("manual", f"manual_{material_key}_{target_key}_molecular", f"manual_{material_key}_{target_key}_required_manual", f"manual_{material_key}_{target_key}_optional_manual"):
-                            st.session_state[f"{prefix}_{field_name}"] = val_str
-                            st.session_state[f"{prefix}_{field_name}_number"] = default_number(val_str, 0.0)
-                            st.session_state[f"{prefix}_{field_name}_integer"] = default_integer(val_str, 0)
-                            st.session_state[f"{prefix}_{field_name}_text"] = val_str
+                _sync_ai_state_to_manual(material_key, target_key, state)
                 st.success("🎉 已成功将 AI 提取的参数同步填入手动输入表单！请在上方切换到【手动输入】标签页查看与预测。")
                 st.rerun()
     render_portal_task_panel(st.session_state.get(f'portal_task_ai_{material_key}_{target_key}'), session_key=f'ai_{material_key}_{target_key}')
@@ -1149,6 +1185,107 @@ PORTAL_PRESET_HARDENERS = {
     "9,9-双(4-氨基苯基)芴 (FDA / 芴二胺)": "Nc1ccc(C2(c3ccccc3-c3ccccc32)c2ccc(N)cc2)cc1",
 }
 
+# 课题组经典常用配方库：树脂 + 固化剂 + 配比 + 固化制度（一键整体载入）
+# phr 为按当量化学计量的参考值；temp/time 为代表性等效单阶段固化制度，可按文献/实验调整。
+PORTAL_PRESET_RECIPES = [
+    {
+        "name": "E-51 / DDM 通用结构",
+        "tags": ["通用结构", "中温固化"],
+        "resin_key": "双酚A二缩水甘油醚 (E-51 / DGEBA)",
+        "resin_short": "E-51 / DGEBA",
+        "hardener_key": "4,4'-二氨基二苯甲烷 (DDM)",
+        "hardener_short": "DDM",
+        "phr": 26.0,
+        "temp": 120.0,
+        "time": 3.0,
+        "note": "标准双酚A环氧结构配方；典型制度 80 °C/2 h + 120 °C/2 h 阶段固化，此处取代表性等效单阶段。",
+    },
+    {
+        "name": "E-51 / DDS 耐高温",
+        "tags": ["耐高温", "高Tg"],
+        "resin_key": "双酚A二缩水甘油醚 (E-51 / DGEBA)",
+        "resin_short": "E-51 / DGEBA",
+        "hardener_key": "4,4'-二氨基二苯砜 (4,4'-DDS / 标杆耐高温)",
+        "hardener_short": "4,4'-DDS",
+        "phr": 33.0,
+        "temp": 160.0,
+        "time": 4.0,
+        "note": "DDS 砜基高刚性交联网络；典型制度 130 °C/2 h + 180 °C/2 h，取等效 160 °C/4 h。",
+    },
+    {
+        "name": "AG-80 / DDS 航空承力",
+        "tags": ["航空航天", "碳纤维基体"],
+        "resin_key": "四缩水甘油基二氨基二苯甲烷 (AG-80 / TGDDM / 航空承力)",
+        "resin_short": "AG-80 / TGDDM",
+        "hardener_key": "4,4'-二氨基二苯砜 (4,4'-DDS / 标杆耐高温)",
+        "hardener_short": "4,4'-DDS",
+        "phr": 50.0,
+        "temp": 170.0,
+        "time": 4.0,
+        "note": "经典航空预浸料基体体系（5208 类）；典型制度 130 °C/1 h + 180 °C/2 h，取等效 170 °C/4 h。",
+    },
+    {
+        "name": "E-51 / MTHPA 电绝缘",
+        "tags": ["电绝缘", "酸酐固化"],
+        "resin_key": "双酚A二缩水甘油醚 (E-51 / DGEBA)",
+        "resin_short": "E-51 / DGEBA",
+        "hardener_key": "甲基四氢苯酐 (MTHPA / 电绝缘)",
+        "hardener_short": "MTHPA",
+        "phr": 85.0,
+        "temp": 130.0,
+        "time": 4.0,
+        "note": "酸酐体系常配合叔胺促进剂（如 DMP-30）；典型制度 80 °C/2 h + 140 °C/4 h，取等效 130 °C/4 h。",
+    },
+    {
+        "name": "DGEBF / IPDA 高韧常温",
+        "tags": ["高韧性", "低温固化"],
+        "resin_key": "双酚F环氧树脂 (DGEBF)",
+        "resin_short": "DGEBF",
+        "hardener_key": "异佛尔酮二胺 (IPDA / 脂环高韧)",
+        "hardener_short": "IPDA",
+        "phr": 25.0,
+        "temp": 80.0,
+        "time": 4.0,
+        "note": "脂环胺体系低粘度高韧性；典型制度 室温/24 h + 80 °C/2 h 后固化，取等效 80 °C/4 h。",
+    },
+    {
+        "name": "E-51 / m-PDA 中温经典",
+        "tags": ["中温固化", "经典文献"],
+        "resin_key": "双酚A二缩水甘油醚 (E-51 / DGEBA)",
+        "resin_short": "E-51 / DGEBA",
+        "hardener_key": "间苯二胺 (m-PDA)",
+        "hardener_short": "m-PDA",
+        "phr": 14.0,
+        "temp": 100.0,
+        "time": 3.0,
+        "note": "间苯二胺经典中温体系；典型制度 80 °C/2 h + 150 °C/2 h，取等效 100 °C/3 h。",
+    },
+    {
+        "name": "BPAF-EP / DDS 低介电",
+        "tags": ["低介电", "电子封装"],
+        "resin_key": "六氟双酚A二缩水甘油醚 (BPAF-EP / 低介电)",
+        "resin_short": "BPAF-EP",
+        "hardener_key": "4,4'-二氨基二苯砜 (4,4'-DDS / 标杆耐高温)",
+        "hardener_short": "4,4'-DDS",
+        "phr": 28.0,
+        "temp": 160.0,
+        "time": 4.0,
+        "note": "含氟体系低吸湿低介电；典型制度 130 °C/2 h + 180 °C/2 h，取等效 160 °C/4 h。",
+    },
+    {
+        "name": "EPN / DDM 高交联耐热",
+        "tags": ["高交联", "耐热"],
+        "resin_key": "酚醛环氧树脂 (EPN)",
+        "resin_short": "EPN (酚醛环氧)",
+        "hardener_key": "4,4'-二氨基二苯甲烷 (DDM)",
+        "hardener_short": "DDM",
+        "phr": 28.0,
+        "temp": 150.0,
+        "time": 4.0,
+        "note": "酚醛环氧多官能高交联密度；典型制度 100 °C/2 h + 150 °C/3 h，取等效 150 °C/4 h。",
+    },
+]
+
 
 @st.cache_data(show_spinner=False, max_entries=256)
 def _render_2d_molecule_png_b64(smiles: str, width: int = 360, height: int = 180) -> Tuple[bool, str, str]:
@@ -1173,6 +1310,103 @@ def _render_2d_molecule_png_b64(smiles: str, width: int = 360, height: int = 180
         return True, b64_str, formula
     except Exception as e:
         return False, f"化学解析异常: {e}", ""
+
+
+def init_smiles_field_state(state_key: str, default: str = "") -> None:
+    """确保 SMILES 输入字段在 session_state 中有初始值。"""
+    if state_key not in st.session_state:
+        st.session_state[state_key] = str(default or "")
+
+
+def _recipe_value_for_field(field: Dict[str, Any], recipe: Dict[str, Any]) -> Any:
+    """将配方值按字段名/标签模糊匹配到对应输入项；无匹配返回 None。"""
+    name = str(field.get("name") or "").lower()
+    label = str(field.get("label") or "")
+    if "resin" in name or "树脂" in label:
+        return recipe.get("resin_smiles")
+    if "hardener" in name or "curing_agent" in name or "固化剂" in label:
+        return recipe.get("hardener_smiles")
+    if "phr" in name or "份数" in label:
+        return recipe.get("phr")
+    if "temp" in name or "温度" in label:
+        return recipe.get("temp")
+    if "time" in name or "时间" in label:
+        return recipe.get("time")
+    return None
+
+
+def _recipe_display_value(value: Any) -> str:
+    """配方数值转展示/预填字符串：整数浮点去掉多余小数位。"""
+    try:
+        number = float(value)
+        return str(int(number)) if number.is_integer() else str(number)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def recipe_card_html(recipe: Dict[str, Any]) -> str:
+    """渲染单张常用配方卡片（纯展示，应用按钮由调用方补充）。"""
+    tags = "".join(
+        f'<span class="portal-recipe-tag">{html_escape(str(tag))}</span>'
+        for tag in (recipe.get("tags") or [])
+    )
+    note = html_escape(str(recipe.get("note") or ""))
+    temp = _recipe_display_value(recipe.get("temp"))
+    time_text = _recipe_display_value(recipe.get("time"))
+    phr = _recipe_display_value(recipe.get("phr"))
+    return f"""
+    <article class="portal-recipe-card" title="{note}">
+        <div class="portal-recipe-head">
+            <span class="portal-recipe-name">{html_escape(str(recipe.get('name') or ''))}</span>
+            <span class="portal-recipe-cure-chip">{temp} °C / {time_text} h</span>
+        </div>
+        <div class="portal-recipe-tags">{tags}</div>
+        <div class="portal-recipe-line"><span class="portal-recipe-key">树脂</span><span>{html_escape(str(recipe.get('resin_short') or ''))}</span></div>
+        <div class="portal-recipe-line"><span class="portal-recipe-key">固化剂</span><span>{html_escape(str(recipe.get('hardener_short') or ''))}</span></div>
+        <div class="portal-recipe-line"><span class="portal-recipe-key">配比</span><span>100 : {phr} phr</span></div>
+    </article>
+    """
+
+
+def render_recipe_library(material_key: str, target_key: str) -> Dict[str, Any] | None:
+    """渲染『常用配方快速载入』面板。
+
+    返回需要预填的配方 dict（仅在应用后的下一个渲染周期生效一次），否则 None。
+    """
+    pending_key = f"pending_recipe_{material_key}_{target_key}"
+    flash_key = f"recipe_flash_{material_key}_{target_key}"
+
+    active_recipe: Dict[str, Any] | None = None
+    pending = st.session_state.pop(pending_key, None)
+    if isinstance(pending, dict):
+        active_recipe = {
+            "resin_smiles": PORTAL_PRESET_RESINS.get(str(pending.get("resin_key") or ""), ""),
+            "hardener_smiles": PORTAL_PRESET_HARDENERS.get(str(pending.get("hardener_key") or ""), ""),
+            "phr": pending.get("phr"),
+            "temp": pending.get("temp"),
+            "time": pending.get("time"),
+        }
+
+    flash_name = st.session_state.pop(flash_key, "")
+    if flash_name:
+        st.success(f"已载入配方「{html_escape(str(flash_name))}」，结构与工艺参数已填入下方表单，可继续逐项微调后提交预测。")
+
+    st.markdown("#### ⚗️ 常用配方快速载入")
+    st.caption("课题组经典环氧配方库：一键整体填入树脂/固化剂结构、配比与固化制度；应用后仍可逐项微调。")
+    recipe_cols = st.columns(2)
+    for index, recipe in enumerate(PORTAL_PRESET_RECIPES):
+        with recipe_cols[index % 2]:
+            st.markdown(recipe_card_html(recipe), unsafe_allow_html=True)
+            if st.button(
+                "⚡ 载入此配方",
+                key=f"apply_recipe_{material_key}_{target_key}_{index}",
+                width="stretch",
+            ):
+                st.session_state[pending_key] = recipe
+                st.session_state[flash_key] = str(recipe.get("name") or "配方")
+                st.rerun()
+    st.caption("注：配比为按当量化学计量的参考值，固化制度为代表性等效单阶段；请结合文献与实验方案确认后使用。")
+    return active_recipe
 
 
 def render_jsme_editor(field_key: str, current_smiles: str = "") -> None:
@@ -1228,12 +1462,16 @@ def render_jsme_editor(field_key: str, current_smiles: str = "") -> None:
     st.components.v1.html(jsme_html, height=330, scrolling=False)
 
 
-def render_smiles_field(field: Dict[str, Any], scope_key: str) -> str:
+def render_smiles_field(field: Dict[str, Any], scope_key: str, recipe: Dict[str, Any] | None = None) -> str:
     """多模态分子结构输入复合组件：包含经典预设、手动粘贴、截图识别、2D在线画板与即时拓扑图看板。"""
     label = field.get("label") or field["name"]
     name_low = str(field.get("name") or "").lower()
     state_key = f"{scope_key}_{field['name']}"
     init_smiles_field_state(state_key, field.get("default", ""))
+    if recipe is not None:
+        recipe_value = _recipe_value_for_field(field, recipe)
+        if recipe_value is not None and str(recipe_value).strip():
+            st.session_state[state_key] = str(recipe_value).strip()
 
     is_hardener = any(token in name_low for token in ("hardener", "curing", "固化", "交联", "amine"))
     preset_dict = PORTAL_PRESET_HARDENERS if is_hardener else PORTAL_PRESET_RESINS
@@ -1366,7 +1604,7 @@ def default_integer(value: Any, fallback: int = 0) -> int:
         return fallback
 
 
-def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str) -> Tuple[pd.DataFrame, List[str]]:
+def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str, recipe: Dict[str, Any] | None = None) -> Tuple[pd.DataFrame, List[str]]:
     if not parameters:
         st.info("当前性能项还没有配置输入参数。请先在管理页面设置参数。")
         return pd.DataFrame([{}]), ["未配置参数"]
@@ -1382,7 +1620,7 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str) ->
     for field in smiles_fields:
         label = field.get("label") or field["name"]
         required = bool(field.get("required", False))
-        val = render_smiles_field(field, scope_key)
+        val = render_smiles_field(field, scope_key, recipe=recipe)
         if required and not str(val).strip():
             errors.append(f"【{label}】不能为空，请在上方输入合法分子结构。")
         values[field["name"]] = val
@@ -1412,23 +1650,43 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str) ->
 
             display_label = f"{label}{unit_suffix}" if not label.endswith(")") else label
 
+            recipe_value = _recipe_value_for_field(field, recipe) if recipe is not None else None
+
             with columns[index % 2]:
                 if kind == "number":
-                    value = st.number_input(
-                        display_label,
-                        key=f"{key_base}_number",
-                        value=None if field.get("default") is None else default_number(field.get("default"), 0.0),
-                        help=field.get("help") or None,
-                        format="%.4f",
-                    )
+                    if recipe_value is not None:
+                        st.session_state[f"{key_base}_number"] = default_number(recipe_value, 0.0)
+                        value = st.number_input(
+                            display_label,
+                            key=f"{key_base}_number",
+                            help=field.get("help") or None,
+                            format="%.4f",
+                        )
+                    else:
+                        value = st.number_input(
+                            display_label,
+                            key=f"{key_base}_number",
+                            value=None if field.get("default") is None else default_number(field.get("default"), 0.0),
+                            help=field.get("help") or None,
+                            format="%.4f",
+                        )
                 elif kind == "integer":
-                    value = st.number_input(
-                        display_label,
-                        key=f"{key_base}_integer",
-                        value=None if field.get("default") is None else default_integer(field.get("default"), 0),
-                        help=field.get("help") or None,
-                        step=1,
-                    )
+                    if recipe_value is not None:
+                        st.session_state[f"{key_base}_integer"] = default_integer(recipe_value, 0)
+                        value = st.number_input(
+                            display_label,
+                            key=f"{key_base}_integer",
+                            help=field.get("help") or None,
+                            step=1,
+                        )
+                    else:
+                        value = st.number_input(
+                            display_label,
+                            key=f"{key_base}_integer",
+                            value=None if field.get("default") is None else default_integer(field.get("default"), 0),
+                            help=field.get("help") or None,
+                            step=1,
+                        )
                     value = None if value is None else int(value)
                 elif kind == "select":
                     options = parse_options(field.get("options"))
@@ -1443,6 +1701,14 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str) ->
                         options=options,
                         index=default_index,
                         key=f"{key_base}_select",
+                        help=field.get("help") or None,
+                    )
+                elif recipe_value is not None:
+                    st.session_state[f"{key_base}_text"] = _recipe_display_value(recipe_value)
+                    value = st.text_input(
+                        display_label,
+                        key=f"{key_base}_text",
+                        placeholder=field.get("placeholder") or "",
                         help=field.get("help") or None,
                     )
                 else:
@@ -1464,6 +1730,7 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str) ->
 def reset_user_selection() -> None:
     st.session_state["predict_selected_material"] = ""
     st.session_state["predict_selected_target"] = ""
+    st.session_state.pop("predict_tab_intent", None)
 
 
 def render_user_home(config: Dict[str, Any]) -> None:
@@ -1500,18 +1767,41 @@ def render_user_home(config: Dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
-    action_col, status_col = st.columns([1.1, 2.4])
-    with action_col:
-        if st.button("打开 AI 输入助手", key="home_open_ai", type="primary", width="stretch"):
-            if enabled_materials:
+    st.markdown("<div class=\"portal-section-heading\"><span>AI</span> 一句话智能输入</div>", unsafe_allow_html=True)
+    home_ai_text = st.text_area(
+        "描述材料、配方和工艺",
+        key="home_ai_input",
+        height=90,
+        placeholder="例如：AG-80 环氧树脂，固化剂 DDS，50 phr，170 °C 固化 4 小时。也可以直接粘贴一段实验记录。",
+        label_visibility="collapsed",
+    )
+    ai_col1, ai_col2 = st.columns([1.1, 2.4])
+    with ai_col1:
+        if st.button("🤖 AI 全自动解析并填入", key="home_open_ai", type="primary", width="stretch"):
+            if not home_ai_text.strip():
+                st.warning("请先在上方输入配方/工艺描述文本。")
+            elif enabled_materials:
+                st.session_state["ai_home_pending_text"] = home_ai_text
                 st.session_state["predict_selected_material"] = enabled_materials[0][0]
                 st.session_state["predict_selected_target"] = ""
-                st.session_state["predict_open_ai_assistant"] = True
+                st.session_state["predict_tab_intent"] = "ai"
                 st.rerun()
             else:
                 st.warning("当前没有已开放的材料方向。")
-    with status_col:
-        st.caption("AI 未配置时仍可使用手动输入和批量上传；所有 AI 建议必须逐项确认后才会进入预测任务。")
+        if st.button("仅打开 AI 输入助手", key="home_open_ai_manual", width="stretch"):
+            if enabled_materials:
+                st.session_state["predict_selected_material"] = enabled_materials[0][0]
+                st.session_state["predict_selected_target"] = ""
+                st.session_state["predict_tab_intent"] = "ai"
+                st.rerun()
+            else:
+                st.warning("当前没有已开放的材料方向。")
+    with ai_col2:
+        st.caption(
+            f"粘贴一段配方/工艺描述，AI 自动解析全部参数并直接填入手动输入表单（当前使用第一个可用方向："
+            f"{enabled_materials[0][1].get('label') or enabled_materials[0][0]}），核对后勾选确认即可预测；"
+            "AI 不会自动生成 EEW、AHEW、PHR 等推导值。未配置 AI 时仍可使用手动输入和批量上传。"
+        )
 
     st.markdown("<div class=\"portal-section-heading\"><span>01</span> 选择材料方向</div>", unsafe_allow_html=True)
     if not materials:
@@ -1526,7 +1816,7 @@ def render_user_home(config: Dict[str, Any]) -> None:
             if st.button(button_text, key=f"open_{material_key}", disabled=not material_cfg.get("enabled"), width="stretch"):
                 st.session_state["predict_selected_material"] = material_key
                 st.session_state["predict_selected_target"] = ""
-                st.session_state["predict_open_ai_assistant"] = False
+                st.session_state["predict_tab_intent"] = "manual"
                 st.rerun()
 
     if len(materials) <= 2:
@@ -1637,7 +1927,6 @@ def render_user_page(config: Dict[str, Any]) -> None:
         st.write("")
         if st.button("返回方向选择", key=f"back_to_materials_{selected_material}", width="stretch"):
             reset_user_selection()
-            st.session_state["predict_open_ai_assistant"] = False
             st.rerun()
     if not material_cfg.get("enabled"):
         st.warning(material_cfg.get("coming_soon_message") or "该方向暂未开放。")
@@ -1706,14 +1995,38 @@ def render_user_page(config: Dict[str, Any]) -> None:
     st.caption("门户预测不会自动补齐缺失特征；模型必须处于已启用、已发布且通过契约验证状态。")
     st.markdown(render_stage_timeline("validated", 0), unsafe_allow_html=True)
 
-    open_ai = bool(st.session_state.get("predict_open_ai_assistant"))
-    if open_ai:
-        tab_ai, tab_manual, tab_batch, tab_config = st.tabs(["AI 辅助输入", "手动输入", "批量上传", "当前配置"])
-    else:
-        tab_manual, tab_batch, tab_ai, tab_config = st.tabs(["手动输入", "批量上传", "AI 辅助输入", "当前配置"])
+    # 工作台功能区导航：用持久化的 segmented_control 取代原先根据 open_ai 标志动态换序的 st.tabs。
+    # st.tabs 的激活状态不跨重跑保留（任何控件交互后都会回到第一个标签），
+    # 导致：在 AI 标签里点「解析输入」后被弹回手动输入、解析结果看似丢失；
+    # AI 标签置顶时，在手动输入里点确认又被弹回 AI。改用 segmented_control 后：
+    # 1) 重跑后停留在当前功能区；2) 入口按钮可通过 predict_tab_intent 精确跳转。
+    active_tab_key = f"predict_active_tab_{selected_material}_{selected_target}"
+    tab_intent = st.session_state.pop("predict_tab_intent", None)
+    if tab_intent == "ai":
+        st.session_state[active_tab_key] = "AI 辅助输入"
+    elif tab_intent == "manual":
+        st.session_state[active_tab_key] = "手动输入"
+    if st.session_state.get(active_tab_key) not in ("手动输入", "批量上传", "AI 辅助输入", "当前配置"):
+        st.session_state[active_tab_key] = "手动输入"
+    active_tab = st.segmented_control(
+        "功能区",
+        options=["手动输入", "批量上传", "AI 辅助输入", "当前配置"],
+        key=active_tab_key,
+        label_visibility="collapsed",
+    )
+    if not active_tab:
+        active_tab = "手动输入"
 
-    with tab_manual:
+    if active_tab == "手动输入":
         st.markdown("### 手动输入参数")
+        home_flash = st.session_state.pop("ai_home_flash", None)
+        if home_flash:
+            st.success(home_flash)
+        # 常用配方快速载入（仅对树脂/环氧类材料方向展示；返回本次需要预填的配方）
+        active_recipe: Dict[str, Any] | None = None
+        material_label_text = str(material_cfg.get("label") or "")
+        if "epoxy" in selected_material.lower() or "环氧" in material_label_text or "树脂" in material_label_text:
+            active_recipe = render_recipe_library(selected_material, selected_target)
         # 输入分区：必填人工 / 可选人工 / 分子结构 / 系统计算，全部由当前 contract 驱动。
         partition_plan = build_input_partition_plan(selected_contract)
         all_input_fields: List[Dict[str, Any]] = []
@@ -1723,7 +2036,7 @@ def render_user_page(config: Dict[str, Any]) -> None:
             if section["kind"] == "workflow_source":
                 if workflow_fields:
                     section_df, section_errors = render_parameter_inputs(
-                        workflow_fields, f"manual_{selected_material}_{selected_target}_molecular"
+                        workflow_fields, f"manual_{selected_material}_{selected_target}_molecular", recipe=active_recipe
                     )
                 else:
                     section_df, section_errors = pd.DataFrame([{}]), []
@@ -1738,7 +2051,7 @@ def render_user_page(config: Dict[str, Any]) -> None:
                 section_input_fields = [field for field in manual_fields if field["name"] in section["features"]]
                 if section_input_fields:
                     section_df, section_errors = render_parameter_inputs(
-                        section_input_fields, f"manual_{selected_material}_{selected_target}_{section['group']}"
+                        section_input_fields, f"manual_{selected_material}_{selected_target}_{section['group']}", recipe=active_recipe
                     )
                 else:
                     section_df, section_errors = pd.DataFrame([{}]), []
@@ -1804,7 +2117,7 @@ def render_user_page(config: Dict[str, Any]) -> None:
             session_key=f"manual_{selected_material}_{selected_target}",
         )
 
-    with tab_batch:
+    elif active_tab == "批量上传":
         st.markdown("### 上传待预测数据")
         uploaded = st.file_uploader(
             "上传 CSV / Excel 数据文件",
@@ -1831,10 +2144,10 @@ def render_user_page(config: Dict[str, Any]) -> None:
         else:
             st.info("适合已经准备好批量输入表格的场景。缺失特征不会被自动补齐，系统会按发布契约校验并提示具体问题。")
 
-    with tab_ai:
+    elif active_tab == "AI 辅助输入":
         render_ai_assistant_tab(config, selected_material, selected_target, target_cfg, selected_contract, registry_snapshot)
 
-    with tab_config:
+    elif active_tab == "当前配置":
         st.markdown("### 当前性能项参数")
         param_df = parameter_editor_df(manual_fields + workflow_fields)
         st.dataframe(param_df, width="stretch", hide_index=True)
@@ -2295,6 +2608,18 @@ CUSTOM_CSS = """
 .status-closed { color: #a61b35; background: #fdecef; }
 .model-card-meta { display: flex; flex-wrap: wrap; gap: .5rem; margin: .55rem 0; }
 .model-card-meta span { border: 1px solid #cce4ea; border-radius: 999px; padding: .18rem .55rem; color: #175b6b; background: #f1fafb; font-size: .74rem; }
+/* 常用配方快速载入卡片 */
+.portal-recipe-card { border: 1px solid var(--portal-line); border-radius: 10px; background: #ffffff; padding: .8rem .9rem .75rem; margin-bottom: .45rem; transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease; }
+.portal-recipe-card:hover { border-color: #74b9c6; box-shadow: 0 10px 24px rgba(23, 50, 77, .10); transform: translateY(-1px); }
+.portal-recipe-head { display: flex; align-items: center; justify-content: space-between; gap: .6rem; }
+.portal-recipe-name { color: #17324d; font-weight: 750; font-size: .92rem; line-height: 1.3; }
+.portal-recipe-cure-chip { flex: 0 0 auto; padding: .14rem .5rem; border-radius: 999px; border: 1px solid #cce4ea; background: #f1fafb; color: #175b6b; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .7rem; white-space: nowrap; }
+.portal-recipe-tags { display: flex; flex-wrap: wrap; gap: .3rem; margin: .45rem 0 .55rem; }
+.portal-recipe-tag { padding: .1rem .45rem; border-radius: 999px; background: #eef4f8; color: #344054; font-size: .68rem; }
+.portal-recipe-line { display: flex; align-items: baseline; gap: .5rem; margin-top: .22rem; color: #475467; font-size: .8rem; }
+.portal-recipe-line span:last-child { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .76rem; }
+.portal-recipe-key { flex: 0 0 auto; color: #667085; font-size: .68rem; letter-spacing: .08em; }
+.portal-recipe-card + [data-testid="stButton"] button { min-height: 2.1rem; font-size: .76rem; margin-bottom: .35rem; }
 @media (max-width: 800px) {
     .main .block-container { padding: .75rem .65rem 2.25rem; max-width: 100%; }
     [data-testid="stHorizontalBlock"] { gap: .65rem; }
@@ -2318,6 +2643,9 @@ CUSTOM_CSS = """
     .portal-card-state { margin-left: auto; }
     .portal-card-metrics { gap: .4rem; padding-top: .6rem; font-size: .72rem; }
     .portal-workflow-card { min-height: 0; padding: .85rem; }
+    .portal-recipe-card { padding: .7rem .75rem; }
+    .portal-recipe-name { font-size: .86rem; }
+    .portal-recipe-cure-chip { font-size: .64rem; }
     .portal-stage-wrap { overflow-x: auto; padding: 10px 2px; margin-bottom: .8rem; }
     .portal-stage { min-width: 112px; font-size: .72rem; }
     [data-testid="stTabs"] [role="tablist"] { overflow-x: auto; scrollbar-width: none; }
@@ -2360,7 +2688,6 @@ def render_sidebar(config: Dict[str, Any]) -> str:
         target_cfg = (material_cfg.get("targets") or {}).get(selected_target, {})
         selected_material_label = material_cfg.get("label") or "尚未选择材料方向"
         selected_target_label = target_cfg.get("label") or "请选择预测性能"
-        ai_open = bool(st.session_state.get("predict_open_ai_assistant"))
 
         if mode == "用户页面":
             st.markdown('<div class="sidebar-section-title">当前预测</div>', unsafe_allow_html=True)
@@ -2373,12 +2700,20 @@ def render_sidebar(config: Dict[str, Any]) -> str:
             st.markdown('<div class="sidebar-section-title">快速操作</div>', unsafe_allow_html=True)
             if st.button("回到材料方向", key="sidebar_home", width="stretch", disabled=not selected_material):
                 reset_user_selection()
-                st.session_state["predict_open_ai_assistant"] = False
                 st.rerun()
-            if st.button("打开 AI 输入助手", key="sidebar_ai", width="stretch", disabled=not selected_material):
-                st.session_state["predict_open_ai_assistant"] = True
+            if st.button(
+                "跳转到 AI 输入助手",
+                key="sidebar_ai",
+                width="stretch",
+                disabled=not selected_material,
+                help="需要先进入某个材料方向的工作台；也可在首页点击「打开 AI 输入助手」自动进入。",
+            ):
+                st.session_state["predict_tab_intent"] = "ai"
                 st.rerun()
-            st.caption("AI 状态：已打开" if ai_open else "AI 状态：可从工作台开启")
+            active_section = st.session_state.get(
+                f"predict_active_tab_{selected_material}_{selected_target}", ""
+            ) if selected_material else ""
+            st.caption(f"当前功能区：{active_section or '尚未进入工作台'}")
         else:
             st.markdown('<div class="sidebar-section-title">管理导航</div>', unsafe_allow_html=True)
             st.caption("材料、性能项和模型配置集中在管理页面中。")

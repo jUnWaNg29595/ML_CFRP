@@ -160,6 +160,9 @@ def _safe_error(
             msg = f"AI 服务请求过于频繁{suffix}{stage_str}，请稍后重试。{excerpt_str}"
         else:
             msg = f"AI 服务暂时不可用{suffix}{stage_str}，请检查网络或服务状态。{excerpt_str}"
+        # [改进] 保留底层原因细节（如“网络连接失败：[WinError 10061]...”）
+        if detail:
+            msg = f"{msg} {detail}"
         sug = suggestion or "网络波动或上游限流，请稍后重试。"
         return PortalAITransientError(msg, stage=stage, service_id=service_id, status_code=status_code, raw_excerpt=_sanitize_excerpt(raw_excerpt), suggestion=sug)
 
@@ -810,10 +813,13 @@ def _http_transport(
     except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError) as exc:
         reason = str(getattr(exc, "reason", exc))
         if "proxy" in reason.lower() or "tunnel" in reason.lower():
-            raise PortalAITransientError(f"代理连接失败（network_mode={network_mode}）", stage="proxy_connection") from exc
+            raise PortalAITransientError(f"代理连接失败（network_mode={network_mode}）：{reason[:160]}", stage="proxy_connection") from exc
         if "name or service not known" in reason.lower() or "getaddrinfo" in reason.lower() or "nodename" in reason.lower():
             raise PortalAITransientError("DNS 解析失败，请检查 base_url 域名是否正确", stage="dns_failure") from exc
-        raise PortalAITransientError(stage="network_connection") from exc
+        if isinstance(exc, (TimeoutError, socket.timeout)) or "timed out" in reason.lower():
+            raise PortalAITransientError(f"请求超时：{reason[:160]}", stage="network_timeout") from exc
+        # [改进] 保留底层原因，不再吞掉（否则用户只能看到笼统的 transient_network）
+        raise PortalAITransientError(f"网络连接失败：{reason[:160]}", stage="network_connection") from exc
 
     if stream or "text/event-stream" in content_type:
         aggregated_text = _parse_sse_stream_to_text(body)
@@ -939,7 +945,11 @@ class PortalAIClient:
                 if attempted <= max_retries:
                     retry = True
                 else:
-                    pending_error = _safe_error(PortalAITransientError, stage="transient_network", service_id=self.config.service_id, status_code=exc.status_code, raw_excerpt=exc.raw_excerpt)
+                    # [改进] 保留传输层的具体故障阶段与原因，不再一律覆盖为 transient_network
+                    _exc_stage = str(getattr(exc, "stage", "") or "").strip()
+                    _keep_stage = _exc_stage if _exc_stage and _exc_stage not in {"transient_network", "retry_exhausted"} else "transient_network"
+                    _keep_detail = str(exc) if _keep_stage != "transient_network" else None
+                    pending_error = _safe_error(PortalAITransientError, stage=_keep_stage, service_id=self.config.service_id, status_code=exc.status_code, raw_excerpt=exc.raw_excerpt, detail=_keep_detail)
             except (TimeoutError, socket.timeout, ConnectionError, urllib.error.URLError):
                 if attempted <= max_retries:
                     retry = True
@@ -995,9 +1005,21 @@ class PortalAIClient:
                 message=str(exc), diagnosis="API Key 无权访问该模型或账号欠费，请检查模型名称和权限。", raw_excerpt=exc.raw_excerpt or "",
             )
         except PortalAITransientError as exc:
+            # [改进] 按真实故障阶段给出可行动的诊断，而不是笼统的“限流或超时”。
+            _stage = str(getattr(exc, "stage", "") or "")
+            _diagnosis_map = {
+                "proxy_connection": "本地代理连接失败：请确认代理软件（如 Clash/v2rayN）正在运行、端口正确；或把该服务的【网络模式】改为 direct（直连）。",
+                "dns_failure": str(getattr(exc, "args", [""])[0] if exc.args else "") or "DNS 解析失败：请检查 base_url 域名拼写。",
+                "network_connection": "网络连接失败：网关地址不可达。请检查 base_url、本机网络/防火墙，或稍后重试。",
+                "network_timeout": f"请求超时（超过 {int(getattr(self.config, 'timeout_seconds', 30))} 秒）：可在服务配置中调大超时或重试次数后重试。",
+                "retry_exhausted": "多次重试后仍失败：上游网关限流或暂时不可用，请稍后重试。",
+            }
+            _diag = _diagnosis_map.get(_stage, "上游服务限流或网关超时，请稍后重试。")
+            if getattr(exc, "status_code", None):
+                _diag = f"[HTTP {exc.status_code}] {_diag}"
             return HealthCheckResult(
                 ok=False, stage="网络/网关暂时不可用", service_id=self.config.service_id, status_code=exc.status_code,
-                message=str(exc), diagnosis="上游服务限流或网关超时，请稍后重试。", raw_excerpt=exc.raw_excerpt or "",
+                message=str(exc), diagnosis=_diag, raw_excerpt=exc.raw_excerpt or "",
             )
         except PortalAIHTTPError as exc:
             if exc.status_code == 404:
@@ -1015,9 +1037,13 @@ class PortalAIClient:
                 message=str(exc), diagnosis="服务端返回了非标准 OpenAI 结构（如缺少 choices 或 content 为空）。", raw_excerpt=exc.raw_excerpt or "",
             )
         except Exception as exc:
+            # [修复] config 可能是 dict（部分调用路径），属性访问会二次崩溃并 mask 真实异常
+            _svc_id = getattr(self.config, "service_id", None)
+            if _svc_id is None and isinstance(self.config, dict):
+                _svc_id = self.config.get("service_id")
             return HealthCheckResult(
-                ok=False, stage="请求异常", service_id=self.config.service_id,
-                message=str(exc), diagnosis="连接发生未预期异常，请检查基础网络与地址。",
+                ok=False, stage="请求异常", service_id=_svc_id,
+                message=str(exc), diagnosis=f"连接发生未预期异常（{type(exc).__name__}），请检查基础网络与地址。",
             )
 
         # Content JSON parsing

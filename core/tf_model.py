@@ -132,22 +132,57 @@ def _force_cpu_mode():
         print(f"⚠ 无法修改可见 GPU（可能已初始化），将继续使用 CPU 设备上下文: {e}")
 
 
-# 执行配置
-TENSORFLOW_AVAILABLE, GPU_AVAILABLE, DEVICE_INFO, TENSORFLOW_IMPORT_ERROR = _configure_tensorflow()
+# [内存优化] 不再在模块导入时立即执行 _configure_tensorflow()，
+# 仅用 find_spec 检查可用性（不加载 TF，节省约 310MB 启动内存）。
+# TF 的完整导入/GPU 检测延迟到首次真正使用时（TFSequentialRegressor 训练/预测）。
 
-# 根据配置结果导入 TensorFlow 组件
+class _LazyTFModule:
+    """TensorFlow 模块懒加载代理：首次访问属性时才真正 import"""
+
+    def __init__(self, candidates):
+        # candidates: 候选模块名列表（如 ['tensorflow.keras', 'keras']）
+        object.__setattr__(self, '_candidates', list(candidates))
+        object.__setattr__(self, '_loaded', None)
+
+    def _load(self):
+        loaded = object.__getattribute__(self, '_loaded')
+        if loaded is None:
+            last_err = None
+            for name in object.__getattribute__(self, '_candidates'):
+                try:
+                    loaded = __import__(name, fromlist=['__doc__'])
+                    object.__setattr__(self, '_loaded', loaded)
+                    break
+                except Exception as e:
+                    last_err = e
+            if loaded is None:
+                raise ImportError(f"懒加载 TensorFlow 组件失败: {last_err}")
+        return loaded
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+
+def _tensorflow_installable():
+    """仅检查 tensorflow 是否已安装，不实际导入（不产生内存开销）"""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("tensorflow") is not None
+    except Exception:
+        return False
+
+
+TENSORFLOW_AVAILABLE = _tensorflow_installable()
+GPU_AVAILABLE = False
+DEVICE_INFO = "懒加载模式（首次使用 TensorFlow 时检测 GPU）"
+TENSORFLOW_IMPORT_ERROR = None
+
 if TENSORFLOW_AVAILABLE:
-    import tensorflow as tf
-    # 兼容 Keras 2.x 和 Keras 3.x
-    try:
-        from tensorflow import keras
-    except ImportError:
-        import keras  # Keras 3 独立安装
-    
-    try:
-        from tensorflow.keras import layers, callbacks, regularizers
-    except ImportError:
-        from keras import layers, callbacks, regularizers
+    tf = _LazyTFModule(['tensorflow'])
+    keras = _LazyTFModule(['tensorflow.keras', 'keras'])
+    layers = _LazyTFModule(['tensorflow.keras.layers', 'keras.layers'])
+    callbacks = _LazyTFModule(['tensorflow.keras.callbacks', 'keras.callbacks'])
+    regularizers = _LazyTFModule(['tensorflow.keras.regularizers', 'keras.regularizers'])
 else:
     tf = None
     keras = None
@@ -846,9 +881,13 @@ def check_tensorflow_available():
 
 
 def get_tensorflow_version():
-    """获取 TensorFlow 版本"""
+    """获取 TensorFlow 版本（懒加载：仅在 TF 已被真正导入时返回版本号）"""
     if TENSORFLOW_AVAILABLE:
-        return tf.__version__
+        import sys
+        mod = sys.modules.get('tensorflow')
+        if mod is not None:
+            return getattr(mod, '__version__', None)
+        return None  # TF 未加载（懒加载模式），避免为显示版本号而拉起 310MB 内存
     return None
 
 

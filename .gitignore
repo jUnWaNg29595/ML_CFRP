@@ -72,3 +72,26 @@ temp/
 tmp/
 *.bak
 *.tmp
+
+# 运行时缓存与训练中间产物
+cache/
+catboost_info/
+outputs/
+results/
+
+# Agent 与本地工具配置
+.agents/
+.claude/
+.pi/
+.pytest_cache/
+
+# 依赖快照（主 requirements.txt 已保留）
+requirements-actual.txt
+requirements-batch1.txt
+requirements-batch2.txt
+
+# 临时脚本
+tmp*.py
+
+# bigsmiles_ui 生成资源
+bigsmiles_ui/bigsmiles_ui/generated/

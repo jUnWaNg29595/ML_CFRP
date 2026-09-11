@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Mapping
 from uuid import uuid4
 
+import streamlit as st
+
 from .dataset_manifest import compute_dataset_manifest_hash
 from .feature_mapping_review import (
     apply_feature_review_decision,
@@ -229,6 +231,7 @@ def build_feature_mapping_candidates(registry: Mapping[str, Any], profile_id: st
     return candidates
 
 
+@st.fragment
 def render_feature_registry_page(
     *,
     frame: Any = None,
@@ -351,7 +354,11 @@ def render_feature_registry_page(
     review_context = None
     frame_columns = frame_column_names(frame)
     if frame is not None and profile_id:
-        review_context = build_feature_review_context(frame, registry, profile_id)
+        # [增量审核] 应用自己提取的特征列（molecular_feature_names）不送 AI 审核
+        _extracted_cols = set(st.session_state.get("molecular_feature_names") or [])
+        review_context = build_feature_review_context(
+            frame, registry, profile_id, exclude_columns=_extracted_cols,
+        )
         st.session_state["feature_review_context"] = review_context
     else:
         st.session_state.pop("feature_review_context", None)
@@ -463,6 +470,19 @@ def render_feature_registry_page(
                     # 2) 剩余未匹配列送 AI 分析（支持分批与流式）
                     ai_context = dict(review_context or {})
                     ai_context["raw_columns"] = unmapped_cols
+                    # [增量审核] 已有建议（待审核/已接受）覆盖过的数据列不再重复送 AI，
+                    # 页面刷新/重复点击【分析】时只分析真正的新增列。
+                    if analyze_clicked and not reanalyze_clicked:
+                        _reviewed_cols: set[str] = set()
+                        for _s in suggestions:
+                            if isinstance(_s, Mapping):
+                                for _c in (_s.get("raw_columns") or []):
+                                    _reviewed_cols.add(str(_c))
+                        _skipped_reviewed = [c for c in unmapped_cols if str(c) in _reviewed_cols]
+                        if _skipped_reviewed:
+                            unmapped_cols = [c for c in unmapped_cols if str(c) not in _reviewed_cols]
+                            ai_context["raw_columns"] = unmapped_cols
+                            st.caption(f"⏭️ 增量审核：跳过已有建议的 {len(_skipped_reviewed)} 列（如需全部重析请用【重新分析】）")
                     new_suggs = list(local_matched)
                     if unmapped_cols:
                         with st.spinner("AI 正在分析剩余数据列与语义特征映射..."):
@@ -489,7 +509,7 @@ def render_feature_registry_page(
                         "ai_count": len(new_suggs) - len(local_matched),
                     })
                     st.success(f"分析完成，共载入 {len(new_suggs)} 条待审核建议（本地匹配 {len(local_matched)} 条，AI 分析 {len(new_suggs) - len(local_matched)} 条）。")
-                    st.rerun()
+                    st.rerun(scope="fragment")
                 except PortalAIError as exc:
                     formatted = format_feature_review_error(exc)
                     st.error(f"❌ {formatted['title']} {formatted['detail']}")
@@ -598,7 +618,7 @@ def render_feature_registry_page(
             if profile_id:
                 save_profile_suggestions(profile_id, remaining, portal_root)
             st.success(f"已清理已处理建议，剩余 {len(remaining)} 条。")
-            st.rerun()
+            st.rerun(scope="fragment")
 
         # 安全建议全部纳入一次性审核；逐项入口保留在下方人工处理区。
         safe_feature_ids = [str(item.get("feature_id")) for item in safe_suggestions]
@@ -715,7 +735,7 @@ def render_feature_registry_page(
                         f"已由审核人 {reviewer} 接受 {len(selected_ids)} 条特征映射建议，已写入当前 manifest；"
                         f"当前 manifest 状态为 {updated_manifest.get('status')}，Registry/Profile 或绑定完整性仍未满足正式训练资格。"
                     )
-                st.rerun()
+                st.rerun(scope="fragment")
             except Exception as exc:
                 st.error(f"批量接受失败（未写入任何数据）：{exc}")
 
@@ -825,7 +845,7 @@ def render_feature_registry_page(
                                 "suggestion": dict(item),
                             })
                             st.success(f"已接受修改后结果：{feature_id}")
-                            st.rerun()
+                            st.rerun(scope="fragment")
                         except Exception as exc:
                             st.error(f"接受修改后结果失败：{exc}")
                     if mark_conflict:
@@ -840,7 +860,7 @@ def render_feature_registry_page(
                             "reviewer": reviewer, "feature_id": feature_id,
                         })
                         st.success(f"已标记冲突：{feature_id}")
-                        st.rerun()
+                        st.rerun(scope="fragment")
                     if reject:
                         for s in suggestions:
                             if isinstance(s, Mapping) and str(s.get("feature_id") or "") == feature_id:
@@ -853,7 +873,7 @@ def render_feature_registry_page(
                             "reviewer": reviewer, "feature_id": feature_id,
                         })
                         st.success(f"已拒绝：{feature_id}")
-                        st.rerun()
+                        st.rerun(scope="fragment")
                     if retry_ai:
                         st.info("请��用上方【重新分析】按钮重新运行整批 AI 分析。")
                     st.json(dict(item))
@@ -914,7 +934,7 @@ def render_feature_registry_page(
                         "manifest_hash": saved_manifest.get("manifest_hash"),
                     })
                     st.success(f"Manifest 已原子保存：{saved_file.name}")
-                    st.rerun()
+                    st.rerun(scope="fragment")
             with tool_c2:
                 download_payload = build_manifest_download(profile_id, active_manifest, portal_root)
                 if download_payload:
@@ -1041,7 +1061,7 @@ def render_feature_registry_page(
                     "suggestion": suggestion,
                 })
                 st.success("新建候选仅保存为 pending_review，尚未批准，也未写入 registry。")
-                st.rerun()
+                st.rerun(scope="fragment")
             except Exception as exc:
                 st.error(str(exc))
 
@@ -1178,7 +1198,7 @@ def render_feature_registry_page(
                         save_profile_suggestions(profile_id, suggestions, portal_root)
                         event["status"] = "applied"
                         st.success("已记录本地审核动作；AI 建议不会自动写入登记库。")
-                        st.rerun()
+                        st.rerun(scope="fragment")
                     except Exception as exc:
                         event["status"] = "failed"
                         event["error"] = str(exc)

@@ -531,6 +531,8 @@ class GNNFeaturizer:
         # 设备与 eval 模式
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        elif isinstance(device, str):
+            device = torch.device(device)
         self.device = device
 
         # 尝试将模型移到 GPU，显存不足时报错而不是自动降级

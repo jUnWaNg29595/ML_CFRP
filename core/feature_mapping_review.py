@@ -108,7 +108,13 @@ def _is_molecular_feature_column(column_name: Any) -> bool:
     return any(name.startswith(prefix) for prefix in _MOLECULAR_PREFIXES) or "maccs" in name or "morgan" in name or "rdkit" in name or "mordred" in name
 
 
-def build_feature_review_context(frame: Any, registry: Mapping[str, Any], profile_id: str) -> dict[str, Any]:
+def build_feature_review_context(
+    frame: Any,
+    registry: Mapping[str, Any],
+    profile_id: str,
+    *,
+    exclude_columns: Any = None,
+) -> dict[str, Any]:
     """Build a small, feature-only context; metrics, prediction state, and generated molecular features are excluded."""
     raw_columns = getattr(frame, "columns", [])
     columns = list(raw_columns) if raw_columns is not None else []
@@ -117,10 +123,34 @@ def build_feature_review_context(frame: Any, registry: Mapping[str, Any], profil
     if not isinstance(profile, Mapping):
         profile = {}
     target_columns = _target_column_names(profile, columns)
-    # 过滤掉目标列以及系统自动提取的分子特征列（仅处理原始特征/工艺列）
+    # [增量审核] 已被 Registry 收录的列（名称精确命中 feature_id/name/legacy_name/别名）
+    # 是工作流提取/已登记的特征，语义已知，无需 AI 重复审核；只把真正未知的新列送 AI。
+    known_registry_names: set[str] = set()
+    for item in (registry.get("features", []) if isinstance(registry, Mapping) else []):
+        if not isinstance(item, Mapping):
+            continue
+        for key in ("feature_id", "name", "legacy_name"):
+            token = _normalized_column(item.get(key))
+            if token:
+                known_registry_names.add(token)
+        for key in ("aliases", "accepted_aliases"):
+            values = item.get(key) or []
+            for value in (values if isinstance(values, list) else [values]):
+                token = _normalized_column(value)
+                if token:
+                    known_registry_names.add(token)
+    # 过滤掉目标列、系统自动提取的分子特征列、Registry 已收录的已知列，
+    # 以及调用方显式传入的提取列（molecular_feature_names）；仅处理未知新列
+    excluded_explicit = {
+        str(column) for column in (exclude_columns or [])
+        if str(column or "").strip()
+    }
     review_columns = [
         column for column in columns
-        if str(column) not in target_columns and not _is_molecular_feature_column(column)
+        if str(column) not in target_columns
+        and not _is_molecular_feature_column(column)
+        and _normalized_column(column) not in known_registry_names
+        and str(column) not in excluded_explicit
     ]
     feature_ids = set(profile.get("feature_ids", []) if isinstance(profile, Mapping) else [])
     normalized_columns = {_normalized_column(column) for column in review_columns}

@@ -692,6 +692,250 @@ class AdvancedDataCleaner:
         # 更新数据
         self.cleaned_data = df.loc[indices_to_keep].reset_index(drop=True)
         return self.cleaned_data
+
+    def balance_formulation_stratified(
+        self,
+        group_cols,
+        max_samples_per_group=None,
+        target_col=None,
+        target_type="auto",
+        n_bins=5,
+        bin_strategy="quantile",
+        stratify_mode="within_group",
+        max_per_group_per_bin=None,
+        max_samples_per_target_class=None,
+        random_state=42,
+    ):
+        """按配方分层的类别平衡：在源头控制训练数据集的配方分布与目标类别。
+
+        支持两种核心分层模式：
+        1. 'within_group' (配方体系平衡 + 目标分层抽样):
+           限制每个化学配方体系的最大样本数（缓解 E51 等优势配方垄断）。
+           当某个大配方被削减时，若指定了 target_col，会在配方内部按 target_col
+           的分层/分箱进行等比例分层抽样，避免破坏该配方的性能梯度分布。
+
+        2. 'by_target_with_group_cap' (目标类别平衡 + 配方多样性约束):
+           以目标属性（如 Tg 分级区间或分类标签）为主层控制类别平衡，
+           同时限制每个类别中来自同一配方的样本数不超过 max_per_group_per_bin，
+           避免单一配方垄断某一类别，杜绝伪相关性。
+
+        Args:
+            group_cols: 配方分组列（str 或 list[str]，如 ['resin_1_structure', 'curing_agent_1_structure']）
+            max_samples_per_group: 每个配方的最大样本上限（within_group 模式使用）
+            target_col: 用于分层的目标列名（如 'Tg' 或分类标签）
+            target_type: 目标类型，'auto'、'continuous'、'categorical'
+            n_bins: 连续目标的分箱数（默认 5）
+            bin_strategy: 分箱策略，'quantile' (等频分位数) 或 'uniform' (等宽区间)
+            stratify_mode: 分层模式，'within_group' 或 'by_target_with_group_cap'
+            max_per_group_per_bin: 每个目标分层中单一配方的样本上限（by_target_with_group_cap 模式使用）
+            max_samples_per_target_class: 每个目标分层的样本总数上限
+            random_state: 随机种子，保证抽样可复现
+
+        Returns:
+            tuple[pd.DataFrame, dict]: 清洗后的 DataFrame 与详细统计信息字典
+        """
+        df = self.cleaned_data
+        if df is None or df.empty:
+            return self.cleaned_data, {"error": "数据为空"}
+
+        # 1. 校验并构建配方分组序列 group_series
+        if isinstance(group_cols, (list, tuple)):
+            valid_group_cols = [c for c in group_cols if c in df.columns]
+        elif isinstance(group_cols, str) and group_cols in df.columns:
+            valid_group_cols = [group_cols]
+        else:
+            valid_group_cols = []
+
+        if not valid_group_cols:
+            raise ValueError("指定的配方分组列均不在数据集中，请检查列名。")
+
+        if len(valid_group_cols) == 1:
+            group_series = df[valid_group_cols[0]].fillna("<missing>").astype(str)
+        else:
+            group_series = df[valid_group_cols].fillna("<missing>").astype(str).agg(" || ".join, axis=1)
+
+        # 2. 校验并构建目标分层序列 stratum_series
+        stratum_series = None
+        target_bin_edges = None
+        if target_col is not None and str(target_col).strip() in df.columns:
+            target_col = str(target_col).strip()
+            num_target = pd.to_numeric(df[target_col], errors="coerce")
+            finite_mask = np.isfinite(num_target.to_numpy(dtype=float))
+            is_continuous = (
+                target_type == "continuous"
+                or (
+                    target_type == "auto"
+                    and finite_mask.sum() >= max(5, int(0.4 * len(df)))
+                    and num_target[finite_mask].nunique() > 10
+                )
+            )
+
+            if is_continuous:
+                valid_num = num_target[finite_mask]
+                actual_bins = max(2, min(int(n_bins), valid_num.nunique()))
+                if actual_bins >= 2 and valid_num.nunique() >= 2:
+                    try:
+                        if bin_strategy == "quantile":
+                            binned, target_bin_edges = pd.qcut(
+                                valid_num, q=actual_bins, retbins=True, duplicates="drop"
+                            )
+                        else:
+                            binned, target_bin_edges = pd.cut(
+                                valid_num, bins=actual_bins, retbins=True
+                            )
+                        stratum_series = pd.Series("<missing_target>", index=df.index, dtype=object)
+                        stratum_series.loc[valid_num.index] = binned.astype(str)
+                    except Exception:
+                        binned, target_bin_edges = pd.cut(valid_num, bins=actual_bins, retbins=True)
+                        stratum_series = pd.Series("<missing_target>", index=df.index, dtype=object)
+                        stratum_series.loc[valid_num.index] = binned.astype(str)
+                else:
+                    stratum_series = df[target_col].fillna("<missing_target>").astype(str)
+            else:
+                stratum_series = df[target_col].fillna("<missing_target>").astype(str)
+
+        indices_to_keep = []
+
+        # 3. 分层模式执行
+        if stratify_mode == "by_target_with_group_cap":
+            if stratum_series is None:
+                raise ValueError("使用 'by_target_with_group_cap' 模式时必须指定有效的 target_col。")
+
+            unique_strata = stratum_series.unique()
+            rng_master = np.random.RandomState(int(random_state))
+
+            for s in unique_strata:
+                s_mask = stratum_series == s
+                s_indices = df.index[s_mask].tolist()
+                s_groups = group_series.loc[s_indices]
+
+                # 3a. 在该类别内部限制单一配方的最大样本数
+                if max_per_group_per_bin is not None and int(max_per_group_per_bin) > 0:
+                    g_cap = int(max_per_group_per_bin)
+                    s_kept = []
+                    for grp_id, grp_count in s_groups.value_counts().items():
+                        grp_in_s_idx = s_groups[s_groups == grp_id].index.tolist()
+                        if grp_count > g_cap:
+                            salt = abs(hash(f"{s}_{grp_id}")) % 1000000
+                            rng_grp = np.random.RandomState((int(random_state) + salt) % (2**31 - 1))
+                            chosen = rng_grp.choice(grp_in_s_idx, size=g_cap, replace=False).tolist()
+                            s_kept.extend(chosen)
+                        else:
+                            s_kept.extend(grp_in_s_idx)
+                else:
+                    s_kept = s_indices
+
+                # 3b. 限制该目标类别的总样本上限
+                if max_samples_per_target_class is not None and int(max_samples_per_target_class) > 0:
+                    t_cap = int(max_samples_per_target_class)
+                    if len(s_kept) > t_cap:
+                        salt_t = abs(hash(str(s))) % 1000000
+                        rng_t = np.random.RandomState((int(random_state) + salt_t) % (2**31 - 1))
+                        s_kept = rng_t.choice(s_kept, size=t_cap, replace=False).tolist()
+
+                indices_to_keep.extend(s_kept)
+
+        else:
+            # 模式 1: 'within_group' (配方为主层，配方内可选目标分层)
+            unique_groups = group_series.unique()
+            for grp_id in unique_groups:
+                grp_mask = group_series == grp_id
+                grp_indices = df.index[grp_mask].tolist()
+                m = len(grp_indices)
+
+                if max_samples_per_group is None or m <= int(max_samples_per_group):
+                    indices_to_keep.extend(grp_indices)
+                else:
+                    cap = int(max_samples_per_group)
+                    salt = abs(hash(str(grp_id))) % 1000000
+                    rng_grp = np.random.RandomState((int(random_state) + salt) % (2**31 - 1))
+
+                    if stratum_series is None:
+                        # 纯配方级下采样
+                        chosen = rng_grp.choice(grp_indices, size=cap, replace=False).tolist()
+                        indices_to_keep.extend(chosen)
+                    else:
+                        # 配方内目标属性分层抽样 (Largest Remainder Method)
+                        grp_strata = stratum_series.loc[grp_indices]
+                        strata_counts = grp_strata.value_counts()
+
+                        quotas = {}
+                        remainders = {}
+                        allocated = 0
+                        for s_val, count_s in strata_counts.items():
+                            exact = cap * count_s / m
+                            base_q = int(exact)
+                            quotas[s_val] = min(base_q, count_s)
+                            allocated += quotas[s_val]
+                            remainders[s_val] = exact - base_q
+
+                        unallocated = cap - allocated
+                        # 按余额降序补齐
+                        sorted_strata = sorted(remainders.keys(), key=lambda k: remainders[k], reverse=True)
+                        for s_val in sorted_strata:
+                            if unallocated <= 0:
+                                break
+                            if quotas[s_val] < strata_counts[s_val]:
+                                quotas[s_val] += 1
+                                unallocated -= 1
+
+                        # 若仍有空缺（因极小分箱受限），从有富余的分箱中填补
+                        if unallocated > 0:
+                            for s_val in sorted_strata:
+                                if unallocated <= 0:
+                                    break
+                                can_add = strata_counts[s_val] - quotas[s_val]
+                                add_n = min(can_add, unallocated)
+                                quotas[s_val] += add_n
+                                unallocated -= add_n
+
+                        # 从各个分箱中抽取
+                        grp_chosen = []
+                        for s_val, q in quotas.items():
+                            if q > 0:
+                                s_candidates = grp_strata[grp_strata == s_val].index.tolist()
+                                chosen_s = rng_grp.choice(s_candidates, size=q, replace=False).tolist()
+                                grp_chosen.extend(chosen_s)
+
+                        indices_to_keep.extend(grp_chosen)
+
+        # 4. 排序并构建结果
+        indices_to_keep = sorted(set(indices_to_keep))
+        self.cleaned_data = df.loc[indices_to_keep].reset_index(drop=True)
+
+        # 5. 聚合统计指标
+        total_before = len(df)
+        total_after = len(self.cleaned_data)
+        n_groups_before = int(group_series.nunique())
+        n_groups_after = int(group_series.loc[indices_to_keep].nunique()) if indices_to_keep else 0
+
+        vc_before = group_series.value_counts()
+        vc_after = group_series.loc[indices_to_keep].value_counts() if indices_to_keep else pd.Series(dtype=int)
+
+        max_cnt_before = int(vc_before.iloc[0]) if n_groups_before > 0 else 0
+        max_cnt_after = int(vc_after.iloc[0]) if n_groups_after > 0 else 0
+
+        stats = {
+            "stratify_mode": stratify_mode,
+            "group_cols": valid_group_cols,
+            "target_col": target_col,
+            "total_before": total_before,
+            "total_after": total_after,
+            "removed_rows": total_before - total_after,
+            "n_groups_before": n_groups_before,
+            "n_groups_after": n_groups_after,
+            "max_group_count_before": max_cnt_before,
+            "max_group_count_after": max_cnt_after,
+            "max_group_pct_before": float(max_cnt_before / total_before * 100.0) if total_before > 0 else 0.0,
+            "max_group_pct_after": float(max_cnt_after / total_after * 100.0) if total_after > 0 else 0.0,
+            "top_groups_before": vc_before.head(10).to_dict(),
+            "top_groups_after": vc_after.head(10).to_dict(),
+            "target_distribution_before": stratum_series.value_counts().to_dict() if stratum_series is not None else {},
+            "target_distribution_after": stratum_series.loc[indices_to_keep].value_counts().to_dict() if (stratum_series is not None and indices_to_keep) else {},
+            "bin_edges": [float(b) for b in target_bin_edges] if target_bin_edges is not None else None,
+        }
+
+        return self.cleaned_data, stats
     def aggregate_by_keys(self, keys, target_col, agg: str = 'median', dropna_target: bool = True):
         """按配方/键聚合重复记录(用于 Tg/力学等性质的稳健建模)
 

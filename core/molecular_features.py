@@ -112,7 +112,8 @@ except ImportError:
 from .task_manager import (
     get_task_manager, 
     is_cancelled, 
-    CancellableProcessPoolExecutor
+    CancellableProcessPoolExecutor,
+    safe_worker_count
 )
 
 # [新增] 支持 SMILES / SELFIES / BigSMILES 输入
@@ -2078,6 +2079,22 @@ def _rdkit_single_smiles_worker(smiles, start_idx):
         return None, start_idx
 
 
+def _kill_loky_executor():
+    """强制丢弃 joblib/loky 可复用执行器，防止其非守护线程/进程
+
+    在 Streamlit 退出时阻塞（表现为卡在 "Stopping..."，Ctrl+C 无效）。
+    多次调用安全。
+    """
+    try:
+        from joblib.externals import loky
+        try:
+            loky.get_reusable_executor().shutdown(wait=False, kill_workers=True)
+        except Exception:
+            pass
+    except ImportError:
+        pass
+
+
 class OptimizedRDKitFeatureExtractor:
     """
     并行版 RDKit 提取器 (V4 - 使用 joblib 解决 Streamlit 死锁)
@@ -2099,10 +2116,14 @@ class OptimizedRDKitFeatureExtractor:
         """
         cpu_count = mp.cpu_count() or 4
 
+        # [Windows 安全修复] WaitForMultipleObjects 最多 63 句柄，
+        # worker > ~62 时 loky/multiprocessing 会崩（need at most 63 handles）
+        cpu_count = safe_worker_count(cpu_count)
+
         # [性能修复] 解除线程限制，使用全部CPU核心
         if n_jobs == -1:
             if max_workers is None:
-                # 使用全部核心（不再限制为8）
+                # 使用全部核心（安全上限内）
                 self.n_jobs = cpu_count
             else:
                 self.n_jobs = max(1, min(max_workers, cpu_count))
@@ -2185,10 +2206,20 @@ class OptimizedRDKitFeatureExtractor:
             print(f"\n✅ joblib 并行完成: {len(all_indices)}/{total_samples} 样本")
             sys.stdout.flush()
             
-        except Exception as e:
+        except (KeyboardInterrupt, Exception) as e:
+            # [Windows 退出修复] loky 的可复用执行器持有非守护线程/进程，
+            # 被打断后不清理会卡住 Streamlit 的 "Stopping..."（Ctrl+C 无法退出）。
+            # 这里无论成败都强制丢弃 loky worker。
+            _kill_loky_executor()
+            if isinstance(e, KeyboardInterrupt):
+                print("\n⏹️ 任务被中断，已清理并行 worker")
+                sys.stdout.flush()
+                raise
             print(f"\n❌ joblib 失败: {e}")
             sys.stdout.flush()
             return None
+        finally:
+            _kill_loky_executor()
         
         return self._build_dataframe(all_features, all_indices)
     
@@ -2860,6 +2891,8 @@ class MLForceFieldExtractor:
                 fail_stats = {}  # 统计失败原因
 
                 ctx = mp.get_context('spawn')
+                # [Windows 安全修复] 钳制进程数避免 63 句柄上限崩溃
+                n_jobs = safe_worker_count(n_jobs)
                 pbar = tqdm(total=total, desc=f"3D Generation (spawn, {n_jobs} workers)")
 
                 # 每批提交的任务数（控制内存峰值）
@@ -3401,6 +3434,8 @@ class QuickForceFieldFeatureExtractor:
             error_count = 0
             batch_size = max(1, n_jobs * 8)
             ctx = mp.get_context("spawn") if os.name == "nt" else mp.get_context("fork")
+            # [Windows 安全修复] 钳制进程数避免 63 句柄上限崩溃
+            n_jobs = safe_worker_count(n_jobs)
             pbar = tqdm(total=total, desc=f"Quick FF ({n_jobs} workers)")
             for batch_start in range(0, total, batch_size):
                 if is_cancelled():
@@ -3661,7 +3696,8 @@ class XTBFeatureExtractor:
 
     def _parse_xtb_output(self, text: str):
         out = {}
-        for line in text.splitlines():
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
             low = line.lower().strip()
             if "total energy" in low and "free energy" not in low:
                 val = self._last_float(line)
@@ -3682,9 +3718,25 @@ class XTBFeatureExtractor:
                 if val is not None:
                     out["lumo"] = val
             if "dipole moment" in low or "molecular dipole" in low:
-                val = self._last_float(line)
-                if val is not None:
-                    out["dipole"] = val
+                # xtb >= 6.5 输出为标题行 "molecular dipole:"，数值在后续 "full:" 行：
+                #   molecular dipole:
+                #            x        y        z   tot (Debye)
+                #    q only: ...
+                #      full: ...   3.613
+                if low.rstrip(':').endswith("dipole") or not any(ch.isdigit() for ch in line):
+                    for follow in lines[i + 1:i + 6]:
+                        follow_low = follow.lower().strip()
+                        if follow_low.startswith("molecular quadrupole"):
+                            break
+                        if follow_low.startswith("full") or "full:" in follow_low:
+                            val = self._last_float(follow)
+                            if val is not None:
+                                out["dipole"] = val
+                            break
+                else:
+                    val = self._last_float(line)
+                    if val is not None:
+                        out["dipole"] = val
         return out
 
     def _run_xtb(self, xyz_text: str, timeout_s: int | None = None):
@@ -4136,6 +4188,22 @@ class ExternalMDFeatureExtractor:
             valid_indices = list(range(len(features_df)))
         return features_df, valid_indices
 
+def _epoxy_domain_worker_chunk(chunk_items, stoich_mode, enable_reaction_simulation, target_conversion):
+    """子进程 Worker 函数：负责批量提取单个数据块的环氧双组分领域特征"""
+    ext = EpoxyDomainFeatureExtractor(
+        enable_reaction_simulation=enable_reaction_simulation,
+        target_conversion=target_conversion
+    )
+    features_list = []
+    valid_indices = []
+    for orig_idx, smi_r, smi_h, stoich_val in chunk_items:
+        feat = ext._extract_single_pair(smi_r, smi_h, stoich_val, stoich_mode)
+        if feat is not None:
+            features_list.append(feat)
+            valid_indices.append(orig_idx)
+    return features_list, valid_indices
+
+
 class EpoxyDomainFeatureExtractor:
     """环氧树脂领域知识特征提取器 (增强版：加入电子效应模拟 + 反应产物模拟)"""
 
@@ -4147,10 +4215,14 @@ class EpoxyDomainFeatureExtractor:
         """
         if not RDKIT_AVAILABLE:
             raise ImportError("需要安装 rdkit")
-        
+
         self.enable_reaction_simulation = enable_reaction_simulation
         self.target_conversion = target_conversion
-        
+
+        # 性能优化：记忆化缓存，避免高频单体重复解析与电荷计算
+        self._electronic_cache = {}
+        self._crosslink_cache = {}
+
         # 尝试加载反应模拟模块
         self._reaction_simulator = None
         self._crosslink_extractor = None
@@ -4171,31 +4243,27 @@ class EpoxyDomainFeatureExtractor:
     def _get_active_hydrogen_count(self, mol):
         count = 0
         for atom in mol.GetAtoms():
-            # 计算与氮原子相连的氢原子数 (胺类固化剂)
             if atom.GetAtomicNum() == 7:
                 count += atom.GetTotalNumHs()
         return count
-    
+
     def _get_anhydride_count(self, mol):
-        """计算酸酐基团数量"""
         patt = Chem.MolFromSmarts("[CX3](=[OX1])[OX2][CX3](=[OX1])")
         matches = mol.GetSubstructMatches(patt)
         return len(matches)
-    
+
     def _get_thiol_count(self, mol):
-        """计算硫醇基团数量"""
         patt = Chem.MolFromSmarts("[SX2H]")
         matches = mol.GetSubstructMatches(patt)
         return len(matches)
-    
+
     def _detect_curer_type(self, mol):
-        """检测固化剂类型"""
         amine_count = self._get_active_hydrogen_count(mol)
         anhydride_count = self._get_anhydride_count(mol)
         thiol_count = self._get_thiol_count(mol)
-        
+
         if anhydride_count > 0:
-            return "anhydride", anhydride_count * 2  # 酸酐开环后有2个反应位点
+            return "anhydride", anhydride_count * 2
         elif thiol_count > 0:
             return "thiol", thiol_count
         elif amine_count > 0:
@@ -4203,185 +4271,227 @@ class EpoxyDomainFeatureExtractor:
         else:
             return "unknown", 0
 
-    def _calc_electronic_props(self, mol):
-        """计算电子性质 (作为DFT的低成本替代)"""
+    def _calc_electronic_props(self, mol, smi=None):
+        if smi and hasattr(self, '_electronic_cache') and smi in self._electronic_cache:
+            return self._electronic_cache[smi]
         try:
-            # 计算 Gasteiger 部分电荷
             AllChem.ComputeGasteigerCharges(mol)
             charges = []
             for atom in mol.GetAtoms():
-                # 获取计算出的电荷
                 c = atom.GetProp('_GasteigerCharge')
-                # 有些原子可能无法计算，返回inf或nan
                 if c and not c.lower().startswith('nan') and not c.lower().startswith('inf'):
                     charges.append(float(c))
 
             if not charges:
-                return 0.0, 0.0, 0.0
+                res = (0.0, 0.0, 0.0)
+            else:
+                max_pos_charge = max(charges)
+                max_neg_charge = min(charges)
+                tpsa = Descriptors.TPSA(mol)
+                res = (float(max_pos_charge), float(max_neg_charge), float(tpsa))
 
-            max_pos_charge = max(charges)  # 亲电性指标
-            max_neg_charge = min(charges)  # 亲核性指标
-
-            # 拓扑极性表面积 (TPSA) - 表征分子极性
-            tpsa = Descriptors.TPSA(mol)
-
-            return max_pos_charge, max_neg_charge, tpsa
+            if smi and hasattr(self, '_electronic_cache'):
+                self._electronic_cache[smi] = res
+            return res
         except Exception:
             return 0.0, 0.0, 0.0
-    
+
     def _extract_crosslink_features(self, smi_r, smi_h):
-        """提取交联反应产物特征"""
         if not self.enable_reaction_simulation or self._crosslink_extractor is None:
             return {}
-        
+
+        c_key = f"{smi_r}||{smi_h}"
+        if hasattr(self, '_crosslink_cache') and c_key in self._crosslink_cache:
+            return dict(self._crosslink_cache[c_key])
+
         try:
             features = self._crosslink_extractor.extract_crosslink_features(
                 smi_r, smi_h, target_conversion=self.target_conversion
             )
-            # 添加前缀以区分
-            return {f"Crosslink_{k}": v for k, v in features.items()}
+            res = {f"Crosslink_{k}": v for k, v in features.items()}
+            if hasattr(self, '_crosslink_cache'):
+                self._crosslink_cache[c_key] = res
+            return res
         except Exception:
             return {}
 
-    def extract_features(self, resin_smiles_list, hardener_smiles_list, stoichiometry_list=None, stoich_mode: str = 'Resin/Hardener (总质量比, R/H)'):
+    def _extract_single_pair(self, smi_r: str, smi_h: str, stoich_val=None, stoich_mode: str = 'Resin/Hardener (总质量比, R/H)'):
+        if pd.isna(smi_r) or pd.isna(smi_h):
+            return None
+
+        mol_r = parse_chemical_string(
+            smi_r,
+            repair=True,
+            keep_largest_frag=False,
+        )
+        mol_h = parse_chemical_string(
+            smi_h,
+            repair=True,
+            keep_largest_frag=False,
+        )
+
+        if mol_r is None or mol_h is None:
+            return None
+
+        mw_r = Descriptors.MolWt(mol_r)
+        mw_h = Descriptors.MolWt(mol_h)
+        f_epoxy = self._get_epoxide_count(mol_r)
+        f_amine = self._get_active_hydrogen_count(mol_h)
+
+        eew = mw_r / f_epoxy if f_epoxy > 0 else mw_r
+        ahew = mw_h / f_amine if f_amine > 0 else mw_h
+
+        theo_phr = (ahew / eew) * 100 if eew > 0 else 0
+
+        actual_phr = theo_phr
+        if stoich_val is not None:
+            try:
+                v = float(stoich_val)
+                if v > 0:
+                    if stoich_mode.startswith("Resin/Hardener"):
+                        actual_phr = 100.0 / v
+                    elif stoich_mode.startswith("PHR"):
+                        actual_phr = v
+                    elif stoich_mode.startswith("Equiv Ratio (当量比, H/R)"):
+                        actual_phr = (v * 100.0 * ahew / eew) if eew > 0 and ahew > 0 else 0.0
+                    elif stoich_mode.startswith("Equiv Ratio (当量比, R/H)"):
+                        actual_phr = (100.0 * ahew / (eew * v)) if eew > 0 and ahew > 0 else 0.0
+                    else:
+                        actual_phr = v
+            except Exception:
+                pass
+
+        stoich_ratio = (actual_phr / theo_phr) if theo_phr > 0 else 0.0
+        stoich_delta = actual_phr - theo_phr
+
+        resin_eq = (100.0 / eew) if eew > 0 else 0.0
+        hardener_eq = (actual_phr / ahew) if ahew > 0 else 0.0
+        equiv_ratio_h_to_r = (hardener_eq / resin_eq) if resin_eq > 0 else 0.0
+        equiv_ratio_r_to_h = (resin_eq / hardener_eq) if hardener_eq > 0 else 0.0
+
+        r_pos_chg, r_neg_chg, r_tpsa = self._calc_electronic_props(mol_r, str(smi_r))
+        h_pos_chg, h_neg_chg, h_tpsa = self._calc_electronic_props(mol_h, str(smi_h))
+
+        features = {
+            'EEW': eew,
+            'AHEW': ahew,
+            'Resin_Functionality': f_epoxy,
+            'Hardener_Functionality': f_amine,
+            'Theoretical_PHR': theo_phr,
+            'Actual_PHR': actual_phr,
+            'Stoich_Ratio': stoich_ratio,
+            'Stoich_Delta': stoich_delta,
+            'Resin_Eq_100': resin_eq,
+            'Hardener_Eq': hardener_eq,
+            'Equiv_Ratio_H_to_R': equiv_ratio_h_to_r,
+            'Equiv_Ratio_R_to_H': equiv_ratio_r_to_h,
+            'Resin_Max_Pos_Charge': r_pos_chg,
+            'Resin_Max_Neg_Charge': r_neg_chg,
+            'Resin_TPSA': r_tpsa,
+            'Hardener_Max_Pos_Charge': h_pos_chg,
+            'Hardener_TPSA': h_tpsa
+        }
+
+        curer_type, curer_func = self._detect_curer_type(mol_h)
+        features['Curer_Type_Amine'] = 1 if curer_type == 'amine' else 0
+        features['Curer_Type_Anhydride'] = 1 if curer_type == 'anhydride' else 0
+        features['Curer_Type_Thiol'] = 1 if curer_type == 'thiol' else 0
+        features['Curer_Functionality_Detected'] = curer_func
+
+        r_val = equiv_ratio_h_to_r
+        if r_val > 0:
+            theo_alpha_max = min(1.0, r_val, 1.0 / r_val)
+        else:
+            theo_alpha_max = 0.0
+
+        if f_epoxy > 1 and f_amine > 1:
+            try:
+                alpha_gel = 1.0 / math.sqrt((f_epoxy - 1) * (f_amine - 1))
+                alpha_gel = min(1.0, alpha_gel)
+            except Exception:
+                alpha_gel = 1.0
+        else:
+            alpha_gel = 1.0
+
+        features['Theoretical_Max_Conversion'] = theo_alpha_max
+        features['Gel_Point_Conversion'] = alpha_gel
+        features['Stoich_Balance_Factor'] = 1.0 - abs(1.0 - r_val) if r_val <= 2.0 else 0.0
+
+        lumo_proxy = -1.0 * r_pos_chg * 5.0 - 0.5
+        homo_proxy = h_neg_chg * 4.0 - 6.0
+        features['Resin_LUMO_Proxy'] = round(lumo_proxy, 4)
+        features['Hardener_HOMO_Proxy'] = round(homo_proxy, 4)
+        features['Delta_E_Gap'] = round(abs(lumo_proxy - homo_proxy), 4)
+
+        if self.enable_reaction_simulation:
+            crosslink_features = self._extract_crosslink_features(str(smi_r), str(smi_h))
+            features.update(crosslink_features)
+
+        return features
+
+    def extract_features(self, resin_smiles_list, hardener_smiles_list, stoichiometry_list=None, stoich_mode: str = 'Resin/Hardener (总质量比, R/H)', n_jobs: int = 1):
         features_list = []
         valid_indices = []
         error_count = 0
-        error_samples = []  # 记录前几个错误样本
+        error_samples = []
 
         if len(resin_smiles_list) != len(hardener_smiles_list):
             print(f"❌ 错误：树脂列表长度 ({len(resin_smiles_list)}) 与固化剂列表长度 ({len(hardener_smiles_list)}) 不匹配")
             return pd.DataFrame(), []
+
+        # 解析并行核心数
+        import os
+        if n_jobs is None or n_jobs == 0:
+            effective_n_jobs = 1
+        elif n_jobs < 0:
+            system_cores = os.cpu_count() or 4
+            max_safe = max(1, system_cores - 1)
+            if os.name == 'nt':
+                max_safe = min(max_safe, 60)
+            effective_n_jobs = max_safe
+        else:
+            effective_n_jobs = n_jobs
+
+        # 多核并行加速处理
+        if effective_n_jobs > 1 and len(resin_smiles_list) >= 20:
+            try:
+                from joblib import Parallel, delayed
+                import numpy as np
+
+                n_chunks = min(effective_n_jobs * 2, len(resin_smiles_list))
+                all_items = []
+                for i in range(len(resin_smiles_list)):
+                    s_r = resin_smiles_list[i]
+                    s_h = hardener_smiles_list[i]
+                    st_val = stoichiometry_list[i] if stoichiometry_list is not None and i < len(stoichiometry_list) else None
+                    all_items.append((i, s_r, s_h, st_val))
+
+                chunks = [list(c) for c in np.array_split(all_items, n_chunks) if len(c) > 0]
+                print(f"🚀 启动服务器多核并行提取 (Workers: {effective_n_jobs}, 样本数: {len(resin_smiles_list)})...")
+                nested_res = Parallel(n_jobs=effective_n_jobs, backend='loky')(
+                    delayed(_epoxy_domain_worker_chunk)(
+                        c, stoich_mode, self.enable_reaction_simulation, self.target_conversion
+                    )
+                    for c in chunks
+                )
+                features_list = [f for sub_f, _ in nested_res for f in sub_f]
+                valid_indices = [idx for _, sub_idx in nested_res for idx in sub_idx]
+                return pd.DataFrame(features_list), valid_indices
+            except Exception as par_err:
+                print(f"⚠️ 多核并行提取异常，平滑回退至单线程: {par_err}")
 
         print(f"🔍 开始提取环氧树脂反应特征，共 {len(resin_smiles_list)} 个样本")
 
         # 遍历每对样本
         for idx, (smi_r, smi_h) in enumerate(zip(resin_smiles_list, hardener_smiles_list)):
             try:
-                # 检查输入是否为空
-                if pd.isna(smi_r) or pd.isna(smi_h):
-                    error_count += 1
-                    if len(error_samples) < 5:
-                        error_samples.append(f"样本 {idx}: 树脂或固化剂 SMILES 为空")
-                    continue
-
-                mol_r = parse_chemical_string(
-                    smi_r,
-                    repair=True,
-                    keep_largest_frag=False,
-                )
-                mol_h = parse_chemical_string(
-                    smi_h,
-                    repair=True,
-                    keep_largest_frag=False,
-                )
-
-                if mol_r is None or mol_h is None:
-                    error_count += 1
-                    if len(error_samples) < 5:
-                        error_samples.append(f"样本 {idx}: 无法解析 SMILES (树脂={smi_r[:50] if isinstance(smi_r, str) else smi_r}, 固化剂={smi_h[:50] if isinstance(smi_h, str) else smi_h})")
-                    continue
-
-                # 1. 基础化学计量特征 (原有功能)
-                mw_r = Descriptors.MolWt(mol_r)
-                mw_h = Descriptors.MolWt(mol_h)
-                f_epoxy = self._get_epoxide_count(mol_r)
-                f_amine = self._get_active_hydrogen_count(mol_h)
-
-                eew = mw_r / f_epoxy if f_epoxy > 0 else mw_r
-                ahew = mw_h / f_amine if f_amine > 0 else mw_h
-
-                # 计算理论配比 (phr)
-                theo_phr = (ahew / eew) * 100 if eew > 0 else 0
-
-
-                # 用户提供的配比（可选）
-                # 说明：
-                # - stoich_mode = "Resin/Hardener (总质量比, R/H)"：列值为 树脂总量/固化剂总量 (R/H)
-                #   则可换算为实际 PHR = 100 / (R/H)
-                # - stoich_mode = "PHR (Hardener per 100 Resin)"：列值即为 PHR
-                # - stoich_mode = "Equiv Ratio (当量比, H/R)"：列值为 固化剂当量/树脂当量
-                # - stoich_mode = "Equiv Ratio (当量比, R/H)"：列值为 树脂当量/固化剂当量
-                actual_phr = theo_phr
-                if stoichiometry_list is not None and idx < len(stoichiometry_list):
-                    try:
-                        v = float(stoichiometry_list[idx])
-                        if v > 0:
-                            if stoich_mode.startswith("Resin/Hardener"):
-                                # R/H -> PHR = 100 * H/R = 100 / (R/H)
-                                actual_phr = 100.0 / v
-                            elif stoich_mode.startswith("PHR"):
-                                actual_phr = v
-                            elif stoich_mode.startswith("Equiv Ratio (当量比, H/R)"):
-                                # H/R = (actual_phr / AHEW) / (100 / EEW)
-                                actual_phr = (v * 100.0 * ahew / eew) if eew > 0 and ahew > 0 else 0.0
-                            elif stoich_mode.startswith("Equiv Ratio (当量比, R/H)"):
-                                # R/H = (100 / EEW) / (actual_phr / AHEW)
-                                actual_phr = (100.0 * ahew / (eew * v)) if eew > 0 and ahew > 0 else 0.0
-                            else:
-                                actual_phr = v
-                    except Exception:
-                        pass
-
-                # 与理论配比的偏离（用于反映固化欠量/过量）
-                stoich_ratio = (actual_phr / theo_phr) if theo_phr > 0 else 0.0
-                stoich_delta = actual_phr - theo_phr
-
-                # 当量比（基于树脂/固化剂等效重量）
-                # resin_eq: 每100份树脂的环氧当量；hardener_eq: 实际配比下的固化剂当量
-                resin_eq = (100.0 / eew) if eew > 0 else 0.0
-                hardener_eq = (actual_phr / ahew) if ahew > 0 else 0.0
-                equiv_ratio_h_to_r = (hardener_eq / resin_eq) if resin_eq > 0 else 0.0
-                equiv_ratio_r_to_h = (resin_eq / hardener_eq) if hardener_eq > 0 else 0.0
-                # 2. 电子性质特征 (新增功能 - 模拟DFT)
-                r_pos_chg, r_neg_chg, r_tpsa = self._calc_electronic_props(mol_r)
-                h_pos_chg, h_neg_chg, h_tpsa = self._calc_electronic_props(mol_h)
-
-                features = {
-                    'EEW': eew,
-                    'AHEW': ahew,
-                    'Resin_Functionality': f_epoxy,
-                    'Hardener_Functionality': f_amine,
-                    'Theoretical_PHR': theo_phr,
-                    'Actual_PHR': actual_phr,
-                    'Stoich_Ratio': stoich_ratio,
-                    'Stoich_Delta': stoich_delta,
-                    'Resin_Eq_100': resin_eq,
-                    'Hardener_Eq': hardener_eq,
-                    'Equiv_Ratio_H_to_R': equiv_ratio_h_to_r,
-                    'Equiv_Ratio_R_to_H': equiv_ratio_r_to_h,
-                    # 新增特征列
-                    'Resin_Max_Pos_Charge': r_pos_chg,
-                    'Resin_Max_Neg_Charge': r_neg_chg,
-                    'Resin_TPSA': r_tpsa,
-                    'Hardener_Max_Pos_Charge': h_pos_chg,
-                    'Hardener_TPSA': h_tpsa
-                }
-                
-                # 3. 检测固化剂类型并添加相关特征
-                curer_type, curer_func = self._detect_curer_type(mol_h)
-                features['Curer_Type_Amine'] = 1 if curer_type == 'amine' else 0
-                features['Curer_Type_Anhydride'] = 1 if curer_type == 'anhydride' else 0
-                features['Curer_Type_Thiol'] = 1 if curer_type == 'thiol' else 0
-                features['Curer_Functionality_Detected'] = curer_func
-                
-                # 4. 计算理论最大转化率 (基于化学计量比)
-                if f_epoxy > 0 and curer_func > 0:
-                    r_value = curer_func / f_epoxy  # 活性氢/环氧比
-                    features['Stoichiometry_r'] = r_value
-                    features['Theoretical_Alpha_Max'] = min(1.0, r_value, 1.0/r_value) if r_value > 0 else 0.0
+                st_val = stoichiometry_list[idx] if stoichiometry_list is not None and idx < len(stoichiometry_list) else None
+                feat = self._extract_single_pair(smi_r, smi_h, st_val, stoich_mode)
+                if feat is not None:
+                    features_list.append(feat)
+                    valid_indices.append(idx)
                 else:
-                    features['Stoichiometry_r'] = 0.0
-                    features['Theoretical_Alpha_Max'] = 0.0
-                
-                # 5. 交联反应模拟特征 (如果启用)
-                if self.enable_reaction_simulation:
-                    crosslink_features = self._extract_crosslink_features(smi_r, smi_h)
-                    features.update(crosslink_features)
-
-                features_list.append(features)
-                valid_indices.append(idx)
-
+                    error_count += 1
             except Exception as e:
                 error_count += 1
                 if len(error_samples) < 5:
@@ -4584,10 +4694,11 @@ def _add_prefix_to_columns(df, prefix):
         DataFrame: 列名添加前缀后的 DataFrame
     """
     if prefix and len(df.columns) > 0:
-        # [修复] 确保 prefix 是字符串
-        prefix_str = str(prefix) if prefix is not None else ""
-        if prefix_str:  # 只有非空字符串才添加前缀
-            df.columns = [f"{prefix_str}_{col}" for col in df.columns]
+        # [修复] 确保 prefix 是字符串，并避免重复下划线
+        prefix_str = str(prefix).strip() if prefix is not None else ""
+        if prefix_str:
+            p = prefix_str if prefix_str.endswith("_") else f"{prefix_str}_"
+            df.columns = [f"{p}{col}" for col in df.columns]
     return df
 
 

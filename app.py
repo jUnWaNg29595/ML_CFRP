@@ -143,11 +143,13 @@ except Exception as e:
         return None
 
 # [新增] LazyPredict 支持（快速模型对比）
+# [内存优化] lazypredict 会连带导入约 30 个模型库（实测 +429MB），
+# 改为 find_spec 检查可用性，仅在用户实际运行 LazyPredict 时才真正导入。
 try:
-    from lazypredict.Supervised import LazyRegressor
-    LAZYPREDICT_AVAILABLE = True
-    LAZYPREDICT_IMPORT_ERROR = None
-except ImportError as e:
+    import importlib.util as _il_util
+    LAZYPREDICT_AVAILABLE = _il_util.find_spec("lazypredict") is not None
+    LAZYPREDICT_IMPORT_ERROR = None if LAZYPREDICT_AVAILABLE else "lazypredict 未安装"
+except Exception as e:
     LAZYPREDICT_AVAILABLE = False
     LAZYPREDICT_IMPORT_ERROR = str(e)
     LazyRegressor = None
@@ -1215,6 +1217,11 @@ from core.navigation import (
 )
 from core.feature_registry_ui import render_feature_registry_page
 from core.applicability_domain import ApplicabilityDomainAnalyzer, TanimotoADAnalyzer
+from core.formulation_grouping import (
+    get_formulation_group_options,
+    build_group_series,
+    analyze_group_distribution,
+)
 from core.ui_config import (
     MANUAL_TUNING_PARAMS,
     MODEL_PARAMETERS,
@@ -1975,13 +1982,24 @@ except ImportError: pass
 
 
 # === TensorFlow (for TFS model) ===
+# [内存优化] 与 core/tf_model.py 保持一致的懒加载策略：
+# 启动时不导入 TF（节省约 310MB），仅用 find_spec 检查可用性，
+# 首次访问 tf/keras/layers/... 时才真正导入。
 try:
-    import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers, callbacks, regularizers
-    tf.get_logger().setLevel('ERROR')
-    TENSORFLOW_AVAILABLE = True
+    import importlib.util as _tf_il_util
+    TENSORFLOW_AVAILABLE = _tf_il_util.find_spec("tensorflow") is not None
 except Exception:
+    TENSORFLOW_AVAILABLE = False
+
+if TENSORFLOW_AVAILABLE:
+    from core.tf_model import _LazyTFModule
+
+    tf = _LazyTFModule(['tensorflow'])
+    keras = _LazyTFModule(['tensorflow.keras', 'keras'])
+    layers = _LazyTFModule(['tensorflow.keras.layers', 'keras.layers'])
+    callbacks = _LazyTFModule(['tensorflow.keras.callbacks', 'keras.callbacks'])
+    regularizers = _LazyTFModule(['tensorflow.keras.regularizers', 'keras.regularizers'])
+else:
     TENSORFLOW_AVAILABLE = False
     tf = None
     keras = None
@@ -3749,11 +3767,20 @@ def _df_cache_key(df: pd.DataFrame) -> int:
 
 def _get_cached_cleaner(df: pd.DataFrame) -> AdvancedDataCleaner:
     """Cache cleaner per DataFrame object to avoid repeated copies on reruns."""
+    import importlib
+    import core.data_processor
+    if not hasattr(core.data_processor.AdvancedDataCleaner, "balance_formulation_stratified"):
+        importlib.reload(core.data_processor)
+
     cache = st.session_state.get("_data_cleaner_cache")
     df_id = id(df)
-    if cache and cache.get("df_id") == df_id:
+    if (
+        cache
+        and cache.get("df_id") == df_id
+        and hasattr(cache.get("cleaner"), "balance_formulation_stratified")
+    ):
         return cache["cleaner"]
-    cleaner = AdvancedDataCleaner(df)
+    cleaner = core.data_processor.AdvancedDataCleaner(df)
     st.session_state["_data_cleaner_cache"] = {"df_id": df_id, "cleaner": cleaner}
     return cleaner
 
@@ -4181,6 +4208,9 @@ def _render_network_proxy_panel(active_task_lock: bool = False):
 
 
 
+# [片段化] fragment：面板内按钮/表单交互只重绘本面板（不闪屏、不丢滚动位置），
+# 面板内部的重定向也限定 scope='fragment'。
+@st.fragment
 def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
     """Render safe, interactive AI service administration without exposing credentials."""
     with st.expander('AI 服务管理', expanded=False):
@@ -4274,7 +4304,10 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
                     'provider': str(base_template.get('provider') or 'openai-compatible'),
                     'base_url': str(base_template.get('base_url') or 'https://api.openai.com/v1'),
                     'endpoint': str(base_template.get('endpoint') or ''),
-                    'model': '',
+                    # [修复] 校验器要求 model 非空（_service_mapping → _text required），
+                    # 模板预填默认服务的模型名（仅同网关时合理），无默认则用占位符，
+                    # 用户随后可在编辑表单中修改。
+                    'model': str(base_template.get('model') or 'gpt-4o-mini'),
                     'purpose': 'both', 'timeout_seconds': int(base_template.get('timeout_seconds') or 30),
                     'max_tokens': int(base_template.get('max_tokens') or 2048),
                     'temperature': float(base_template.get('temperature') or 0.2),
@@ -4283,9 +4316,14 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
                     'headers': dict(base_template.get('headers') or {}),
                 }
                 services.append(new_svc)
-                save_ai_config(config_root, {'services': services})
+                try:
+                    save_ai_config(config_root, {'services': services})
+                except Exception as _svc_exc:
+                    st.error(f'新建服务保存失败（请检查默认服务的网关/模型配置）：{_svc_exc}')
+                    services.pop()
+                    return
                 st.session_state['portal_ai_edit_service_selector'] = new_id
-                st.rerun()
+                st.rerun(scope='fragment')
         with btn_c2:
             if selected_edit_id and st.button('📋 复制所选服务', key='portal_ai_btn_clone_svc', disabled=active_task_lock, width='stretch'):
                 source_svc = next((s for s in services if s.get('service_id') == selected_edit_id), None)
@@ -4297,7 +4335,7 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
                     services.append(cloned_svc)
                     save_ai_config(config_root, {'services': services})
                     st.session_state['portal_ai_edit_service_selector'] = cloned_id
-                    st.rerun()
+                    st.rerun(scope='fragment')
         with btn_c3:
             if selected_edit_id:
                 delete_confirm = st.checkbox('确认删除所选服务', key=f'portal_ai_del_confirm_{selected_edit_id}', disabled=active_task_lock)
@@ -4306,7 +4344,7 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
                     save_ai_config(config_root, {'services': services})
                     st.session_state.pop('portal_ai_client', None)
                     st.success(f'已删除服务 [{selected_edit_id}]')
-                    st.rerun()
+                    st.rerun(scope='fragment')
 
         # Target item to edit (keyed specifically by selected_edit_id to prevent state bleeding)
         current = next((s for s in services if s.get('service_id') == selected_edit_id), {}) if selected_edit_id else {}
@@ -4568,7 +4606,7 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
                     normalized = save_ai_config(config_root, {'services': new_services})
                     st.session_state.pop('portal_ai_client', None)
                     st.success(f'已安全保存服务 [{service_id.strip()}]！')
-                    st.rerun()
+                    st.rerun(scope='fragment')
                 except Exception as exc:
                     st.error(f'AI 配置校验或保存失败：{exc}')
 
@@ -4619,6 +4657,277 @@ def _render_portal_ai_service_panel(active_task_lock: bool = False) -> None:
         )
         st.caption('AI 只辅助输入和特征审核建议；不会自动批准、生成虚假测量值或替代 Python 预测。')
 
+# [片段化] 会话保护/性能监控/系统信息面板：自包含（只写 session_state），
+# 注册为 fragment —— 面板内交互只重绘本面板，不再触发整页刷新。
+@st.fragment
+def _render_sidebar_session_panel(active_task_lock: bool = False) -> None:
+    st.markdown("---")
+    st.markdown("### 💾 会话保护")
+
+    autosave = st.checkbox(
+        "自动保存",
+        value=st.session_state.get("_autosave_enabled", True),
+        key="autosave_enabled_toggle",
+        disabled=active_task_lock,
+    )
+    st.session_state["_autosave_enabled"] = autosave
+    auto_restore = st.checkbox(
+        "自动恢复",
+        value=st.session_state.get("_auto_restore_enabled", True),
+        key="auto_restore_toggle",
+        disabled=active_task_lock,
+    )
+    st.session_state["_auto_restore_enabled"] = auto_restore
+    interval = st.slider(
+        "保存间隔 (秒)",
+        10,
+        300,
+        int(st.session_state.get("_autosave_interval_sec", 120) or 120),
+        key="autosave_interval_slider",
+        disabled=active_task_lock,
+    )
+    st.session_state["_autosave_interval_sec"] = int(interval)
+
+    meta = _load_snapshot_meta("latest")
+    if meta:
+        st.caption(f"最近保存: {meta.get('saved_at', '-')}")
+    else:
+        st.caption("暂无快照")
+
+    # 性能监控
+    st.markdown("---")
+    st.markdown("### ⚡ 性能监控")
+
+    # 初始化性能计数器
+    if 'perf_rerun_count' not in st.session_state:
+        import time
+        st.session_state.perf_rerun_count = 0
+        st.session_state.perf_start_time = time.time()
+
+    st.session_state.perf_rerun_count += 1
+
+    # 显示性能指标
+    import time
+    elapsed = time.time() - st.session_state.perf_start_time
+    st.metric("页面重载次数", st.session_state.perf_rerun_count)
+    st.metric("运行时间", f"{elapsed:.1f}s")
+
+    # 内存监控
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        st.metric("内存占用", f"{memory_mb:.0f} MB")
+    except ImportError:
+        pass
+
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        if st.button("立即保存", key="snapshot_save_btn", disabled=active_task_lock):
+            ok, _ = _save_session_snapshot("latest")
+            if ok:
+                st.success("✅ 已保存快照")
+            else:
+                st.warning("⚠️ 保存失败或无数据")
+    with col_s2:
+        if st.button(
+            "恢复快照",
+            key="snapshot_restore_btn",
+            disabled=meta is None or active_task_lock,
+        ):
+            ok, _ = _restore_session_snapshot("latest", override=True)
+            if ok:
+                st.success("✅ 已恢复快照")
+                st.rerun()  # [片段化] 恢复快照影响全站，需要整页重跑
+            else:
+                st.warning("⚠️ 未找到快照")
+
+    if st.session_state.get("_snapshot_loaded"):
+        st.caption(f"已恢复快照: {st.session_state.get('_snapshot_loaded_at') or '-'}")
+
+    st.markdown("---")
+    st.markdown("### 🔧 系统信息")
+    st.caption(f"CPU核心: {mp.cpu_count()}")
+    if PSUTIL_AVAILABLE:
+        mem = psutil.virtual_memory()
+        st.caption(f"内存使用: {mem.percent}%")
+
+
+# [片段化] 计算设备/依赖检测面板：compute_device 只在任务执行时读取，
+# 注册为 fragment —— 切换设备不再整页刷新。
+@st.fragment
+def _render_sidebar_compute_panel(active_task_lock: bool = False) -> None:
+    # --- [新增] GPU/计算设备选择（影响 Torch 模型训练 & 部分分子特征提取） ---
+    # 说明：在 AMD ROCm/HIP 的 PyTorch 版本中，仍然使用 torch.cuda / device='cuda' 接口（只是后端是 HIP）。
+    # 因此本项目统一用选项 'cuda' 表示"使用 GPU"（包括 NVIDIA CUDA 或 AMD ROCm/HIP）。
+    st.markdown("---")
+    st.markdown("### 🖥️ 计算设备")
+
+    # 检测可用 GPU
+    _opts = ["auto", "cpu"]
+    if TORCH_AVAILABLE and torch is not None:
+        try:
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                for i in range(gpu_count):
+                    gpu_name = torch.cuda.get_device_name(i)
+                    _opts.insert(-1, f"cuda:{i}")  # 在 cpu 之前插入
+        except Exception:
+            pass
+
+    # 如果没有检测到具体 GPU，添加通用 cuda 选项
+    if "cuda:0" not in _opts and "cuda:1" not in _opts:
+        _opts.insert(-1, "cuda")
+
+    _cur = st.session_state.get('compute_device', 'auto')
+    _idx = _opts.index(_cur) if _cur in _opts else 0
+
+    _choice = st.selectbox(
+        "深度学习设备（Torch）",
+        options=_opts,
+        index=_idx,
+        help="auto=自动选择（检测到 GPU 就用）；cuda:0/cuda:1=指定 GPU；cpu=强制 CPU。",
+        key="compute_device_selectbox",
+        disabled=active_task_lock,
+    )
+
+    # --- 设备探测（CUDA vs ROCm/HIP） ---
+    _gpu_available = False
+    _backend = None  # 'cuda' | 'hip'
+    _backend_ver = None
+    try:
+        _gpu_available = bool(getattr(torch.cuda, 'is_available', lambda: False)())
+        if _gpu_available:
+            if getattr(torch.version, "hip", None):
+                _backend = "hip"
+                _backend_ver = torch.version.hip
+            elif getattr(torch.version, "cuda", None):
+                _backend = "cuda"
+                _backend_ver = torch.version.cuda
+    except Exception:
+        _gpu_available = False
+
+    if _choice == 'cuda' and not _gpu_available:
+        st.warning("当前环境未检测到可用 GPU（或未安装 ROCm/CUDA 版 PyTorch），已回退到 CPU。")
+        _choice = 'cpu'
+
+    st.session_state.compute_device = _choice
+
+    if _gpu_available:
+        try:
+            _gpu_name = torch.cuda.get_device_name(0)
+            _gpu_cnt = torch.cuda.device_count()
+            if _backend == "hip":
+                st.caption(f"GPU: ✅ 可用 | 后端：ROCm/HIP ({_backend_ver}) | {_gpu_cnt}×GPU | {_gpu_name}")
+            elif _backend == "cuda":
+                st.caption(f"GPU: ✅ 可用 | 后端：CUDA ({_backend_ver}) | {_gpu_cnt}×GPU | {_gpu_name}")
+            else:
+                st.caption(f"GPU: ✅ 可用 | {_gpu_cnt}×GPU | {_gpu_name}")
+        except Exception:
+            st.caption("GPU: ✅ 可用（未能读取设备名称）")
+    else:
+        st.caption("GPU: ❌ 未检测到（将使用 CPU）")
+        st.info("如果你在 **WSL(Ubuntu 22.04/24.04)** 上使用 AMD 集成显卡（如 780M），需要先安装 **AMD WSL 驱动 + ROCm**，并安装 **ROCm/HIP 版 PyTorch**，这样本系统选择 `cuda` 才能真正走 GPU。")
+
+
+    # --- [新增] 依赖检测（让 TFS 模型入口更"可见"） ---
+    st.markdown("### 🧩 依赖检测")
+    tf_ver = None
+    try:
+        tf_ver = get_tensorflow_version()
+    except Exception:
+        tf_ver = None
+
+    if bool(TENSORFLOW_AVAILABLE) and tf_ver:
+        st.success(f"TensorFlow: {tf_ver}")
+    else:
+        st.caption("TensorFlow: 未安装或不可用")
+        try:
+            err = globals().get('TENSORFLOW_IMPORT_ERROR', '')
+            if err:
+                st.caption(f"TF 导入信息: {str(err)[:160]}")
+        except Exception:
+            pass
+
+    st.caption(f"TorchANI: {'可用' if TORCHANI_AVAILABLE else '不可用'}")
+
+
+# [片段化] 用户预测门户面板：自包含（portal_enabled 仅面板自身读取，门户状态也只在面板内展示），
+# 注册为 fragment —— 开关门户、切换自动运行不再整页刷新；面板内的状态刷新限定 fragment 范围。
+@st.fragment
+def _render_sidebar_portal_panel() -> None:
+    st.markdown("### 🌐 用户预测门户")
+    if "user_prediction_portal_enabled" not in st.session_state:
+        st.session_state["user_prediction_portal_enabled"] = False
+    portal_enabled = st.checkbox(
+        "自动运行并显示用户预测门户入口",
+        key="user_prediction_portal_enabled",
+        help="勾选后，主平台会自动启动 8555 端口的独立用户预测页面；取消勾选不会强制关闭已运行的门户。",
+    )
+
+    portal_start_col, portal_stop_col = st.columns(2)
+    with portal_start_col:
+        if st.button("开启门户", key="portal_start_button", width="stretch"):
+            start_result = start_prediction_portal(port=8555)
+            if start_result.get("status") == "error":
+                st.error(f"门户启动失败：{start_result.get('error', '未知错误')}")
+            else:
+                st.session_state["_portal_notice"] = "已发送门户启动请求，正在等待 8555 端口就绪。"
+    with portal_stop_col:
+        if st.button("关闭门户", key="portal_stop_button", width="stretch"):
+            stop_result = stop_prediction_portal(port=8555)
+            if stop_result.get("status") == "error":
+                st.error(f"门户关闭失败：{stop_result.get('error', '未知错误')}")
+            elif stop_result.get("error"):
+                st.warning(stop_result["error"])
+            else:
+                st.session_state["_portal_notice"] = "门户已关闭。"
+
+    portal_notice = st.session_state.pop("_portal_notice", None)
+    if portal_notice:
+        st.info(portal_notice)
+
+    if portal_enabled:
+        # 增加 3 秒轻量节流防抖，避免侧边栏每次重复发送 TCP 探活包导致整个 UI 挂起
+        import time
+        now_ts = time.time()
+        cached_portal_status = st.session_state.get("_cached_portal_status_dict")
+        cached_portal_status_ts = st.session_state.get("_cached_portal_status_ts", 0)
+
+        if not cached_portal_status or (now_ts - cached_portal_status_ts > 3.0):
+            portal_status = portal_process_status(port=8555)
+            if portal_status.get("status") == "stopped":
+                auto_start_result = start_prediction_portal(port=8555)
+                if auto_start_result.get("status") == "error":
+                    st.error(f"门户自动启动失败：{auto_start_result.get('error', '未知错误')}")
+                else:
+                    portal_status = portal_process_status(port=8555)
+            st.session_state["_cached_portal_status_dict"] = portal_status
+            st.session_state["_cached_portal_status_ts"] = now_ts
+        else:
+            portal_status = cached_portal_status
+
+    else:
+        portal_status = {"status": "stopped", "managed": False, "pid": None, "port": 8555}
+
+    if portal_status.get("status") == "running":
+        if portal_status.get("managed"):
+            st.success(f"门户状态：{portal_health_label(True)}（由主平台管理，PID {portal_status.get('pid')}）")
+        else:
+            st.success("门户状态：可访问（由其他进程启动）")
+        st.link_button(
+            "打开用户预测门户",
+            "http://localhost:8555",
+            width="stretch",
+        )
+    elif portal_status.get("status") == "starting":
+        st.info(f"门户状态：正在启动（PID {portal_status.get('pid')}），稍后刷新即可访问。")
+        st.caption("访问地址：http://localhost:8555")
+    else:
+        st.warning("门户状态：未启动。可点击“开启门户”，或勾选上方自动运行。")
+        st.caption("访问地址：http://localhost:8555")
+
+
 def render_sidebar():
     """渲染侧边栏导航"""
     with st.sidebar:
@@ -4668,76 +4977,7 @@ def render_sidebar():
         st.session_state["_last_active_page"] = page
 
         st.markdown("---")
-        st.markdown("### 🌐 用户预测门户")
-        if "user_prediction_portal_enabled" not in st.session_state:
-            st.session_state["user_prediction_portal_enabled"] = False
-        portal_enabled = st.checkbox(
-            "自动运行并显示用户预测门户入口",
-            key="user_prediction_portal_enabled",
-            help="勾选后，主平台会自动启动 8555 端口的独立用户预测页面；取消勾选不会强制关闭已运行的门户。",
-        )
-
-        portal_start_col, portal_stop_col = st.columns(2)
-        with portal_start_col:
-            if st.button("开启门户", key="portal_start_button", width="stretch"):
-                start_result = start_prediction_portal(port=8555)
-                if start_result.get("status") == "error":
-                    st.error(f"门户启动失败：{start_result.get('error', '未知错误')}")
-                else:
-                    st.session_state["_portal_notice"] = "已发送门户启动请求，正在等待 8555 端口就绪。"
-        with portal_stop_col:
-            if st.button("关闭门户", key="portal_stop_button", width="stretch"):
-                stop_result = stop_prediction_portal(port=8555)
-                if stop_result.get("status") == "error":
-                    st.error(f"门户关闭失败：{stop_result.get('error', '未知错误')}")
-                elif stop_result.get("error"):
-                    st.warning(stop_result["error"])
-                else:
-                    st.session_state["_portal_notice"] = "门户已关闭。"
-
-        portal_notice = st.session_state.pop("_portal_notice", None)
-        if portal_notice:
-            st.info(portal_notice)
-
-        if portal_enabled:
-            # 增加 3 秒轻量节流防抖，避免侧边栏每次重复发送 TCP 探活包导致整个 UI 挂起
-            import time
-            now_ts = time.time()
-            cached_portal_status = st.session_state.get("_cached_portal_status_dict")
-            cached_portal_status_ts = st.session_state.get("_cached_portal_status_ts", 0)
-
-            if not cached_portal_status or (now_ts - cached_portal_status_ts > 3.0):
-                portal_status = portal_process_status(port=8555)
-                if portal_status.get("status") == "stopped":
-                    auto_start_result = start_prediction_portal(port=8555)
-                    if auto_start_result.get("status") == "error":
-                        st.error(f"门户自动启动失败：{auto_start_result.get('error', '未知错误')}")
-                    else:
-                        portal_status = portal_process_status(port=8555)
-                st.session_state["_cached_portal_status_dict"] = portal_status
-                st.session_state["_cached_portal_status_ts"] = now_ts
-            else:
-                portal_status = cached_portal_status
-
-        else:
-            portal_status = {"status": "stopped", "managed": False, "pid": None, "port": 8555}
-
-        if portal_status.get("status") == "running":
-            if portal_status.get("managed"):
-                st.success(f"门户状态：{portal_health_label(True)}（由主平台管理，PID {portal_status.get('pid')}）")
-            else:
-                st.success("门户状态：可访问（由其他进程启动）")
-            st.link_button(
-                "打开用户预测门户",
-                "http://localhost:8555",
-                width="stretch",
-            )
-        elif portal_status.get("status") == "starting":
-            st.info(f"门户状态：正在启动（PID {portal_status.get('pid')}），稍后刷新即可访问。")
-            st.caption("访问地址：http://localhost:8555")
-        else:
-            st.warning("门户状态：未启动。可点击“开启门户”，或勾选上方自动运行。")
-            st.caption("访问地址：http://localhost:8555")
+        _render_sidebar_portal_panel()
         _render_network_proxy_panel(active_task_lock)
         _render_portal_ai_service_panel(active_task_lock)
 
@@ -4821,190 +5061,9 @@ def render_sidebar():
                 r2 = st.session_state.train_result.get('r2', 0)
                 st.caption(f"当前 R²: {r2:.4f}")
 
-        st.markdown("---")
-        st.markdown("### 💾 会话保护")
+        _render_sidebar_session_panel(active_task_lock)
 
-        autosave = st.checkbox(
-            "自动保存",
-            value=st.session_state.get("_autosave_enabled", True),
-            key="autosave_enabled_toggle",
-            disabled=active_task_lock,
-        )
-        st.session_state["_autosave_enabled"] = autosave
-        auto_restore = st.checkbox(
-            "自动恢复",
-            value=st.session_state.get("_auto_restore_enabled", True),
-            key="auto_restore_toggle",
-            disabled=active_task_lock,
-        )
-        st.session_state["_auto_restore_enabled"] = auto_restore
-        interval = st.slider(
-            "保存间隔 (秒)",
-            10,
-            300,
-            int(st.session_state.get("_autosave_interval_sec", 120) or 120),
-            key="autosave_interval_slider",
-            disabled=active_task_lock,
-        )
-        st.session_state["_autosave_interval_sec"] = int(interval)
-
-        meta = _load_snapshot_meta("latest")
-        if meta:
-            st.caption(f"最近保存: {meta.get('saved_at', '-')}")
-        else:
-            st.caption("暂无快照")
-
-        # 性能监控
-        st.markdown("---")
-        st.markdown("### ⚡ 性能监控")
-
-        # 初始化性能计数器
-        if 'perf_rerun_count' not in st.session_state:
-            import time
-            st.session_state.perf_rerun_count = 0
-            st.session_state.perf_start_time = time.time()
-
-        st.session_state.perf_rerun_count += 1
-
-        # 显示性能指标
-        import time
-        elapsed = time.time() - st.session_state.perf_start_time
-        st.metric("页面重载次数", st.session_state.perf_rerun_count)
-        st.metric("运行时间", f"{elapsed:.1f}s")
-
-        # 内存监控
-        try:
-            import psutil
-            process = psutil.Process(os.getpid())
-            memory_mb = process.memory_info().rss / 1024 / 1024
-            st.metric("内存占用", f"{memory_mb:.0f} MB")
-        except ImportError:
-            pass
-
-        col_s1, col_s2 = st.columns(2)
-        with col_s1:
-            if st.button("立即保存", key="snapshot_save_btn", disabled=active_task_lock):
-                ok, _ = _save_session_snapshot("latest")
-                if ok:
-                    st.success("✅ 已保存快照")
-                else:
-                    st.warning("⚠️ 保存失败或无数据")
-        with col_s2:
-            if st.button(
-                "恢复快照",
-                key="snapshot_restore_btn",
-                disabled=meta is None or active_task_lock,
-            ):
-                ok, _ = _restore_session_snapshot("latest", override=True)
-                if ok:
-                    st.success("✅ 已恢复快照")
-                    # st.rerun() removed - auto-rerun on button click
-                else:
-                    st.warning("⚠️ 未找到快照")
-
-        if st.session_state.get("_snapshot_loaded"):
-            st.caption(f"已恢复快照: {st.session_state.get('_snapshot_loaded_at') or '-'}")
-
-        st.markdown("---")
-        st.markdown("### 🔧 系统信息")
-        st.caption(f"CPU核心: {mp.cpu_count()}")
-        if PSUTIL_AVAILABLE:
-            mem = psutil.virtual_memory()
-            st.caption(f"内存使用: {mem.percent}%")
-
-        # --- [新增] GPU/计算设备选择（影响 Torch 模型训练 & 部分分子特征提取） ---
-        # 说明：在 AMD ROCm/HIP 的 PyTorch 版本中，仍然使用 torch.cuda / device='cuda' 接口（只是后端是 HIP）。
-        # 因此本项目统一用选项 'cuda' 表示"使用 GPU"（包括 NVIDIA CUDA 或 AMD ROCm/HIP）。
-        st.markdown("---")
-        st.markdown("### 🖥️ 计算设备")
-
-        # 检测可用 GPU
-        _opts = ["auto", "cpu"]
-        if TORCH_AVAILABLE and torch is not None:
-            try:
-                if torch.cuda.is_available():
-                    gpu_count = torch.cuda.device_count()
-                    for i in range(gpu_count):
-                        gpu_name = torch.cuda.get_device_name(i)
-                        _opts.insert(-1, f"cuda:{i}")  # 在 cpu 之前插入
-            except Exception:
-                pass
-
-        # 如果没有检测到具体 GPU，添加通用 cuda 选项
-        if "cuda:0" not in _opts and "cuda:1" not in _opts:
-            _opts.insert(-1, "cuda")
-
-        _cur = st.session_state.get('compute_device', 'auto')
-        _idx = _opts.index(_cur) if _cur in _opts else 0
-
-        _choice = st.selectbox(
-            "深度学习设备（Torch）",
-            options=_opts,
-            index=_idx,
-            help="auto=自动选择（检测到 GPU 就用）；cuda:0/cuda:1=指定 GPU；cpu=强制 CPU。",
-            key="compute_device_selectbox",
-            disabled=active_task_lock,
-        )
-
-        # --- 设备探测（CUDA vs ROCm/HIP） ---
-        _gpu_available = False
-        _backend = None  # 'cuda' | 'hip'
-        _backend_ver = None
-        try:
-            _gpu_available = bool(getattr(torch.cuda, 'is_available', lambda: False)())
-            if _gpu_available:
-                if getattr(torch.version, "hip", None):
-                    _backend = "hip"
-                    _backend_ver = torch.version.hip
-                elif getattr(torch.version, "cuda", None):
-                    _backend = "cuda"
-                    _backend_ver = torch.version.cuda
-        except Exception:
-            _gpu_available = False
-
-        if _choice == 'cuda' and not _gpu_available:
-            st.warning("当前环境未检测到可用 GPU（或未安装 ROCm/CUDA 版 PyTorch），已回退到 CPU。")
-            _choice = 'cpu'
-
-        st.session_state.compute_device = _choice
-
-        if _gpu_available:
-            try:
-                _gpu_name = torch.cuda.get_device_name(0)
-                _gpu_cnt = torch.cuda.device_count()
-                if _backend == "hip":
-                    st.caption(f"GPU: ✅ 可用 | 后端：ROCm/HIP ({_backend_ver}) | {_gpu_cnt}×GPU | {_gpu_name}")
-                elif _backend == "cuda":
-                    st.caption(f"GPU: ✅ 可用 | 后端：CUDA ({_backend_ver}) | {_gpu_cnt}×GPU | {_gpu_name}")
-                else:
-                    st.caption(f"GPU: ✅ 可用 | {_gpu_cnt}×GPU | {_gpu_name}")
-            except Exception:
-                st.caption("GPU: ✅ 可用（未能读取设备名称）")
-        else:
-            st.caption("GPU: ❌ 未检测到（将使用 CPU）")
-            st.info("如果你在 **WSL(Ubuntu 22.04/24.04)** 上使用 AMD 集成显卡（如 780M），需要先安装 **AMD WSL 驱动 + ROCm**，并安装 **ROCm/HIP 版 PyTorch**，这样本系统选择 `cuda` 才能真正走 GPU。")
-
-
-        # --- [新增] 依赖检测（让 TFS 模型入口更"可见"） ---
-        st.markdown("### 🧩 依赖检测")
-        tf_ver = None
-        try:
-            tf_ver = get_tensorflow_version()
-        except Exception:
-            tf_ver = None
-
-        if bool(TENSORFLOW_AVAILABLE) and tf_ver:
-            st.success(f"TensorFlow: {tf_ver}")
-        else:
-            st.caption("TensorFlow: 未安装或不可用")
-            try:
-                err = globals().get('TENSORFLOW_IMPORT_ERROR', '')
-                if err:
-                    st.caption(f"TF 导入信息: {str(err)[:160]}")
-            except Exception:
-                pass
-
-        st.caption(f"TorchANI: {'可用' if TORCHANI_AVAILABLE else '不可用'}")
+        _render_sidebar_compute_panel(active_task_lock)
 
         # [新增] 后台任务管理器 UI
         render_task_manager_ui()
@@ -5230,7 +5289,7 @@ def page_data_upload():
     """数据上传页面"""
     st.title("📤 数据上传")
 
-    tab1, tab2 = st.tabs(["📁 上传文件", "📝 生成示例数据"])
+    tab1, tab2, tab3 = st.tabs(["📁 上传文件", "🔗 跨表配方融合 (One-Click Fusion)", "📝 生成示例数据"])
 
     with tab1:
         uploaded_file = st.file_uploader(
@@ -5292,6 +5351,10 @@ def page_data_upload():
                     st.error(f"❌ 加载失败: {msg}")
 
     with tab2:
+        from core.formulation_fusion_ui import render_formulation_fusion_ui
+        render_formulation_fusion_ui(standalone=False)
+
+    with tab3:
         st.markdown("### 生成示例数据集")
 
         if not SAMPLE_DATA_AVAILABLE:
@@ -5333,6 +5396,15 @@ def page_data_upload():
                         message=f"数据维度：{df.shape[0]}×{df.shape[1]}"
                     )
                 st.dataframe(df.head(), width="stretch")
+
+
+# ============================================================
+# 页面：跨表配方数据融合
+# ============================================================
+def page_formulation_fusion():
+    """跨表配方数据融合页面"""
+    from core.formulation_fusion_ui import render_formulation_fusion_ui
+    render_formulation_fusion_ui(standalone=True)
 
 
 # ============================================================
@@ -5895,10 +5967,14 @@ def page_data_cleaning():
             st.dataframe(df.head(int(preview_rows)), width="stretch")
 
     _clean_tab_names = [
-        "♾️ 无穷值处理", "❓ 缺失值处理", "📊 异常值检测", "🔄 重复数据", "🔧 数据类型", "🧪 SMILES清洗", "🧩 SMILES组分分列", "⚖️ 类别平衡", "🗑️ 删除列"]
+        "🔗 跨表配方融合", "♾️ 无穷值处理", "❓ 缺失值处理", "📊 异常值检测", "🔄 重复数据", "🔧 数据类型", "🧪 SMILES清洗", "🧩 SMILES组分分列", "⚖️ 类别平衡", "🗑️ 删除列"]
     _clean_tab_choice = st.radio("功能选择", _clean_tab_names, horizontal=True, key="clean_tab_choice", label_visibility="collapsed")
 
-    if _clean_tab_choice == _clean_tab_names[0]:
+    if _clean_tab_choice == "🔗 跨表配方融合":
+        from core.formulation_fusion_ui import render_formulation_fusion_ui
+        render_formulation_fusion_ui(standalone=False)
+
+    elif _clean_tab_choice == "♾️ 无穷值处理":
         st.markdown("### 无穷值处理")
         st.info("💡 处理数据中的无穷大值（inf和-inf），这些值通常由除零或数值溢出产生")
 
@@ -7888,52 +7964,396 @@ def page_data_cleaning():
             else:
                 st.info("当前数据还没有 *_key 或 *_数字 的分列列。你可以先点击上方按钮执行分列。")
 
-    # ================= [顺延] 原 Tab 6 -> Tab 8: 类别平衡 =================
+    # ================= [顺延] 原 Tab 6 -> Tab 8: 类别与配方分层平衡 =================
     elif _clean_tab_choice == _clean_tab_names[7]:
-        # (这里是原来的 "with tab6:" 的内容，不做修改，直接粘贴过来)
-        st.markdown("### ⚖️ 类别平衡 (针对化学结构)")
-        # ... (原 tab6 代码内容) ...
-        # (确保缩进正确)
-        st.info("💡 解决特定单体/分子重复次数过多的问题...")
+        st.markdown("### ⚖️ 类别与配方分层平衡 (Formulation & Class Stratified Balancing)")
+        st.info(
+            "💡 **在源头控制训练集的类别与配方分布**：\n"
+            "- **避免高频配方死记硬背**：材料数据中单一经典配方（如 E51+DDS）常占上百条记录，导致模型过拟合主导配方；\n"
+            "- **物理连续性保护**：在削减高频配方时，按性能属性（如 Tg、拉伸强度）分层抽样，避免破坏高低温梯度；\n"
+            "- **目标类别均衡与去假相关**：直接平衡目标分类/分箱，同时限制每个类别中同一配方的占比，杜绝“某类别全是某配方”的虚假关联。"
+        )
 
-        text_cols = df.select_dtypes(include=['object']).columns.tolist()
-        if text_cols:
-            cat_col = st.selectbox("选择要平衡的类别列 (通常是SMILES)", text_cols, key="bal_col_select")
+        from core.formulation_grouping import (
+            get_formulation_group_options,
+            build_group_series,
+            analyze_group_distribution,
+        )
 
-            counts = df[cat_col].value_counts()
-            n_unique = len(counts)
+        # 模式选择
+        bal_mode = st.radio(
+            "选择平衡与分层策略",
+            [
+                "🎯 配方体系分层平衡 (推荐：限制单一配方主导，配方内目标属性分层)",
+                "📊 目标类别分层平衡 (控制目标分类/分箱平衡，限制单一配方占比)",
+                "📌 传统单列类别平衡 (仅按单一文本列做简单截断)",
+            ],
+            key="bal_strategy_mode",
+        )
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric("唯一类别数", n_unique)
-            col2.metric("最大样本数", counts.max())
-            _median = counts.median()
-            col3.metric("中位数样本数", int(_median) if pd.notna(_median) else 0)
+        # ============================================================
+        # 模式 1: 配方体系分层平衡
+        # ============================================================
+        if bal_mode.startswith("🎯"):
+            st.markdown("#### 1️⃣ 定义配方体系 (Formulation Groups)")
+            group_options = get_formulation_group_options(df)
+            group_option_labels = [opt["label"] for opt in group_options]
 
-            st.markdown("#### Top 10 出现最频繁的分子")
-            st.bar_chart(counts.head(10))
-
-            st.markdown("#### 🔧 平衡设置")
-
-            limit_val = st.slider(
-                "每个类别的最大样本数 (Max Samples per Category)",
-                min_value=1,
-                max_value=int(counts.max()),
-                value=int(_median) if pd.notna(_median) and n_unique > 0 else 10,
-                key="bal_slider"
+            selected_group_label = st.selectbox(
+                "配方分组依据",
+                options=group_option_labels,
+                index=0 if group_option_labels else 0,
+                key="bal_formulation_opt_select",
+            )
+            matched_opt = next(
+                (opt for opt in group_options if opt["label"] == selected_group_label),
+                group_options[0] if group_options else None,
             )
 
-            if st.button(f"⚖️ 执行平衡 (限制为 {limit_val} 个)", type="primary", key="bal_btn"):
-                old_len = len(df)
-                cleaned_df = cleaner.balance_category_counts(cat_col, max_samples=limit_val)
-                new_len = len(cleaned_df)
+            if matched_opt and matched_opt.get("key") == "custom":
+                selected_group_cols = st.multiselect(
+                    "自定义组合配方列",
+                    options=df.columns.tolist(),
+                    default=[c for c in ["resin_1_structure", "curing_agent_1_structure"] if c in df.columns],
+                    key="bal_custom_group_cols",
+                )
+            else:
+                selected_group_cols = matched_opt.get("columns", []) if matched_opt else []
+                if matched_opt and matched_opt.get("description"):
+                    st.caption(f"ℹ️ {matched_opt['description']}")
 
-                st.session_state.processed_data = cleaned_df
+            if not selected_group_cols:
+                st.warning("⚠️ 请至少选择一个用于定义配方的列。")
+            else:
+                # 分析当前配方分布
+                current_groups = build_group_series(df, selected_group_cols)
+                group_dist = analyze_group_distribution(current_groups)
 
-                st.success(f"✅ 平衡完成！")
-                st.info(f"📊 总样本数从 {old_len} 减少到 {new_len} (删除了 {old_len - new_len} 个过度重复样本)")
-                # st.rerun() removed - Streamlit auto-reruns after interactions
+                m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+                m_col1.metric("配方体系总数", group_dist["n_groups"])
+                m_col2.metric("最大单一配方样本数", group_dist["max_group_size"])
+                m_col3.metric("最大配方占比", f"{group_dist['max_group_pct']:.1f}%")
+                _group_median = current_groups.value_counts().median()
+                m_col4.metric("配方样本中位数", int(_group_median) if pd.notna(_group_median) else 0)
+
+                if group_dist.get("is_skewed"):
+                    st.warning(group_dist.get("warning"))
+
+                with st.expander("📊 查看当前 Top 10 优势配方分布", expanded=False):
+                    vc_groups = current_groups.value_counts().head(10)
+                    st.bar_chart(vc_groups)
+
+                st.markdown("#### 2️⃣ 配方样本上限与分层设置")
+                max_group_cap_default = min(
+                    int(group_dist["max_group_size"]),
+                    max(5, int(_group_median) if pd.notna(_group_median) and _group_median > 0 else 20),
+                )
+                col_cap, col_strat = st.columns([1, 1])
+                with col_cap:
+                    limit_per_group = st.number_input(
+                        "每个配方体系的最大保留样本数",
+                        min_value=1,
+                        max_value=max(1, int(group_dist["max_group_size"])),
+                        value=max_group_cap_default,
+                        step=1,
+                        key="bal_limit_per_group",
+                        help="样本数超过该阈值的配方将被削减；样本数少于该阈值的配方将完整保留，绝不丢失小众配方。",
+                    )
+
+                with col_strat:
+                    enable_target_strat = st.checkbox(
+                        "启用配方内目标属性分层抽样 (强烈推荐)",
+                        value=True,
+                        key="bal_enable_target_strat",
+                        help="在削减优势大配方时，按目标属性（如 Tg）的不同区间等比例抽样，保证抽样后的样本依然涵盖高、中、低温段物理梯度。",
+                    )
+
+                target_col_selected = None
+                target_bins_selected = 5
+                bin_strategy_selected = "quantile"
+
+                if enable_target_strat:
+                    sc1, sc2, sc3 = st.columns(3)
+                    with sc1:
+                        # 自动推断可能的目标列 (优先 session_state 中的 target_col 或数值列)
+                        default_target_idx = 0
+                        candidate_targets = df.columns.tolist()
+                        preferred_targets = [
+                            c for c in candidate_targets if any(k in str(c).lower() for k in ["tg", "temp", "strength", "modulus", "target", "label", "目标", "温度", "强度"])
+                        ]
+                        if preferred_targets:
+                            default_target_idx = candidate_targets.index(preferred_targets[0])
+                        elif "target_col" in st.session_state and st.session_state.target_col in candidate_targets:
+                            default_target_idx = candidate_targets.index(st.session_state.target_col)
+
+                        target_col_selected = st.selectbox(
+                            "分层参考目标列",
+                            options=candidate_targets,
+                            index=default_target_idx,
+                            key="bal_strat_target_col",
+                        )
+                    with sc2:
+                        target_bins_selected = st.slider(
+                            "目标分层区间数 (Bins)",
+                            min_value=2,
+                            max_value=10,
+                            value=5,
+                            key="bal_strat_bins",
+                        )
+                    with sc3:
+                        bin_strategy_label = st.radio(
+                            "分箱方式",
+                            ["等频分位数 (Quantile, 推荐)", "等宽区间 (Uniform)"],
+                            horizontal=True,
+                            key="bal_bin_strategy",
+                        )
+                        bin_strategy_selected = "quantile" if "Quantile" in bin_strategy_label else "uniform"
+
+                # 预览将被移除的样本数
+                est_removed = sum(max(0, count - int(limit_per_group)) for count in current_groups.value_counts().values)
+                st.caption(f"预计平衡后将从 {len(df)} 样本减少至约 {len(df) - est_removed} 样本（削减 {est_removed} 条优势配方冗余样本）。")
+
+                if st.button("⚖️ 执行配方分层平衡", type="primary", key="btn_apply_formulation_balance"):
+                    try:
+                        import importlib
+                        import core.data_processor
+                        if not hasattr(core.data_processor.AdvancedDataCleaner, "balance_formulation_stratified"):
+                            importlib.reload(core.data_processor)
+                        active_cleaner = core.data_processor.AdvancedDataCleaner(df)
+
+                        df_before = df.copy()
+                        cleaned_df, stats = active_cleaner.balance_formulation_stratified(
+                            group_cols=selected_group_cols,
+                            max_samples_per_group=int(limit_per_group),
+                            target_col=target_col_selected if enable_target_strat else None,
+                            n_bins=int(target_bins_selected),
+                            bin_strategy=bin_strategy_selected,
+                            stratify_mode="within_group",
+                            random_state=42,
+                        )
+                        st.session_state.processed_data = cleaned_df
+                        st.session_state["_data_cleaner_cache"] = {"df_id": id(cleaned_df), "cleaner": active_cleaner}
+
+                        log_fe_step(
+                            operation="配方分层类别平衡",
+                            description=(
+                                f"按配方体系 [{', '.join(selected_group_cols)}] 平衡，单配方上限 {limit_per_group}"
+                                + (f"，按目标 [{target_col_selected}] {target_bins_selected}分箱分层抽样" if enable_target_strat else "")
+                            ),
+                            params={
+                                "group_cols": selected_group_cols,
+                                "max_samples_per_group": int(limit_per_group),
+                                "target_col": target_col_selected if enable_target_strat else None,
+                                "n_bins": int(target_bins_selected) if enable_target_strat else None,
+                                "stratify_mode": "within_group",
+                            },
+                            input_df=df_before,
+                            output_df=cleaned_df,
+                            message=f"总样本数从 {stats['total_before']} 优化为 {stats['total_after']}，最大配方占比从 {stats['max_group_pct_before']:.1f}% 降至 {stats['max_group_pct_after']:.1f}%",
+                        )
+
+                        st.success("✅ 配方分层平衡执行完成！已更新数据集。")
+                        r_col1, r_col2, r_col3 = st.columns(3)
+                        r_col1.metric("总样本数变化", f"{stats['total_before']} → {stats['total_after']}", f"-{stats['removed_rows']}")
+                        r_col2.metric("配方体系总数", f"{stats['n_groups_before']} → {stats['n_groups_after']}")
+                        r_col3.metric("最大配方占比下降", f"{stats['max_group_pct_before']:.1f}% → {stats['max_group_pct_after']:.1f}%", f"-{stats['max_group_pct_before'] - stats['max_group_pct_after']:.1f}%")
+
+                        if stats.get("target_distribution_after"):
+                            st.markdown("##### 📈 平衡后目标属性分层覆盖情况")
+                            t_after_df = pd.DataFrame(
+                                list(stats["target_distribution_after"].items()),
+                                columns=["分层区间/类别", "保留样本数"],
+                            )
+                            st.dataframe(t_after_df, width="stretch", hide_index=True)
+                    except Exception as e:
+                        import traceback
+                        st.error(f"❌ 执行配方分层平衡失败: {e}")
+                        st.code(traceback.format_exc(), language="python")
+
+        # ============================================================
+        # 模式 2: 目标类别分层平衡 (带配方多样性约束)
+        # ============================================================
+        elif bal_mode.startswith("📊"):
+            st.markdown("#### 1️⃣ 选择要控制的目标列 (Target Column)")
+            target_candidates = df.columns.tolist()
+            default_t_idx = 0
+            pref_t = [c for c in target_candidates if any(k in str(c).lower() for k in ["tg", "class", "label", "type", "category", "target", "目标", "类别"])]
+            if pref_t:
+                default_t_idx = target_candidates.index(pref_t[0])
+
+            selected_target_col = st.selectbox(
+                "目标列 (支持连续数值自动分箱或分类标签)",
+                options=target_candidates,
+                index=default_t_idx,
+                key="bal_mode2_target_select",
+            )
+
+            is_numeric_target = pd.to_numeric(df[selected_target_col], errors="coerce").notna().sum() > 0.4 * len(df) and df[selected_target_col].nunique() > 10
+
+            t_bins_val = 4
+            t_strategy_val = "quantile"
+            if is_numeric_target:
+                tb_c1, tb_c2 = st.columns(2)
+                with tb_c1:
+                    t_bins_val = st.slider("连续目标分箱数 (Number of Bins)", 2, 8, 4, key="bal_mode2_bins")
+                with tb_c2:
+                    t_strat_label = st.radio("分箱方式", ["等频分位数 (Quantile, 推荐)", "等宽区间 (Uniform)"], horizontal=True, key="bal_mode2_bin_strategy")
+                    t_strategy_val = "quantile" if "Quantile" in t_strat_label else "uniform"
+
+            st.markdown("#### 2️⃣ 选择配方多样性约束列")
+            g_opts = get_formulation_group_options(df)
+            g_opt_labels = [opt["label"] for opt in g_opts]
+            sel_g_label = st.selectbox(
+                "配方分组定义",
+                options=g_opt_labels,
+                index=0 if g_opt_labels else 0,
+                key="bal_mode2_group_opt_select",
+            )
+            matched_g_opt = next((opt for opt in g_opts if opt["label"] == sel_g_label), g_opts[0] if g_opts else None)
+            if matched_g_opt and matched_g_opt.get("key") == "custom":
+                mode2_group_cols = st.multiselect(
+                    "自定义配方列",
+                    options=df.columns.tolist(),
+                    default=[c for c in ["resin_1_structure", "curing_agent_1_structure"] if c in df.columns],
+                    key="bal_mode2_custom_group_cols",
+                )
+            else:
+                mode2_group_cols = matched_g_opt.get("columns", []) if matched_g_opt else []
+
+            st.markdown("#### 3️⃣ 约束参数设置")
+            c_p1, c_p2 = st.columns(2)
+            with c_p1:
+                cap_per_group_per_bin = st.number_input(
+                    "每个类别中单一配方的最大样本数",
+                    min_value=1,
+                    max_value=500,
+                    value=10,
+                    step=1,
+                    key="bal_mode2_cap_per_grp_bin",
+                    help="强制要求任何单一配方在某一个目标类别或分箱中的样本量不得超过此上限，避免模型在某一类别上只记住某单一配方。",
+                )
+            with c_p2:
+                enable_total_class_cap = st.checkbox("同时限制每个类别的总样本上限", value=False, key="bal_mode2_enable_class_cap")
+                total_class_cap = None
+                if enable_total_class_cap:
+                    total_class_cap = st.number_input(
+                        "每个类别的最大总样本数",
+                        min_value=5,
+                        max_value=len(df),
+                        value=min(100, len(df)),
+                        step=5,
+                        key="bal_mode2_total_class_cap",
+                    )
+
+            if st.button("⚖️ 执行目标分层与配方多样性平衡", type="primary", key="btn_apply_mode2_balance"):
+                try:
+                    import importlib
+                    import core.data_processor
+                    if not hasattr(core.data_processor.AdvancedDataCleaner, "balance_formulation_stratified"):
+                        importlib.reload(core.data_processor)
+                    active_cleaner = core.data_processor.AdvancedDataCleaner(df)
+
+                    df_before = df.copy()
+                    cleaned_df, stats = active_cleaner.balance_formulation_stratified(
+                        group_cols=mode2_group_cols,
+                        target_col=selected_target_col,
+                        n_bins=int(t_bins_val),
+                        bin_strategy=t_strategy_val,
+                        stratify_mode="by_target_with_group_cap",
+                        max_per_group_per_bin=int(cap_per_group_per_bin),
+                        max_samples_per_target_class=int(total_class_cap) if total_class_cap else None,
+                        random_state=42,
+                    )
+                    st.session_state.processed_data = cleaned_df
+                    st.session_state["_data_cleaner_cache"] = {"df_id": id(cleaned_df), "cleaner": active_cleaner}
+
+                    log_fe_step(
+                        operation="目标分层与配方多样性平衡",
+                        description=f"目标列 [{selected_target_col}] 分层，单配方单类别上限 {cap_per_group_per_bin}",
+                        params={
+                            "target_col": selected_target_col,
+                            "group_cols": mode2_group_cols,
+                            "max_per_group_per_bin": int(cap_per_group_per_bin),
+                            "max_samples_per_target_class": int(total_class_cap) if total_class_cap else None,
+                            "stratify_mode": "by_target_with_group_cap",
+                        },
+                        input_df=df_before,
+                        output_df=cleaned_df,
+                        message=f"总样本数从 {stats['total_before']} 优化为 {stats['total_after']} (移除了 {stats['removed_rows']} 条过度集中的样本)",
+                    )
+
+                    st.success("✅ 目标分层与多样性平衡执行完成！")
+                    st.info(f"📊 样本数从 {stats['total_before']} 优化至 {stats['total_after']} (削减 {stats['removed_rows']} 条集中样本)。")
+
+                    if stats.get("target_distribution_after"):
+                        st.markdown("##### 📈 各类别平衡后样本分布")
+                        td_df = pd.DataFrame([
+                            {
+                                "目标类别/分箱": k,
+                                "平衡前样本数": stats.get("target_distribution_before", {}).get(k, 0),
+                                "平衡后样本数": v,
+                            }
+                            for k, v in stats["target_distribution_after"].items()
+                        ])
+                        st.dataframe(td_df, width="stretch", hide_index=True)
+                except Exception as e:
+                    import traceback
+                    st.error(f"❌ 执行目标分层与配方多样性平衡失败: {e}")
+                    st.code(traceback.format_exc(), language="python")
+
+        # ============================================================
+        # 模式 3: 传统单列类别平衡 (仅按单一文本列)
+        # ============================================================
         else:
-            st.warning("⚠️ 没有找到文本列，无法执行类别平衡")
+            st.markdown("#### 📌 传统单列类别平衡")
+            st.caption("针对单一分子结构或分类列，限制每个类别的最大出现次数。")
+            text_cols = df.select_dtypes(include=['object']).columns.tolist()
+            if text_cols:
+                cat_col = st.selectbox("选择要平衡的类别列 (通常是SMILES)", text_cols, key="bal_col_select")
+
+                counts = df[cat_col].value_counts()
+                n_unique = len(counts)
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("唯一类别数", n_unique)
+                col2.metric("最大样本数", counts.max())
+                _median = counts.median()
+                col3.metric("中位数样本数", int(_median) if pd.notna(_median) else 0)
+
+                st.markdown("#### Top 10 出现最频繁的分子")
+                st.bar_chart(counts.head(10))
+
+                st.markdown("#### 🔧 平衡设置")
+
+                limit_val = st.slider(
+                    "每个类别的最大样本数 (Max Samples per Category)",
+                    min_value=1,
+                    max_value=int(counts.max()),
+                    value=int(_median) if pd.notna(_median) and n_unique > 0 else 10,
+                    key="bal_slider",
+                )
+
+                if st.button(f"⚖️ 执行单列平衡 (限制为 {limit_val} 个)", type="primary", key="bal_btn"):
+                    df_before = df.copy()
+                    old_len = len(df)
+                    cleaned_df = cleaner.balance_category_counts(cat_col, max_samples=limit_val)
+                    new_len = len(cleaned_df)
+
+                    st.session_state.processed_data = cleaned_df
+
+                    log_fe_step(
+                        operation="单列类别平衡",
+                        description=f"列 [{cat_col}] 限制最大样本数为 {limit_val}",
+                        params={"column": cat_col, "max_samples": limit_val},
+                        input_df=df_before,
+                        output_df=cleaned_df,
+                        message=f"总样本数从 {old_len} 减少到 {new_len} (删除了 {old_len - new_len} 个过度重复样本)",
+                    )
+
+                    st.success(f"✅ 平衡完成！")
+                    st.info(f"📊 总样本数从 {old_len} 减少到 {new_len} (删除了 {old_len - new_len} 个过度重复样本)")
+            else:
+                st.warning("⚠️ 没有找到文本列，无法执行单列类别平衡")
 
     # ================= Tab 9: 删除列 =================
     elif _clean_tab_choice == _clean_tab_names[8]:
@@ -8270,6 +8690,10 @@ def page_molecular_features():
     st.title("🧬 分子特征提取")
     _render_molecular_feature_clear_restore_control()
 
+    with st.expander("🔗 跨表配方数据融合工具 (若当前为目标性能窄表，可一键关联母宽表补全 PHR / 当量 / 机理特征)", expanded=False):
+        from core.formulation_fusion_ui import render_formulation_fusion_ui
+        render_formulation_fusion_ui(standalone=False)
+
     if st.session_state.data is None:
         st.warning("⚠️ 请先上传数据")
         return
@@ -8309,16 +8733,17 @@ def page_molecular_features():
     text_cols = [c for c in text_cols if not _is_extracted_feature_col(c)]
 
     # [调试] 显示所有列的数据类型
-    with st.expander("🔍 调试：查看所有列的数据类型"):
-        dtype_info = []
-        for col in df.columns:
-            dtype_info.append({
-                "列名": col,
-                "数据类型": str(df[col].dtype),
-                "是否为文本": df[col].dtype == 'object',
-                "是否被过滤": _is_extracted_feature_col(col)
-            })
-        st.dataframe(pd.DataFrame(dtype_info), width="stretch", height=300)
+    with st.expander("🔍 调试：查看所有列的数据类型", expanded=False):
+        if st.checkbox("加载列数据类型明细", value=False, key="show_col_dtypes_debug_chk"):
+            dtype_info = []
+            for col in df.columns:
+                dtype_info.append({
+                    "列名": col,
+                    "数据类型": str(df[col].dtype),
+                    "是否为文本": df[col].dtype == 'object',
+                    "是否被过滤": _is_extracted_feature_col(col)
+                })
+            st.dataframe(pd.DataFrame(dtype_info), width="stretch", height=300)
     
     # 智能检测：基于列名和内容判断
     def _detect_smiles_cols_smart(df_in, exclude_features=True):
@@ -9105,14 +9530,29 @@ def page_molecular_features():
     else:
         st.caption("💡 提示：如果数据中包含离子化合物且特征提取失败，可以尝试开启此选项。")
 
+    # 智能探测选中的结构列中是否包含 BigSMILES 语法
+    target_cols_to_check = batch_smiles_cols if batch_mode else ([smiles_col] if smiles_col else [])
+    has_detected_bigsmiles = False
+    for tc in target_cols_to_check:
+        if tc in df.columns:
+            try:
+                sample_vals = df[tc].dropna().head(128).tolist()
+                if _looks_polymer_rich(sample_vals):
+                    has_detected_bigsmiles = True
+                    break
+            except Exception:
+                pass
+
     st.markdown("### 🧩 聚合物 / 离子语义增强")
     sem_col1, sem_col2 = st.columns(2)
     with sem_col1:
         append_polymer_semantic_features = st.checkbox(
             "附加 BigSMILES / 聚合物语义特征",
-            value=False,
-            help="保留 BigSMILES 的聚合物语法、随机图采样统计和多次采样集成信息，而不是只依赖单个代理分子。",
+            value=has_detected_bigsmiles,
+            help="保留 BigSMILES 的聚合物语法、随机图采样统计和多次采样集成信息。检测到数据中含 BigSMILES 时默认开启；若未开启，则不会在特征提取时自动附加这 52 个 BigSMILES 记号与采样特征，避免特征冗余。",
         )
+        if has_detected_bigsmiles:
+            st.caption("✨ 检测到当前结构列包含 BigSMILES 语法，已自动为您开启聚合物语义特征提取。")
     with sem_col2:
         append_ionic_semantic_features = st.checkbox(
             "附加 金属/离子 语义特征",
@@ -9769,41 +10209,33 @@ def page_molecular_features():
         # ============== 树脂选择 ==============
         st.markdown("#### 🧪 树脂组分选择")
 
-        # 自动识别全部编号树脂列，不再限制为 resin_smiles_1~6
-        resin_column_pattern = re.compile(r"^resin_smiles_\d+$")
-        auto_resin_cols = sorted(
-            [col for col in text_cols if resin_column_pattern.match(str(col))],
-            key=lambda col: (
-                str(col).lower().rsplit("_", 1)[0],
-                int(str(col).rsplit("_", 1)[1]),
-            ),
-        )
+        # 智能识别全部树脂列：结合化学内容验证与正则拓展（支持 resin_smiles_1, resin_1_structure, epoxy_1 等）
+        from core.formulation_fusion import FormulationFusionEngine
+        _fusion_engine = FormulationFusionEngine()
+        _detected_roles = _fusion_engine.detect_column_roles_with_semantic_check(df)
+        auto_resin_cols = [r[0] for r in _detected_roles.get("resins", []) if r[0] in text_cols]
 
-        # 如果没找到，尝试其他格式
         if not auto_resin_cols:
-            for prefix in ["epoxy_smiles", "resin"]:
-                prefix_pattern = re.compile(rf"^{re.escape(prefix)}_\d+$")
-                auto_resin_cols = sorted(
-                    [col for col in text_cols if prefix_pattern.match(str(col))],
-                    key=lambda col: (
-                        str(col).lower().rsplit("_", 1)[0],
-                        int(str(col).rsplit("_", 1)[1]),
-                    ),
-                )
-                if auto_resin_cols:
-                    break
+            resin_column_pattern = re.compile(r"^resin_(?:smiles_)?\d+(?:_structure)?$")
+            auto_resin_cols = sorted(
+                [col for col in text_cols if resin_column_pattern.match(str(col))],
+                key=lambda col: int(re.search(r"\d+", str(col)).group()) if re.search(r"\d+", str(col)) else 0,
+            )
 
         # 初始化默认值
         if "epoxy_resin_cols" not in st.session_state:
             if auto_resin_cols:
                 st.session_state["epoxy_resin_cols"] = auto_resin_cols
             else:
-                # 默认使用当前选择的 smiles_col
                 st.session_state["epoxy_resin_cols"] = [smiles_col] if smiles_col else []
 
-        # 显示自动识别结果
+        # 显示自动识别结果与化学语义检测
         if auto_resin_cols:
-            st.success(f"✅ 自动识别到 {len(auto_resin_cols)} 个树脂组分列: {', '.join(auto_resin_cols)}")
+            resin_notes = []
+            for col in auto_resin_cols:
+                n = next((r[1] for r in _detected_roles.get("resins", []) if r[0] == col), "已匹配")
+                resin_notes.append(f"`{col}` ({n})")
+            st.success(f"✅ 智能识别到 {len(auto_resin_cols)} 个树脂组分列: {', '.join(resin_notes)}")
 
         # 过滤默认值
         valid_resin_defaults = [col for col in st.session_state["epoxy_resin_cols"]
@@ -9814,7 +10246,7 @@ def page_molecular_features():
             options=text_cols,
             default=valid_resin_defaults,
             key="epoxy_resin_cols_select",
-            help="✨ 自动识别所有 resin_smiles_数字 列（包括 resin_smiles_1）。可手动调整或添加其他列。"
+            help="✨ 自动识别所有树脂列（支持 resin_1_structure, resin_smiles_1 等）。可手动调整或添加其他列。"
         )
 
         # 更新 session_state
@@ -9834,36 +10266,14 @@ def page_molecular_features():
         with col_h:
             candidate_cols = [c for c in text_cols if c not in resin_cols]  # 排除已选的树脂列
 
-            # [调试] 显示所有可用的列
-            with st.expander("🔍 调试信息：查看所有列"):
-                st.write("**所有文本列 (text_cols):**", text_cols)
-                st.write("**已选树脂列 (resin_cols):**", resin_cols)
-                st.write("**候选固化剂列 (candidate_cols):**", candidate_cols)
-                st.write("**数据中的所有列:**", df.columns.tolist())
-
-            # ✅ 自动识别多组分固化剂列（curing_agent_smiles_1 到 curing_agent_smiles_6）
-            auto_curing_cols = []
-            for i in range(1, 7):
-                col_name = f"curing_agent_smiles_{i}"
-                if col_name in df.columns and col_name in candidate_cols:
-                    auto_curing_cols.append(col_name)
-
-            # 如果没有找到 curing_agent_smiles_X 格式，尝试其他常见格式
+            # 智能识别固化剂列（支持 curing_agent_smiles_1, curing_agent_1_structure 等）
+            auto_curing_cols = [c[0] for c in _detected_roles.get("curers", []) if c[0] in candidate_cols]
             if not auto_curing_cols:
-                for prefix in ["hardener_smiles", "curer_smiles", "curing_smiles"]:
-                    for i in range(1, 7):
-                        col_name = f"{prefix}_{i}"
-                        if col_name in df.columns:
-                            auto_curing_cols.append(col_name)
-                    if auto_curing_cols:
-                        break
-
-            # 如果还是没找到，尝试单列
-            if not auto_curing_cols:
-                for col_name in ["curing_agent_smiles", "hardener_smiles", "curer_smiles"]:
-                    if col_name in df.columns:
-                        auto_curing_cols = [col_name]
-                        break
+                curing_pat = re.compile(r"^(?:curing_agent|hardener|curer)_(?:smiles_)?\d+(?:_structure)?$")
+                auto_curing_cols = sorted(
+                    [col for col in candidate_cols if curing_pat.match(str(col))],
+                    key=lambda col: int(re.search(r"\d+", str(col)).group()) if re.search(r"\d+", str(col)) else 0,
+                )
 
             # 初始化默认值
             if "epoxy_hardener_cols" not in st.session_state:
@@ -9874,7 +10284,11 @@ def page_molecular_features():
 
             # 显示自动识别结果
             if auto_curing_cols:
-                st.success(f"✅ 自动识别到 {len(auto_curing_cols)} 个固化剂组分列: {', '.join(auto_curing_cols)}")
+                curer_notes = []
+                for col in auto_curing_cols:
+                    n = next((c[1] for c in _detected_roles.get("curers", []) if c[0] == col), "已匹配")
+                    curer_notes.append(f"`{col}` ({n})")
+                st.success(f"✅ 智能识别到 {len(auto_curing_cols)} 个固化剂组分列: {', '.join(curer_notes)}")
 
             # 过滤默认值：只保留在 candidate_cols 中的列
             valid_defaults = [col for col in st.session_state["epoxy_hardener_cols"]
@@ -9883,42 +10297,63 @@ def page_molecular_features():
             hardener_cols = st.multiselect(
                 "选择【固化剂】SMILES列（多组分）",
                 options=candidate_cols,
-                default=valid_defaults,  # 使用过滤后的默认值
+                default=valid_defaults,
                 key="epoxy_hardener_cols_select",
-                help="✨ 已自动识别 curing_agent_smiles_1~6 列。可手动调整或添加其他列。"
+                help="✨ 已自动识别固化剂列（支持 curing_agent_1_structure 等）。可手动调整或添加其他列。"
             )
 
             # 更新 session_state
             st.session_state["epoxy_hardener_cols"] = hardener_cols
 
-            # 为兼容后续逻辑：hardener_col 保留第一个选择；hardener_component_cols 为全部选择
             hardener_col = hardener_cols[0] if hardener_cols else None
             hardener_component_cols = hardener_cols if hardener_cols else None
 
         with col_p:
             num_cols = df.select_dtypes(include=np.number).columns.tolist()
-            phr_col = st.selectbox("选择【配比】列 (可选)", ["无 (假设理想配比)"] + num_cols)
+            # 优先自动预选 formulation_r_value
+            default_phr_idx = 0
+            for idx_c, c_cand in enumerate(["无 (假设理想配比)"] + num_cols):
+                if c_cand in ["formulation_r_value", "stoichiometric_ratio_r_cleaned", "r_value"]:
+                    default_phr_idx = idx_c
+                    break
+
+            phr_col = st.selectbox("选择【配比】列 (可选)", ["无 (假设理想配比)"] + num_cols, index=default_phr_idx)
 
             stoich_mode = "theoretical"
             if phr_col and phr_col != "无 (假设理想配比)":
                 stoich_mode = st.selectbox(
                     "配比含义",
                     [
+                        "Equiv Ratio (当量比, H/R)",
                         "Resin/Hardener (总质量比, R/H)",
                         "PHR (Hardener per 100 Resin)",
-                        "Equiv Ratio (当量比, H/R)",
                         "Equiv Ratio (当量比, R/H)",
                     ],
                     index=0,
                     help=(
-                        "R/H 为树脂总量/固化剂总量；PHR 为每100份树脂对应固化剂份数；"
-                        "当量比 H/R 为固化剂当量/树脂当量；当量比 R/H 为树脂当量/固化剂当量。"
+                        "当量比 H/R 为固化剂当量/树脂当量（即 r 值）；R/H 为树脂总量/固化剂总量；"
+                        "PHR 为每100份树脂对应固化剂份数。"
                     )
                 )
 
+        # ============== [新增] 跨表配方母宽表自动对齐 ==============
+        st.markdown("---")
+        st.markdown("#### 🔗 跨表配方大宽表自动对齐 (Formulation Data Fusion)")
+        _default_wide_path = _fusion_engine.find_companion_wide_table(
+            st.session_state.get("last_data_path", ""),
+            custom_dir=r"C:\Users\wangj\Desktop\ml_dataset"
+        )
+        auto_fuse_wide = st.checkbox(
+            "🔗 自动关联母配方宽表 (ml_wide_samples.csv) 补充各组分精确 PHR 与当量",
+            value=bool(_default_wide_path and os.path.exists(_default_wide_path)),
+            help="开启后：系统自动根据样本行与化学指纹关联 ml_wide_samples.csv，无需手动外部脚本合并！"
+        )
+        if auto_fuse_wide and _default_wide_path:
+            st.caption(f"📁 找到配方母宽表：`{_default_wide_path}`（将在特征提取时自动对齐注入各组分独立用量）")
+
         # ============== [新增] 反应模拟选项 ==============
         st.markdown("---")
-        st.markdown("#### ⚗️ 反应模拟设置")
+        st.markdown("#### ⚗️ 反应模拟与高分子物理网络设置")
 
         col_sim1, col_sim2, col_sim3 = st.columns(3)
         with col_sim1:
@@ -9944,7 +10379,23 @@ def page_molecular_features():
         with col_sim3:
             st.info("✨ **转化率自动估算**\n\n基于化学计量比、官能度、固化剂类型自动估算。")
 
-        if enable_reaction_simulation:
+        # ============== [新增] 服务器多核并行加速配置 ==============
+        st.markdown("---")
+        st.markdown("#### ⚡ 高性能服务器多核加速配置")
+        col_w1, col_w2 = st.columns(2)
+        with col_w1:
+            _sys_workers = max(1, (os.cpu_count() or 1) - 1)
+            if os.name == 'nt':
+                _sys_workers = min(_sys_workers, 60)
+            epoxy_cpu_workers = st.slider(
+                "CPU 并行进程数 (Workers)",
+                min_value=1,
+                max_value=max(1, _sys_workers),
+                value=min(max(1, _sys_workers), 16),
+                help=f"检测到系统可用 CPU 核心数: {os.cpu_count()}。多进程并发计算各样本的高分子物理特征、官能团与反应模拟。"
+            )
+        with col_w2:
+            st.caption(f"💻 **服务器多核加速已开启**\n\n将启用 **{epoxy_cpu_workers}** 个独立的 Python 进程并行分批提取，相比单线程速度提升 5~15 倍。")
             with st.expander("📖 反应模拟说明", expanded=False):
                 st.markdown("""
                 **反应模拟功能**将基于RDKit的反应模板，模拟以下类型的固化反应：
@@ -10035,62 +10486,67 @@ def page_molecular_features():
         )
 
         with st.expander("🧪 3D Diagnostics / 自检（看这里定位失败原因）", expanded=False):
-            try:
-                import rdkit as _rdkit
-                from rdkit.Chem import AllChem as _AllChem
-                from core import molecular_features as _mf
-                st.write(f"RDKit version: **{getattr(_rdkit, '__version__', 'unknown')}**")
-                st.write(f"RDKIT_AVAILABLE in system: **{getattr(_mf, 'RDKIT_AVAILABLE', False)}**")
-                st.write(f"Has ETKDGv3: **{hasattr(_AllChem, 'ETKDGv3')}**")
-            except Exception as _e:
-                st.error(f"Import self-test failed: {_e}")
-
-            col_a, col_b = st.columns(2)
-            with col_a:
-                run_self_test = st.button("Run 3D self-test", key="rdkit3d_selftest_btn")
-            with col_b:
-                quick_n = st.number_input("Test first N rows", min_value=1, max_value=200, value=30, step=1, key="rdkit3d_selftest_n")
-
-            if run_self_test:
+            @st.fragment
+            def _render_3d_diagnostics_frag():
                 try:
-                    from core.molecular_features import _rdkit3d_feature_worker, rdkit3d_debug_one
-                    st.caption("1) 用最简单分子 CCO 测试 3D pipeline（应当成功）。")
-                    out0 = _rdkit3d_feature_worker("CCO", coulomb_top_k=int(rdkit3d_coulomb_top_k))
-                    st.write("CCO worker: " + ("✅ OK" if out0 is not None else "❌ None (failed)"))
-                    if out0 is None:
-                        st.json(rdkit3d_debug_one("CCO", coulomb_top_k=int(rdkit3d_coulomb_top_k)))
+                    import rdkit as _rdkit
+                    from rdkit.Chem import AllChem as _AllChem
+                    from core import molecular_features as _mf
+                    st.write(f"RDKit version: **{getattr(_rdkit, '__version__', 'unknown')}**")
+                    st.write(f"RDKIT_AVAILABLE in system: **{getattr(_mf, 'RDKIT_AVAILABLE', False)}**")
+                    st.write(f"Has ETKDGv3: **{hasattr(_AllChem, 'ETKDGv3')}**")
+                except Exception as _e:
+                    st.error(f"Import self-test failed: {_e}")
 
-                    st.caption("2) 测试你当前选择列的前 N 行（仅统计成功/失败）。")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    run_self_test = st.button("Run 3D self-test", key="rdkit3d_selftest_btn")
+                with col_b:
+                    quick_n = st.number_input("Test first N rows", min_value=1, max_value=200, value=30, step=1, key="rdkit3d_selftest_n")
+
+                if run_self_test:
                     try:
-                        # 兼容：页面主选择变量通常叫 smiles_col；若不存在再尝试其它名字
-                        _col = (locals().get("smiles_col", None) or locals().get("resin_smiles_col", None) or st.session_state.get("selected_smiles_col", None))
-                        if _col is None:
-                            st.warning("无法自动确定要测试的 SMILES 列名（请先在页面上方选择 SMILES 列并重新展开自检）。")
+                        from core.molecular_features import _rdkit3d_feature_worker, rdkit3d_debug_one
+                        _top_k = int(locals().get("rdkit3d_coulomb_top_k", 20))
+                        st.caption("1) 用最简单分子 CCO 测试 3D pipeline（应当成功）。")
+                        out0 = _rdkit3d_feature_worker("CCO", coulomb_top_k=_top_k)
+                        st.write("CCO worker: " + ("✅ OK" if out0 is not None else "❌ None (failed)"))
+                        if out0 is None:
+                            st.json(rdkit3d_debug_one("CCO", coulomb_top_k=_top_k))
+
+                        st.caption("2) 测试你当前选择列的前 N 行（仅统计成功/失败）。")
+                        try:
+                            # 兼容：页面主选择变量通常叫 smiles_col；若不存在再尝试其它名字
+                            _col = (locals().get("smiles_col", None) or locals().get("resin_smiles_col", None) or st.session_state.get("selected_smiles_col", None))
+                            if _col is None:
+                                st.warning("无法自动确定要测试的 SMILES 列名（请先在页面上方选择 SMILES 列并重新展开自检）。")
+                                sample_list = []
+                            else:
+                                exists = bool((_col in df.columns)) if "df" in locals() else False
+                                st.write(f"Testing column: `{_col}` | exists in df: **{exists}**")
+                                sample_list = df[_col].tolist()[: int(quick_n)] if exists else []
+                                if len(sample_list) == 0:
+                                    st.warning("未获取到任何样本行用于测试：可能 df 未加载、列名不在 df 中，或该列全为空。")
+                        except Exception as _e:
+                            st.error(f"加载样本失败: {_e}")
                             sample_list = []
-                        else:
-                            exists = bool((_col in df.columns)) if "df" in locals() else False
-                            st.write(f"Testing column: `{_col}` | exists in df: **{exists}**")
-                            sample_list = df[_col].tolist()[: int(quick_n)] if exists else []
-                            if len(sample_list) == 0:
-                                st.warning("未获取到任何样本行用于测试：可能 df 未加载、列名不在 df 中，或该列全为空。")
-                    except Exception as _e:
-                        st.error(f"加载样本失败: {_e}")
-                        sample_list = []
-                    ok_cnt = 0
-                    first_fail = None
-                    for _s in sample_list:
-                        out = _rdkit3d_feature_worker(_s, coulomb_top_k=int(rdkit3d_coulomb_top_k))
-                        if out is None and first_fail is None:
-                            first_fail = _s
-                        if out is not None:
-                            ok_cnt += 1
-                    st.write(f"First {len(sample_list)} rows: ✅ {ok_cnt} success / ❌ {len(sample_list)-ok_cnt} fail")
-                    if first_fail is not None and ok_cnt == 0:
-                        st.warning("所有样本都失败了：下面给出第一条失败样本的详细诊断（解析/嵌入阶段原因）。")
-                        st.code(str(first_fail)[:300])
-                        st.json(rdkit3d_debug_one(first_fail, coulomb_top_k=int(rdkit3d_coulomb_top_k)))
-                except Exception as e:
-                    st.error(f"Self-test failed: {e}")
+                        ok_cnt = 0
+                        first_fail = None
+                        for _s in sample_list:
+                            out = _rdkit3d_feature_worker(_s, coulomb_top_k=_top_k)
+                            if out is None and first_fail is None:
+                                first_fail = _s
+                            if out is not None:
+                                ok_cnt += 1
+                        st.write(f"First {len(sample_list)} rows: ✅ {ok_cnt} success / ❌ {len(sample_list)-ok_cnt} fail")
+                        if first_fail is not None and ok_cnt == 0:
+                            st.warning("所有样本都失败了：下面给出第一条失败样本的详细诊断（解析/嵌入阶段原因）。")
+                            st.code(str(first_fail)[:300])
+                            st.json(rdkit3d_debug_one(first_fail, coulomb_top_k=_top_k))
+                    except Exception as e:
+                        st.error(f"Self-test failed: {e}")
+
+            _render_3d_diagnostics_frag()
 
     if "ML力场特征" in extraction_method:
         st.markdown("#### ⚛️ ML 力场 (ANI2x) 参数")
@@ -10339,8 +10795,11 @@ def page_molecular_features():
         with col1:
             # 默认使用较少的进程数，避免资源争抢
             default_jobs = min(8, max(1, mp.cpu_count() // 2))
-            n_jobs = st.slider("并行进程数", 1, mp.cpu_count(), default_jobs, 
-                              help="建议 4-8 个进程，过多会导致性能下降")
+            # [Windows 安全修复] WaitForMultipleObjects 上限 63 句柄，
+            # 进程池 > ~62 必崩；滑条上限钳到 31
+            _slider_max = min(mp.cpu_count(), 31)
+            n_jobs = st.slider("并行进程数", 1, _slider_max, min(default_jobs, _slider_max), 
+                              help="建议 4-8 个进程；Windows 下进程池超过 62 会触发系统句柄上限崩溃，已自动钳制")
         with col2:
             batch_size = st.number_input("批处理大小", 100, 5000, 500,
                                         help="每批处理的样本数")
@@ -10729,6 +11188,8 @@ def page_molecular_features():
             st.session_state.molecular_feature_workflow = None
             st.session_state.molecular_feature_config = None
             st.session_state.molecular_feature_trace = []
+            st.session_state["latest_extracted_features_df"] = None
+            st.session_state["latest_extraction_summary"] = None
             # 检查是否有记录的特征列名
             if st.session_state.get('molecular_feature_names'):
                 current_df = st.session_state.processed_data
@@ -10750,7 +11211,6 @@ def page_molecular_features():
                     if 'feature_classification' in st.session_state:
                         del st.session_state['feature_classification']
                     st.success(f"✅ 已成功清除 {len(cols_to_remove)} 个分子特征列！")
-                    # st.rerun() removed - Streamlit auto-reruns after interactions
                 else:
                     st.warning("⚠️ 数据表中未找到可清除的特征列（可能已被修改）。")
 
@@ -10758,7 +11218,6 @@ def page_molecular_features():
                 # 兜底逻辑：如果有特征数据但没记录列名（旧状态），强制重置状态
                 st.session_state.molecular_features = None
                 st.warning("⚠️ 特征状态已重置，但无法自动从数据表中移除具体列（建议重新上传数据）。")
-                # st.rerun() removed - Streamlit auto-reruns after interactions
             else:
                 st.info("ℹ️ 当前没有已提取的特征。")
 
@@ -10880,7 +11339,7 @@ def page_molecular_features():
                     and not (isinstance(value, float) and np.isnan(value))
                     and str(value).strip()
                 ]
-                auto_polymer_features_batch = _looks_polymer_rich(smiles_list_input)
+                auto_polymer_features_batch = bool(append_polymer_semantic_features) and _looks_polymer_rich(smiles_list_input)
                 workflow_step["semantic_params"] = _workflow_semantic_params(
                     auto_polymer_features_batch
                 )
@@ -11358,19 +11817,14 @@ def page_molecular_features():
                 for feature_frame in all_batch_features
                 for name in feature_frame.columns.tolist()
             ]
+            # 检查本次批量提取自身内部是否有重复特征名
             batch_duplicate_feature_names.extend(
                 name
                 for name in find_duplicate_feature_names(emitted_feature_names)
                 if name not in batch_duplicate_feature_names
             )
-            source_feature_conflicts = [
-                name
-                for name in find_duplicate_feature_names(
-                    list(df.columns) + emitted_feature_names
-                )
-                if name not in batch_duplicate_feature_names
-            ]
-            batch_duplicate_feature_names.extend(source_feature_conflicts)
+            # 允许覆盖已存在的历史特征列：只检查 df 中是否有与本次提取冲突但非特征列的严重冲突
+            # 若 df 中已存在同名特征列，合并时将丢弃旧列并采用新提取的列进行幂等覆盖
             batch_success = (
                 bool(all_batch_features)
                 and len(all_batch_features) == len(batch_smiles_cols)
@@ -11381,8 +11835,12 @@ def page_molecular_features():
             if batch_success:
                 combined_features = pd.concat(all_batch_features, axis=1)
                 
-                # 合并到原始数据
-                merged_df = pd.concat([df.reset_index(drop=True), combined_features.reset_index(drop=True)], axis=1)
+                # 覆盖式合并到原始数据：若原始数据中已存在同名特征，先移除旧列以防重复膨胀
+                base_df = df.reset_index(drop=True)
+                cols_to_drop = [c for c in combined_features.columns if c in base_df.columns]
+                if cols_to_drop:
+                    base_df = base_df.drop(columns=cols_to_drop)
+                merged_df = pd.concat([base_df, combined_features.reset_index(drop=True)], axis=1)
                 
                 st.session_state.processed_data = merged_df
                 
@@ -11416,6 +11874,13 @@ def page_molecular_features():
                         )
                     )
                 
+                st.session_state["latest_extracted_features_df"] = combined_features
+                st.session_state["latest_extraction_summary"] = {
+                    "n_samples": len(df),
+                    "n_features": len(all_batch_feature_names),
+                    "dual": False,
+                    "method": "batch",
+                }
                 st.success(f"🎉 批量提取完成！共从 {len(batch_smiles_cols)} 列提取了 {len(all_batch_feature_names)} 个特征（累计 {len(combined_mol_names)} 个分子特征）")
                 
                 # 显示特征预览
@@ -11679,9 +12144,9 @@ def page_molecular_features():
                         # np.nan 在多进程序列化时会导致 'float' object is not subscriptable 错误
                         smiles_list_input.append(None)
 
-            auto_polymer_string_features = _looks_polymer_rich(smiles_list_input)
+            auto_polymer_string_features = bool(append_polymer_semantic_features) and _looks_polymer_rich(smiles_list_input)
             if auto_polymer_string_features:
-                st.caption("检测到 BIGSMILES / gBigSMILES 风格结构，当前提取会自动附加聚合物记号特征。")
+                st.caption("检测到 BIGSMILES / gBigSMILES 风格结构且已启用聚合物语义增强，当前提取会自动附加聚合物记号特征。")
                 try:
                     mf_cfg['params']['append_polymer_string_features'] = True
                 except Exception:
@@ -12146,8 +12611,11 @@ def page_molecular_features():
                 _enable_rxn = locals().get('enable_reaction_simulation', True)
                 _multicomp_method = locals().get('multicomp_reaction_method', 'weighted')
 
-                # 检查是否为多组分（有多个固化剂列）
-                is_multicomponent = hardener_component_cols and len(hardener_component_cols) > 1
+                # 检查是否为多组分（有多个树脂列或多个固化剂列）
+                is_multicomponent = bool(
+                    (hardener_component_cols and len(hardener_component_cols) > 1)
+                    or (resin_component_cols and len(resin_component_cols) > 1)
+                )
 
                 if is_multicomponent:
                     # 使用多组分提取器
@@ -12192,16 +12660,29 @@ def page_molecular_features():
 
                     extractor = MulticomponentCrosslinkedFeatureExtractor(verbose=False)
 
+                    _wide_df_for_fusion = None
+                    if 'auto_fuse_wide' in locals() and auto_fuse_wide and '_default_wide_path' in locals() and _default_wide_path and os.path.exists(_default_wide_path):
+                        try:
+                            _wide_df_for_fusion = pd.read_csv(_default_wide_path, low_memory=False)
+                            st.info(f"🔗 正在跨表融合母配方宽表 ({len(_wide_df_for_fusion)} 行) 提取各组分精确 PHR 与当量...")
+                        except Exception as _e_w:
+                            st.warning(f"⚠️ 无法读取母配方宽表: {_e_w}")
+
+                    _cpu_jobs = locals().get('epoxy_cpu_workers', -1)
                     # 提取特征
                     features_df = extractor.batch_extract_features_from_dataframe(
                         df,
+                        resin_cols=resin_component_cols,
+                        curer_cols=hardener_component_cols,
                         resin_cols_prefix=resin_prefix,
                         curer_cols_prefix=hardener_prefix,
                         max_components=6,
                         stoichiometry_col=phr_col if phr_col != "无 (假设理想配比)" else None,
                         auto_estimate_conversion=True,
                         reaction_method=_multicomp_method,  # 使用用户选择的方法
-                        prefix='crosslink'  # 使用 crosslink_ 前缀
+                        prefix='crosslink',  # 使用 crosslink_ 前缀
+                        wide_df=_wide_df_for_fusion,
+                        n_jobs=_cpu_jobs
                     )
 
                     # 多组分提取器返回的是完整DataFrame，需要提取valid_indices
@@ -12232,7 +12713,10 @@ def page_molecular_features():
                         enable_reaction_simulation=_enable_rxn,
                         target_conversion=0.5
                     )
-                    features_df, valid_indices = extractor.extract_features(smiles_list, hardener_list, phr_list, stoich_mode)
+                    _cpu_jobs = locals().get('epoxy_cpu_workers', 1)
+                    features_df, valid_indices = extractor.extract_features(
+                        smiles_list, hardener_list, phr_list, stoich_mode, n_jobs=_cpu_jobs
+                    )
 
             stage_timings["特征提取"] = time.perf_counter() - extraction_stage_t0
             progress_bar.progress(92)
@@ -12375,6 +12859,13 @@ def page_molecular_features():
                         "duplicate columns after single-column merge: "
                         + ", ".join(merged_duplicates)
                     )
+                st.session_state["latest_extracted_features_df"] = features_df
+                st.session_state["latest_extraction_summary"] = {
+                    "n_samples": len(valid_indices),
+                    "n_features": features_df.shape[1],
+                    "dual": bool(hardener_list),
+                    "method": extraction_method,
+                }
                 st.session_state.molecular_features = features_df
                 st.session_state.processed_data = merged_df
                 
@@ -12573,82 +13064,13 @@ def page_molecular_features():
                     message=f"新增分子特征 {features_df.shape[1]} 列，数据列数 {df.shape[1]} → {merged_df.shape[1]}"
                 )
 
-                # 结果统计
-                col1, col2, col3 = st.columns(3)
-                col1.metric("有效样本", len(valid_indices))
-                col2.metric("特征数量", features_df.shape[1])
-                col3.metric("双组分模式", "是" if hardener_list else "否")
-
-                st.markdown("### 📋 特征预览")
-                st.dataframe(features_df.head(), width='stretch')
-                
-                # [新增] 选择性添加特征到数据集
-                st.markdown("---")
-                st.markdown("### 🎯 选择性添加分子特征")
-                st.caption("💡 您可以选择保留全部特征，或只保留部分特征添加到数据集中。")
-                
-                all_mol_features = features_df.columns.tolist()
-                feature_selection_mode = st.radio(
-                    "特征添加模式",
-                    ["保留全部特征（推荐）", "手动选择特征"],
-                    horizontal=True,
-                    key="mol_feature_mode"
-                )
-                
-                if feature_selection_mode == "手动选择特征":
-                    # 提供特征筛选选项
-                    col_sel1, col_sel2 = st.columns(2)
-                    with col_sel1:
-                        # 按特征名前缀过滤
-                        prefixes = merge_feature_name_lists_in_order(
-                            [],
-                            [f.split('_')[0] for f in all_mol_features if '_' in f],
-                        )
-                        selected_prefixes = st.multiselect(
-                            "按前缀筛选（可选）",
-                            options=prefixes,
-                            default=[],
-                            key="mol_prefix_filter"
-                        )
-                    
-                    with col_sel2:
-                        # 显示当前筛选结果数量
-                        if selected_prefixes:
-                            filtered_features = [f for f in all_mol_features if any(f.startswith(p) for p in selected_prefixes)]
-                        else:
-                            filtered_features = all_mol_features
-                        st.metric("筛选后特征数", len(filtered_features))
-                    
-                    # 详细特征选择
-                    selected_mol_features = st.multiselect(
-                        "选择要保留的分子特征",
-                        options=all_mol_features,
-                        default=filtered_features[:min(50, len(filtered_features))],
-                        key="mol_features_select"
-                    )
-                    
-                    if st.button("📥 应用选择的特征", type="primary", key="apply_selected_mol_features"):
-                        if selected_mol_features:
-                            # 只保留选中的特征
-                            base_df = st.session_state.processed_data.copy()
-                            # 移除未选中的分子特征
-                            cols_to_remove = [c for c in all_mol_features if c not in selected_mol_features and c in base_df.columns]
-                            if cols_to_remove:
-                                base_df = base_df.drop(columns=cols_to_remove)
-                                st.session_state.processed_data = base_df
-                                st.session_state.molecular_feature_names = selected_mol_features
-                                # ✅ 同步更新feature_cols：移除被删除的特征
-                                if st.session_state.get('feature_cols'):
-                                    st.session_state.feature_cols = [f for f in st.session_state.feature_cols if f not in cols_to_remove]
-                                if st.session_state.get('multiselect_features'):
-                                    st.session_state.multiselect_features = [f for f in st.session_state.multiselect_features if f not in cols_to_remove]
-                                # 清除特征分类缓存
-                                if 'feature_classification' in st.session_state:
-                                    del st.session_state['feature_classification']
-                                st.success(f"✅ 已保留 {len(selected_mol_features)} 个分子特征（移除了 {len(cols_to_remove)} 个）")
-                                # st.rerun() removed - Streamlit auto-reruns after interactions
-                        else:
-                            st.warning("⚠️ 请至少选择一个分子特征")
+                st.session_state["latest_extracted_features_df"] = features_df
+                st.session_state["latest_extraction_summary"] = {
+                    "n_samples": len(valid_indices),
+                    "n_features": features_df.shape[1],
+                    "dual": bool(hardener_list),
+                    "method": extraction_method,
+                }
             else:
                 st.error("❌ 未能提取任何特征：当前选择的 SMILES 列可能全部为空/无效，或 3D 构象生成全部失败。")
                 _record_single_workflow_failure(
@@ -12674,6 +13096,86 @@ def page_molecular_features():
             st.error(f"❌ 提取失败: {str(e)}")
             st.code(traceback.format_exc())
             _record_single_workflow_failure(str(e))
+
+    # [片段化] 特征管理与选择性添加面板 (交互不触发布局跳变与全页刷新)
+    @st.fragment
+    def _render_extracted_features_panel():
+        features_df = st.session_state.get("latest_extracted_features_df")
+        if features_df is None or not isinstance(features_df, pd.DataFrame) or len(features_df.columns) == 0:
+            mf = st.session_state.get("molecular_features")
+            if isinstance(mf, pd.DataFrame) and len(mf.columns) > 0:
+                features_df = mf
+            else:
+                return
+
+        summary = st.session_state.get("latest_extraction_summary") or {}
+        st.markdown("---")
+        st.markdown("### 📋 提取特征预览与管理")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("有效样本", summary.get("n_samples", len(features_df)))
+        col2.metric("特征数量", summary.get("n_features", features_df.shape[1]))
+        col3.metric("模式", "双组分" if summary.get("dual") else ("批量" if summary.get("method") == "batch" else "单组分"))
+
+        st.dataframe(features_df.head(20), width="stretch")
+
+        st.markdown("#### 🎯 选择性添加分子特征")
+        st.caption("💡 您可以选择保留全部特征，或只保留部分特征添加到数据集中。操作将在当前面板即时生效，不会触发整页刷新。")
+
+        all_mol_features = features_df.columns.tolist()
+        feature_selection_mode = st.radio(
+            "特征添加模式",
+            ["保留全部特征（推荐）", "手动选择特征"],
+            horizontal=True,
+            key="mol_feature_mode_frag"
+        )
+
+        if feature_selection_mode == "手动选择特征":
+            col_sel1, col_sel2 = st.columns(2)
+            with col_sel1:
+                prefixes = sorted(list(set(f.split('_')[0] for f in all_mol_features if '_' in f)))
+                selected_prefixes = st.multiselect(
+                    "按前缀筛选（可选）",
+                    options=prefixes,
+                    default=[],
+                    key="mol_prefix_filter_frag"
+                )
+
+            with col_sel2:
+                if selected_prefixes:
+                    filtered_features = [f for f in all_mol_features if any(f.startswith(p) for p in selected_prefixes)]
+                else:
+                    filtered_features = all_mol_features
+                st.metric("筛选后特征数", len(filtered_features))
+
+            selected_mol_features = st.multiselect(
+                "选择要保留的分子特征",
+                options=all_mol_features,
+                default=filtered_features[:min(50, len(filtered_features))],
+                key="mol_features_select_frag"
+            )
+
+            if st.button("📥 应用选择的特征", type="primary", key="apply_selected_mol_features_frag"):
+                if selected_mol_features:
+                    base_df = st.session_state.processed_data.copy()
+                    cols_to_remove = [c for c in all_mol_features if c not in selected_mol_features and c in base_df.columns]
+                    if cols_to_remove:
+                        base_df = base_df.drop(columns=cols_to_remove)
+                        st.session_state.processed_data = base_df
+                        st.session_state.molecular_feature_names = selected_mol_features
+                        if st.session_state.get('feature_cols'):
+                            st.session_state.feature_cols = [f for f in st.session_state.feature_cols if f not in cols_to_remove]
+                        if st.session_state.get('multiselect_features'):
+                            st.session_state.multiselect_features = [f for f in st.session_state.multiselect_features if f not in cols_to_remove]
+                        if 'feature_classification' in st.session_state:
+                            del st.session_state['feature_classification']
+                        st.success(f"✅ 已成功保留 {len(selected_mol_features)} 个分子特征（移除了 {len(cols_to_remove)} 个）")
+                    else:
+                        st.info("✅ 当前所有特征均已保留。")
+                else:
+                    st.warning("⚠️ 请至少选择一个分子特征")
+
+    _render_extracted_features_panel()
 
 
 # ============================================================
@@ -13119,14 +13621,23 @@ def _clear_molecular_features_from_session():
     return removed
 
 
+@st.fragment
 def _render_molecular_feature_clear_restore_control():
     """Render clear/restore controls for extracted molecular features."""
     if st.button("清除已提取分子特征", key="clear_molecular_features"):
-        _clear_molecular_features_from_session()
+        removed = _clear_molecular_features_from_session()
+        st.session_state["latest_extracted_features_df"] = None
+        st.session_state["latest_extraction_summary"] = None
+        if removed:
+            st.success(f"✅ 已成功清除 {len(removed)} 个分子特征列！")
+        else:
+            st.info("ℹ️ 当前没有已提取的特征。")
     backup_tag = st.session_state.get("molecular_feature_clear_backup_tag")
     if backup_tag:
         st.caption(f"已保存快照：{backup_tag}")
-        st.button("恢复清除前分子特征", key="restore_molecular_features")
+        if st.button("恢复清除前分子特征", key="restore_molecular_features"):
+            _restore_session_snapshot(backup_tag)
+            st.success("✅ 已成功恢复清除前分子特征快照！")
 
 
 def page_feature_selection():
@@ -13756,6 +14267,161 @@ def _lock_current_training_contract(frame, feature_cols, target_col, workflow=No
     return context
 
 
+def _show_mpl_fig_fullwidth(fig, target_px: int = 1400) -> None:
+    """以与页面容器宽度匹配的 DPI 渲染 matplotlib 图，保证宽屏下文字不缩小。
+
+    Streamlit 的 st.pyplot 固定用 dpi=200 重存图片：13 英寸宽的图会产生 2600px 原生宽度，
+    被浏览器压缩到 ~1400px 容器后文字只剩 54% 大小（显得“小/不正常”）。
+    此处按图宽动态计算 dpi，使原生像素 ≈ 容器宽度，文字保持原始大小。
+    """
+    import io as _io
+    try:
+        figw = float(fig.get_figwidth()) or 10.0
+        dpi = int(max(100, min(200, target_px / max(figw, 1e-6))))
+        buf = _io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+        buf.seek(0)
+        st.image(buf, width="stretch")
+    except Exception:
+        st.pyplot(fig, width="stretch")
+
+
+_TABPFN_HF_REPO = "Prior-Labs/tabpfn_3"
+
+
+def _tabpfn_license_name_via_mirror(repo: str) -> str:
+    """huggingface.co 被墙时，从 hf-mirror 镜像 API 获取模型 License 名称。
+
+    Prior-Labs 系列模型仓库实际均非 gated（无需登录/条款），
+    镜像可匿名返回与官方 API 相同的元数据。
+    """
+    import urllib.request
+
+    url = f"https://hf-mirror.com/api/models/Prior-Labs/{repo}"
+    # hf-mirror 会拦截 python-urllib 默认 UA（403），必须带正常 UA
+    req = urllib.request.Request(url, headers={"User-Agent": "CFRP-App/1.0 (huggingface_hub compat)"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read())
+    license_name = (data.get("cardData") or {}).get("license_name")
+    if not license_name:
+        raise RuntimeError("镜像 API 未返回 license_name")
+    return license_name
+
+
+def _ensure_tabpfn_license_ready() -> tuple:
+    """确保 TabPFN v3 的 Prior Labs License 校验在中国网络环境下可通过。
+
+    tabpfn 库的 ensure_license_accepted() 会直连 huggingface.co 获取
+    license_name，该域名在国内常不可达，且任何失败（含网络超时）都会
+    被库误报为 “This model is gated” 错误。此函数改用可达途径完成
+    同样的校验：
+      1. API Key 有效性 + License 接受状态 → api.priorlabs.ai（国内可达）
+      2. license_name → 优先官方，失败回退 hf-mirror 镜像 API
+      3. 全部通过后写入 tabpfn 进程内缓存（_accepted_repos），
+         库内部检查直接短路，训练即可经 hf-mirror 正常下载权重
+    返回 (是否通过, 问题列表)。
+    """
+    try:
+        from tabpfn import browser_auth
+        from tabpfn.settings import settings
+    except ImportError:
+        return False, ["tabpfn 包未安装，无法进行 License 校验。"]
+
+    if "tabpfn_3" in browser_auth._accepted_repos:
+        return True, []
+
+    pl_token = str(
+        st.session_state.get("tabpfn_pl_token")
+        or os.environ.get("TABPFN_TOKEN")
+        or browser_auth.get_cached_token()
+        or ""
+    ).strip()
+    if not pl_token:
+        return False, [
+            "**缺少 Prior Labs API Key**：TabPFN v3 下载前需完成一次 License 校验。"
+            "请注册/登录 [ux.priorlabs.ai](https://ux.priorlabs.ai)，在 **Licenses** 页接受许可，"
+            "再到 Account 页复制 API Key 填入上方输入框。"
+        ]
+
+    # 1) API Key 有效性（api.priorlabs.ai 国内可达）
+    status = browser_auth.verify_token(pl_token, settings.tabpfn.auth_api_url)
+    if status is False:
+        return False, [
+            "**Prior Labs API Key 无效/过期**：请到 "
+            "[ux.priorlabs.ai/account](https://ux.priorlabs.ai/account) 重新复制。"
+        ]
+    if status is None:
+        return False, [
+            "无法连接 Prior Labs 授权服务器（api.priorlabs.ai），"
+            "请检查网络/代理后重试。"
+        ]
+
+    # 2) license_name：优先官方 API，被墙时回退镜像
+    try:
+        license_version = browser_auth._get_license_name("tabpfn_3")
+    except Exception:
+        try:
+            license_version = _tabpfn_license_name_via_mirror("tabpfn_3")
+        except Exception as exc:
+            return False, [
+                f"无法获取模型 License 信息（huggingface.co 与镜像 hf-mirror 均不可达）：{exc}。"
+                "请检查网络/代理后重试。"
+            ]
+
+    # 3) License 接受状态
+    lic = browser_auth.check_license_accepted(pl_token, settings.tabpfn.auth_api_url, license_version)
+    if lic is False:
+        return False, [
+            f"**Prior Labs License 尚未接受**：请打开 [ux.priorlabs.ai](https://ux.priorlabs.ai) "
+            f"→ Licenses 页，接受 TabPFN {license_version} 许可后重试。"
+        ]
+    if lic is None:
+        return False, ["无法确认 License 接受状态（授权服务器不可达），训练可能中途失败。"]
+
+    # 4) 全部通过 → 写入进程内缓存，tabpfn 内部检查短路；Token 持久化供后续会话使用
+    browser_auth.save_token(pl_token)
+    browser_auth._accepted_repos.add("tabpfn_3")
+    return True, []
+
+
+def _tabpfn_preflight_check() -> tuple:
+    """TabPFN v3 训练前预检。
+
+    包含：(1) 权重下载通道（hf-mirror 镜像）可达性；
+    (2) Prior Labs License 校验（含被墙回退，见 _ensure_tabpfn_license_ready）。
+    返回 (是否全部通过, 问题列表)；在训练开始前提前拦截，
+    避免训练中途报出难懂的 “gated model” 错误。
+    """
+    import urllib.error
+    import urllib.request
+
+    problems: list = []
+
+    # ---- 1) 权重下载通道：经 hf-mirror 镜像检查模型仓库与权重文件可达 ----
+    try:
+        req = urllib.request.Request(
+            f"https://hf-mirror.com/api/models/{_TABPFN_HF_REPO}",
+            method="HEAD",
+            # hf-mirror 会拦截 python-urllib 默认 UA（403），必须带正常 UA
+            headers={"User-Agent": "CFRP-App/1.0 (huggingface_hub compat)"},
+        )
+        with urllib.request.urlopen(req, timeout=15):
+            pass  # 200 = 镜像可达
+    except urllib.error.HTTPError:
+        pass  # HEAD 不被支持时按可达处理，后续 GET 会再验证
+    except Exception as exc:
+        problems.append(
+            f"无法连接模型镜像 hf-mirror.com（权重下载通道）：{exc}。"
+            "请检查网络/代理后重试。"
+        )
+
+    # ---- 2) Prior Labs License（含 huggingface.co 被墙回退 + 进程内缓存） ----
+    _ok, _lic_problems = _ensure_tabpfn_license_ready()
+    problems.extend(_lic_problems)
+
+    return (len(problems) == 0), problems
+
+
 def page_model_training():
     """模型训练页面（稳健版：支持分层/分组划分 + Repeated KFold CV）"""
     st.title("🤖 模型训练")
@@ -14001,16 +14667,9 @@ def page_model_training():
     else:
         st.sidebar.info("💻 使用 CPU 训练")
 
-    # 分组划分可用性检测
-    has_resin = "resin_smiles" in df.columns
-    has_hardener = "curing_agent_smiles" in df.columns
-    group_key_options = []
-    if has_resin and has_hardener:
-        group_key_options = ["resin_smiles + curing_agent_smiles", "resin_smiles", "curing_agent_smiles"]
-    elif has_resin:
-        group_key_options = ["resin_smiles"]
-    elif has_hardener:
-        group_key_options = ["curing_agent_smiles"]
+    # 分组划分可用性检测与智能配方组识别
+    formulation_group_options_list = get_formulation_group_options(df)
+    has_formulation_groups = any(opt.get("columns") for opt in formulation_group_options_list if opt["key"] != "custom")
 
     col1, col2 = st.columns([1, 2])
     smiles_col = None
@@ -14137,20 +14796,59 @@ def page_model_training():
             use_lazypredict = False
 
         if model_name == "TabPFN":
-            st.markdown("### 🔑 TabPFN Token")
-            if "tabpfn_hf_token" not in st.session_state:
-                st.session_state["tabpfn_hf_token"] = (
-                    os.environ.get("HF_TOKEN")
-                    or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-                    or os.environ.get("HUGGINGFACE_TOKEN")
-                    or ""
+            st.markdown("### 🔑 TabPFN 下载授权（Prior Labs License）")
+            _pl_ready = bool(os.environ.get("TABPFN_TOKEN") or st.session_state.get("tabpfn_pl_token"))
+            with st.expander("📖 首次使用：请先完成以下一次性步骤", expanded=not _pl_ready):
+                st.markdown(
+                    "TabPFN v3 模型 (`Prior-Labs/tabpfn_3`) 在 HuggingFace 上实际**非 Gated**，"
+                    "权重经 hf-mirror 镜像即可匿名下载，**无需**在 HF 网站接受任何条款。\n\n"
+                    "唯一需要的是 **Prior Labs API Key**（下载前库会向 Prior Labs 服务器校验 License）：\n\n"
+                    "1. 注册/登录 [ux.priorlabs.ai](https://ux.priorlabs.ai)；\n"
+                    "2. 在 **Licenses** 页接受 TabPFN 许可；\n"
+                    "3. 在 **Account** 页复制 API Key，填入下方输入框。\n\n"
+                    "⚠️ 之前报错 “This model is gated” 实为 tabpfn 库直连 huggingface.co "
+                    "被墙后误报；本系统已自动改走镜像，不再需要 HF 条款。"
                 )
-            hf_token = st.text_input("Hugging Face Token", key="tabpfn_hf_token", type="password")
-            st.markdown("[获取/验证 Token](https://huggingface.co/settings/tokens)")
+            if "tabpfn_pl_token" not in st.session_state:
+                st.session_state["tabpfn_pl_token"] = os.environ.get("TABPFN_TOKEN") or ""
+            pl_token = st.text_input("Prior Labs API Key（License 校验用，必填）", key="tabpfn_pl_token", type="password")
+            st.markdown("[获取/管理 Prior Labs API Key](https://ux.priorlabs.ai)")
+            hf_token = ""
+            with st.expander("⚙️ 可选：HuggingFace Token（非必需，仅提升下载稳定性）"):
+                if "tabpfn_hf_token" not in st.session_state:
+                    st.session_state["tabpfn_hf_token"] = (
+                        os.environ.get("HF_TOKEN")
+                        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+                        or os.environ.get("HUGGINGFACE_TOKEN")
+                        or ""
+                    )
+                hf_token = st.text_input("Hugging Face Token（可选，匿名也可下载）", key="tabpfn_hf_token", type="password")
+                st.markdown("[获取 HuggingFace Token](https://huggingface.co/settings/tokens)")
+            if st.button("🔍 验证授权", key="tabpfn_verify_auth_btn"):
+                _pf_ok, _pf_problems = _tabpfn_preflight_check()
+                if _pf_ok:
+                    st.success("✅ 授权预检通过：Prior Labs License 有效，权重下载通道（hf-mirror 镜像）可达，可以开始训练。")
+                else:
+                    st.warning("⚠️ 授权预检发现问题，请先处理：")
+                    for _p in _pf_problems:
+                        st.markdown(f"- {_p}")
             if hf_token:
                 os.environ["HF_TOKEN"] = hf_token
                 os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
                 os.environ["HUGGINGFACE_TOKEN"] = hf_token
+                # 持久化到 huggingface_hub 令牌缓存，保证子进程/后续会话也能认证
+                try:
+                    from huggingface_hub import login as _hf_login
+                    _hf_login(token=hf_token, add_to_git_credential=False)
+                except Exception:
+                    pass
+            if pl_token:
+                os.environ["TABPFN_TOKEN"] = pl_token
+                try:
+                    from tabpfn.browser_auth import save_token as _save_tabpfn_token
+                    _save_tabpfn_token(pl_token)
+                except Exception:
+                    pass
 
         if model_name in smiles_aware_models:
             text_cols = [c for c in df.columns if df[c].dtype == object or df[c].dtype.name == "string"]
@@ -14318,17 +15016,61 @@ def page_model_training():
             n_bins = st.slider("分层分箱数（建议 8~12）", 4, 20, 10)
         elif split_ui.startswith("按配方"):
             split_strategy = "group"
-            if not group_key_options:
-                st.warning("⚠️ 当前数据缺少 resin_smiles / curing_agent_smiles，无法使用分组划分，将回退为随机划分。")
+            if not has_formulation_groups and len(df.columns) <= 1:
+                st.warning("⚠️ 当前数据未检测到配方结构或标识列，无法使用分组划分，将回退为随机划分。")
                 split_strategy = "random"
             else:
-                group_key = st.selectbox("分组键", options=group_key_options, index=0)
-                if group_key == "resin_smiles + curing_agent_smiles":
-                    groups = df["resin_smiles"].astype(str) + "||" + df["curing_agent_smiles"].astype(str)
-                elif group_key == "resin_smiles":
-                    groups = df["resin_smiles"].astype(str)
-                elif group_key == "curing_agent_smiles":
-                    groups = df["curing_agent_smiles"].astype(str)
+                group_labels = [opt["label"] for opt in formulation_group_options_list]
+                selected_group_label = st.selectbox(
+                    "选择配方分组模式",
+                    options=group_labels,
+                    index=0,
+                    help="对于含大量 E51 的体系，推荐使用【主树脂 + 主固化剂配对】，可将高频单体细化为独立反应配方组，杜绝数据泄漏并保证划分均衡。"
+                )
+                selected_opt = next(
+                    (opt for opt in formulation_group_options_list if opt["label"] == selected_group_label),
+                    formulation_group_options_list[0],
+                )
+
+                selected_cols = list(selected_opt.get("columns", []))
+                if selected_opt["key"] == "custom":
+                    selected_cols = st.multiselect(
+                        "请选择用于配方分组的列（支持多选联合分组）",
+                        options=list(df.columns),
+                        default=[c for c in df.columns if any(k in c.lower() for k in ["resin", "curing", "hardener"])][:2],
+                        help="选中的列将被联合拼接为一个复合分组键。"
+                    )
+                else:
+                    st.caption(f"💡 {selected_opt['description']}")
+
+                if selected_cols:
+                    groups = build_group_series(df, selected_cols)
+                    group_key = " + ".join(selected_cols)
+
+                    # 动态分析分组分布健康度并展示
+                    group_stats = analyze_group_distribution(groups, test_size=float(test_size))
+
+                    col_gs1, col_gs2 = st.columns(2)
+                    with col_gs1:
+                        st.metric("独立配方组总数", f"{group_stats['n_groups']} 组")
+                    with col_gs2:
+                        st.metric(
+                            "最大单一组占比",
+                            f"{group_stats['max_group_pct']:.1f}%",
+                            help=f"最大组包含 {group_stats['max_group_size']} 条样本",
+                        )
+
+                    if group_stats["is_skewed"]:
+                        st.warning(group_stats["warning"])
+                        if group_stats.get("recommendation"):
+                            st.info(f"💡 优化建议：{group_stats['recommendation']}")
+                    else:
+                        st.success(
+                            f"✓ 配方组划分就绪：共 {group_stats['n_groups']} 个独立组，最大组占比 {group_stats['max_group_pct']:.1f}%，分布均衡健康。"
+                        )
+                else:
+                    st.warning("⚠️ 请至少选择一个列作为分组键。")
+                    split_strategy = "random"
 
         # --- [P0-5] 回归目标分布平衡 ---
         st.markdown("### ⚖️ 目标分布平衡")
@@ -14690,6 +15432,18 @@ def page_model_training():
 
     with c_btn1:
         if st.button("🚀 开始训练", type="primary", disabled=disable_train if "disable_train" in locals() else False):
+            # [TabPFN 预检] Gated 模型双重授权（HF 条款 + Prior Labs License）提前拦截，
+            # 避免训练中途报出难懂的 GatedRepoError
+            if model_name == "TabPFN" and not (use_lazypredict and LAZYPREDICT_AVAILABLE):
+                with st.spinner("正在预检 TabPFN 下载授权（HuggingFace 条款 + Prior Labs License）..."):
+                    _pf_ok, _pf_problems = _tabpfn_preflight_check()
+                if not _pf_ok:
+                    st.error("❌ TabPFN 授权预检未通过，已取消本次训练。请按以下提示处理后重试：")
+                    for _p in _pf_problems:
+                        st.markdown(f"- {_p}")
+                    st.stop()
+                else:
+                    st.success("✅ TabPFN 授权预检通过（Prior Labs License 有效，权重下载通道可达）")
             # [新增] LazyPredict 快速对比模式
             if use_lazypredict and LAZYPREDICT_AVAILABLE:
                 st.markdown("### 🔍 LazyPredict 模型对比结果")
@@ -14729,6 +15483,8 @@ def page_model_training():
                         X_test_scaled = scaler.transform(X_test)
 
                         # 运行 LazyPredict
+                        # [内存优化] 懒加载：仅在实际运行 LazyPredict 时才导入（+429MB）
+                        from lazypredict.Supervised import LazyRegressor
                         reg = LazyRegressor(verbose=0, ignore_warnings=True, custom_metric=None)
                         models, predictions = reg.fit(X_train_scaled, X_test_scaled, y_train, y_test)
 
@@ -15307,7 +16063,7 @@ def page_model_training():
                                 y_pred_test,
                                 target_name=target_col,
                             )
-                        st.pyplot(fig_paper, width="stretch")
+                        _show_mpl_fig_fullwidth(fig_paper)
                         paper_png_bytes = fig_to_png_bytes(fig_paper)
                         paper_csv_bytes = b""
                         if paper_export_df is not None and not paper_export_df.empty:
@@ -15533,7 +16289,7 @@ def page_model_training():
                         fig_curve, hist_export_df = plot_history(history, title=f"{model_name} Training Curves")
 
                         st.markdown("### 📉 训练曲线（统一科研级风格）")
-                        st.pyplot(fig_curve, width="stretch")
+                        _show_mpl_fig_fullwidth(fig_curve)
 
                         if hist_export_df is not None and not hist_export_df.empty:
                             with st.expander("🧾 查看训练曲线数据", expanded=False):
@@ -15568,7 +16324,7 @@ def page_model_training():
                                         pca_analyzer.fit()
 
                                         fig_pca = pca_analyzer.visualize_domain(X_new=None, y_train=y_train_for_pca, figsize=(12, 7.5))
-                                        st.pyplot(fig_pca, width="stretch")
+                                        _show_mpl_fig_fullwidth(fig_pca)
 
                                         st.caption("💡 PCA适用域可视化展示训练数据在低维空间的分布，凸包表示模型可靠适用域（Applicability Domain），颜色表示目标值大小。")
                                 else:
@@ -15829,25 +16585,12 @@ def page_model_training():
                                 "feature_process_path": export_proc_path,
                             }
 
-                            with st.expander("📦 自动导出（训练完成后已生成文件）", expanded=False):
-                                st.caption(f"已保存至: {export_model_path}")
-                                dl_col1, dl_col2 = st.columns(2)
-                                with dl_col1:
-                                    st.download_button(
-                                        "⬇️ 下载模型文件（joblib）",
-                                        data=model_bytes,
-                                        file_name=os.path.basename(export_model_path),
-                                        mime='application/octet-stream',
-                                        key="download_model_trained"
-                                    )
-                                with dl_col2:
-                                    st.download_button(
-                                        "⬇️ 下载特征提取流程（json）",
-                                        data=process_bytes,
-                                        file_name='feature_process.json',
-                                        mime='application/json',
-                                        key="download_process_trained"
-                                    )
+                            # [去重] 下载入口统一收敛到下方常驻的【📦 导出训练好的模型】，
+                            # 此处仅提示文件已自动保存到训练记录目录，避免同一页出现两套下载按钮
+                            st.caption(
+                                f"📦 模型文件已自动保存至训练记录目录：`{export_model_path}`\n\n"
+                                f"📥 下载请用下方【📦 导出训练好的模型（.joblib）】（已包含同一文件与 feature_process.json）"
+                            )
                         except Exception as export_exc:
                             export_message = f"自动导出失败：{export_exc}"
                             st.session_state.last_export_status = {
@@ -15922,30 +16665,7 @@ def page_model_training():
                     if cv_res is not None:
                         tab_a, tab_b = st.tabs(["残差分析", "CV (OOF)"])
                         with tab_a:
-                            col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
-                            with col_img2:
-                                if fig_resid is None:
-                                    visualizer = Visualizer()
-                                    fig_resid, _ = visualizer.plot_residuals(
-                                        res['y_test'],
-                                        y_pred_test,
-                                        model_name=model_name,
-                                    )
-                                st.pyplot(fig_resid, width="stretch")
-                        with tab_b:
-                            col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
-                            with col_img2:
-                                if fig_oof is None:
-                                    visualizer = Visualizer()
-                                    fig_oof, _ = visualizer.plot_predictions_vs_true(
-                                        cv_res['oof_true'],
-                                        cv_res['oof_pred'],
-                                        model_name=f"{model_name} (OOF)"
-                                    )
-                                st.pyplot(fig_oof, width="stretch")
-                    else:
-                        col_img1, col_img2, col_img3 = st.columns([1, 2, 1])
-                        with col_img2:
+                            # [优化] 去掉列挤压，全宽渲染，避免图被压缩到半宽容器里显小
                             if fig_resid is None:
                                 visualizer = Visualizer()
                                 fig_resid, _ = visualizer.plot_residuals(
@@ -15953,7 +16673,25 @@ def page_model_training():
                                     y_pred_test,
                                     model_name=model_name,
                                 )
-                            st.pyplot(fig_resid, width="stretch")
+                            _show_mpl_fig_fullwidth(fig_resid)
+                        with tab_b:
+                            if fig_oof is None:
+                                visualizer = Visualizer()
+                                fig_oof, _ = visualizer.plot_predictions_vs_true(
+                                    cv_res['oof_true'],
+                                    cv_res['oof_pred'],
+                                    model_name=f"{model_name} (OOF)"
+                                )
+                            _show_mpl_fig_fullwidth(fig_oof)
+                    else:
+                        if fig_resid is None:
+                            visualizer = Visualizer()
+                            fig_resid, _ = visualizer.plot_residuals(
+                                res['y_test'],
+                                y_pred_test,
+                                model_name=model_name,
+                            )
+                        _show_mpl_fig_fullwidth(fig_resid)
 
                 except Exception as e:
                     cancelled_by_user = _is_user_cancelled_error(e) or is_cancelled()
@@ -16046,6 +16784,9 @@ def page_model_training():
                 st.markdown("---")
                 with st.expander("📦 导出训练好的模型（.joblib）", expanded=False):
                     st.caption("导出的模型文件包含：pipeline/模型、特征列、目标列、评估指标等。可在【预测应用】页面直接导入使用。")
+                    _saved_model_path = st.session_state.get("last_export_model_path")
+                    if _saved_model_path:
+                        st.caption(f"💾 训练完成后已自动保存到：`{_saved_model_path}`")
                     _cached_bytes = st.session_state.get("_trained_model_artifact")
                     _cached_proc_bytes = st.session_state.get("_trained_process_artifact")
                     _cached_name = st.session_state.get("_trained_model_name", "model_artifact.joblib")
@@ -26395,6 +27136,37 @@ def _load_structure_visualization_apis():
         )
 
 
+def page_smiles_structure_tools() -> None:
+    """Combine image recognition, structure rendering, and batch checks in one page.
+
+    This integrated entrypoint intentionally exposes render_structure, SMILES,
+    BigSMILES, page_image_to_smiles, process_table and batch workflows.
+    """
+    st.title("🧪 SMILES / BigSMILES 结构图像工具")
+    st.caption("在同一页面完成图像转 SMILES、SMILES/BigSMILES 转图片和批量结构检查。")
+
+    # 采用单选 Radio 切换代替 st.tabs，实现真正的按需渲染与懒加载
+    sub_mode = st.radio(
+        "子功能选择",
+        options=["🖼️ 图像/文件转 SMILES", "🎨 SMILES / BigSMILES 转图片", "📊 批量结构检查"],
+        index=0,
+        horizontal=True,
+        key="smiles_tools_sub_mode_v2",
+    )
+
+    if sub_mode == "🖼️ 图像/文件转 SMILES":
+        page_image_to_smiles()
+    elif sub_mode == "🎨 SMILES / BigSMILES 转图片":
+        _page_smiles_to_structure_image(render_result=True)
+    elif sub_mode == "📊 批量结构检查":
+        _page_batch_structure_check()
+
+
+def page_structure_recognition() -> None:
+    """Legacy name for the merged SMILES / BigSMILES structure tools page."""
+    return page_smiles_structure_tools()
+
+
 @st.cache_data(show_spinner=False, max_entries=128)
 def _cached_render_structure(raw: str, requested_type: str, sample: bool, repeat_units: int, random_seed: int, image_width: int, image_height: int):
     RenderOptions, _RenderResult, render_structure, *_ = _load_structure_visualization_apis()
@@ -26409,51 +27181,6 @@ def _cached_render_structure(raw: str, requested_type: str, sample: bool, repeat
     output_dir = _structure_visualization_output_root() / "single"
     result = render_structure(raw, output_dir, options)
     return result, str(output_dir)
-    """Load the vendored renderer lazily so the main app keeps its optional dependencies optional."""
-    try:
-        from bigsmiles_ui.bigsmiles_ui.batch_io import (
-            list_structure_columns,
-            process_table,
-            read_uploaded_table,
-            write_table,
-        )
-        from bigsmiles_ui.bigsmiles_ui.renderer import (
-            RenderOptions,
-            RenderResult,
-            render_structure,
-        )
-        return (
-            RenderOptions,
-            RenderResult,
-            render_structure,
-            list_structure_columns,
-            process_table,
-            read_uploaded_table,
-            write_table,
-        )
-    except ImportError:
-        # Support running from a packaged checkout where the outer namespace package
-        # is not already present on sys.path.
-        vendor_root = Path(__file__).resolve().parent / "bigsmiles_ui"
-        if str(vendor_root) not in sys.path:
-            sys.path.insert(0, str(vendor_root))
-        from bigsmiles_ui.batch_io import (
-            list_structure_columns,
-            process_table,
-            read_uploaded_table,
-            write_table,
-        )
-        from bigsmiles_ui.renderer import RenderOptions, RenderResult, render_structure
-
-        return (
-            RenderOptions,
-            RenderResult,
-            render_structure,
-            list_structure_columns,
-            process_table,
-            read_uploaded_table,
-            write_table,
-        )
 
 
 def _structure_visualization_output_root() -> Path:
@@ -26800,36 +27527,6 @@ def _page_batch_structure_check() -> None:
     st.caption(f"图片位于结果目录：{output_dir / 'images'}；移动结果表时请保留 images 文件夹。")
 
 
-def page_smiles_structure_tools() -> None:
-    """Combine image recognition, structure rendering, and batch checks in one page.
-
-    This integrated entrypoint intentionally exposes render_structure, SMILES,
-    BigSMILES, page_image_to_smiles, process_table and batch workflows.
-    """
-    st.title("🧪 SMILES / BigSMILES 结构图像工具")
-    st.caption("在同一页面完成图像转 SMILES、SMILES/BigSMILES 转图片和批量结构检查。")
-    
-    # 采用单选 Radio 切换代替 st.tabs，实现真正的按需渲染与懒加载
-    sub_mode = st.radio(
-        "子功能选择",
-        options=["🖼️ 图像/文件转 SMILES", "🎨 SMILES / BigSMILES 转图片", "📊 批量结构检查"],
-        index=0,
-        horizontal=True,
-        key="smiles_tools_sub_mode_v2",
-    )
-    
-    if sub_mode == "🖼️ 图像/文件转 SMILES":
-        page_image_to_smiles()
-    elif sub_mode == "🎨 SMILES / BigSMILES 转图片":
-        _page_smiles_to_structure_image(render_result=True)
-    elif sub_mode == "📊 批量结构检查":
-        _page_batch_structure_check()
-
-
-def page_structure_recognition() -> None:
-    """Legacy name for the merged SMILES / BigSMILES structure tools page."""
-    return page_smiles_structure_tools()
-
 # ============================================================
 # 主程序入口（保持原有结构）
 # ============================================================
@@ -26861,6 +27558,8 @@ if page == "🏠 首页":
     page_home()
 elif page == "📤 数据上传":
     page_data_upload()
+elif page == "🔗 配方数据融合":
+    page_formulation_fusion()
 elif page == "🔍 数据探索":
     page_data_explore()
 elif page == "🧹 数据清洗":

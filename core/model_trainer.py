@@ -2401,7 +2401,37 @@ class EnhancedModelTrainer:
         elif model_name == "TabPFN":
             if not TABPFN_AVAILABLE:
                 raise ImportError("TabPFN 未安装，请运行: pip install tabpfn")
-            return TabPFNRegressor(**params_clean)
+
+            tabpfn_params = {}
+            valid_tabpfn_keys = {
+                'n_estimators', 'auto_scale_n_estimators', 'categorical_features_indices',
+                'softmax_temperature', 'average_before_softmax', 'model_path', 'device',
+                'ignore_pretraining_limits', 'inference_precision', 'fit_mode',
+                'memory_saving_mode', 'keep_cache_on_device', 'kv_cache_precision',
+                'random_state', 'n_jobs', 'n_preprocessing_jobs', 'inference_config',
+                'differentiable_input', 'eval_metric', 'tuning_config', 'show_progress_bar'
+            }
+            for k, v in params_clean.items():
+                if k in valid_tabpfn_keys:
+                    tabpfn_params[k] = v
+
+            tabpfn_params.setdefault("ignore_pretraining_limits", True)
+            tabpfn_params.setdefault("random_state", int(random_state))
+
+            # 自动探测并绑定本地已缓存的权重文件，避免触发在线请求导致 Hub 查找失败
+            curr_mp = tabpfn_params.get("model_path")
+            if not curr_mp or curr_mp in ["auto", "v3", "default"]:
+                local_candidates = [
+                    os.path.expanduser(r"~\AppData\Roaming\tabpfn\tabpfn-v3-regressor-v3_default.ckpt"),
+                    os.path.expanduser(r"~/.cache/tabpfn/tabpfn-v3-regressor-v3_default.ckpt"),
+                    os.path.expanduser(r"~/.cache/huggingface/hub/models--Prior-Labs--tabpfn_3/snapshots/24a16a89d245878b846555110985634aa2e656d7/tabpfn-v3-regressor-v3_default.ckpt"),
+                ]
+                for cand in local_candidates:
+                    if os.path.exists(cand):
+                        tabpfn_params["model_path"] = cand
+                        break
+
+            return TabPFNRegressor(**tabpfn_params)
 
         elif model_name == "AutoGluon":
             if not AUTOGLUON_AVAILABLE:
@@ -3755,11 +3785,41 @@ class EnhancedModelTrainer:
             and len(y_train) >= 20
         )
         if use_internal_validation:
-            fit_idx, early_idx = train_test_split(
-                np.arange(len(y_train), dtype=int),
-                test_size=0.15,
-                random_state=random_state,
-            )
+            if split_strategy in ['group', '分组', 'group_split'] and groups is not None:
+                train_groups = np.asarray(groups)[train_idx]
+                try:
+                    gss_inner = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=random_state)
+                    fit_idx, early_idx = next(gss_inner.split(np.arange(len(y_train)), y_train, train_groups))
+                except Exception:
+                    fit_idx, early_idx = train_test_split(
+                        np.arange(len(y_train), dtype=int),
+                        test_size=0.15,
+                        random_state=random_state,
+                    )
+            elif split_strategy in ['stratified', '分层', 'stratified_split']:
+                bins = _make_y_bins(y_train, n_bins=n_bins)
+                if bins is not None:
+                    try:
+                        sss_inner = StratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=random_state)
+                        fit_idx, early_idx = next(sss_inner.split(np.arange(len(y_train)).reshape(-1, 1), bins))
+                    except Exception:
+                        fit_idx, early_idx = train_test_split(
+                            np.arange(len(y_train), dtype=int),
+                            test_size=0.15,
+                            random_state=random_state,
+                        )
+                else:
+                    fit_idx, early_idx = train_test_split(
+                        np.arange(len(y_train), dtype=int),
+                        test_size=0.15,
+                        random_state=random_state,
+                    )
+            else:
+                fit_idx, early_idx = train_test_split(
+                    np.arange(len(y_train), dtype=int),
+                    test_size=0.15,
+                    random_state=random_state,
+                )
             if len(early_idx) < 4:
                 fit_idx = np.arange(len(y_train), dtype=int)
                 early_idx = np.asarray([], dtype=int)
@@ -4289,10 +4349,11 @@ class EnhancedModelTrainer:
                     _safe_xgb_fit(base_model, X_model_fit, y_model_fit, fit_kwargs or {})
 
             # 检查是否真的使用了早停
-            if hasattr(base_model, 'best_iteration'):
-                print(f"[DEBUG] ✓ 早停生效! 最佳迭代: {base_model.best_iteration}, 总迭代: {base_model.n_estimators}")
-                if base_model.best_iteration < base_model.n_estimators - 50:
-                    print(f"[DEBUG] ✓ 早停正常工作,节省了 {base_model.n_estimators - base_model.best_iteration} 轮训练")
+            if hasattr(base_model, 'best_iteration') and base_model.best_iteration is not None:
+                n_est = getattr(base_model, 'n_estimators', None) or 100
+                print(f"[DEBUG] ✓ 早停生效! 最佳迭代: {base_model.best_iteration}, 总迭代: {n_est}")
+                if base_model.best_iteration < n_est - 50:
+                    print(f"[DEBUG] ✓ 早停正常工作,节省了 {n_est - base_model.best_iteration} 轮训练")
                 else:
                     print(f"[WARNING] 早停可能未生效,训练了几乎所有轮次")
             else:
