@@ -27927,7 +27927,7 @@ def _page_batch_structure_check() -> None:
         ),
         key="structure_visualization_batch_download",
     )
-    st.caption(f"图片位于结果目录：{output_dir / 'images'}；移动结果表时请保留 images 文件夹。")
+    st.caption(f"图片位于结果目录：{output_dir}；移动结果表时请保留同目录下的 PNG 文件。")
 
 
 # ============================================================

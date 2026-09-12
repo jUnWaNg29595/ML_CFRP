@@ -10,36 +10,42 @@ Public API (kept compatible with the host app in ``app.py``):
 
 from __future__ import annotations
 
-import re
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
 
-from bigsmiles_ui.renderer import RenderOptions, render_structure
-
-_STATUS_ORDER = {"valid": 0, "valid_but_not_renderable": 1, "invalid": 2, "empty": 3}
+from .renderer import RenderOptions, render_structure
 
 
 def read_uploaded_table(file_name: str, file_bytes: bytes) -> pd.DataFrame:
-    """Read an uploaded CSV / XLSX / XLSM file given its raw bytes."""
+    """Read an uploaded CSV / XLSX / XLSM file given its raw bytes.
+
+    CSV 解码按 ``utf-8-sig`` → ``gb18030`` 顺序回退，兼容中文 Excel 导出文件。
+    """
     suffix = Path(str(file_name)).suffix.lower()
     if suffix in (".xlsx", ".xlsm"):
-        return pd.read_excel(
-            __import__("io").BytesIO(file_bytes),
-            engine="openpyxl",
-        )
-    return pd.read_csv(__import__("io").BytesIO(file_bytes))
+        frame = pd.read_excel(BytesIO(file_bytes), engine="openpyxl")
+    else:
+        last_error: Exception | None = None
+        frame = None
+        for encoding in ("utf-8-sig", "gb18030"):
+            try:
+                frame = pd.read_csv(BytesIO(file_bytes), encoding=encoding)
+                break
+            except UnicodeDecodeError as exc:
+                last_error = exc
+        if frame is None:
+            raise ValueError(f"CSV 编码无法识别：{last_error}")
+    frame.columns = [str(column) for column in frame.columns]
+    return frame
 
 
 def list_structure_columns(frame: pd.DataFrame) -> list[str]:
     """Heuristic: object columns look like structure candidates, ranked by name."""
     if frame is None or frame.empty:
         return []
-    columns = [
-        str(col)
-        for col in frame.columns
-        if frame[col].dtype == object
-    ]
+    columns = [str(col) for col in frame.columns if frame[col].dtype == object]
     priority = ("smiles", "bigsmiles", "结构", "结构式")
 
     def rank(name: str) -> tuple:
@@ -75,6 +81,8 @@ def process_table(
     error_messages: list[str] = []
     warning_messages: list[str] = []
     image_paths: list[str] = []
+    sample_paths: list[str] = []
+    raw_values: list[str] = []
 
     for index, value in enumerate(result_frame[structure_column], start=1):
         raw = "" if pd.isna(value) else str(value).strip()
@@ -86,11 +94,13 @@ def process_table(
         draw_statuses.append(result.draw_status)
         error_messages.append(result.error_message)
         warning_messages.append(result.warning_message)
-        image_paths.append(
-            f"images/{Path(result.main_image_path).name}"
-            if result.main_image_path
-            else ""
-        )
+        # 原版渲染器返回相对 output_dir 的文件名（如 main_xxxxx.png）。
+        # 仅当路径仍然存在时写入，避免把失败行写成悬空引用。
+        main_name = str(result.main_image_path or "").strip()
+        image_paths.append(main_name if (output_dir / main_name).is_file() else "")
+        sample_name = str(result.sample_image_path or "").strip()
+        sample_paths.append(sample_name if (output_dir / sample_name).is_file() else "")
+        raw_values.append(raw)
 
         if progress_callback is not None:
             try:
@@ -98,6 +108,7 @@ def process_table(
             except Exception:
                 pass
 
+    result_frame["原始字符串"] = raw_values
     result_frame["解析状态"] = statuses
     result_frame["结构类型"] = detected
     result_frame["规范化结构"] = normalized
@@ -105,6 +116,7 @@ def process_table(
     result_frame["错误信息"] = error_messages
     result_frame["警告信息"] = warning_messages
     result_frame["图片路径"] = image_paths
+    result_frame["采样图路径"] = sample_paths
     return result_frame
 
 
@@ -115,9 +127,5 @@ def write_table(frame: pd.DataFrame, output_path) -> Path:
     if output_path.suffix.lower() in (".xlsx", ".xlsm"):
         frame.to_excel(output_path, index=False, engine="openpyxl")
     else:
-        frame.to_csv(
-            output_path,
-            index=False,
-            encoding="utf-8-sig",
-        )
+        frame.to_csv(output_path, index=False, encoding="utf-8-sig")
     return output_path

@@ -287,6 +287,7 @@ XGBOOST_DEFAULTS = {
     "reg_lambda": 1.0,
     "early_stopping_rounds": 50,
     "eval_metric": "rmse",
+    "objective": "reg:squarederror",
     "max_bin": 256,
     "verbosity": 0,
 }
@@ -301,6 +302,7 @@ LIGHTGBM_DEFAULTS = {
     "reg_alpha": 0.0,
     "reg_lambda": 0.0,
     "min_child_samples": 20,
+    "objective": "regression",
     "verbose": -1,
 }
 
@@ -337,6 +339,7 @@ ANN_DEFAULTS = {
     "use_amp": False,
     "scaler_type": "standard",
     "normalize_target": False,
+    "loss_name": "mse",
     "random_state": 42,
     "verbose": True,
 }
@@ -851,6 +854,14 @@ MANUAL_TUNING_PARAMS = {
         _number("reg_lambda", "L2 Regularization", XGBOOST_DEFAULTS["reg_lambda"], 0.0, 20.0, 0.1, "%.1f"),
         _slider("early_stopping_rounds", "Early Stopping Rounds", XGBOOST_DEFAULTS["early_stopping_rounds"], 0, 300, 10),
         _select("eval_metric", "Eval Metric", XGBOOST_DEFAULTS["eval_metric"], ["rmse", "mae", "mape", "rmsle"]),
+        _select(
+            "objective",
+            "Objective (Loss)",
+            XGBOOST_DEFAULTS["objective"],
+            ["reg:squarederror", "reg:pseudohubererror", "reg:absoluteerror"],
+            "回归损失函数。reg:pseudohubererror = Huber 损失（残差超过 δ 后自动转为线性惩罚），"
+            "reg:absoluteerror = MAE；二者对目标值异常样本更鲁棒，默认 reg:squarederror 与历史行为一致。仅影响训练目标，测试集评估不受影响。",
+        ),
         _slider("max_bin", "Max Bins", XGBOOST_DEFAULTS["max_bin"], 64, 1024, 64),
         _slider("verbosity", "Verbose Level", XGBOOST_DEFAULTS["verbosity"], 0, 3, 1),
     ],
@@ -864,6 +875,14 @@ MANUAL_TUNING_PARAMS = {
         _number("reg_alpha", "L1 Regularization", LIGHTGBM_DEFAULTS["reg_alpha"], 0.0, 10.0, 0.1, "%.1f"),
         _number("reg_lambda", "L2 Regularization", LIGHTGBM_DEFAULTS["reg_lambda"], 0.0, 20.0, 0.1, "%.1f"),
         _slider("min_child_samples", "Min Child Samples", LIGHTGBM_DEFAULTS["min_child_samples"], 2, 100, 1),
+        _select(
+            "objective",
+            "Objective (Loss)",
+            LIGHTGBM_DEFAULTS["objective"],
+            ["regression", "huber", "regression_l1"],
+            "回归损失函数。huber = Huber 损失（alpha 参数控制 δ），regression_l1 = MAE；"
+            "二者对目标值异常样本更鲁棒，默认 regression（L2）与历史行为一致。仅影响训练目标，测试集评估不受影响。",
+        ),
     ],
     "CatBoost": [
         _slider("iterations", "Iterations", CATBOOST_DEFAULTS["iterations"], 50, 3000, 50),
@@ -929,6 +948,15 @@ MANUAL_TUNING_PARAMS = {
             0.0001,
             "%.4f",
             "L2 regularization coefficient.",
+            "基础训练",
+        ),
+        _select(
+            "loss_name",
+            "Loss Function",
+            ANN_DEFAULTS["loss_name"],
+            ["mse", "huber", "mae"],
+            "训练损失函数。huber = Huber 损失（残差小用平方、残差大自动转线性，压制异常样本影响），"
+            "mae = 平均绝对误差；二者对目标值异常样本更鲁棒，默认 mse 与历史行为一致。仅影响训练目标，测试集评估不受影响。",
             "基础训练",
         ),
         _slider(

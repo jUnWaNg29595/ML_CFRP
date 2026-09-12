@@ -38,6 +38,8 @@ _ACTIVATIONS = {
 }
 _OPTIMIZERS = {"adam", "adamw", "rmsprop", "sgd"}
 _SCHEDULERS = {"none", "reduce_on_plateau", "cosine_annealing"}
+# 回归损失：mse（默认，对异常敏感）/ huber（压制异常样本）/ mae（最强鲁棒）
+_LOSS_NAMES = {"mse", "huber", "mae", "l1"}
 
 
 def _normalise_activation(activation):
@@ -118,6 +120,7 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
         optimizer="adam",
         learning_rate=0.001,
         weight_decay=0.0,
+        loss_name="mse",
         batch_size=512,
         epochs=100,
         validation_split=0.0,
@@ -142,6 +145,7 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
         self.optimizer = optimizer
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.loss_name = loss_name
         self.batch_size = batch_size
         self.epochs = epochs
         self.validation_split = validation_split
@@ -198,6 +202,10 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
         optimizer = str(self.optimizer or "").strip().lower()
         if optimizer not in _OPTIMIZERS:
             raise ValueError("optimizer must be one of adam, adamw, rmsprop, sgd")
+
+        loss_name = str(getattr(self, "loss_name", "mse") or "mse").strip().lower()
+        if loss_name not in _LOSS_NAMES:
+            raise ValueError(f"loss_name must be one of {sorted(_LOSS_NAMES)}")
 
         try:
             validation_split = float(self.validation_split)
@@ -259,6 +267,7 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
             "optimizer": optimizer,
             "learning_rate": learning_rate,
             "weight_decay": weight_decay,
+            "loss_name": loss_name,
             "validation_split": validation_split,
             "patience": patience,
             "min_delta": min_delta,
@@ -413,6 +422,7 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
             "use_data_parallel": True,
             "external_preprocess": False,
             "random_state": 42,
+            "loss_name": "mse",
             "batch_size": 512,
             "epochs": 100,
             "learning_rate": 0.001,
@@ -540,7 +550,13 @@ class ANNRegressor(BaseEstimator, RegressorMixin):
             num_workers=0 if platform.system() == "Windows" else 0,
         )
 
-        criterion = nn.MSELoss(reduction="none")
+        loss_name = str(config.get("loss_name", "mse") or "mse").strip().lower()
+        if loss_name == "huber":
+            criterion = nn.HuberLoss(reduction="none", delta=1.0)
+        elif loss_name in ("mae", "l1"):
+            criterion = nn.L1Loss(reduction="none")
+        else:
+            criterion = nn.MSELoss(reduction="none")
         optimizer = self._make_optimizer(
             config["optimizer"],
             self.model.parameters(),
