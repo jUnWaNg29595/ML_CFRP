@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 
 
-APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
+APP_PATH = Path(__file__).resolve().parents[1] / "app_lib.py"
 
 
 def _app_source() -> str:

@@ -5,7 +5,7 @@ from core.navigation import NAVIGATION_ALIASES, NAVIGATION_PAGES, resolve_naviga
 
 
 ROOT = Path(__file__).resolve().parents[1]
-APP_PATH = ROOT / "app.py"
+APP_PATH = ROOT / "app_lib.py"
 
 
 def test_structure_image_page_has_new_canonical_name_and_legacy_alias():

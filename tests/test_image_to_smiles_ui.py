@@ -13,7 +13,7 @@ def _png_bytes(size=(2400, 1200)):
 
 
 def test_clipboard_payload_decodes_image_and_preserves_filename(monkeypatch):
-    import app
+    import app_lib as app
 
     raw = _png_bytes()
     payload = {
@@ -33,7 +33,7 @@ def test_clipboard_payload_decodes_image_and_preserves_filename(monkeypatch):
 
 
 def test_clipboard_payload_rejects_non_image_and_oversized_data():
-    import app
+    import app_lib as app
 
     raw = _png_bytes((64, 64))
     encoded = base64.b64encode(raw).decode("ascii")
@@ -52,7 +52,7 @@ def test_clipboard_payload_rejects_non_image_and_oversized_data():
 
 
 def test_image_preview_is_bounded_without_mutating_source():
-    import app
+    import app_lib as app
 
     raw = _png_bytes()
     preview = app._build_image_preview(raw, max_width=640, max_height=480)
@@ -68,7 +68,7 @@ def test_image_preview_is_bounded_without_mutating_source():
 def test_image_to_smiles_page_uses_clipboard_component_and_bounded_preview():
     from pathlib import Path
 
-    source = (Path(__file__).resolve().parents[1] / "app.py").read_text(
+    source = (Path(__file__).resolve().parents[1] / "app_lib.py").read_text(
         encoding="utf-8-sig"
     )
     start = source.index("def page_image_to_smiles():")

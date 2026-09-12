@@ -8,7 +8,7 @@ import core.virtual_screening as virtual_screening
 from core.training_runs import TrainingRunManager
 
 
-APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
+APP_PATH = Path(__file__).resolve().parents[1] / "app_lib.py"
 
 from core.molecular_features import (
     OptimizedRDKitFeatureExtractor,
@@ -48,7 +48,7 @@ from core.virtual_screening import (
 
 
 def test_virtual_screening_page_exposes_design_engine_only():
-    source = Path(__file__).resolve().parents[1].joinpath("app.py").read_text(encoding="utf-8")
+    source = Path(__file__).resolve().parents[1].joinpath("app_lib.py").read_text(encoding="utf-8")
     source = source[source.rfind("def page_virtual_screening") :]
     assert "分子设计引擎" in source
     assert "叠加 PubChem 候选" not in source
@@ -348,7 +348,7 @@ def test_training_run_model_artifact_receives_molecular_feature_metadata(tmp_pat
 
 
 def test_app_metadata_restore_prefers_extra_and_clears_missing_fields():
-    import app
+    import app_lib as app
 
     workflow_from_extra = {
         "schema_version": 2,
@@ -392,7 +392,7 @@ def test_app_metadata_restore_prefers_extra_and_clears_missing_fields():
 
 
 def test_app_workflow_only_restore_projects_legacy_config_into_session():
-    import app
+    import app_lib as app
 
     workflow_payload = {
         "schema_version": 2,
@@ -424,7 +424,7 @@ def test_app_workflow_only_restore_projects_legacy_config_into_session():
 
 
 def test_app_imported_molecular_workflow_replays_and_replaces_columns(monkeypatch):
-    import app
+    import app_lib as app
 
     data = pd.DataFrame(
         {
@@ -485,7 +485,7 @@ def test_app_imported_molecular_workflow_replays_and_replaces_columns(monkeypatc
 
 
 def test_artifact_extra_contains_post_feature_mapping_default(monkeypatch):
-    import app
+    import app_lib as app
 
     app.st.session_state["post_feature_mapping_default"] = {
         "schema_version": 1,
@@ -504,7 +504,7 @@ def test_artifact_extra_contains_post_feature_mapping_default(monkeypatch):
 
 
 def test_restore_model_metadata_loads_mapping_as_unconfirmed_draft():
-    import app
+    import app_lib as app
 
     app._restore_molecular_feature_metadata(
         {
@@ -529,7 +529,7 @@ def test_restore_model_metadata_loads_mapping_as_unconfirmed_draft():
 
 
 def test_post_feature_mapping_invalidation_keeps_molecular_metadata():
-    import app
+    import app_lib as app
 
     app.st.session_state["molecular_feature_workflow"] = {"workflow": "keep"}
     app.st.session_state["molecular_feature_trace"] = [{"step": "keep"}]
@@ -553,7 +553,7 @@ def test_post_feature_mapping_invalidation_keeps_molecular_metadata():
 
 
 def test_app_v1_snapshot_restore_clears_new_workflow_metadata(monkeypatch):
-    import app
+    import app_lib as app
 
     app.st.session_state["molecular_feature_workflow"] = {"stale": True}
     app.st.session_state["molecular_feature_trace"] = [{"stale": True}]
@@ -581,7 +581,7 @@ def test_app_v1_snapshot_restore_clears_new_workflow_metadata(monkeypatch):
 
 
 def test_snapshot_restore_does_not_restore_stringified_optimization_result(monkeypatch):
-    import app
+    import app_lib as app
 
     app.st.session_state["optimization_result"] = "OptimizationResult(...)"
     monkeypatch.setattr(

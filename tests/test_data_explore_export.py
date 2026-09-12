@@ -313,7 +313,7 @@ def test_figure_to_bytes_exports_matplotlib_svg():
 def test_data_explore_export_controls_send_real_payloads_to_each_download_button(
     monkeypatch,
 ):
-    import app
+    import app_lib as app
 
     class Column:
         def __enter__(self):

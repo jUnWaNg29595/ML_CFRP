@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 
 
-APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
+APP_PATH = Path(__file__).resolve().parents[1] / "app_lib.py"
 
 
 def test_molecular_features_page_does_not_bind_torch_locally():
@@ -31,10 +31,10 @@ def test_molecular_features_page_does_not_bind_torch_locally():
 
 
 def test_hyperparameter_page_uses_persisted_result_without_second_random_split():
-    source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "app_lib.py").read_text(encoding="utf-8")
     start = source.index("def page_hyperparameter_optimization():")
     end = source.index(
-        "\n\n# ============================================================\n# 页面：主动学习",
+        "\ndef page_active_learning():",
         start,
     )
     page_source = source[start:end]
@@ -47,10 +47,10 @@ def test_hyperparameter_page_uses_persisted_result_without_second_random_split()
 
 
 def test_hyperparameter_page_does_not_apply_reliable_preflight_to_exploration():
-    source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "app_lib.py").read_text(encoding="utf-8")
     start = source.index("def page_hyperparameter_optimization():")
     end = source.index(
-        "\n\n# ============================================================\n# 页面：主动学习",
+        "\ndef page_active_learning():",
         start,
     )
     page_source = source[start:end]
@@ -62,7 +62,7 @@ def test_hyperparameter_page_does_not_apply_reliable_preflight_to_exploration():
 
 
 def test_data_explore_preview_uses_selected_source_and_caps_rows_at_5000(monkeypatch):
-    import app
+    import app_lib as app
 
     raw = pd.DataFrame(
         {
@@ -111,7 +111,7 @@ def test_data_explore_preview_uses_selected_source_and_caps_rows_at_5000(monkeyp
 def test_data_explore_preview_keeps_only_valid_selected_columns_after_source_switch(
     monkeypatch,
 ):
-    import app
+    import app_lib as app
 
     raw = pd.DataFrame(
         {
@@ -162,7 +162,7 @@ def test_data_explore_preview_keeps_only_valid_selected_columns_after_source_swi
 
 
 def test_data_explore_preview_keeps_explicit_empty_selection_hidden(monkeypatch):
-    import app
+    import app_lib as app
 
     frame = pd.DataFrame({"feature": [1, 2]})
     state = {}
@@ -201,7 +201,7 @@ def test_data_explore_preview_keeps_explicit_empty_selection_hidden(monkeypatch)
 
 
 def test_molecular_feature_cleanup_collects_recorded_workflow_and_known_prefix_columns():
-    import app
+    import app_lib as app
 
     columns = [
         "resin_smiles",
@@ -228,12 +228,12 @@ def test_molecular_feature_cleanup_collects_recorded_workflow_and_known_prefix_c
 
 
 def test_feature_selection_page_exposes_molecular_feature_cleanup_without_touching_raw_data():
-    import app
+    import app_lib as app
 
     source = APP_PATH.read_text(encoding="utf-8-sig")
     start = source.index("def page_feature_selection():")
     end = source.index(
-        "\n\n# ============================================================\n# 页面：模型训练",
+        "\ndef page_model_training():",
         start,
     )
     page_source = source[start:end]
@@ -244,7 +244,7 @@ def test_feature_selection_page_exposes_molecular_feature_cleanup_without_touchi
 
 
 def test_molecular_feature_cleanup_creates_named_backup_before_mutating_state(monkeypatch):
-    import app
+    import app_lib as app
 
     state = {
         "data": pd.DataFrame(
@@ -305,7 +305,7 @@ def test_data_explore_export_center_supports_raw_and_processed_data():
     source = APP_PATH.read_text(encoding="utf-8-sig")
     start = source.index("def page_data_explore():")
     end = source.index(
-        "\n\n# ============================================================\n# 页面：数据清洗",
+        "\ndef page_data_cleaning():",
         start,
     )
     page_source = source[start:end]

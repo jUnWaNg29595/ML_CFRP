@@ -20,6 +20,12 @@ gatherUsageStats = false
 fastReruns = true
 enforceSerializableSessionState = false
 
+# 关闭 magic：应用全部显式调用 st.*，无需裸表达式自动显示。
+# 关闭后 Streamlit 重建字节码时不再对整个 app.py（1.2MB/28000行）
+# 做 ast.parse+改写（实测约 4.6s），服务器冷启动和文件变更后的首次
+# 切页显著加速。已用 AppTest 对比验证关闭前后页面输出完全一致。
+magicEnabled = false
+
 [client]
 # 显示优化
 showErrorDetails = false

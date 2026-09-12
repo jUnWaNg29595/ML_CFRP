@@ -891,7 +891,8 @@ MANUAL_TUNING_PARAMS = {
         _number("l2_leaf_reg", "L2 Leaf Regularization", CATBOOST_DEFAULTS["l2_leaf_reg"], 0.0, 20.0, 0.1, "%.1f"),
         _slider("subsample", "Subsample", CATBOOST_DEFAULTS["subsample"], 0.3, 1.0, 0.05),
         _number("bagging_temperature", "Bagging Temperature", CATBOOST_DEFAULTS["bagging_temperature"], 0.0, 5.0, 0.1, "%.1f"),
-        _select("loss_function", "Loss Function", CATBOOST_DEFAULTS["loss_function"], ["RMSE", "MAE", "Huber", "Quantile"]),
+        _select("loss_function", "Loss Function", CATBOOST_DEFAULTS["loss_function"], ["RMSE", "MAE", "Huber:delta=1.0", "Quantile:alpha=0.5"],
+                "回归损失函数。MAE 与 Huber:delta=1.0 对目标值异常样本更鲁棒（Huber：残差小用平方、残差大自动转线性）；默认 RMSE 与历史行为一致。"),
         _slider("verbose", "Verbose Interval", CATBOOST_DEFAULTS["verbose"], 0, 200, 10),
     ],
     "人工神经网络": [

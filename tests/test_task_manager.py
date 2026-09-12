@@ -50,7 +50,7 @@ def test_completed_task_keeps_result_for_later_rerun():
 
 def test_sidebar_initializes_task_lock_before_widget_uses_it():
     app_source = (
-        Path(__file__).resolve().parents[1] / 'app.py'
+        Path(__file__).resolve().parents[1] / 'app_lib.py'
     ).read_text(encoding='utf-8')
     lock_assignment = 'active_task_lock = bool(get_task_manager().get_active_tasks())'
     widget_usage = 'disabled=active_task_lock'
@@ -60,7 +60,7 @@ def test_sidebar_initializes_task_lock_before_widget_uses_it():
 
 def test_virtual_screening_restores_saved_result_before_run_controls():
     app_source = (
-        Path(__file__).resolve().parents[1] / 'app.py'
+        Path(__file__).resolve().parents[1] / 'app_lib.py'
     ).read_text(encoding='utf-8')
     result_state = 'saved_vs_formula_result = st.session_state.get("vs_formula_result_df")'
     run_button = '"🚀 开始配方级高通量筛选"'
@@ -69,11 +69,12 @@ def test_virtual_screening_restores_saved_result_before_run_controls():
 
 
 def test_main_dispatch_has_global_task_lock_before_page_controls():
+    # 拆分后：任务锁门控与 pg.run() 都在薄入口 app.py 中（lib 只保留 def）
     app_source = (
         Path(__file__).resolve().parents[1] / 'app.py'
     ).read_text(encoding='utf-8')
     lock_gate = 'if _render_global_task_lock(page):'
-    first_dispatch = 'if page == "🏠 首页":'
+    first_dispatch = 'pg.run()'
 
     assert app_source.index(lock_gate) < app_source.index(first_dispatch)
 
@@ -106,7 +107,7 @@ def test_acquiring_new_task_clears_cancel_flag_after_previous_run_stops():
 
 def test_virtual_screening_guard_catches_streamlit_control_flow_exceptions():
     app_source = (
-        Path(__file__).resolve().parents[1] / 'app.py'
+        Path(__file__).resolve().parents[1] / 'app_lib.py'
     ).read_text(encoding='utf-8')
 
     assert 'except BaseException as exc:' in app_source

@@ -14,7 +14,7 @@ real_names = [f"MolDesc_{i:03d}" for i in range(N_REAL)]
 session_names = [f"Canon_{i:03d}" for i in range(N_SESSION)]
 
 # ---------- 1) 从 app.py 提取 _coerce_feature_frame / _build_split_snapshot_tables ----------
-app_src = open("app.py", encoding="utf-8").read()
+app_src = open("app_lib.py", encoding="utf-8").read()
 tree = ast.parse(app_src)
 ns = {"pd": pd, "np": np, "re": re}
 wanted = {"_coerce_feature_frame", "_coerce_target_array", "_build_split_snapshot_tables"}

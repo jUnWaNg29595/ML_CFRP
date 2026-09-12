@@ -71,7 +71,7 @@ def test_regression_cross_validation_excludes_only_missing_targets():
 
 
 def test_exported_training_script_keeps_rows_with_missing_features():
-    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text(
+    app_source = (Path(__file__).resolve().parents[1] / "app_lib.py").read_text(
         encoding="utf-8"
     )
     script_start = app_source.index("def load_and_train():")

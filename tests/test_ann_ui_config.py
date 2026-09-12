@@ -29,6 +29,7 @@ def test_ann_defaults_include_professional_controls():
         'use_amp',
         'scaler_type',
         'normalize_target',
+        'loss_name',
         'random_state',
         'verbose',
     }
@@ -56,6 +57,7 @@ def test_ann_defaults_include_professional_controls():
         'use_amp': False,
         'scaler_type': 'standard',
         'normalize_target': False,
+        'loss_name': 'mse',
         'random_state': 42,
         'verbose': True,
     }

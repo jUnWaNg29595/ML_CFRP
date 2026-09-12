@@ -1,10 +1,32 @@
-# CFRP智能预测平台 - 变更日志
+# 材料机器学习平台 - 变更日志
 
 所有重要的更改都将记录在此文件中。
 
 本文档格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/),
 并且本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.6.0] - 2026-09-13
+
+### 变更
+- 平台更名：「碳纤维复合材料智能预测平台」→「材料机器学习平台」，浏览器标题、侧边栏品牌位与文档同步更新
+- 架构重构：28000 行单体 app.py 拆分为薄入口（236 行）+ app_lib.py 共享库（27855 行，每进程仅导入一次）+ app_pages/ 下 19 个 st.Page 页面，页面导航升级为 st.navigation 分组侧边栏
+- 侧边栏布局：导航菜单固定顶部（Streamlit 官方行为），平台名品牌位移至侧边栏底部
+- 首页快速入口由 _nav_to 机制改为原生 st.switch_page
+
+### 性能
+- 关闭 Streamlit magic：消除每次字节码重建时对全量脚本（1.2MB）的 ast.parse+改写（实测 4.6s/次）
+- 每次重跑执行的代码从 28000 行降至 236 行，页面切换显著加速
+- 侧边栏快照元信息读取增加 15s 会话级节流，不再每次重跑解析 3.5MB 快照 JSON
+- 自动保存（快照序列化与写盘）移至单工作线程后台执行，meta 改为临时文件原子替换，不再周期性冻结 UI
+- 服务器启动时后台预加载 shap/plotly/seaborn/xgboost/lightgbm/catboost/tensorflow，消除各页面首次访问的懒加载卡顿
+
+### 修复
+- 后台快照的线程池与在途门锁改为 sys 属性进程级单例，修复模块级变量被每次重跑重建导致的线程泄漏与防堆积失效
+
+### 文档
+- README/CHANGELOG/DEVELOPMENT 同步新平台名与 v1.6.0 版本号
+
+---
 ## [1.5.2] - 2026-08-25
 
 ### 修复
@@ -23,7 +45,10 @@
 ## [Unreleased]
 
 ### 新增
+- 模型训练页新增鲁棒损失选项（训练中自动压制目标异常样本影响，无需剔除数据）：XGBoost/LightGBM 新增 Objective (Loss) 选项（reg:squarederror / reg:pseudohubererror / reg:absoluteerror；regression / huber / regression_l1），人工神经网络新增 Loss Function 选项（mse / huber / mae，含旧模型反序列化兼容）；Huber 在残差超过 δ 后自动由平方转线性惩罚、MAE 全程线性，异常样本影响被自动压低，默认值与历史行为一致，仅影响训练目标、测试集评估不变；含异常点数据的对比验证中 Huber 相对 MSE 稳定取得更低测试 RMSE
 - 模型训练页新增「内部验证集（早停用）」配置块：自动（默认，训练样本 ≥ 20 条时划出 15%，与历史行为一致）/ 自定义比例（5%~40%，验证样本不足 4 条自动回退）/ 关闭（全部训练样本参与拟合）三种模式；仅对支持早停的模型（XGBoost/LightGBM/CatBoost 及 FT-Transformer/Transformer+BNN/Transformer+PINN/GNN+Transformer 融合）生效，其他模型显示明确提示；切分尊重分组/分层划分策略，避免配方组同时出现在拟合与验证两侧
+
+- 修复 CatBoost 损失函数选项选 Huber/Quantile 时因缺少 delta/alpha 参数导致训练报错的问题（选项值改为 Huber:delta=1.0 / Quantile:alpha=0.5）
 - 训练结果新增「内部验证集（早停）」指标卡片：展示启用状态、验证样本数、验证集 R²/RMSE 及模型最优迭代轮次，回退时给出原因警告；验证集指标在原始目标量纲下计算
 - 训练样本 < 100 且启用验证集时提示用交叉验证（CV mean±std）获得更稳定评估
 - 验证集模式/比例写入参数保存、训练日志与训练记录元数据（val_mode/val_effective/val_size/val_sample_count），训练结果字典新增 validation_set 结构化信息

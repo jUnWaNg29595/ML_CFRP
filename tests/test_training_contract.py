@@ -28,7 +28,7 @@ def test_model_specific_training_inputs_do_not_reuse_strict_numeric_context():
 
 
 def test_training_page_routes_model_specific_context_for_all_raw_frame_models():
-    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    app_source = (Path(__file__).resolve().parents[1] / "app_lib.py").read_text(encoding="utf-8")
     assert "RAW_FRAME_MODEL_NAMES" in app_source
     raw_frame_line = next(line for line in app_source.splitlines() if line.strip().startswith("raw_frame_models ="))
     assert "set(RAW_FRAME_MODEL_NAMES)" in raw_frame_line

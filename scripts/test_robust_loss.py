@@ -83,8 +83,8 @@ def test_catboost_loss_function():
                               iterations=80, loss_function="MAE", verbose=0)
     assert res["model"].get_params()["loss_function"] == "MAE"
     res2 = trainer.train_model(X, y, model_name="CatBoost", test_size=0.2, random_state=42,
-                               iterations=80, loss_function="Huber", verbose=0)
-    assert res2["model"].get_params()["loss_function"] == "Huber"
+                               iterations=80, loss_function="Huber:delta=1.0", verbose=0)
+    assert res2["model"].get_params()["loss_function"] == "Huber:delta=1.0"
     print(f"[PASS] CatBoost loss_function 透传: MAE RMSE={res['rmse']:.3f}, Huber RMSE={res2['rmse']:.3f}")
 
 

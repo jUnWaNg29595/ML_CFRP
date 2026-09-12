@@ -7,10 +7,13 @@ def test_feature_registry_ui_exports_minimal_renderer():
 def test_app_dispatch_exposes_feature_management_page():
     from pathlib import Path
 
-    source = Path(__file__).resolve().parents[1] / "app.py"
-    text = source.read_text(encoding="utf-8")
-    assert "🧩 特征管理" in text
-    assert "render_feature_registry_page" in text
+    root = Path(__file__).resolve().parents[1]
+    entry_source = (root / "app.py").read_text(encoding="utf-8")
+    lib_source = (root / "app_lib.py").read_text(encoding="utf-8")
+    # 拆分后架构：入口 st.navigation 注册导航条目；共享库提供页面渲染函数
+    assert "🧩 特征管理" in entry_source
+    assert "app_pages/feature_registry.py" in entry_source
+    assert "render_feature_registry_page" in lib_source
 
 
 def test_feature_review_ui_persists_ai_and_local_decision_records():
