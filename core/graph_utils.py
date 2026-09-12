@@ -174,13 +174,23 @@ def smiles_to_pyg_graph(smiles, add_hs: bool = True):
         if not s or s.lower() in {"nan", "none", "<na>"}:
             return None
         mol = Chem.MolFromSmiles(normalize_chemical_string(s, canonicalize=False, repair=True, keep_largest_frag=False) or "")
-        if mol is None:
+        # [关键修复] RDKit 对空串/不可解析串会返回 0 原子的空 mol（而非 None），
+        # 若不拦截会产生 x=torch.tensor([]) 的一维退化图，导致下游 NNConv 等消息传递层
+        # 访问 node_dim=-2 时抛出 IndexError: Dimension out of range。
+        if mol is None or mol.GetNumAtoms() == 0:
             return None
         if add_hs:
             mol = Chem.AddHs(mol)
+            if mol is None or mol.GetNumAtoms() == 0:
+                return None
 
         atom_feats = [get_atom_features(atom) for atom in mol.GetAtoms()]
         x = torch.tensor(atom_feats, dtype=torch.float32)
+        if x.numel() == 0:
+            # 任何情况下都不允许空节点图进入 DataLoader（防御性二次保险）
+            return None
+        if x.dim() == 1:
+            x = x.view(1, -1)
 
         edge_indices, edge_attrs = [], []
         for bond in mol.GetBonds():
@@ -765,10 +775,30 @@ class GNNFeaturizer:
             if graph is not None:
                 graphs.append(graph)
         if graphs:
-            return graphs
+            return [g for g in graphs if self._is_valid_graph(g)]
 
         graph = self._build_graph(s)
-        return [graph] if graph is not None else []
+        if graph is not None and self._is_valid_graph(graph):
+            return [graph]
+        return []
+
+    @staticmethod
+    def _is_valid_graph(graph) -> bool:
+        """[防御性过滤] 丢弃节点数为 0 或特征张量维度异常的退化图，
+        防止其进入 Batch 拼接后使 NNConv/GCN 等消息传递层崩溃。"""
+        try:
+            x = getattr(graph, "x", None)
+            if x is None or not hasattr(x, "dim") or x.dim() != 2 or x.size(0) == 0:
+                return False
+            edge_index = getattr(graph, "edge_index", None)
+            if edge_index is None or edge_index.dim() != 2 or edge_index.size(0) != 2:
+                return False
+            edge_attr = getattr(graph, "edge_attr", None)
+            if edge_attr is not None and edge_attr.dim() != 2:
+                return False
+            return True
+        except Exception:
+            return False
 
     def featurize(self, smiles_list, batch_size=32, chunk_size=None, num_workers=None, show_progress=True):
         """批量提取特征（支持分块、缓存和多进程加载）- 带自动恢复"""
@@ -867,41 +897,39 @@ class GNNFeaturizer:
                     loader_kwargs['persistent_workers'] = True
                     loader_kwargs['prefetch_factor'] = 2  # 从 4 降低到 2
 
-            loader = DataLoader(graph_data_list, **loader_kwargs)
-
-            if show_progress:
-                loader_iter = tqdm(loader, desc="GNN推理", leave=False)
-            else:
-                loader_iter = loader
-
-            sample_feature_map = {}
-            sample_order = list(dict.fromkeys(chunk_valid))
-            graph_offset = 0
-            with torch.no_grad():
-                for batch in loader_iter:
+            # [健壮性] DataLoader 多进程 worker 崩溃时自动降级为单进程重建后重试当前 chunk
+            def _run_loader_with_fallback(kwargs):
+                nonlocal graph_offset
+                loader_kwargs_fb = dict(kwargs)
+                attempt = 0
+                while True:
+                    loader_fb = DataLoader(graph_data_list, **loader_kwargs_fb)
+                    fb_offset = 0
                     try:
-                        batch_n = int(getattr(batch, "num_graphs", 0) or 0)
-                        if batch_n <= 0:
-                            try:
-                                batch_n = int(batch.batch.max().item()) + 1
-                            except Exception:
-                                batch_n = len(graph_owner_indices[graph_offset:])
-                        batch_owner_indices = graph_owner_indices[graph_offset:graph_offset + batch_n]
-                        graph_offset += batch_n
-                        batch = batch.to(self.device)
-                        out = self.model(batch)
-                        out_np = out.cpu().numpy()
-                        for owner_idx, vec in zip(batch_owner_indices, out_np):
-                            sample_feature_map.setdefault(owner_idx, []).append(vec)
-
-                        # [修复] 每个 batch 处理完立即清理 GPU 显存
-                        del batch, out
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
+                        with torch.no_grad():
+                            for batch_fb in loader_fb:
+                                batch_n_fb = int(getattr(batch_fb, "num_graphs", 0) or 0)
+                                if batch_n_fb <= 0:
+                                    try:
+                                        batch_n_fb = int(batch_fb.batch.max().item()) + 1
+                                    except Exception:
+                                        batch_n_fb = len(graph_owner_indices[graph_offset + fb_offset:])
+                                owner_idx_fb = graph_owner_indices[graph_offset + fb_offset:graph_offset + fb_offset + batch_n_fb]
+                                fb_offset += batch_n_fb
+                                batch_fb = batch_fb.to(self.device)
+                                out_fb = self.model(batch_fb)
+                                out_np_fb = out_fb.cpu().numpy()
+                                for owner_idx, vec in zip(owner_idx_fb, out_np_fb):
+                                    sample_feature_map.setdefault(owner_idx, []).append(vec)
+                                del batch_fb, out_fb
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                        del loader_fb
+                        graph_offset += fb_offset
+                        return
                     except RuntimeError as e:
-                        # 显存不足时报错，不自动降级
-                        if "out of memory" in str(e).lower():
+                        msg = str(e).lower()
+                        if "out of memory" in msg:
                             torch.cuda.empty_cache()
                             raise RuntimeError(
                                 f"❌ GPU 显存不足，推理过程中断。\n"
@@ -913,8 +941,31 @@ class GNNFeaturizer:
                                 f"  4. 运行 'python force_clear_gpu.py' 清理显存\n"
                                 f"  5. 如需使用 CPU 模式，请在 UI 中选择 'CPU' 设备"
                             ) from e
-                        else:
-                            raise
+                        worker_crashed = (
+                            "worker" in msg and "exited" in msg
+                        ) or ("dataloader" in msg and "exceeded" in msg)
+                        if worker_crashed and loader_kwargs_fb.get('num_workers', 0) > 0:
+                            attempt += 1
+                            try:
+                                del loader_fb
+                            except Exception:
+                                pass
+                            loader_kwargs_fb['num_workers'] = 0
+                            loader_kwargs_fb.pop('persistent_workers', None)
+                            loader_kwargs_fb.pop('prefetch_factor', None)
+                            graph_offset -= fb_offset  # 回滚本 chunk 已消费的图偏移后整体重跑
+                            if attempt > 2:
+                                raise
+                            continue
+                        raise
+                    except Exception:
+                        del loader_fb
+                        raise
+
+            sample_feature_map = {}
+            sample_order = list(dict.fromkeys(chunk_valid))
+            graph_offset = 0
+            _run_loader_with_fallback(loader_kwargs)
 
             for owner_idx in sample_order:
                 feats = sample_feature_map.get(owner_idx)
@@ -925,7 +976,7 @@ class GNNFeaturizer:
                 valid_indices.append(owner_idx)
 
             # [修复] 每个 chunk 处理完清理
-            del graph_data_list, loader
+            del graph_data_list
 
             # [关键修复] 清理图缓存，防止内存泄漏
             if self.cache_graphs and len(self._graph_cache) > self.max_cache_size:

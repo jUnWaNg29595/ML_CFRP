@@ -1217,7 +1217,7 @@ def filter_candidates_by_epoxy_rules(
             if A <= 0:
                 mask.append(False)
                 continue
-            ratio = float(resin_feat.get("epoxide", 0)) / float(2 * A)
+            ratio = float(resin_feat.get("epoxide", 0)) / float(A)
             if not _in_range(ratio, anhydride_ratio[0], anhydride_ratio[1]):
                 mask.append(False)
                 continue
@@ -1276,6 +1276,24 @@ def _count_smarts(mol, pattern: str) -> int:
         return 0
     try:
         return len(mol.GetSubstructMatches(patt))
+    except Exception:
+        return 0
+
+
+# 环状酸酐通用 SMARTS：兼容 RDKit 芳构化感知（PMDA/BTDA 型稠环芳酐
+# 的羰基骨架会被感知为芳香体系，传统 "C(=O)OC(=O)" 脂肪碳模式完全匹配不上）
+ANHYDRIDE_RING_SMARTS = "[o,OX2]1~[#6](=[OX1])~[#6]~[#6]~[#6](=[OX1])~1"
+
+
+def _count_anhydride_groups(mol) -> int:
+    """Count cyclic anhydride groups via unique central oxygen atoms."""
+    if mol is None:
+        return 0
+    patt = _get_smarts(ANHYDRIDE_RING_SMARTS)
+    if patt is None:
+        return 0
+    try:
+        return len({m[0] for m in mol.GetSubstructMatches(patt)})
     except Exception:
         return 0
 
@@ -1354,7 +1372,9 @@ def _calc_rule_features(smiles: str, allowed_elements: Optional[set]) -> Dict[st
     out["primary_amine"] = _count_smarts(mol, "[NX3;H2;!$(NC=O)][#6]")
     out["secondary_amine"] = _count_smarts(mol, "[NX3;H1;!$(NC=O)]([#6])[#6]")
     out["tertiary_amine"] = _count_smarts(mol, "[NX3;H0;!$(NC=O)]([#6])[#6][#6]")
-    out["anhydride"] = _count_smarts(mol, "[CX3](=O)O[CX3](=O)")
+    # 环状酸酐通用计数：兼容 RDKit 芳构化感知（PMDA/BTDA 型稠环芳酐），
+    # 以唯一中心氧原子计数，避免对称环双向匹配重复
+    out["anhydride"] = _count_anhydride_groups(mol)
     out["phenol_oh"] = _count_smarts(mol, "[cX3][OX2H]")
     out["thiol"] = _count_smarts(mol, "[SX2H]")
     out["imidazole"] = _count_smarts(mol, "n1cc[nH]c1") + _count_smarts(mol, "n1cncc1")

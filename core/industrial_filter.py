@@ -48,6 +48,8 @@ HARDENER_CLASS_SMARTS: Dict[str, List[str]] = {
         "O=C1OC(=O)C=C1",                # 马来酸酐
         "[CX3](=[OX1])[OX2][CX3](=[OX1])",  # 线性酸酐
         "O=C1OC(=O)C2CC1C2",            # 降莰烷二酸酐
+        # 环状酸酐通用模式：兼容 RDKit 芳构化感知（PMDA/BTDA 型稠环芳酐）
+        "[o,OX2]1~[#6](=[OX1])~[#6]~[#6]~[#6](=[OX1])~1",
     ],
     "酚": [
         "[OX2H]c1ccccc1",                # 酚羟基
@@ -68,16 +70,16 @@ HARDENER_CLASS_SMARTS: Dict[str, List[str]] = {
 
 # 类别典型物化范围（用于类别感知阈值）
 CLASS_PROP_RANGES: Dict[str, Dict[str, Tuple[float, float]]] = {
-    "胺":   {"mol_wt": (60, 600), "logp": (-1.0, 5.0), "heavy": (4, 45)},
-    "酸酐": {"mol_wt": (80, 500), "logp": (0.0, 4.5), "heavy": (5, 35)},
-    "酚":   {"mol_wt": (80, 500), "logp": (1.0, 6.0), "heavy": (5, 40)},
+    "胺":   {"mol_wt": (60, 900), "logp": (-1.0, 5.0), "heavy": (4, 60)},
+    "酸酐": {"mol_wt": (80, 800), "logp": (0.0, 4.5), "heavy": (5, 55)},
+    "酚":   {"mol_wt": (80, 800), "logp": (1.0, 6.0), "heavy": (5, 55)},
     "硫醇": {"mol_wt": (100, 800), "logp": (1.0, 5.0), "heavy": (5, 55)},
     "咪唑": {"mol_wt": (60, 300), "logp": (-0.5, 3.0), "heavy": (4, 25)},
 }
 
 # 未知类别的保守范围
 UNKNOWN_RANGES: Dict[str, Tuple[float, float]] = {
-    "mol_wt": (80, 500), "logp": (-1.0, 5.0), "heavy": (4, 40),
+    "mol_wt": (80, 800), "logp": (-1.0, 5.0), "heavy": (4, 55),
 }
 
 # 类别优先级（匹配顺序，酸酐优先以避免被胺误匹配）

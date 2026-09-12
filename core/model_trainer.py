@@ -529,6 +529,171 @@ def _make_y_bins(y: np.ndarray, n_bins: int = 10):
             return None
 
 
+VALIDATION_MODE_AUTO = "auto"      # 沿用历史默认：训练样本 >= 20 时切 15%
+VALIDATION_MODE_CUSTOM = "custom"  # 按 val_size 自定义比例切分
+VALIDATION_MODE_OFF = "off"        # 不切分，全部训练样本参与拟合
+
+_VALIDATION_MIN_TRAIN_AUTO = 20    # 自动模式触发切分的最小训练样本数
+_VALIDATION_MIN_VAL_SAMPLES = 4    # 验证集最少样本数（不足则回退为不切分）
+_VALIDATION_DEFAULT_SIZE = 0.15    # 默认验证集比例
+
+
+def _compute_validation_metrics(y_true, y_pred):
+    """在原始 y 量纲下计算验证集回归指标（R²/RMSE/MAE），无效值自动掩蔽。"""
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    y_pred = np.asarray(y_pred, dtype=float).ravel()
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if int(mask.sum()) < 2:
+        return None
+    y_true_m = y_true[mask]
+    y_pred_m = y_pred[mask]
+    try:
+        r2_val = float(r2_score(y_true_m, y_pred_m))
+    except Exception:
+        r2_val = float("nan")
+    try:
+        rmse_val = float(np.sqrt(mean_squared_error(y_true_m, y_pred_m)))
+    except Exception:
+        rmse_val = float("nan")
+    try:
+        mae_val = float(mean_absolute_error(y_true_m, y_pred_m))
+    except Exception:
+        mae_val = float("nan")
+    return {
+        "r2": r2_val,
+        "rmse": rmse_val,
+        "mae": mae_val,
+        "sample_count": int(mask.sum()),
+    }
+
+
+def _empty_validation_set_info(mode="auto", reason=None):
+    return {
+        "mode": str(mode),
+        "effective": VALIDATION_MODE_OFF,
+        "val_size": 0.0,
+        "sample_count": 0,
+        "reason": reason,
+    }
+
+
+def _finalize_validation_set_info(info, metrics=None, best_iteration=None):
+    """把切分信息与验证集指标合并为最终写入训练结果的结构。"""
+    out = dict(info or _empty_validation_set_info())
+    out["metrics"] = metrics
+    out["best_iteration"] = best_iteration
+    return out
+
+
+def _resolve_early_validation_split(
+    y_train,
+    val_mode=VALIDATION_MODE_AUTO,
+    val_size=_VALIDATION_DEFAULT_SIZE,
+    random_state=42,
+    split_strategy="random",
+    n_bins=10,
+    train_groups=None,
+):
+    """按用户配置从训练集内部切出早停验证集。
+
+    val_mode:
+      - "auto":   沿用历史默认行为（训练样本 >= 20 时切 15%，验证样本不足 4 条则放弃）
+      - "custom": 按 val_size 比例切分（验证样本不足 4 条时回退为不切分）
+      - "off":    不切分，全部训练样本参与拟合
+
+    切分会尊重外层划分策略：分组划分时按组切分，分层划分时按目标分箱切分，
+    避免同一配方组同时出现在拟合与验证两侧。
+
+    返回 (fit_idx, early_idx, info)。info 字段：
+      mode        请求的模式
+      effective   实际生效模式（auto / custom / off）
+      val_size    实际切分比例（未切分为 0.0）
+      sample_count 验证样本数
+      reason      未按请求生效的原因（可为 None）
+    """
+    y_arr = np.asarray(y_train)
+    n_train = len(y_arr)
+    val_mode = str(val_mode or VALIDATION_MODE_AUTO).lower()
+
+    all_fit = np.arange(n_train, dtype=int)
+    empty_idx = np.asarray([], dtype=int)
+
+    def _inner_split(size_frac):
+        """按比例切分，尽量尊重分组/分层策略，失败时回退随机切分。"""
+        if size_frac is None or size_frac <= 0 or size_frac >= 1:
+            return all_fit, empty_idx
+        if split_strategy in ("group", "分组", "group_split") and train_groups is not None:
+            try:
+                splitter = GroupShuffleSplit(n_splits=1, test_size=size_frac, random_state=random_state)
+                fit_idx, early_idx = next(splitter.split(all_fit, y_arr, train_groups))
+                return np.asarray(fit_idx, dtype=int), np.asarray(early_idx, dtype=int)
+            except Exception:
+                pass
+        elif split_strategy in ("stratified", "分层", "stratified_split"):
+            bins = _make_y_bins(y_arr, n_bins=n_bins)
+            if bins is not None:
+                try:
+                    splitter = StratifiedShuffleSplit(n_splits=1, test_size=size_frac, random_state=random_state)
+                    fit_idx, early_idx = next(splitter.split(all_fit.reshape(-1, 1), bins))
+                    return np.asarray(fit_idx, dtype=int), np.asarray(early_idx, dtype=int)
+                except Exception:
+                    pass
+        fit_idx, early_idx = train_test_split(
+            all_fit,
+            test_size=size_frac,
+            random_state=random_state,
+        )
+        return np.asarray(fit_idx, dtype=int), np.asarray(early_idx, dtype=int)
+
+    if val_mode == VALIDATION_MODE_OFF:
+        return all_fit, empty_idx, _empty_validation_set_info(
+            mode=VALIDATION_MODE_OFF,
+            reason=None,
+        )
+
+    if val_mode == VALIDATION_MODE_CUSTOM:
+        try:
+            size_frac = float(np.clip(float(val_size), 0.05, 0.5))
+        except Exception:
+            size_frac = _VALIDATION_DEFAULT_SIZE
+        fit_idx, early_idx = _inner_split(size_frac)
+        if len(early_idx) < _VALIDATION_MIN_VAL_SAMPLES:
+            return all_fit, empty_idx, _empty_validation_set_info(
+                mode=VALIDATION_MODE_CUSTOM,
+                reason=(
+                    f"验证集比例 {size_frac:.0%} 对应 {len(early_idx)} 条样本，"
+                    f"不足 {_VALIDATION_MIN_VAL_SAMPLES} 条，已回退为全部训练样本拟合"
+                ),
+            )
+        return fit_idx, early_idx, {
+            "mode": VALIDATION_MODE_CUSTOM,
+            "effective": VALIDATION_MODE_CUSTOM,
+            "val_size": size_frac,
+            "sample_count": int(len(early_idx)),
+            "reason": None,
+        }
+
+    # auto：沿用历史默认行为
+    if n_train < _VALIDATION_MIN_TRAIN_AUTO:
+        return all_fit, empty_idx, _empty_validation_set_info(
+            mode=VALIDATION_MODE_AUTO,
+            reason=f"训练样本 {n_train} 条（<{_VALIDATION_MIN_TRAIN_AUTO}），自动模式未切分验证集",
+        )
+    fit_idx, early_idx = _inner_split(_VALIDATION_DEFAULT_SIZE)
+    if len(early_idx) < _VALIDATION_MIN_VAL_SAMPLES:
+        return all_fit, empty_idx, _empty_validation_set_info(
+            mode=VALIDATION_MODE_AUTO,
+            reason=f"验证集样本不足 {_VALIDATION_MIN_VAL_SAMPLES} 条，自动模式未切分验证集",
+        )
+    return fit_idx, early_idx, {
+        "mode": VALIDATION_MODE_AUTO,
+        "effective": VALIDATION_MODE_AUTO,
+        "val_size": _VALIDATION_DEFAULT_SIZE,
+        "sample_count": int(len(early_idx)),
+        "reason": None,
+    }
+
+
 def _build_target_balance_info(
     y_train,
     enabled=True,
@@ -808,6 +973,25 @@ def _finalize_target_balance_result(
         early_stopping_validation_count
     )
     return result
+
+
+def _has_real_feature_names(names) -> bool:
+    """判断候选特征名列表是否为真实语义名（而非 feat_0/Feature_1/纯序号占位名）。"""
+    import re
+
+    if names is None:
+        return False
+    try:
+        values = [str(n) for n in names]
+    except Exception:
+        return False
+    if not values:
+        return False
+    pattern = re.compile(
+        r"(?:\d+|(?:feature|feat|f|x|column)[_\s:-]*\d+|unnamed:\s*\d+)",
+        re.IGNORECASE,
+    )
+    return not all(pattern.fullmatch(str(n).strip()) for n in values)
 
 
 def _sanitize_feature_frame(df_in: pd.DataFrame, model_name_in: str) -> pd.DataFrame:
@@ -2917,6 +3101,8 @@ class EnhancedModelTrainer:
         balance_max_weight=3.0,
         process_pls_config=None,
         use_process_pls=False,
+        val_mode=VALIDATION_MODE_AUTO,
+        val_size=_VALIDATION_DEFAULT_SIZE,
         **params,
     ):
         if isinstance(X, pd.DataFrame):
@@ -2961,18 +3147,18 @@ class EnhancedModelTrainer:
         X_test_raw = X_df.iloc[test_idx].reset_index(drop=True)
         y_train = y_arr[train_idx]
         y_test = y_arr[test_idx]
-        if len(y_train) >= 20:
-            fit_idx, early_idx = train_test_split(
-                np.arange(len(y_train), dtype=int),
-                test_size=0.15,
-                random_state=random_state,
-            )
-            if len(early_idx) < 4:
-                fit_idx = np.arange(len(y_train), dtype=int)
-                early_idx = np.asarray([], dtype=int)
-        else:
-            fit_idx = np.arange(len(y_train), dtype=int)
-            early_idx = np.asarray([], dtype=int)
+        train_groups_inner = None
+        if split_strategy in ("group", "分组", "group_split") and groups is not None:
+            train_groups_inner = np.asarray(groups)[train_idx]
+        fit_idx, early_idx, validation_set_info = _resolve_early_validation_split(
+            y_train,
+            val_mode=val_mode,
+            val_size=val_size,
+            random_state=random_state,
+            split_strategy=split_strategy,
+            n_bins=n_bins,
+            train_groups=train_groups_inner,
+        )
 
         if use_process_pls and model_name in RAW_FRAME_MODELS_WITH_SMILES:
             raise ValueError("工艺 PLS 暂不支持含 SMILES 的原始帧融合模型，请先关闭工艺 PLS")
@@ -3032,6 +3218,15 @@ class EnhancedModelTrainer:
         pipeline = Pipeline(steps=pipeline_steps + [("model", model)])
         y_pred_test = np.asarray(pipeline.predict(X_test_raw)).ravel()
         y_pred_train = np.asarray(pipeline.predict(X_train_raw)).ravel()
+
+        # 验证集指标（仅在实际切分时计算；与测试集同量纲）
+        validation_metrics = None
+        if len(y_early_valid) >= _VALIDATION_MIN_VAL_SAMPLES:
+            try:
+                y_pred_val = np.asarray(pipeline.predict(X_early_valid_raw)).ravel()
+                validation_metrics = _compute_validation_metrics(y_early_valid, y_pred_val)
+            except Exception:
+                validation_metrics = None
 
         def _safe_metrics(y_true, y_pred):
             y_true = np.asarray(y_true).ravel()
@@ -3131,6 +3326,11 @@ class EnhancedModelTrainer:
             "training_history": training_history,
             "training_history_df": history_to_frame(training_history) if training_history else pd.DataFrame(),
             "target_balance": balance_result,
+            "validation_set": _finalize_validation_set_info(
+                validation_set_info,
+                metrics=validation_metrics,
+                best_iteration=getattr(model, "best_iteration", None),
+            ),
             "test_bin_metrics": test_bin_metrics,
         }
 
@@ -3346,6 +3546,20 @@ class EnhancedModelTrainer:
 
         metrics = _compute_binary_classification_metrics(y_test, y_pred_test_encoded, y_pred_proba_test)
 
+        # [关键修复] 同回归分支：为 numpy 拟合的模型注入真实特征名
+        try:
+            if (
+                feature_names is not None
+                and len(feature_names) == X_train_proc.shape[1]
+                and _has_real_feature_names(feature_names)
+                and (not hasattr(base_model, "feature_names_in_") or getattr(base_model, "feature_names_in_", None) is None)
+            ):
+                base_model.feature_names_in_ = np.asarray([str(n) for n in feature_names], dtype=object)
+                if not hasattr(base_model, "n_features_in_"):
+                    base_model.n_features_in_ = int(X_train_proc.shape[1])
+        except Exception:
+            pass
+
         X_train_view = pd.DataFrame(X_train_proc, columns=feature_names)
         X_test_view = pd.DataFrame(X_test_proc, columns=feature_names)
 
@@ -3355,6 +3569,7 @@ class EnhancedModelTrainer:
             "pipeline": pipeline,
             "scaler": scaler,
             "imputer": imputer,
+            "feature_names": list(feature_names) if feature_names is not None else [],
             "X_train": X_train_view,
             "X_test": X_test_view,
             "X_train_raw": X_train_raw,
@@ -3606,6 +3821,8 @@ class EnhancedModelTrainer:
         process_pls_config=None,
         use_process_pls=False,
         feature_contract_context=None,
+        val_mode=VALIDATION_MODE_AUTO,
+        val_size=_VALIDATION_DEFAULT_SIZE,
         **params
     ):
         """训练单个模型（支持随机/分层/分组划分）"""
@@ -3658,6 +3875,8 @@ class EnhancedModelTrainer:
                 balance_max_weight=balance_max_weight,
                 process_pls_config=process_pls_config,
                 use_process_pls=use_process_pls,
+                val_mode=val_mode,
+                val_size=val_size,
                 **params,
             )
 
@@ -3780,52 +3999,27 @@ class EnhancedModelTrainer:
         y_test = y_arr[test_idx]
 
         early_stop_models = {"XGBoost", "LightGBM", "CatBoost"}
-        use_internal_validation = (
-            model_name in early_stop_models
-            and len(y_train) >= 20
-        )
+        use_internal_validation = model_name in early_stop_models
         if use_internal_validation:
-            if split_strategy in ['group', '分组', 'group_split'] and groups is not None:
-                train_groups = np.asarray(groups)[train_idx]
-                try:
-                    gss_inner = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=random_state)
-                    fit_idx, early_idx = next(gss_inner.split(np.arange(len(y_train)), y_train, train_groups))
-                except Exception:
-                    fit_idx, early_idx = train_test_split(
-                        np.arange(len(y_train), dtype=int),
-                        test_size=0.15,
-                        random_state=random_state,
-                    )
-            elif split_strategy in ['stratified', '分层', 'stratified_split']:
-                bins = _make_y_bins(y_train, n_bins=n_bins)
-                if bins is not None:
-                    try:
-                        sss_inner = StratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=random_state)
-                        fit_idx, early_idx = next(sss_inner.split(np.arange(len(y_train)).reshape(-1, 1), bins))
-                    except Exception:
-                        fit_idx, early_idx = train_test_split(
-                            np.arange(len(y_train), dtype=int),
-                            test_size=0.15,
-                            random_state=random_state,
-                        )
-                else:
-                    fit_idx, early_idx = train_test_split(
-                        np.arange(len(y_train), dtype=int),
-                        test_size=0.15,
-                        random_state=random_state,
-                    )
-            else:
-                fit_idx, early_idx = train_test_split(
-                    np.arange(len(y_train), dtype=int),
-                    test_size=0.15,
-                    random_state=random_state,
-                )
-            if len(early_idx) < 4:
-                fit_idx = np.arange(len(y_train), dtype=int)
-                early_idx = np.asarray([], dtype=int)
+            train_groups_inner = None
+            if split_strategy in ('group', '分组', 'group_split') and groups is not None:
+                train_groups_inner = np.asarray(groups)[train_idx]
+            fit_idx, early_idx, validation_set_info = _resolve_early_validation_split(
+                y_train,
+                val_mode=val_mode,
+                val_size=val_size,
+                random_state=random_state,
+                split_strategy=split_strategy,
+                n_bins=n_bins,
+                train_groups=train_groups_inner,
+            )
         else:
             fit_idx = np.arange(len(y_train), dtype=int)
             early_idx = np.asarray([], dtype=int)
+            validation_set_info = _empty_validation_set_info(
+                mode=val_mode,
+                reason="当前模型不使用内部早停验证集",
+            )
 
         y_fit = y_train[fit_idx]
         y_early_valid = y_train[early_idx]
@@ -4439,6 +4633,24 @@ class EnhancedModelTrainer:
         train_time = time.time() - start_time
 
         model = base_model
+
+        # [关键修复] 为在 numpy 数组上拟合的模型（如 TabPFN）注入真实特征名。
+        # TabPFN 等模型 fit 后 feature_names_in_ 为 None 或不存在，导致 SHAP/解释器
+        # 无法从模型侧恢复列名，最终回退到 Feature_0/Feature_1 占位名。
+        try:
+            if (
+                feature_names is not None
+                and len(feature_names) == X_train_proc.shape[1]
+                and _has_real_feature_names(feature_names)
+                and (not hasattr(model, "feature_names_in_") or getattr(model, "feature_names_in_", None) is None)
+            ):
+                model.feature_names_in_ = np.asarray([str(n) for n in feature_names], dtype=object)
+                if not hasattr(model, "n_features_in_"):
+                    model.n_features_in_ = int(X_train_proc.shape[1])
+                print(f"✓ 已为模型注入 {len(feature_names)} 个真实特征名 (feature_names_in_)")
+        except Exception as _fname_exc:
+            print(f"⚠️ 注入 feature_names_in_ 失败（不影响训练结果）: {_fname_exc}")
+
         best_iteration = getattr(model, "best_iteration", None)
         best_score = getattr(model, "best_score", None)
         if best_score is not None:
@@ -4526,6 +4738,24 @@ class EnhancedModelTrainer:
         if y_scaler is not None:
             y_pred_test = y_scaler.inverse_transform(y_pred_test.reshape(-1, 1)).ravel()
             y_pred_train = y_scaler.inverse_transform(y_pred_train.reshape(-1, 1)).ravel()
+
+        # 验证集指标（仅在实际切分时计算；与测试集同量纲）
+        validation_metrics = None
+        if (
+            len(early_idx) >= _VALIDATION_MIN_VAL_SAMPLES
+            and validation_set_info.get("effective") != VALIDATION_MODE_OFF
+        ):
+            try:
+                if isinstance(X_train_raw, pd.DataFrame):
+                    X_early_valid_input = X_train_raw.iloc[early_idx]
+                else:
+                    X_early_valid_input = X_train_raw[early_idx]
+                y_val_pred = np.asarray(pipeline.predict(X_early_valid_input)).ravel()
+                if y_scaler is not None:
+                    y_val_pred = y_scaler.inverse_transform(y_val_pred.reshape(-1, 1)).ravel()
+                validation_metrics = _compute_validation_metrics(y_early_valid, y_val_pred)
+            except Exception:
+                validation_metrics = None
 
         # 8) 训练曲线提取（尽量不额外训练）
         # [修复] 对于 XGBoost，使用提前提取的训练历史
@@ -4712,6 +4942,11 @@ class EnhancedModelTrainer:
                  'training_history': training_history,
                  'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
                  'target_balance': balance_result,
+                 'validation_set': _finalize_validation_set_info(
+                     validation_set_info,
+                     metrics=validation_metrics,
+                     best_iteration=best_iteration,
+                 ),
                  'test_bin_metrics': test_bin_metrics,
                  '_xgb_temp_model_path': temp_model_path,
                 '_xgb_temp_data_path': temp_data_path,
@@ -4754,6 +4989,11 @@ class EnhancedModelTrainer:
              'training_history': training_history,
              'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
              'target_balance': balance_result,
+             'validation_set': _finalize_validation_set_info(
+                 validation_set_info,
+                 metrics=validation_metrics,
+                 best_iteration=best_iteration,
+             ),
              'test_bin_metrics': test_bin_metrics,
              '_xgb_temp_model_path': temp_model_path,  # XGBoost临时文件路径
         }

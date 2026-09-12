@@ -43,6 +43,7 @@ def main() -> int:
             kernel_background=payload.get("kernel_background"),
             kernel_nsamples=payload.get("kernel_nsamples"),
             scaler=payload.get("scaler"),
+            pipeline=payload.get("pipeline"),
         )
 
         fig, df_shap = interp.plot_summary(

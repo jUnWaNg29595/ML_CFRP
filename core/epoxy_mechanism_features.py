@@ -44,8 +44,15 @@ class EpoxyMechanismEngine:
             self._epoxy_pattern = Chem.MolFromSmarts('[C]1[O][C]1')
             self._pri_amine_pattern = Chem.MolFromSmarts('[NX3;H2]')
             self._sec_amine_pattern = Chem.MolFromSmarts('[NX3;H1]')
-            self._anhydride_pattern = Chem.MolFromSmarts('C(=O)OC(=O)')
+            # 环状酸酐通用模式：兼容 RDKit 芳构化感知（PMDA/BTDA 型稠环芳酐
+            # 的羰基骨架会被感知为芳香体系，传统 C(=O)OC(=O) 模式完全匹配不上）
+            self._anhydride_pattern = Chem.MolFromSmarts('[o,OX2]1~[#6](=[OX1])~[#6]~[#6]~[#6](=[OX1])~1')
             self._thiol_pattern = Chem.MolFromSmarts('[SX2;H1]')
+            # [R 修复] 扩展固化剂类型识别：异氰酸酯 / 酚羟基 / 醇羟基 / 羧基
+            self._isocyanate_pattern = Chem.MolFromSmarts('[NX2]=[CX2]=[OX1]')
+            self._phenol_oh_pattern = Chem.MolFromSmarts('[OX2H]-c')
+            self._alcohol_oh_pattern = Chem.MolFromSmarts('[OX2H]-[CX4]')
+            self._carboxyl_pattern = Chem.MolFromSmarts('[OX2H]-[CX3]=[OX1]')
             self._aromatic_ring_pattern = Chem.MolFromSmarts('a1aaaaa1')
         else:
             self._epoxy_pattern = None
@@ -122,27 +129,53 @@ class EpoxyMechanismEngine:
         return max(epoxy_matches, 2 if "dgeba" in s.lower() or "epoxy" in s.lower() else 0)
 
     def get_active_hydrogen_count(self, smi: str, mol: Optional[Any] = None) -> Tuple[int, str]:
-        """获取固化剂活性氢数量及类型"""
+        """获取固化剂活性氢（当量位点）数量及类型
+
+        [R 修复] 化学覆盖扩展：
+        - 异氰酸酯 (-NCO)：每个 -NCO 与活泼氢反应为 1 个当量位点
+        - 酰胺化/酚醛体系：酚 -OH、羧酸 -COOH、醇 -OH 依次作为活性位点
+        优先级：异氰酸酯 > 伯/仲胺 > 酸酐 > 硫醇 > 酚羟基 > 羧基 > 醇羟基 > 正则降级
+        """
         if mol is None:
             mol = self.parse_molecule_safe(smi)
 
         curer_type = "other"
         if mol is not None and RDKIT_AVAILABLE:
             try:
+                n_nco = len(mol.GetSubstructMatches(self._isocyanate_pattern)) if self._isocyanate_pattern is not None else 0
                 n_pri = len(mol.GetSubstructMatches(self._pri_amine_pattern))
                 n_sec = len(mol.GetSubstructMatches(self._sec_amine_pattern))
-                n_anh = len(mol.GetSubstructMatches(self._anhydride_pattern))
+                # 以唯一中心氧原子计数酸酐基团，避免对称环双向匹配重复计数
+                n_anh = len({m[0] for m in mol.GetSubstructMatches(self._anhydride_pattern)})
                 n_sh = len(mol.GetSubstructMatches(self._thiol_pattern))
+                n_ph_oh = len(mol.GetSubstructMatches(self._phenol_oh_pattern)) if self._phenol_oh_pattern is not None else 0
+                n_cooh = len(mol.GetSubstructMatches(self._carboxyl_pattern)) if self._carboxyl_pattern is not None else 0
+                n_al_oh = len(mol.GetSubstructMatches(self._alcohol_oh_pattern)) if self._alcohol_oh_pattern is not None else 0
 
+                if n_nco > 0:
+                    # 异氰酸酯固化体系：每个 -NCO 为 1 个当量位点（与环氧羟基/水/胺反应）
+                    return n_nco, "isocyanate"
                 if n_pri > 0 or n_sec > 0:
                     curer_type = "amine"
                     return (n_pri * 2 + n_sec), curer_type
                 elif n_anh > 0:
+                    # 1个酸酐基团对应开环消耗1个环氧基（1:1 化学计量）
                     curer_type = "anhydride"
-                    return (n_anh * 2), curer_type
+                    return n_anh, curer_type
                 elif n_sh > 0:
                     curer_type = "thiol"
                     return n_sh, curer_type
+                elif n_ph_oh > 0:
+                    # 酚醛/酚氧树脂体系：酚 -OH 与环氧开环 1:1
+                    curer_type = "phenol"
+                    return n_ph_oh, curer_type
+                elif n_cooh > 0:
+                    curer_type = "carboxyl"
+                    return n_cooh, curer_type
+                elif n_al_oh > 0:
+                    # 多元醇（与 NCO/环氧醚化）
+                    curer_type = "polyol"
+                    return n_al_oh, curer_type
             except Exception:
                 pass
 
@@ -151,13 +184,19 @@ class EpoxyMechanismEngine:
         if not s:
             return 0, "unknown"
 
-        # 胺类正则估计 (N, NH2)
-        n_count = len(re.findall(r'N', s))
-        if n_count > 0:
-            # 芳香二胺通常有 2 个 -NH2，共 4 个活性氢
-            if n_count >= 2:
-                return 4, "amine"
-            return 2, "amine"
+        # [R 修复] 降级识别也按官能团类型计数，而非粗略数 N 原子：
+        # 异氰酸酯
+        nco = len(re.findall(r'N=C=O|N\\?C=O|NCO', s))
+        if nco > 0:
+            return nco, "isocyanate"
+        # 酚/醇羟基（-O 不在 N/C=O 邻位的 OH 记法）
+        oh = len(re.findall(r'(?:^|[^A-Za-z])O(?![A-Za-z])|\[OH\]|cO', s))
+        amine_h = len(re.findall(r'N(?![A-Za-z])|\[NH2\]|\[NH\]', s))
+        if nco == 0 and amine_h > 0:
+            # 伯胺假设：每个裸 N 计 2 活性氢
+            return min(amine_h * 2, 8), "amine"
+        if oh > 0:
+            return min(oh, 8), "phenol"
         return 1, "other"
 
     def calc_single_molecule_properties(
@@ -280,10 +319,10 @@ class EpoxyMechanismEngine:
         weighted_f_h = sum(c["functionality"] * c["norm_weight"] for c in valid_curers)
 
         # 加权 EEW 与 AHEW
-        inv_eew = sum((r["norm_weight"] / r["ew"]) for r in valid_resins if r["ew"] > 0)
+        inv_eew = sum((r["norm_weight"] / r["ew"]) for r in valid_resins if r["ew"] > 0 and r["ew"] < 5000)
         weighted_eew = (1.0 / inv_eew) if inv_eew > 0 else 180.0
 
-        inv_ahew = sum((c["norm_weight"] / c["ew"]) for c in valid_curers if c["ew"] > 0)
+        inv_ahew = sum((c["norm_weight"] / c["ew"]) for c in valid_curers if c["ew"] > 0 and c["ew"] < 5000)
         weighted_ahew = (1.0 / inv_ahew) if inv_ahew > 0 else 50.0
 
         # 3. 决定化学计量比 r (AHEW/EEW 当量比)
@@ -297,6 +336,9 @@ class EpoxyMechanismEngine:
                 if r_phr > 0 and h_phr > 0 and weighted_eew > 0 and weighted_ahew > 0:
                     # r = (h_phr / ahew) / (r_phr / eew)
                     r_val = (h_phr / weighted_ahew) / (r_phr / weighted_eew)
+                    # [R 修复] 活性氢/当量识别失败时自算 R 会严重偏离物理区间；
+                    # 真实固化体系 R 几乎必落在 [0.2, 5.0]，越界则钳到边界。
+                    r_val = float(np.clip(r_val, 0.2, 5.0))
             except Exception:
                 pass
 
@@ -429,7 +471,15 @@ class EpoxyMechanismEngine:
         if not curer_smi_cols:
             curer_smi_cols = [c for c in df_out.columns if "cur" in c and "smiles" in c or "structure" in c]
 
-        r_value_col = "formulation_r_value" if "formulation_r_value" in df_out.columns else None
+        # [R 修复] 真实 R 列逐行回退链：优先数据集自带 R，缺失时用反应提取链路算出的 R
+        r_value_candidates = [c for c in (
+            "formulation_r_value",
+            "formulation_resin_hardener_equivalent_ratio",
+            "crosslink_stoichiometry_r",
+            "stoichiometric_ratio_r_cleaned",
+            "r_value",
+        ) if c in df_out.columns]
+        r_value_col = r_value_candidates[0] if r_value_candidates else None
         r_phr_col = "resin_total_phr" if "resin_total_phr" in df_out.columns else None
         h_phr_col = "curing_agent_total_phr" if "curing_agent_total_phr" in df_out.columns else None
 
@@ -501,7 +551,13 @@ class EpoxyMechanismEngine:
                     curers.append(p)
 
             # 3. 计算配方机理特征
-            given_r = row.get(r_value_col) if r_value_col else None
+            # [R 修复] 逐行回退：第一个非空的真实 R 值
+            given_r = None
+            for _rc in r_value_candidates:
+                _rv = row.get(_rc)
+                if _rv is not None and not pd.isna(_rv) and float(_rv) > 0:
+                    given_r = float(_rv)
+                    break
             given_r_phr = row.get(r_phr_col) if r_phr_col else None
             given_h_phr = row.get(h_phr_col) if h_phr_col else None
 

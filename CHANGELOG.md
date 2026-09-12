@@ -23,11 +23,17 @@
 ## [Unreleased]
 
 ### 新增
+- 模型训练页新增「内部验证集（早停用）」配置块：自动（默认，训练样本 ≥ 20 条时划出 15%，与历史行为一致）/ 自定义比例（5%~40%，验证样本不足 4 条自动回退）/ 关闭（全部训练样本参与拟合）三种模式；仅对支持早停的模型（XGBoost/LightGBM/CatBoost 及 FT-Transformer/Transformer+BNN/Transformer+PINN/GNN+Transformer 融合）生效，其他模型显示明确提示；切分尊重分组/分层划分策略，避免配方组同时出现在拟合与验证两侧
+- 训练结果新增「内部验证集（早停）」指标卡片：展示启用状态、验证样本数、验证集 R²/RMSE 及模型最优迭代轮次，回退时给出原因警告；验证集指标在原始目标量纲下计算
+- 训练样本 < 100 且启用验证集时提示用交叉验证（CV mean±std）获得更稳定评估
+- 验证集模式/比例写入参数保存、训练日志与训练记录元数据（val_mode/val_effective/val_size/val_sample_count），训练结果字典新增 validation_set 结构化信息
 - 首页新增「一句话智能输入」入口：直接粘贴配方/工艺描述，点击「🤖 AI 全自动解析并填入」后自动进入工作台完成 解析→确认→回填手动表单→切换到手动输入 全流程，核对后勾选确认即可预测；保留「仅打开 AI 输入助手」的传统入口
 - 预测工作台（手动输入）新增「常用配方快速载入」面板：内置 8 组课题组经典环氧体系配方（E-51/DDM、E-51/DDS、AG-80/DDS、E-51/MTHPA、DGEBF/IPDA、E-51/m-PDA、BPAF-EP/DDS、EPN/DDM），一键整体填入树脂/固化剂 SMILES、phr 配比与固化制度，应用后可逐项微调
 - 新增配方卡片 UI（portal-recipe-card）与响应式样式，沿用现有科学主题设计令牌
 
 ### 修复
+- 修复 TabPFN 模型 SHAP 蜂群图特征名显示为 Feature_40/Feature_94 等占位名的问题（多层修复）：① 训练完成后为在 numpy 数组上拟合的模型（TabPFN 等，fit 后 feature_names_in_ 为 None）注入真实特征名元数据；② 修复训练页 split 快照保存块引用未定义变量 feature_cols 触发 NameError 被 except 静默吞掉、导致训练记录从未保存 split_X_train.csv 的问题；③ _coerce_feature_frame 在 feature_cols 与数据列数不一致时回退到数据自身真实列名，不再生成 Feature_i 占位列，且不再用长度巧合的错误列表覆写真实列名；④ _resolve_effective_feature_cols 新增 train_result['feature_names'] 作为候选名源；⑤ EnhancedModelInterpreter 新增 pipeline / fallback_feature_names 参数，占位名解析时可从训练结果特征名列表恢复真实名
+- 修复 SHAP 蜂群图着色数据反标准化失败（operands could not be broadcast）导致颜色映射使用标准化值而非原始特征值的问题：先对全宽度 X_sample 反标准化后再取 top-N 子集
 - 修复 render_smiles_field 调用未定义函数 init_smiles_field_state 导致手动输入分子结构区块潜在 NameError 崩溃的问题
 - 修复 AI 输入助手入口逻辑：原先 st.tabs 激活状态不跨重跑保留且标签顺序随入口动态互换，导致在 AI 标签内点「解析输入/确认字段」后被弹回其它标签、解析结果看似丢失；现改用持久化 segmented_control 导航，重跑后停留在当前功能区，首页/侧边栏入口可精确跳转到 AI 辅助输入，侧边栏按钮置灰时增加原因提示并实时显示当前功能区
 

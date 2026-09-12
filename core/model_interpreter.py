@@ -351,7 +351,7 @@ class ModelInterpreter:
 class EnhancedModelInterpreter:
     """增强版模型解释器 - 修复版"""
 
-    def __init__(self, model, X_train, y_train, X_test, y_test, model_name, feature_names=None, max_samples: int = 200, kernel_background: int = 50, kernel_nsamples: int = 200, scaler=None):
+    def __init__(self, model, X_train, y_train, X_test, y_test, model_name, feature_names=None, max_samples: int = 200, kernel_background: int = 50, kernel_nsamples: int = 200, scaler=None, pipeline=None, fallback_feature_names=None):
         self.model = model
         self.max_samples = int(max_samples) if max_samples is not None else 200
         self.kernel_background = int(kernel_background) if kernel_background is not None else 50
@@ -401,7 +401,21 @@ class EnhancedModelInterpreter:
             X_train,
             feature_names=feature_names,
             model=model,
+            pipeline=pipeline,
         )
+        # [关键修复] 若所有候选都退化为 Feature_i 占位名，尝试用调用方提供的
+        # 真实特征名列表（如 train_result['feature_names'] / artifact effective cols）补救。
+        if all(_is_placeholder_feature_name(name) for name in feature_names) and fallback_feature_names is not None:
+            try:
+                fallback_list = [str(name) for name in fallback_feature_names]
+                if (
+                    len(fallback_list) == n_features
+                    and _has_meaningful_feature_names(fallback_list, n_features)
+                ):
+                    print("  ✓ 使用 fallback_feature_names 恢复真实特征名")
+                    feature_names = fallback_list
+            except Exception:
+                pass
         print(f"  ✓ Resolved feature names from matrix/model metadata")
 
         self.feature_names = feature_names
@@ -782,15 +796,22 @@ class EnhancedModelInterpreter:
         print(vals_plot[:3, :5])
 
         # 关键修复：如果数据被标准化了，需要反标准化用于着色
+        # [修复] 必须先对全宽度 X_sample 反标准化，再取 top-N 子集；
+        # 直接对 top-N 子集调用 inverse_transform 会因列数不匹配而报错，
+        # 导致 beeswarm 颜色退化为标准化值而非原始特征值。
         X_plot_for_color = X_plot.copy()
         if self.scaler is not None and plot_type == 'dot':
             try:
                 print(f"\n⚠️ 检测到 scaler，尝试反标准化数据用于 beeswarm 着色...")
-                # 反标准化
-                X_plot_raw = self.scaler.inverse_transform(X_plot)
-                X_plot_for_color = pd.DataFrame(X_plot_raw, columns=feature_names_plot, index=X_plot.index)
-                print(f"✓ 反标准化成功")
-                print(f"反标准化后的值范围: min={X_plot_for_color.min().min():.6f}, max={X_plot_for_color.max().max():.6f}")
+                X_full_raw = self.scaler.inverse_transform(X_plot_full)
+                X_full_raw = np.asarray(X_full_raw, dtype=np.float64)
+                if X_full_raw.shape[1] == X_plot_full.shape[1]:
+                    X_full_raw_frame = pd.DataFrame(X_full_raw, columns=list(X_plot_full.columns), index=X_plot_full.index)
+                    X_plot_for_color = X_full_raw_frame[selected_features]
+                    print(f"✓ 反标准化成功")
+                    print(f"反标准化后的值范围: min={np.nanmin(X_plot_for_color.values):.6f}, max={np.nanmax(X_plot_for_color.values):.6f}")
+                else:
+                    raise ValueError(f"反标准化后列数不匹配: {X_full_raw.shape[1]} != {X_plot_full.shape[1]}")
             except Exception as e:
                 print(f"⚠️ 反标准化失败: {e}，使用原始数据")
                 X_plot_for_color = X_plot

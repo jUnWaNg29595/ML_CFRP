@@ -399,11 +399,62 @@ def _extract_bigsmiles_graph_sample_features(
     random_state: int = 17,
 ) -> dict:
     feat = _empty_polymer_graph_sample_features()
-    if not BIGSMILES_STOCHASTIC_AVAILABLE or not text:
+    if not text:
         return feat
 
     s = str(text).strip()
     if not s or s.lower() in {"nan", "none", "<na>", "na", "null"}:
+        return feat
+
+    # [修复] 普通 SMILES（含交联产物的 * 悬键占位）不是 BigSMILES，
+    # 直接走 BigSMILES 解析必然失败 → 用 RDKit 分子图作为回退，
+    # 避免 polymer_graph_parse_success 等特征恒为 0。
+    try:
+        fmt = _cached_detect_chem_string_format(s)
+    except Exception:
+        fmt = "smiles"
+
+    if fmt != "bigsmiles":
+        if not RDKIT_AVAILABLE:
+            return feat
+        mol = _cached_parse_smiles_quiet(s)
+        if mol is None:
+            mol = _safe_fragment_mol_from_text(s)
+        if mol is None:
+            return feat
+        try:
+            n_frags = max(1, len(Chem.GetMolFrags(mol)))
+        except Exception:
+            n_frags = max(1, s.count(".") + 1)
+        feat["polymer_graph_parse_success"] = 1.0
+        feat["polymer_graph_segment_count"] = float(n_frags)
+        feat["polymer_graph_block_count"] = 1.0
+        feat["polymer_graph_repeat_candidate_count"] = float(sum(
+            1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 0
+        ))
+        feat["polymer_graph_edge_count"] = float(mol.GetNumBonds())
+        feat["polymer_graph_free_fragment_count"] = float(n_frags)
+
+        # 补全非BigSMILES输入时的单体/低聚物基准特征，避免polymer_sample_*大面积恒为0
+        feat["polymer_sample_count"] = 1.0
+        feat["polymer_sample_unique_count"] = 1.0
+        feat["polymer_sample_unique_ratio"] = 1.0
+        feat["polymer_sample_valid_count"] = 1.0
+        feat["polymer_sample_valid_ratio"] = 1.0
+        feat["polymer_sample_char_len_mean"] = float(len(s))
+        feat["polymer_sample_char_len_std"] = 0.0
+        feat["polymer_sample_fragment_count_mean"] = float(n_frags)
+        try:
+            feat["polymer_sample_heavy_atoms_mean"] = float(mol.GetNumHeavyAtoms())
+            feat["polymer_sample_heavy_atoms_std"] = 0.0
+            feat["polymer_sample_hetero_atoms_mean"] = float(sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() not in {1, 6}))
+            feat["polymer_sample_ring_count_mean"] = float(Descriptors.RingCount(mol))
+            feat["polymer_sample_exact_mw_mean"] = float(Descriptors.ExactMolWt(mol))
+        except Exception:
+            pass
+        return feat
+
+    if not BIGSMILES_STOCHASTIC_AVAILABLE:
         return feat
 
     try:
@@ -423,6 +474,16 @@ def _extract_bigsmiles_graph_sample_features(
         feat["polymer_graph_end_group_candidate_count"] = float(summary.get("n_end_group_candidates", 0.0) or 0.0)
         feat["polymer_graph_edge_count"] = float(summary.get("n_edges", 0.0) or 0.0)
         feat["polymer_graph_free_fragment_count"] = float(summary.get("n_free_fragments", 0.0) or 0.0)
+    else:
+        # 针对罕见语法BigSMILES进行单体拓扑保底
+        raw_smi = convert_to_smiles(s) or s
+        mol = _cached_parse_smiles_quiet(raw_smi) if RDKIT_AVAILABLE else None
+        if mol is not None:
+            feat["polymer_graph_parse_success"] = 1.0
+            feat["polymer_graph_segment_count"] = 1.0
+            feat["polymer_graph_block_count"] = 1.0
+            feat["polymer_graph_repeat_candidate_count"] = 1.0
+            feat["polymer_graph_edge_count"] = float(mol.GetNumBonds())
 
     try:
         sampled = sample_bigsmiles_realizations(
@@ -437,7 +498,9 @@ def _extract_bigsmiles_graph_sample_features(
 
     sampled = [str(item).strip() for item in (sampled or []) if str(item).strip()]
     if not sampled:
-        return feat
+        raw_smi = convert_to_smiles(s) or s
+        if raw_smi:
+            sampled = [raw_smi]
 
     feat["polymer_sample_count"] = float(len(sampled))
     unique_sampled = list(OrderedDict((item, None) for item in sampled).keys())
@@ -595,7 +658,9 @@ def extract_polymer_string_features(smiles_like_list, prefix=None, include_bigsm
         feat["polymer_num_unit_candidates"] = float(len(candidates))
         feat["polymer_num_unique_unit_candidates"] = float(len(set(candidates)))
 
-        if include_bigsmiles_graph_stats and (fmt == "bigsmiles" or feat["polymer_has_polymer_syntax"] > 0):
+        # [修复] 不再仅限于 BigSMILES/含聚合物语法的文本：普通 SMILES（含交联
+        # 产物的 * 悬键）也统一填充图特征，避免 polymer_graph_* 大面积为 0
+        if include_bigsmiles_graph_stats:
             feat.update(_extract_bigsmiles_graph_sample_features(s))
 
         if candidates:
@@ -4248,9 +4313,14 @@ class EpoxyDomainFeatureExtractor:
         return count
 
     def _get_anhydride_count(self, mol):
-        patt = Chem.MolFromSmarts("[CX3](=[OX1])[OX2][CX3](=[OX1])")
-        matches = mol.GetSubstructMatches(patt)
-        return len(matches)
+        # 环状酸酐通用模式：兼容 RDKit 芳构化感知（如 PMDA），以唯一中心氧计数
+        patt = Chem.MolFromSmarts("[o,OX2]1~[#6](=[OX1])~[#6]~[#6]~[#6](=[OX1])~1")
+        if patt is None:
+            return 0
+        try:
+            return len({m[0] for m in mol.GetSubstructMatches(patt)})
+        except Exception:
+            return 0
 
     def _get_thiol_count(self, mol):
         patt = Chem.MolFromSmarts("[SX2H]")
@@ -4263,7 +4333,8 @@ class EpoxyDomainFeatureExtractor:
         thiol_count = self._get_thiol_count(mol)
 
         if anhydride_count > 0:
-            return "anhydride", anhydride_count * 2
+            # 1个酸酐基团对应开环消耗1个环氧基（1:1 化学计量）
+            return "anhydride", anhydride_count
         elif thiol_count > 0:
             return "thiol", thiol_count
         elif amine_count > 0:
@@ -4336,7 +4407,10 @@ class EpoxyDomainFeatureExtractor:
         mw_r = Descriptors.MolWt(mol_r)
         mw_h = Descriptors.MolWt(mol_h)
         f_epoxy = self._get_epoxide_count(mol_r)
-        f_amine = self._get_active_hydrogen_count(mol_h)
+        # 优先按固化剂类型取当量官能度（酸酐 1:1、硫醇按巯基数），
+        # 回退到全部 N-H 计数（胺类路径与原逻辑一致）
+        _curer_type_h, f_curer = self._detect_curer_type(mol_h)
+        f_amine = f_curer if f_curer > 0 else self._get_active_hydrogen_count(mol_h)
 
         eew = mw_r / f_epoxy if f_epoxy > 0 else mw_r
         ahew = mw_h / f_amine if f_amine > 0 else mw_h

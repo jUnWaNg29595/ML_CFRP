@@ -226,7 +226,7 @@ def _compute_product_descriptors(smiles, include_3d=True):
                 out['product_num_rings'] = float(Descriptors.RingCount(mol))
                 out['product_num_aromatic_rings'] = float(Descriptors.NumAromaticRings(mol))
                 out['product_num_aliphatic_rings'] = float(Descriptors.NumAliphaticRings(mol))
-                out['product_fraction_csp3'] = float(Descriptors.FractionCsp3(mol))
+                out['product_fraction_csp3'] = float(Descriptors.FractionCSP3(mol))
                 out['product_num_saturated_rings'] = float(Descriptors.NumSaturatedRings(mol))
                 out['product_num_heteroatoms'] = float(Descriptors.NumHeteroatoms(mol))
                 # 官能团（交联相关）
@@ -290,11 +290,29 @@ EPOXY_SECONDARY_AMINE_RXN = ReactionTemplate(
     reactivity_order=2
 )
 
-# 环氧-酸酐反应：环氧 + 酸酐 -> 酯键
+# 环氧-酸酐反应（5元环）：环氧 + 5元环酸酐 -> 具有游离羧酸的单酯
+EPOXY_ANHYDRIDE_5_RXN = ReactionTemplate(
+    name="epoxy_anhydride_5",
+    smirks="[C:1]1[O:2][C:3]1.[#6:9]1~[#6:10]~[C:4](=[O:5])[O:6][C:7](=[O:8])1>>[C:1]([O:2])[C:3][O:6][C:4](=[O:5])[#6:10]~[#6:9][C:7](=[O:8])[O]",
+    description="环氧基与5元环酸酐开环反应，生成单酯和游离羧酸",
+    curing_agent_type="anhydride",
+    reactivity_order=1
+)
+
+# 环氧-酸酐反应（6元环）：环氧 + 6元环酸酐 -> 具有游离羧酸的单酯
+EPOXY_ANHYDRIDE_6_RXN = ReactionTemplate(
+    name="epoxy_anhydride_6",
+    smirks="[C:1]1[O:2][C:3]1.[#6:9]1~[#6:10]~[#6:11]~[C:4](=[O:5])[O:6][C:7](=[O:8])1>>[C:1]([O:2])[C:3][O:6][C:4](=[O:5])[#6:11]~[#6:10]~[#6:9][C:7](=[O:8])[O]",
+    description="环氧基与6元环酸酐开环反应，生成单酯和游离羧酸",
+    curing_agent_type="anhydride",
+    reactivity_order=1
+)
+
+# 环氧-酸酐反应（通用/开链保底）：环氧 + 酸酐 -> 单酯主产物（无分离副产物）
 EPOXY_ANHYDRIDE_RXN = ReactionTemplate(
     name="epoxy_anhydride",
-    smirks="[C:1]1[O:2][C:3]1.[C:4](=[O:5])[O:6][C:7](=[O:8])>>[C:1]([O:2][C:4](=[O:5]))[C:3][O:6].[O:8]=[C:7]",
-    description="环氧基与酸酐反应，生成酯键",
+    smirks="[C:1]1[O:2][C:3]1.[C:4](=[O:5])[O:6][C:7](=[O:8])>>[C:1]([O:2])[C:3][O:6][C:4](=[O:5])",
+    description="环氧基与酸酐反应主产物",
     curing_agent_type="anhydride",
     reactivity_order=1
 )
@@ -348,6 +366,8 @@ EPOXY_ISOCYANATE_RXN = ReactionTemplate(
 ALL_REACTION_TEMPLATES = [
     EPOXY_PRIMARY_AMINE_RXN,
     EPOXY_SECONDARY_AMINE_RXN,
+    EPOXY_ANHYDRIDE_5_RXN,
+    EPOXY_ANHYDRIDE_6_RXN,
     EPOXY_ANHYDRIDE_RXN,
     EPOXY_THIOL_RXN,
     EPOXY_HYDRAZIDE_RXN,
@@ -371,7 +391,8 @@ FUNCTIONAL_GROUP_PATTERNS = {
     "aromatic_amine": "[NX3;H2]c",  # 芳香胺（如DDM、DDS）
     
     # 酸酐
-    "anhydride": "[CX3](=[OX1])[OX2][CX3](=[OX1])",
+    # 环状酸酐通用模式(兼容RDKit芳构化表示, 如PMDA)
+    "anhydride": "[o,OX2]1~[#6](=[OX1])~[#6]~[#6]~[#6](=[OX1])~1",
     
     # 硫醇
     "thiol": "[SX2H]",
@@ -424,6 +445,8 @@ class EpoxyReactionSimulator:
         self.verbose = verbose
         self._compiled_patterns = {}
         self._compiled_reactions = {}
+        # [重复率修复] 共聚网络单元缓存: (epoxy, curer, conv) -> unit_smiles
+        self._copolymer_unit_cache = {}
         
         # 预编译SMARTS模式
         self._compile_patterns()
@@ -616,7 +639,7 @@ class EpoxyReactionSimulator:
             secondary_amine = curer_fg.get('secondary_amine', 0)
             curer_functionality = primary_amine * 2 + secondary_amine
         elif curer_type == 'anhydride':
-            curer_functionality = curer_fg.get('anhydride', 0) * 2
+            curer_functionality = curer_fg.get('anhydride', 0)
         elif curer_type == 'thiol':
             curer_functionality = curer_fg.get('thiol', 0)
         elif curer_type == 'hydrazide':
@@ -766,7 +789,7 @@ class EpoxyReactionSimulator:
                 curer_func = primary * 2 + secondary
                 base_conv = 0.88
             elif curer_type == 'anhydride':
-                curer_func = curer_fg.get('anhydride', 0) * 2
+                curer_func = curer_fg.get('anhydride', 0)
                 base_conv = 0.78
             elif curer_type == 'thiol':
                 curer_func = curer_fg.get('thiol', 0)
@@ -876,6 +899,125 @@ class EpoxyReactionSimulator:
         else:
             raise ValueError(f"Unknown method: {method}")
 
+    # ------------------------------------------------------------------
+    # [重复率修复] 组成区分特征 + 多组分共聚网络单元辅助方法
+    # ------------------------------------------------------------------
+    _MIN_COMPONENT_WEIGHT = 0.05  # 参与共聚网络单元的最小组分质量分数
+
+    def _composition_discriminator_features(
+        self,
+        resin_components: List[Tuple[str, float]],
+        curer_components: List[Tuple[str, float]],
+    ) -> Dict[str, float]:
+        """行间组成区分特征：即使主反应对相同，也能量化各行组成的差异。"""
+        import math
+        r_ws = [w for _, w in resin_components if w > 0]
+        c_ws = [w for _, w in curer_components if w > 0]
+        r_active = [w for w in r_ws if w >= self._MIN_COMPONENT_WEIGHT]
+        c_active = [w for w in c_ws if w >= self._MIN_COMPONENT_WEIGHT]
+
+        def _entropy(ws):
+            total = sum(ws) or 1.0
+            return float(-sum((w / total) * math.log(w / total) for w in ws if w > 0)) if len(ws) > 1 else 0.0
+
+        all_ws = r_ws + c_ws
+        return {
+            'n_active_resin_components': float(len(r_active) if r_active else (1 if r_ws else 0)),
+            'n_active_curer_components': float(len(c_active) if c_active else (1 if c_ws else 0)),
+            'top_resin_fraction': float(max(r_ws) if r_ws else 0.0),
+            'top_curer_fraction': float(max(c_ws) if c_ws else 0.0),
+            'n_reaction_pairs': float(min(len(r_active) or 1, len(c_active) or 1) * max(len(r_active) or 1, len(c_active) or 1)),
+            'composition_entropy': _entropy(all_ws),
+        }
+
+    def _composition_seed(
+        self,
+        resin_components: List[Tuple[str, float]],
+        curer_components: List[Tuple[str, float]],
+    ) -> int:
+        """行组成确定性种子：同组成 -> 同抽样（可复现）；不同权重 -> 不同抽样 -> 结构可区分。"""
+        import hashlib
+        canon = (
+            sorted((str(smi)[:200], round(float(w), 4)) for smi, w in resin_components if w > 0),
+            sorted((str(smi)[:200], round(float(w), 4)) for smi, w in curer_components if w > 0),
+        )
+        return int(hashlib.sha1(repr(canon).encode('utf-8')).hexdigest()[:12], 16)
+
+    def _build_copolymer_bigsmiles(
+        self,
+        resin_components: List[Tuple[str, float]],
+        curer_components: List[Tuple[str, float]],
+        main_resin_smi: str,
+        main_curer_smi: str,
+        target_conversion: float,
+        max_units: int = 4,
+    ) -> Optional[str]:
+        """构造多组分随机共聚网络单元 BigSMILES。
+
+        将权重达阈的 (树脂_i × 主固化剂) 与 (主树脂 × 固化剂_j) 网络单元并入
+        同一 BigSMILES 随机对象的 repeat-unit 候选（本项目解析器约定：候选间用 ','，
+        end-groups 用 ';'），使次要组分的行间差异体现在网络拓扑候选上：
+            {[$]unit_main[$],[$]unit_alt1[$],[$]unit_alt2[$]}
+        """
+        if not RDKIT_AVAILABLE:
+            return None
+        units: List[str] = []
+        seen: set = set()
+
+        def _unit_for(epoxy_smi: str, curer_smi: str) -> Optional[str]:
+            key = (str(epoxy_smi), str(curer_smi), round(float(target_conversion), 3))
+            cached = self._copolymer_unit_cache.get(key)
+            if cached is not None:
+                return cached if cached != '' else None
+            try:
+                u = self.build_network_unit(epoxy_smi, curer_smi, target_conversion=float(target_conversion))
+            except Exception:
+                u = None
+            if not u:
+                try:
+                    r_act = self._to_reactive_smiles(epoxy_smi) or self._clean_smiles(epoxy_smi)
+                    c_act = self._to_reactive_smiles(curer_smi) or self._clean_smiles(curer_smi)
+                    u = self._virtual_crosslink_safe(r_act, c_act)
+                except Exception:
+                    u = None
+            self._copolymer_unit_cache[key] = u or ''
+            return u
+
+        # 主对优先
+        main_unit = _unit_for(main_resin_smi, main_curer_smi)
+        if main_unit and main_unit not in seen:
+            seen.add(main_unit)
+            units.append(main_unit)
+
+        # 主要固化剂 × 主树脂
+        for curer_smi, w in sorted(curer_components, key=lambda x: -x[1]):
+            if len(units) >= max_units:
+                break
+            if curer_smi == main_curer_smi or w < self._MIN_COMPONENT_WEIGHT:
+                continue
+            u = _unit_for(main_resin_smi, curer_smi)
+            if u and u not in seen:
+                seen.add(u)
+                units.append(u)
+
+        # 次要树脂 × 主固化剂
+        for resin_smi, w in sorted(resin_components, key=lambda x: -x[1]):
+            if len(units) >= max_units:
+                break
+            if resin_smi == main_resin_smi or w < self._MIN_COMPONENT_WEIGHT:
+                continue
+            u = _unit_for(resin_smi, main_curer_smi)
+            if u and u not in seen:
+                seen.add(u)
+                units.append(u)
+
+        if not units:
+            return None
+        if len(units) == 1:
+            return f"{{[$]{units[0]}[$]}}"
+        joined = ",".join(f"[$]{u}[$]" for u in units)
+        return f"{{{joined}}}"
+
     def _simulate_weighted_average(
         self,
         resin_components: List[Tuple[str, float]],
@@ -885,7 +1027,8 @@ class EpoxyReactionSimulator:
         """
         方案1：加权平均法
 
-        选择主要组分进行反应，其他组分的特征加权平均
+        选择主要组分进行反应，其他组分的特征加权平均；
+        [重复率修复] BigSMILES 升级为按行内权重构造的随机共聚网络单元。
         """
         # 找到主要组分（权重最大的）
         main_resin_smi, main_resin_weight = max(resin_components, key=lambda x: x[1])
@@ -904,7 +1047,7 @@ class EpoxyReactionSimulator:
                 func = (curer_fg.get('primary_amine', 0) + curer_fg.get('aromatic_amine', 0)) * 2 + \
                        curer_fg.get('secondary_amine', 0)
             elif curer_type == 'anhydride':
-                func = curer_fg.get('anhydride', 0) * 2
+                func = curer_fg.get('anhydride', 0)
             elif curer_type == 'thiol':
                 func = curer_fg.get('thiol', 0)
             else:
@@ -922,6 +1065,17 @@ class EpoxyReactionSimulator:
             output_format='auto'
         )
 
+        # [重复率修复] 按行内权重构造随机共聚网络单元，使次要组分差异体现在网络拓扑上
+        copolymer_bigsmiles = None
+        try:
+            copolymer_bigsmiles = self._build_copolymer_bigsmiles(
+                resin_components, curer_components,
+                main_resin_smi, main_curer_smi, target_conversion
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"⚠️ 共聚网络单元构造失败，回退主对 BigSMILES: {e}")
+
         return {
             'method': 'weighted',
             'main_resin': main_resin_smi,
@@ -933,7 +1087,9 @@ class EpoxyReactionSimulator:
             'stoichiometry_r': stoich_r,
             'product_representation': product_repr,
             'representative_smiles': product_repr.get('smiles'),
-            'representative_bigsmiles': product_repr.get('bigsmiles')
+            'representative_bigsmiles': product_repr.get('bigsmiles'),
+            'copolymer_bigsmiles': copolymer_bigsmiles,
+            'composition_features': self._composition_discriminator_features(resin_components, curer_components),
         }
 
     def _simulate_combinatorial(
@@ -966,7 +1122,7 @@ class EpoxyReactionSimulator:
                     curer_func = (curer_fg.get('primary_amine', 0) + curer_fg.get('aromatic_amine', 0)) * 2 + \
                                  curer_fg.get('secondary_amine', 0)
                 elif curer_type == 'anhydride':
-                    curer_func = curer_fg.get('anhydride', 0) * 2
+                    curer_func = curer_fg.get('anhydride', 0)
                 elif curer_type == 'thiol':
                     curer_func = curer_fg.get('thiol', 0)
                 else:
@@ -1005,21 +1161,51 @@ class EpoxyReactionSimulator:
             for p in products:
                 p['probability'] /= total_prob
 
-        # 选择概率最大的作为代表
+        # [重复率修复] 代表选择：由固定 max 概率改为按行组成的确定性概率抽样，
+        # 使次要组分占比不同的行能抽到不同反应对，从而得到可区分的网络结构；
+        # 同一组成的行始终抽中同一组合（可复现、缓存友好）。
         if products:
-            representative = max(products, key=lambda x: x['probability'])
+            try:
+                import random as _random
+                _rng = _random.Random(self._composition_seed(resin_components, curer_components))
+                _pick = _rng.random()
+                _acc = 0.0
+                representative = products[-1]
+                for p in sorted(products, key=lambda x: -x['probability']):
+                    _acc += float(p.get('probability', 0.0))
+                    if _acc >= _pick:
+                        representative = p
+                        break
+            except Exception:
+                representative = max(products, key=lambda x: x['probability'])
             representative_smiles = representative['product_smiles']
             representative_bigsmiles = representative['product_bigsmiles']
         else:
+            representative = None
             representative_smiles = None
             representative_bigsmiles = None
+
+        # [重复率修复] top-2 组合的共聚网络单元 BigSMILES
+        copolymer_bigsmiles = None
+        try:
+            main_resin_smi, main_resin_weight = max(resin_components, key=lambda x: x[1])
+            main_curer_smi, main_curer_weight = max(curer_components, key=lambda x: x[1])
+            copolymer_bigsmiles = self._build_copolymer_bigsmiles(
+                resin_components, curer_components,
+                main_resin_smi, main_curer_smi, target_conversion
+            )
+        except Exception:
+            copolymer_bigsmiles = None
 
         return {
             'method': 'combinatorial',
             'products': products,
             'n_combinations': len(products),
             'representative_smiles': representative_smiles,
-            'representative_bigsmiles': representative_bigsmiles
+            'representative_bigsmiles': representative_bigsmiles,
+            'copolymer_bigsmiles': copolymer_bigsmiles,
+            'composition_features': self._composition_discriminator_features(resin_components, curer_components),
+            'sampled_pair': ({'resin_smiles': representative['resin_smiles'], 'curer_smiles': representative['curer_smiles'], 'probability': representative['probability']} if representative else None),
         }
 
     def _run_single_reaction(
@@ -1045,13 +1231,23 @@ class EpoxyReactionSimulator:
             
             valid_products = []
             for prod_tuple in products:
-                for prod in prod_tuple:
+                # 关键修复：当反应生成多个产物片段（如脱除小分子或开环分离产物）时，
+                # 仅保留重原子数最多的主交联产物，坚决剔除 CCCC=O、C=CC=O 等游离副产物
+                if len(prod_tuple) > 1:
+                    main_prod = max(prod_tuple, key=lambda m: m.GetNumHeavyAtoms() if m else 0)
                     try:
-                        # 清理和标准化产物
-                        Chem.SanitizeMol(prod)
-                        valid_products.append(prod)
+                        Chem.SanitizeMol(main_prod)
+                        valid_products.append(main_prod)
                     except Exception:
                         continue
+                else:
+                    for prod in prod_tuple:
+                        try:
+                            # 清理和标准化产物
+                            Chem.SanitizeMol(prod)
+                            valid_products.append(prod)
+                        except Exception:
+                            continue
             
             return valid_products
             
@@ -1104,7 +1300,12 @@ class EpoxyReactionSimulator:
                 products.extend(prods)
                 
         elif curer_type == 'anhydride':
-            products.extend(self._run_single_reaction(epoxy_mol, curer_mol, 'epoxy_anhydride'))
+            prods = self._run_single_reaction(epoxy_mol, curer_mol, 'epoxy_anhydride_5')
+            if not prods:
+                prods = self._run_single_reaction(epoxy_mol, curer_mol, 'epoxy_anhydride_6')
+            if not prods:
+                prods = self._run_single_reaction(epoxy_mol, curer_mol, 'epoxy_anhydride')
+            products.extend(prods)
             
         elif curer_type == 'thiol':
             products.extend(self._run_single_reaction(epoxy_mol, curer_mol, 'epoxy_thiol'))
@@ -1119,23 +1320,31 @@ class EpoxyReactionSimulator:
             products.extend(self._run_single_reaction(epoxy_mol, curer_mol, 'epoxy_isocyanate'))
         else:
             # 针对未知类型或特殊固化剂，尝试主要反应模板
-            for t_name in ['epoxy_primary_amine', 'epoxy_secondary_amine', 'epoxy_anhydride', 'epoxy_phenol', 'epoxy_thiol', 'epoxy_carboxylic_acid']:
+            for t_name in ['epoxy_primary_amine', 'epoxy_secondary_amine', 'epoxy_anhydride_5', 'epoxy_anhydride_6', 'epoxy_anhydride', 'epoxy_phenol', 'epoxy_thiol', 'epoxy_carboxylic_acid']:
                 prods = self._run_single_reaction(epoxy_mol, curer_mol, t_name)
                 if prods:
                     products.extend(prods)
                     break
         
-        # 转换为SMILES
+        # 转换为SMILES并按分子重原子数/长度降序排序，确保主产物位于首位
         product_smiles = []
         for prod in products:
             try:
                 smi = Chem.MolToSmiles(prod)
                 if smi:
-                    product_smiles.append(smi)
+                    product_smiles.append((smi, prod.GetNumHeavyAtoms()))
             except Exception:
                 continue
         
-        return list(set(product_smiles))  # 去重
+        # 按重原子数降序排序后去重保序
+        seen = set()
+        sorted_smiles = []
+        for smi, _ in sorted(product_smiles, key=lambda x: x[1], reverse=True):
+            if smi not in seen:
+                seen.add(smi)
+                sorted_smiles.append(smi)
+        
+        return sorted_smiles
     
     def simulate_curing(
         self, 
@@ -1212,7 +1421,7 @@ class EpoxyReactionSimulator:
         return results
     
     def _count_reactive_h(self, smiles: str) -> int:
-        # 统计活性氢：伯胺/仲胺N-H、硫醇S-H、酚OH、羧酸OH
+        # 统计活性氢：伯胺/仲胺N-H、硫醇S-H、酚OH、羧酸OH、酸酐等效位点
         if not RDKIT_AVAILABLE:
             return 0
         try:
@@ -1221,10 +1430,12 @@ class EpoxyReactionSimulator:
                 return 0
             n = 0
             n += 2 * len(mol.GetSubstructMatches(Chem.MolFromSmarts('[NX3;H2;!$([n]);!$([NX3]-[CX3]=[OX1])]')))
-            n += len(mol.GetSubstructMatches(Chem.MolFromSmarts('[NX3;H1;!$([n]);!$([NX3]-[CX3]=[OX1])]')))
+            n += len(mol.GetSubstructMatches(Chem.MolFromSmarts('[NX3;H1;!$([n]);$(N(-[#6])-[#6]);!$([NX3]-[CX3]=[OX1])]')))
             n += len(mol.GetSubstructMatches(Chem.MolFromSmarts('[SX2;H1]')))
             n += len(mol.GetSubstructMatches(Chem.MolFromSmarts('[OX2;H1][c]')))
             n += len(mol.GetSubstructMatches(Chem.MolFromSmarts('[CX3](=[OX1])[OX2;H1]')))
+            # 酸酐环每个环开环可反应2次（第1次成单酯单酸，第2次游离酸与环氧反应成二酯）
+            n += 2 * len(mol.GetSubstructMatches(Chem.MolFromSmarts('[CX3](=[OX1])[OX2][CX3](=[OX1])')))
             return n
         except Exception:
             return 0
@@ -1361,61 +1572,40 @@ class EpoxyReactionSimulator:
         self,
         epoxy_smiles: str,
         curer_smiles: str,
-        stoichiometry: float = 1.0
+        stoichiometry: float = 1.0,
+        target_conversion: float = 0.5
     ) -> str:
         """
         生成BigSMILES交联网络表示
 
-        用于高转化率（>70%），表示三维交联网络拓扑
+        用于高转化率（>70%）或标准聚合物表征，表示三维交联网络拓扑
 
         Returns:
-            BigSMILES字符串，格式如: {[$]CC(O)CN(CC(O)C[$])CC(O)C[$]}
+            BigSMILES字符串，格式如: {[$]...[$]}
         """
-        epoxy_act = self._to_reactive_smiles(epoxy_smiles) or self._clean_smiles(epoxy_smiles)
-        curer_act = self._to_reactive_smiles(curer_smiles) or self._clean_smiles(curer_smiles)
-
-        # 识别官能团
-        epoxy_fg = self.identify_functional_groups(epoxy_act)
-        curer_type, curer_fg = self.detect_curer_type(curer_act)
-
-        epoxy_functionality = epoxy_fg.get('epoxide', 0)
-
-        # 生成一个代表性的反应单元
-        products = self.simulate_curing(
-            epoxy_act,
-            curer_act,
-            n_reactions=1,  # 只需要一步反应的产物
-            max_products=3
-        )
-
-        if not products:
-            # 如果反应失败，生成简化的BigSMILES
-            return self._generate_simplified_bigsmiles(epoxy_smiles, curer_smiles, curer_type)
-
-        # 获取反应单元的SMILES
-        unit_smiles = products[0]['smiles']
-
+        curer_type = "unknown"
         try:
-            unit_mol = Chem.MolFromSmiles(unit_smiles)
-            if unit_mol is None:
+            unit_smiles = self.build_network_unit(
+                epoxy_smiles, curer_smiles, target_conversion=target_conversion
+            )
+            if not unit_smiles:
+                r_act = self._to_reactive_smiles(epoxy_smiles) or self._clean_smiles(epoxy_smiles)
+                c_act = self._to_reactive_smiles(curer_smiles) or self._clean_smiles(curer_smiles)
+                unit_smiles = self._virtual_crosslink_safe(r_act, c_act)
+
+            if not unit_smiles:
+                curer_type, _ = self.detect_curer_type(curer_smiles)
                 return self._generate_simplified_bigsmiles(epoxy_smiles, curer_smiles, curer_type)
 
-            # 识别可能的交联点（剩余的环氧基或羟基）
-            unit_fg = self.identify_functional_groups(unit_smiles)
-            remaining_epoxy = unit_fg.get('epoxide', 0)
-            hydroxyl_count = unit_fg.get('hydroxyl', 0)
+            epoxy_act = self._to_reactive_smiles(epoxy_smiles) or self._clean_smiles(epoxy_smiles)
+            epoxy_fg = self.identify_functional_groups(epoxy_act) if epoxy_act else {}
+            epoxy_functionality = epoxy_fg.get('epoxide', 2)
 
-            # 构建BigSMILES
-            # 策略：在反应单元周围添加连接点标记 [$]
+            # 构建BigSMILES交联网络语法：{[$]...[$]}
             if epoxy_functionality >= 2:
-                # 多官能度环氧：形成交联网络
-                # 格式: {[$]反应单元[$]}，表示可以从多个位置交联
-                bigsmiles = f"{{[$]{unit_smiles}[$]}}"
+                return f"{{[$]{unit_smiles}[$]}}"
             else:
-                # 单官能度：线性聚合物
-                bigsmiles = f"{{[>]{unit_smiles}[<]}}"
-
-            return bigsmiles
+                return f"{{[>]{unit_smiles}[<]}}"
 
         except Exception as e:
             if self.verbose:
@@ -1491,75 +1681,20 @@ class EpoxyReactionSimulator:
             'stoichiometry': stoichiometry,
         }
 
-        # 根据output_format决定表示方法
-        if output_format == 'smiles':
-            # 强制SMILES
-            smiles = self.generate_crosslinked_fragment(
-                epoxy_smiles, curer_smiles, stoichiometry, target_conversion
-            )
-            result['representation_type'] = 'smiles'
-            result['smiles'] = smiles
-            result['bigsmiles'] = None
-            result['description'] = '低聚物片段（SMILES）'
+        # 生成代表性网络单元 SMILES（用于 RDKit 描述符/3D/拓扑提取）
+        smiles = self.generate_crosslinked_fragment(
+            epoxy_smiles, curer_smiles, stoichiometry, target_conversion
+        )
+        # 生成标准 BigSMILES 拓扑网络结构（用于聚合物图特征/随机图解析）
+        bigsmiles = self._generate_bigsmiles_network(
+            epoxy_smiles, curer_smiles, stoichiometry, target_conversion
+        )
 
-        elif output_format == 'bigsmiles':
-            # 强制BigSMILES
-            bigsmiles = self._generate_bigsmiles_network(
-                epoxy_smiles, curer_smiles, stoichiometry
-            )
-            result['representation_type'] = 'bigsmiles'
-            result['smiles'] = None
-            result['bigsmiles'] = bigsmiles
-            result['description'] = '交联网络（BigSMILES）'
-
-        elif output_format == 'both':
-            # 返回两者
-            smiles = self.generate_crosslinked_fragment(
-                epoxy_smiles, curer_smiles, stoichiometry, target_conversion
-            )
-            bigsmiles = self._generate_bigsmiles_network(
-                epoxy_smiles, curer_smiles, stoichiometry
-            )
-            result['representation_type'] = 'both'
-            result['smiles'] = smiles
-            result['bigsmiles'] = bigsmiles
-            result['description'] = '低聚物片段 + 交联网络'
-
-        else:  # output_format == 'auto'
-            # 根据转化率自动选择
-            if target_conversion < 0.3:
-                # 低转化率：返回SMILES
-                smiles = self.generate_crosslinked_fragment(
-                    epoxy_smiles, curer_smiles, stoichiometry, target_conversion
-                )
-                result['representation_type'] = 'smiles'
-                result['smiles'] = smiles
-                result['bigsmiles'] = None
-                result['description'] = f'低转化率（{target_conversion*100:.0f}%）- 低聚物片段'
-
-            elif target_conversion < 0.7:
-                # 中等转化率：返回带端基的SMILES
-                smiles = self._generate_oligomer_smiles(
-                    epoxy_smiles, curer_smiles, stoichiometry, target_conversion
-                )
-                result['representation_type'] = 'oligomer'
-                result['smiles'] = smiles
-                result['bigsmiles'] = None
-                result['description'] = f'中等转化率（{target_conversion*100:.0f}%）- 部分交联低聚物'
-
-            else:
-                # 高转化率：生成BigSMILES + SMILES片段
-                smiles = self.generate_crosslinked_fragment(
-                    epoxy_smiles, curer_smiles, stoichiometry, target_conversion
-                )
-                bigsmiles = self._generate_bigsmiles_network(
-                    epoxy_smiles, curer_smiles, stoichiometry
-                )
-                result['representation_type'] = 'bigsmiles'
-                result['smiles'] = smiles  # 保留片段用于特征提取
-                result['bigsmiles'] = bigsmiles
-                result['description'] = f'高转化率（{target_conversion*100:.0f}%）- 交联网络'
-
+        # 默认模式为 both / bigsmiles，确保用户需要的 BigSMILES 网络和 SMILES 产物均完备
+        result['representation_type'] = 'bigsmiles' if output_format in ('bigsmiles', 'auto') else output_format
+        result['smiles'] = smiles
+        result['bigsmiles'] = bigsmiles
+        result['description'] = f'交联网络单元（SMILES + BigSMILES，转化率 {target_conversion*100:.0f}%）'
         return result
 
 
@@ -1631,7 +1766,8 @@ class CrosslinkedFeatureExtractor:
             # 伯胺可以反应2次，仲胺1次
             curer_functionality = features['primary_amine_count'] * 2 + features['secondary_amine_count']
         elif curer_type == 'anhydride':
-            curer_functionality = features['anhydride_count'] * 2  # 酸酐开环后有2个反应位点
+            # 1个酸酐基团对应开环消耗1个环氧基（1:1化学计量）
+            curer_functionality = features['anhydride_count']
         elif curer_type == 'thiol':
             curer_functionality = features['thiol_count']
         else:
@@ -1698,8 +1834,10 @@ class CrosslinkedFeatureExtractor:
 
             # 保存SMILES（如果有）并提取完整分层产物描述符
             product_smi = product_repr.get('smiles')
+            product_bigsmi = product_repr.get('bigsmiles') or (f"{{[$]{product_smi}[$]}}" if product_smi else None)
             if product_smi:
                 features['product_smiles'] = product_smi
+                features['product_structure'] = product_bigsmi or product_smi
                 prod_desc = _compute_product_descriptors(product_smi, include_3d=True)
                 features.update(prod_desc)
                 features.setdefault('product_remaining_epoxide', prod_desc.get('product_residual_epoxide', 0.0))
@@ -1712,19 +1850,15 @@ class CrosslinkedFeatureExtractor:
                     features['estimated_conversion'] = 0.0
             else:
                 features['product_smiles'] = None
+                features['product_structure'] = None
 
-            # 保存BigSMILES（如果有）
-            product_bigsmiles = product_repr.get('bigsmiles')
-            if product_bigsmiles:
-                features['product_bigsmiles'] = product_bigsmiles
-            else:
-                features['product_bigsmiles'] = None
+            # [去重] product_structure（BigSMILES 优先）与 product_smiles（纯 SMILES）
+            # 已覆盖全部信息，不再输出重复的 product_bigsmiles 特征列。
 
         except Exception as e:
             if self.verbose:
                 print(f"⚠️ 产物特征提取失败: {e}")
             features['product_smiles'] = None
-            features['product_bigsmiles'] = None
             features['representation_type'] = 'failed'
         
         return features
@@ -2117,6 +2251,8 @@ class MulticomponentCrosslinkedFeatureExtractor:
         self._curer_type_cache: Dict[str, Tuple[str, Dict[str, int]]] = {}
         self._product_feat_cache: Dict[str, Dict[str, float]] = {}
         self._mol_prop_cache: Dict[str, Dict[str, Any]] = {}
+        # [重复率修复] 共聚网络单元缓存: (epoxy, curer, conv) -> unit_smiles
+        self._copolymer_unit_cache: Dict[Tuple[str, str, float], str] = {}
 
     def _extract_extended_product_features(self, smiles: str, include_3d: bool = True) -> Dict[str, float]:
         # 统一委托模块级 _compute_product_descriptors（含进程级缓存）
@@ -2200,7 +2336,7 @@ class MulticomponentCrosslinkedFeatureExtractor:
                 secondary = curer_fg.get('secondary_amine', 0)
                 curer_func = primary * 2 + secondary
             elif curer_type == 'anhydride':
-                curer_func = curer_fg.get('anhydride', 0) * 2
+                curer_func = curer_fg.get('anhydride', 0)
             elif curer_type == 'thiol':
                 curer_func = curer_fg.get('thiol', 0)
             else:
@@ -2300,7 +2436,14 @@ class MulticomponentCrosslinkedFeatureExtractor:
             if reaction_method == 'weighted':
                 # 方案1：加权平均法
                 smiles_result = reaction_result.get('representative_smiles')
-                bigsmiles_result = reaction_result.get('representative_bigsmiles')
+                # [重复率修复] 优先使用按行内权重构造的随机共聚网络 BigSMILES
+                bigsmiles_result = (reaction_result.get('copolymer_bigsmiles')
+                                    or reaction_result.get('representative_bigsmiles'))
+                for _ck, _cv in (reaction_result.get('composition_features') or {}).items():
+                    features[_ck] = _cv
+                _sp = reaction_result.get('sampled_pair') or {}
+                if _sp:
+                    features['sampled_pair_probability'] = float(_sp.get('probability', 0.0))
 
                 # 检查产物是否有效（分子量增长或结构变化）
                 if smiles_result:
@@ -2327,8 +2470,12 @@ class MulticomponentCrosslinkedFeatureExtractor:
                     except Exception:
                         pass
 
-                # 产物结构字符串：首选 BigSMILES (若有)，否则 SMILES
+                # 产物结构字符串：首选 BigSMILES (若有)，否则包装为 BigSMILES
+                if not bigsmiles_result and smiles_result:
+                    bigsmiles_result = f"{{[$]{smiles_result}[$]}}"
                 features['product_structure'] = bigsmiles_result or smiles_result
+                features['product_smiles'] = smiles_result
+                # [去重] structure 与 smiles 已覆盖全部信息，不再重复输出 bigsmiles 列
 
                 # 提取产物扩展物理/化学特征（2D拓扑 + 交联位点 + 图论 + 3D构象）
                 if smiles_result:
@@ -2346,7 +2493,14 @@ class MulticomponentCrosslinkedFeatureExtractor:
                 # 方案2：组合反应法
                 features['n_combinations'] = reaction_result.get('n_combinations', 0)
                 smiles_result = reaction_result.get('representative_smiles')
-                bigsmiles_result = reaction_result.get('representative_bigsmiles')
+                # [重复率修复] 优先使用按行内权重构造的随机共聚网络 BigSMILES
+                bigsmiles_result = (reaction_result.get('copolymer_bigsmiles')
+                                    or reaction_result.get('representative_bigsmiles'))
+                for _ck, _cv in (reaction_result.get('composition_features') or {}).items():
+                    features[_ck] = _cv
+                _sp = reaction_result.get('sampled_pair') or {}
+                if _sp:
+                    features['sampled_pair_probability'] = float(_sp.get('probability', 0.0))
 
                 if smiles_result:
                     try:
@@ -2371,7 +2525,11 @@ class MulticomponentCrosslinkedFeatureExtractor:
                     except Exception:
                         pass
 
+                if not bigsmiles_result and smiles_result:
+                    bigsmiles_result = f"{{[$]{smiles_result}[$]}}"
                 features['product_structure'] = bigsmiles_result or smiles_result
+                features['product_smiles'] = smiles_result
+                # [去重] structure 与 smiles 已覆盖全部信息，不再重复输出 bigsmiles 列
 
                 # 提取扩展的产物特征（2D拓扑 + 交联位点 + 图论 + 3D构象）
                 if smiles_result:

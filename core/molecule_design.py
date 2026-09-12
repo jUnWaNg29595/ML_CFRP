@@ -2,10 +2,16 @@
 and combinatorial assembly for virtual molecule design in CFRP composites.
 
 This module provides:
-1. RingScaffold, LinkerBridge, RGroupSubstituent building blocks (24 rings, 20 linkers, 12 R-groups).
-2. Scaffold fission and combinatorial intermediate generator.
-3. 12 synthetic Reaction SMARTS templates (Epoxy, Amine, Anhydride, BMI, CE, BOZ, etc.).
-4. Strict quality gates, RDKit sanitization, and automated stoichiometry calculations (EEW, AHEW).
+1. RingScaffold, LinkerBridge, RGroupSubstituent building blocks (24 rings, 20 linkers, 12 R-groups),
+   all gated by user selection during scaffold fission.
+2. Scaffold fission and combinatorial intermediate generator (diphenols, diamines,
+   polyacids, star/tetragonal spatial cores, asymmetric hybrids).
+3. 15 synthetic Reaction SMARTS templates (Epoxy incl. aliphatic OH/NH2, Amine/Mannich,
+   Anhydride, BMI, CE, BOZ, Propargyl, Isocyanurate/TGIC, phenolic hardener retain, etc.).
+   All templates use local adjacency patterns so spectator substituents survive;
+   reactions that do not match a precursor yield no product (no fall-through fakes).
+4. Strict quality gates, RDKit sanitization, per-class stoichiometry (EEW, AHEW with
+   1 epoxy : 1 anhydride-group convention) and deterministic output ordering.
 5. Seamless handshake with downstream formula-level high-throughput virtual screening (HTVS).
 """
 
@@ -35,6 +41,24 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 ALLOWED_ELEMENTS = {1, 6, 7, 8, 9, 14, 15, 16, 17, 35, 53}
+
+# 环状酸酐通用 SMARTS：兼容 RDKit 的芳构化感知（PMDA/BTDA 等稠环芳酐的羰基碳
+# 会被 RDKit 感知为芳香原子，传统 "C(=O)OC(=O)" 脂肪碳模式完全匹配不上）。
+# 计数时以唯一中心氧原子为准，避免对称环的双向匹配重复计数。
+ANHYDRIDE_RING_SMARTS = "[o,OX2]1~[#6](=[OX1])~[#6]~[#6]~[#6](=[OX1])~1"
+
+
+def count_anhydride_groups(mol) -> int:
+    """Count cyclic anhydride groups via unique central oxygen atoms (aromatization-safe)."""
+    if mol is None or not RDKIT_AVAILABLE:
+        return 0
+    patt = Chem.MolFromSmarts(ANHYDRIDE_RING_SMARTS)
+    if patt is None:
+        return 0
+    try:
+        return len({m[0] for m in mol.GetSubstructMatches(patt)})
+    except Exception:
+        return 0
 
 
 # ==============================================================================
@@ -173,17 +197,17 @@ class SyntheticReaction:
     reaction_smarts: str
     description: str
     expected_warhead: str
-    chemical_system: str  # "epoxy" | "amine" | "anhydride" | "bmi" | "cyanate" | "benzoxazine" | "propargyl"
+    chemical_system: str  # "epoxy" | "amine" | "anhydride" | "bmi" | "cyanate" | "benzoxazine" | "propargyl" | "phenol"
     default_enabled: bool = True
 
 
 SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
     SyntheticReaction(
         reaction_id="glycidyl_etherification",
-        name="酚羟基缩水甘油醚化 (R01)",
+        name="羟基缩水甘油醚化 (R01, 酚/脂肪醇通用)",
         target_role="resin",
-        reaction_smarts="[c:1][OX2H:2]>>[c:1]OCC1CO1",
-        description="多元酚 + 环氧氯丙烷生成标准缩水甘油醚环氧树脂 (DGEBA/DGEBF/多酚型)",
+        reaction_smarts="[#6:1]-[OX2H:2]>>[#6:1]-OCC1CO1",
+        description="多元酚/脂肪多元醇 + 环氧氯丙烷生成缩水甘油醚环氧树脂 (DGEBA/氢化双酚A/脂环多元醇醚型)",
         expected_warhead="环氧缩水甘油醚",
         chemical_system="epoxy",
         default_enabled=True,
@@ -195,6 +219,16 @@ SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
         reaction_smarts="[c:1][NX3;H2:2]>>[c:1]N(CC2CO2)CC3CO3",
         description="芳香伯胺 + 环氧氯丙烷生成多官能缩水甘油胺型环氧树脂 (TGDDM/AFG-90 系列)",
         expected_warhead="缩水甘油胺",
+        chemical_system="epoxy",
+        default_enabled=True,
+    ),
+    SyntheticReaction(
+        reaction_id="glycidyl_amination_aliphatic",
+        name="脂肪胺缩水甘油胺化 (R02b)",
+        target_role="resin",
+        reaction_smarts="[CX4:1][NX3;H2:2]>>[CX4:1]N(CC2CO2)CC3CO3",
+        description="脂肪/脂环伯胺 + 环氧氯丙烷生成低粘度脂肪族缩水甘油胺树脂",
+        expected_warhead="脂肪缩水甘油胺",
         chemical_system="epoxy",
         default_enabled=True,
     ),
@@ -212,8 +246,8 @@ SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
         reaction_id="olefin_epoxidation",
         name="双键环氧化 (R04, 脂环环氧)",
         target_role="resin",
-        reaction_smarts="[C:1]1=[C:2]CCCC1>>[C:1]12O[C:2]2CCCC1",
-        description="过氧酸对脂环双键氧化生成高耐候、耐电弧脂环族环氧树脂",
+        reaction_smarts="[C:1]=[C:2]>>[C:1]1O[C:2]1",
+        description="过氧酸对脂肪族双键（环己烯/乙烯基/烯丙基侧链）环氧化生成耐候脂环族环氧（局部模板，保留环上取代基）",
         expected_warhead="脂环环氧",
         chemical_system="epoxy",
         default_enabled=True,
@@ -222,8 +256,8 @@ SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
         reaction_id="mannich_polyamine",
         name="酚醛胺曼尼希反应 (R05, 改性胺固化剂)",
         target_role="hardener",
-        reaction_smarts="[c:1][OX2H:2]>>[c:1](O)CNCCN",
-        description="多元酚 + 甲醛 + 乙二胺曼尼希缩合生成酚醛胺快速低温固化剂",
+        reaction_smarts="[OX2H:1][c:2][cH:3]>>[OX2H:1][c:2][c:3](CNCCN)",
+        description="多元酚邻位 + 甲醛 + 乙二胺曼尼希缩合生成酚醛胺快速低温固化剂（邻位氨甲基化）",
         expected_warhead="酚醛改性胺活性氢",
         chemical_system="amine",
         default_enabled=True,
@@ -239,11 +273,21 @@ SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
         default_enabled=True,
     ),
     SyntheticReaction(
-        reaction_id="anhydride_cyclization",
-        name="邻二羧酸脱水酸酐化 (R07)",
+        reaction_id="anhydride_cyclization_aromatic",
+        name="芳香邻二羧酸脱水酸酐化 (R07a)",
         target_role="hardener",
-        reaction_smarts="[C:1](=O)[OH].[C:2](=O)[OH]>>[C:1](=O)OC(=O)[C:2]",
-        description="邻位羧酸生成环状酸酐固化剂（耐热绝缘电工基体）",
+        reaction_smarts="[C:1](=O)([OH])[c:4][c:3][C:2](=O)[OH]>>[C:1]1(=O)O[C:2](=O)[c:3][c:4]1",
+        description="芳香邻位二羧酸分子内脱水生成环状酸酐固化剂（邻苯二甲酸酐/PMDA/BTDA 型）",
+        expected_warhead="酸酐基",
+        chemical_system="anhydride",
+        default_enabled=True,
+    ),
+    SyntheticReaction(
+        reaction_id="anhydride_cyclization_aliphatic",
+        name="脂肪1,2-二羧酸脱水酸酐化 (R07b)",
+        target_role="hardener",
+        reaction_smarts="[C:1](=O)([OH])[C;X4:4][C;X4:3][C:2](=O)[OH]>>[C:1]1(=O)O[C:2](=O)[C:3][C:4]1",
+        description="相邻 sp3 碳上的 1,2-二羧酸分子内脱水生成五元环酸酐（琥珀酸酐/四氢苯酐/六氢苯酐型）",
         expected_warhead="酸酐基",
         chemical_system="anhydride",
         default_enabled=True,
@@ -272,8 +316,8 @@ SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
         reaction_id="benzoxazine_synthesis",
         name="苯并噁嗪环化 (R10, BOZ树脂)",
         target_role="resin",
-        reaction_smarts="[c:1][OX2H:2]>>[c:1]1OCN(c2ccccc2)Cc1",
-        description="多元酚 + 苯胺 + 甲醛缩合生成双苯并噁嗪单体（近零固化收缩率）",
+        reaction_smarts="[OX2H:1][c:2][cH:3]>>[OX2:1]1[C:5][N:6](c2ccccc2)[C:7][c:3][c:2]1",
+        description="多元酚邻位 + 苯胺 + 甲醛缩合生成苯并噁嗪单体（近零固化收缩率，N-苯基型）",
         expected_warhead="苯并噁嗪环",
         chemical_system="benzoxazine",
         default_enabled=False,
@@ -293,10 +337,30 @@ SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
         name="天然固化剂母核直接继承 (R12)",
         target_role="hardener",
         reaction_smarts="",
-        description="保留芳香多胺、脂环胺、多元酸酐母核本身，并自动计算活性氢/酸酐当量",
+        description="保留芳香多胺、脂环胺、多元酸酐、双氰胺、咪唑、硫醇母核本身，并自动计算活性氢/酸酐当量",
         expected_warhead="活性胺氢/酸酐基",
         chemical_system="amine",
-        default_enabled=False,
+        default_enabled=True,
+    ),
+    SyntheticReaction(
+        reaction_id="isocyanurate_glycidylation",
+        name="异氰脲酸酯/酰亚胺 N-缩水甘油化 (R13, TGIC型)",
+        target_role="resin",
+        reaction_smarts="[nH:1][c:2](=[OX1])>>[n:1](CC1CO1)[c:2](=[OX1])",
+        description="氰尿酸(异氰脲酸)/酰亚胺 N-H + 环氧氯丙烷生成三缩水甘油异氰脲酸酯 (TGIC) 耐候粉末涂料树脂",
+        expected_warhead="异氰脲酸酯缩水甘油",
+        chemical_system="epoxy",
+        default_enabled=True,
+    ),
+    SyntheticReaction(
+        reaction_id="phenolic_hardener_retain",
+        name="多元酚/酚醛固化剂直接继承 (R14)",
+        target_role="hardener",
+        reaction_smarts="",
+        description="多元酚与酚醛低聚物作为酚羟基型环氧固化剂直接入库，按酚羟基数计算当量",
+        expected_warhead="酚羟基",
+        chemical_system="phenol",
+        default_enabled=True,
     ),
 ]
 
@@ -346,6 +410,29 @@ PRECURSOR_CATALOG: list[PrecursorCore] = [
     PrecursorCore("detda", "二乙基甲苯二胺 (DETDA)", "芳香多胺", "hardener", "CCc1cc(C)c(N)c(CC)c1N", "空间位阻芳香二胺，长适用期与高耐温性", True),
     PrecursorCore("mthpa", "甲基四氢苯酐 (MTHPA)", "多元酸酐", "hardener", "CC1=CCC2C(=O)OC(=O)C2C1", "低粘度长适用期酸酐，优异电绝缘性能", True),
     PrecursorCore("pmda", "均苯四甲酸二酐 (PMDA)", "多元酸酐", "hardener", "O=C1OC(=O)c2cc3C(=O)OC(=O)c3cc21", "四元芳香二酐，超高交联与耐温特性", True),
+    # 单环二元酚与酚醛低聚物（线性酚醛环氧/固化剂母核）
+    PrecursorCore("hydroquinone", "对苯二酚 (HQ)", "单环二酚", "resin", "Oc1ccc(O)cc1", "对位双官能母核，低粘度缩水甘油醚与链扩展剂", True),
+    PrecursorCore("catechol", "邻苯二酚 (Catechol)", "单环二酚", "resin", "Oc1ccccc1O", "邻位双官能母核，可环碳酸酯/苯并噁嗪化衍生", True),
+    PrecursorCore("novolac_trimer", "线性酚醛三核体 (Novolac n=1)", "酚醛低聚物", "resin", "Oc1ccccc1Cc1ccc(Cc2ccccc2O)cc1", "酚醛清漆三核低聚物，环氧酚醛(EOCN)与酚醛固化剂母核", True),
+    PrecursorCore("novolac_tetramer", "线性酚醛四核体 (Novolac n=2)", "酚醛低聚物", "resin", "Oc1ccccc1Cc1ccc(Cc2ccc(Cc3ccccc3O)cc2)cc1", "酚醛清漆四核低聚物，高官能度环氧酚醛母核", True),
+    # 多元羧酸与酸酐前驱体（缩水甘油酯树脂 + 酸酐固化剂双路线）
+    PrecursorCore("phthalic_acid", "邻苯二甲酸 (PA)", "多元酸/酯类", "resin", "O=C(O)c1ccccc1C(=O)O", "邻位二酸，分子内脱水生成邻苯二甲酸酐，亦可缩水甘油酯化", True),
+    PrecursorCore("trimellitic_acid", "偏苯三甲酸 (TMA)", "多元酸/酯类", "resin", "O=C(O)c1ccc(C(=O)O)c(C(=O)O)c1", "1,2,4-三酸，偏酐/三缩水甘油酯双路线母核", True),
+    PrecursorCore("pyromellitic_acid", "均苯四甲酸 (PMA)", "多元酸/酯类", "resin", "O=C(O)c1cc(C(=O)O)c(C(=O)O)cc1C(=O)O", "1,2,4,5-四酸，双分子内脱水生成 PMDA，亦可四缩水甘油酯化", True),
+    PrecursorCore("trimesic_acid", "均苯三甲酸 (TMA-135)", "多元酸/酯类", "resin", "O=C(O)c1cc(C(=O)O)cc(C(=O)O)c1", "1,3,5-对称三酸，三官能缩水甘油酯低粘度树脂母核", True),
+    PrecursorCore("btda_acid", "二苯酮四甲酸 (BTDA前体)", "多元酸/酯类", "resin", "O=C(O)c1ccc(C(=O)c2ccc(C(=O)O)c(C(=O)O)c2)cc1C(=O)O", "二苯酮-3,3',4,4'-四甲酸，双脱水生成 BTDA 二酐耐温固化剂", True),
+    PrecursorCore("thpa_acid", "四氢邻苯二甲酸 (THPA前体)", "多元酸/酯类", "resin", "O=C(O)C1CC=CCC1C(=O)O", "环己烯-1,2-二羧酸，脱水生成四氢苯酐，双键可进一步环氧化", True),
+    PrecursorCore("hpa_acid", "六氢邻苯二甲酸 (HHPA前体)", "多元酸/酯类", "resin", "O=C(O)C1CCCCC1C(=O)O", "环己烷-1,2-二羧酸，脱水生成六氢苯酐耐候固化剂", True),
+    # 杂环活性母核（TGIC/三聚氰胺路线）
+    PrecursorCore("cyanuric_acid", "氰尿酸/异氰脲酸 (CYA)", "杂环活性母核", "resin", "O=C1NC(=O)NC(=O)N1", "酮式三嗪三酮，N-缩水甘油化生成 TGIC 耐候粉末涂料树脂", True),
+    PrecursorCore("melamine", "三聚氰胺 (Melamine)", "杂环活性母核", "hardener", "Nc1nc(N)nc(N)n1", "三氨基三嗪高氮固化剂，亦可 N-缩水甘油化衍生", True),
+    # 潜伏型与催化型固化剂
+    PrecursorCore("dicy", "双氰胺 (DICY)", "潜伏型固化剂", "hardener", "N#CN=C(N)N", "CFRP 预浸料标杆潜伏型固化剂，长储存期高温固化", True),
+    PrecursorCore("mi_2", "2-甲基咪唑 (2-MI)", "咪唑固化剂", "hardener", "Cc1ncc[nH]1", "经典咪唑催化型固化剂/促进剂，中温快速凝胶", True),
+    PrecursorCore("emi_24", "2-乙基-4-甲基咪唑 (2E4MZ)", "咪唑固化剂", "hardener", "CCc1nc(C)c[nH]1", "液态咪唑固化剂，长适用期酸酐/双氰胺促进剂", True),
+    PrecursorCore("pz_2", "2-苯基咪唑 (2PZ)", "咪唑固化剂", "hardener", "c1ccc(-c2ncc[nH]2)cc1", "高耐温咪唑固化剂，电工浇注与粉末涂料用", True),
+    # 硫醇快固型固化剂
+    PrecursorCore("petmp", "季戊四醇四硫醇 (PETMP)", "硫醇固化剂", "hardener", "SCC(CS)(CS)CS", "四官能聚硫醇，低温快速固化与光固化体系", True),
 ]
 
 
@@ -373,23 +460,40 @@ def generate_scaffold_intermediates(
     intermediates: list[PrecursorCore] = list(PRECURSOR_CATALOG)
     seen_smiles = {p.smiles for p in intermediates}
 
+    # 环系/桥联选择生效门控：用户取消勾选的环与桥不再参与组装
+    selected_ring_set = {r.ring_id for r in rings} if selected_rings else None
+    selected_linker_ids = {l.linker_id for l in linkers} if selected_linkers else None
+
+    def _ring_enabled(*keys: str) -> bool:
+        if not selected_ring_set:
+            return True
+        return any(k in selected_ring_set for k in keys)
+
+    def _linker_enabled(key: str) -> bool:
+        if not selected_linker_ids:
+            return True
+        return key in selected_linker_ids
+
     # 1. 骨架组装模式
     # 1.1 双核组装模型 (Ring1 - Linker - Ring2)，支持不同环的交叉连接与单/稠环多位点
+    # 元组末位为对应的 RING_SCAFFOLDS ring_id，用于按用户选择过滤
     ring_templates = [
-        ("benzene_14", "苯环-1,4位", "c1ccc({link})cc1", "Oc1ccc{r}c({lk}c2ccc(O)cc2)c1", "Nc1ccc{r}c({lk}c2ccc(N)cc2)c1"),
-        ("benzene_13", "苯环-1,3位", "c1cccc({link})c1", "Oc1cccc{r}c({lk}c2cccc(O)c2)c1", "Nc1cccc{r}c({lk}c2cccc(N)c2)c1"),
-        ("toluene", "甲苯基", "c1cc(C)cc({link})c1", "Cc1cc(O)ccc1{lk}c1ccc(O)c(C)c1", "Cc1cc(N)ccc1{lk}c1ccc(N)c(C)c1"),
-        ("xylene", "二甲苯基", "c1c(C)cc(C)c({link})c1", "Cc1cc(C)c(O)cc1{lk}c1cc(O)c(C)cc1C", "Cc1cc(C)c(N)cc1{lk}c1cc(N)c(C)cc1C"),
-        ("naphthalene_14", "1,4-萘环", "c1ccc2c({link})cccc2c1", "Oc1ccc2ccccc2c1{lk}c1c(O)ccc2ccccc12", "Nc1ccc2ccccc2c1{lk}c1c(N)ccc2ccccc12"),
-        ("naphthalene_15", "1,5-萘环", "c1ccc2c({link})cccc2c1", "Oc1cccc2c(cccc12){lk}c1cccc2c(O)cccc12", "Nc1cccc2c(cccc12){lk}c1cccc2c(N)cccc12"),
-        ("naphthalene_26", "2,6-萘环", "c1cc2cc({link})ccc2cc1", "Oc1ccc2cc({lk}c3ccc4cc(O)ccc4c3)ccc2c1", "Nc1ccc2cc({lk}c3ccc4cc(N)ccc4c3)ccc2c1"),
-        ("naphthalene_27", "2,7-萘环", "c1cc2ccc({link})cc2cc1", "Oc1ccc2ccc({lk}c3ccc4ccc(O)cc4c3)cc2c1", "Nc1ccc2ccc({lk}c3ccc4ccc(N)cc4c3)cc2c1"),
-        ("biphenyl", "4,4'-联苯", "c1ccc(-c2ccc({link})cc2)cc1", "Oc1ccc(-c2ccc({lk}c3ccc(-c4ccc(O)cc4)cc3)cc2)cc1", "Nc1ccc(-c2ccc({lk}c3ccc(-c4ccc(N)cc4)cc3)cc2)cc1"),
-        ("cyclohexyl", "环己基", "C1CCC({link})CC1", "OC1CCC({lk}C2CCC(O)CC2)CC1", "NC1CCC({lk}C2CCC(N)CC2)CC1"),
-        ("adamantane", "金刚烷基", "C1C2CC3CC1CC({link})(C2)C3", "OC1C2CC3CC1CC({lk}C1C4CC5CC1CC(O)(C4)C5)(C2)C3", "NC1C2CC3CC1CC({lk}C1C4CC5CC1CC(N)(C4)C5)(C2)C3"),
+        ("benzene_14", "苯环-1,4位", "benzene", "c1ccc({link})cc1", "Oc1cc{r}c({lk}c2ccc(O)cc2)cc1", "Nc1cc{r}c({lk}c2ccc(N)cc2)cc1"),
+        ("benzene_13", "苯环-1,3位", "benzene", "c1cccc({link})c1", "Oc1cccc{r}c({lk}c2cccc(O)c2)c1", "Nc1cccc{r}c({lk}c2cccc(N)c2)c1"),
+        ("toluene", "甲苯基", "toluene", "c1cc(C)cc({link})c1", "Cc1cc(O)ccc1{lk}c1ccc(O)c(C)c1", "Cc1cc(N)ccc1{lk}c1ccc(N)c(C)c1"),
+        ("xylene", "二甲苯基", "xylene", "c1c(C)cc(C)c({link})c1", "Cc1cc(C)c(O)cc1{lk}c1cc(O)c(C)cc1C", "Cc1cc(C)c(N)cc1{lk}c1cc(N)c(C)cc1C"),
+        ("naphthalene_14", "1,4-萘环", "naphthalene_14", "c1ccc2c({link})cccc2c1", "Oc1ccc2ccccc2c1{lk}c1c(O)ccc2ccccc12", "Nc1ccc2ccccc2c1{lk}c1c(N)ccc2ccccc12"),
+        ("naphthalene_15", "1,5-萘环", "naphthalene_15", "c1ccc2c({link})cccc2c1", "Oc1cccc2c(cccc12){lk}c1cccc2c(O)cccc12", "Nc1cccc2c(cccc12){lk}c1cccc2c(N)cccc12"),
+        ("naphthalene_26", "2,6-萘环", "naphthalene_26", "c1cc2cc({link})ccc2cc1", "Oc1ccc2cc({lk}c3ccc4cc(O)ccc4c3)ccc2c1", "Nc1ccc2cc({lk}c3ccc4cc(N)ccc4c3)ccc2c1"),
+        ("naphthalene_27", "2,7-萘环", "naphthalene_27", "c1cc2ccc({link})cc2cc1", "Oc1ccc2ccc({lk}c3ccc4ccc(O)cc4c3)cc2c1", "Nc1ccc2ccc({lk}c3ccc4ccc(N)cc4c3)cc2c1"),
+        ("biphenyl", "4,4'-联苯", "biphenyl_44", "c1ccc(-c2ccc({link})cc2)cc1", "Oc1ccc(-c2ccc({lk}c3ccc(-c4ccc(O)cc4)cc3)cc2)cc1", "Nc1ccc(-c2ccc({lk}c3ccc(-c4ccc(N)cc4)cc3)cc2)cc1"),
+        ("cyclohexyl", "环己基", "cyclohexane", "C1CCC({link})CC1", "OC1CCC({lk}C2CCC(O)CC2)CC1", "NC1CCC({lk}C2CCC(N)CC2)CC1"),
+        ("adamantane", "金刚烷基", "adamantane", "C1C2CC3CC1CC({link})(C2)C3", "OC1C2CC3CC1CC({lk}C1C4CC5CC1CC(O)(C4)C5)(C2)C3", "NC1C2CC3CC1CC({lk}C1C4CC5CC1CC(N)(C4)C5)(C2)C3"),
     ]
 
-    for r_name, r_desc, ring_base, p_tmpl, a_tmpl in ring_templates:
+    for r_name, r_desc, ring_key, ring_base, p_tmpl, a_tmpl in ring_templates:
+        if not _ring_enabled(ring_key):
+            continue
         for linker in linkers:
             if linker.valency != 2:
                 continue
@@ -483,22 +587,31 @@ def generate_scaffold_intermediates(
 
     # 1.2 稠环与杂环多羟基/多氨基衍生母核 (Naphthalene, Anthracene, Triazine, Pyridine, etc.)
     poly_cores = [
-        ("14_dhn", "1,4-萘环", "Oc1ccc{r}(O)c2ccccc12", "Nc1ccc{r}(N)c2ccccc12"),
-        ("15_dhn", "1,5-萘环", "Oc1cccc2c(O)cc{r}c12", "Nc1cccc2c(N)cc{r}c12"),
-        ("26_dhn", "2,6-萘环", "Oc1cc2cc(O)c{r}cc2cc1", "Nc1cc2cc(N)c{r}cc2cc1"),
-        ("27_dhn", "2,7-萘环", "Oc1ccc2cc(O)c{r}cc2c1", "Nc1ccc2cc(N)c{r}cc2c1"),
-        ("anthracene", "9,10-蒽环", "Oc1ccc2cc3c(O)ccc{r}c3cc2c1", "Nc1ccc2cc3c(N)ccc{r}c3cc2c1"),
-        ("phenanthrene", "菲环", "Oc1ccc2c(c1)ccc1c(O)cc{r}c21", "Nc1ccc2c(c1)ccc1c(N)cc{r}c21"),
-        ("triazine", "对称三嗪", "Oc1nc(O)nc(O)n1", "Nc1nc(N)nc(N)n1"),
-        ("pyridine", "吡啶环", "Oc1cc(O)c{r}cn1", "Nc1cc(N)c{r}cn1"),
-        ("carbazole", "咔唑", "Oc1ccc2c(c1)[nH]c1cc(O)c{r}c21", "Nc1ccc2c(c1)[nH]c1cc(N)c{r}c21"),
-        ("adamantane", "金刚烷", "OC1C2CC3CC1CC(O)(C2)C3", "NC1C2CC3CC1CC(N)(C2)C3"),
+        ("14_dhn", "1,4-萘环", "naphthalene_14", "Oc1ccc{r}(O)c2ccccc12", "Nc1ccc{r}(N)c2ccccc12"),
+        ("15_dhn", "1,5-萘环", "naphthalene_15", "Oc1cccc2c(O)cc{r}c12", "Nc1cccc2c(N)cc{r}c12"),
+        ("26_dhn", "2,6-萘环", "naphthalene_26", "Oc1cc2cc(O)c{r}cc2cc1", "Nc1cc2cc(N)c{r}cc2cc1"),
+        ("27_dhn", "2,7-萘环", "naphthalene_27", "Oc1ccc2cc(O)c{r}cc2c1", "Nc1ccc2cc(N)c{r}cc2c1"),
+        ("anthracene", "9,10-蒽环", "anthracene", "Oc1ccc2cc3c(O)ccc{r}c3cc2c1", "Nc1ccc2cc3c(N)ccc{r}c3cc2c1"),
+        ("phenanthrene", "菲环", "phenanthrene", "Oc1ccc2c3ccc(O)c{r}c3ccc2c1", "Nc1ccc2c3ccc(N)c{r}c3ccc2c1"),
+        ("fluorene", "芴环", "fluorene", "Oc1cc{r}c2c(c1)Cc1ccc(O)cc12", "Nc1cc{r}c2c(c1)Cc1ccc(N)cc12"),
+        ("xanthene", "呫吨/氧杂蒽环", "xanthene", "Oc1cc{r}c2c(c1)Oc1cc(O)ccc1C2", "Nc1cc{r}c2c(c1)Oc1cc(N)ccc1C2"),
+        ("pyrene", "芘环", "pyrene", "Oc1cc2ccc3cc(O)c4c{r}ccc(c1)c4c3-2", "Nc1cc2ccc3cc(N)c4c{r}ccc(c1)c4c3-2"),
+        ("quinoxaline", "喹喔啉环", "quinoxaline", "Oc1nc(O)c2cc{r}ccc2n1", "Nc1c{r}c2nccnc2cc1N"),
+        ("terphenyl", "对三联苯", "terphenyl", "Oc1ccc(-c2cc{r}c(-c3ccc(O)cc3)cc2)cc1", "Nc1ccc(-c2cc{r}c(-c3ccc(N)cc3)cc2)cc1"),
+        ("pyridine", "吡啶环", "pyridine", "Oc1cc(O)c{r}cn1", "Nc1cc(N)c{r}cn1"),
+        ("carbazole", "咔唑环", "carbazole", "Oc1cc{r}c2[nH]c3ccc(O)cc3c2c1", "Nc1cc{r}c2[nH]c3ccc(N)cc3c2c1"),
+        ("adamantane", "金刚烷", "adamantane", "OC1C2CC3CC1CC(O)(C2)C3", "NC1C2CC3CC1CC(N)(C2)C3"),
     ]
-    for c_id, c_name, p_tmpl, a_tmpl in poly_cores:
+    for c_id, c_name, ring_key, p_tmpl, a_tmpl in poly_cores:
+        if not _ring_enabled(ring_key):
+            continue
         for r_grp in r_groups:
             if len(intermediates) >= max_intermediates:
                 break
             r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
+            # 固定模板（无 {r} 槽位）只为首个（无取代）R基生成一次，避免重复去重开销
+            if "{r}" not in p_tmpl and r_str:
+                continue
             p_smi = p_tmpl.replace("{r}", r_str)
             a_smi = a_tmpl.replace("{r}", r_str)
             for s, cat, role, prefix in [(p_smi, "稠环衍生多酚", "resin", "多酚"), (a_smi, "稠环衍生多胺", "hardener", "多胺")]:
@@ -523,56 +636,63 @@ def generate_scaffold_intermediates(
                 except Exception:
                     pass
 
-    # 2. 三核星型组装模型 (>CH- 或 P(=O) 等星型中心)
-    for r_grp in r_groups:
-        if len(intermediates) >= max_intermediates:
-            break
-        r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
-        smi_star_p = f"Oc1ccc{r_str}c(C(c2ccc(O)cc2)c2ccc(O)cc2)c1"
-        smi_star_a = f"Nc1ccc{r_str}c(C(c2ccc(N)cc2)c2ccc(N)cc2)c1"
-        for s, cat, role, prefix in [(smi_star_p, "拓扑星型多酚", "resin", "三酚"), (smi_star_a, "拓扑星型多胺", "hardener", "三胺")]:
-            try:
-                m = Chem.MolFromSmiles(s)
-                if m:
-                    Chem.SanitizeMol(m)
-                    cs = Chem.MolToSmiles(m, canonical=True)
-                    if cs not in seen_smiles:
-                        seen_smiles.add(cs)
-                        intermediates.append(
-                            PrecursorCore(
-                                core_id=f"gen_star_{hashlib.md5(cs.encode()).hexdigest()[:8]}",
-                                name=f"星型{prefix} ({r_grp.name})",
-                                category=cat,
-                                role=role,
-                                smiles=cs,
-                                description=f"三官能度星型拓扑核心前驱体",
-                                default_selected=True,
+    # 2. 三核星型组装模型 (>CH- 次甲基核，由 methine_star 桥联库控制)
+    if _linker_enabled("methine_star") and _ring_enabled("benzene"):
+        for r_grp in r_groups:
+            if len(intermediates) >= max_intermediates:
+                break
+            r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
+            smi_star_p = f"Oc1cc{r_str}c(C(c2ccc(O)cc2)c2ccc(O)cc2)cc1"
+            smi_star_a = f"Nc1cc{r_str}c(C(c2ccc(N)cc2)c2ccc(N)cc2)cc1"
+            for s, cat, role, prefix in [(smi_star_p, "拓扑星型多酚", "resin", "三酚"), (smi_star_a, "拓扑星型多胺", "hardener", "三胺")]:
+                try:
+                    m = Chem.MolFromSmiles(s)
+                    if m:
+                        Chem.SanitizeMol(m)
+                        cs = Chem.MolToSmiles(m, canonical=True)
+                        if cs not in seen_smiles:
+                            seen_smiles.add(cs)
+                            intermediates.append(
+                                PrecursorCore(
+                                    core_id=f"gen_star_{hashlib.md5(cs.encode()).hexdigest()[:8]}",
+                                    name=f"星型{prefix} ({r_grp.name})",
+                                    category=cat,
+                                    role=role,
+                                    smiles=cs,
+                                    description=f"三官能度星型拓扑核心前驱体",
+                                    default_selected=True,
+                                )
                             )
-                        )
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-    # 3. 空间四官能组装模型 (Tetrameric Spatial Core, 如四苯乙烷、季戊四醇、硅中心)
+    # 3. 空间四官能组装模型 (四苯乙烷/四苯甲烷/卡基芴/螺双二氢茚，由对应环系与星型桥联控制)
     for r_grp in r_groups:
         if len(intermediates) >= max_intermediates:
             break
         r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
-        smi_tetra_p = f"Oc1ccc{r_str}c(C(c2ccc(O)cc2)C(c2ccc(O)cc2)c2ccc(O)cc2)c1"
-        smi_tetra_a = f"Nc1ccc{r_str}c(C(c2ccc(N)cc2)C(c2ccc(N)cc2)c2ccc(N)cc2)c1"
-        smi_cardo_p = f"Oc1ccc{r_str}c(C2(c3ccccc3-c3ccccc32)c2ccc(O)cc2)c1"
-        smi_cardo_a = f"Nc1ccc{r_str}c(C2(c3ccccc3-c3ccccc32)c2ccc(N)cc2)c1"
-        smi_spiro_p = f"CC1(C)Cc2ccc(O)c{r_str}c2C12CCCc1cc(O)ccc12"
-        smi_spiro_a = f"CC1(C)Cc2ccc(N)c{r_str}c2C12CCCc1cc(N)ccc12"
-        
-        candidates = [
-            (smi_tetra_p, "四苯乙烷四酚", "resin"),
-            (smi_tetra_a, "四苯乙烷四胺", "hardener"),
-            (smi_cardo_p, "卡基双酚芴", "resin"),
-            (smi_cardo_a, "卡基双胺芴", "hardener"),
-            (smi_spiro_p, "螺双二氢茚双酚", "resin"),
-            (smi_spiro_a, "螺双二氢茚双胺", "hardener"),
-        ]
-        for s, name_desc, role in candidates:
+        spatial_candidates = []
+        if _linker_enabled("ethane_tetra") and _ring_enabled("benzene"):
+            spatial_candidates.extend([
+                (f"Oc1cc{r_str}c(C(c2ccc(O)cc2)C(c2ccc(O)cc2)c2ccc(O)cc2)cc1", "四苯乙烷四酚", "resin"),
+                (f"Nc1cc{r_str}c(C(c2ccc(N)cc2)C(c2ccc(N)cc2)c2ccc(N)cc2)cc1", "四苯乙烷四胺", "hardener"),
+            ])
+        if _linker_enabled("quaternary_carbon") and _ring_enabled("benzene"):
+            spatial_candidates.extend([
+                (f"Oc1cc{r_str}c(C(c2ccc(O)cc2)(c2ccc(O)cc2)c2ccc(O)cc2)cc1", "四苯甲烷四酚", "resin"),
+                (f"Nc1cc{r_str}c(C(c2ccc(N)cc2)(c2ccc(N)cc2)c2ccc(N)cc2)cc1", "四苯甲烷四胺", "hardener"),
+            ])
+        if _ring_enabled("fluorene"):
+            spatial_candidates.extend([
+                (f"Oc1cc{r_str}c(C2(c3ccccc3-c3ccccc32)c2ccc(O)cc2)cc1", "卡基双酚芴", "resin"),
+                (f"Nc1cc{r_str}c(C2(c3ccccc3-c3ccccc32)c2ccc(N)cc2)cc1", "卡基双胺芴", "hardener"),
+            ])
+        if _ring_enabled("spirobiindane"):
+            spatial_candidates.extend([
+                (f"CC1(C)Cc2ccc(O)c{r_str}c2C12CCCc1cc(O)ccc12", "螺双二氢茚双酚", "resin"),
+                (f"CC1(C)Cc2ccc(N)c{r_str}c2C12CCCc1cc(N)ccc12", "螺双二氢茚双胺", "hardener"),
+            ])
+        for s, name_desc, role in spatial_candidates:
             try:
                 m = Chem.MolFromSmiles(s)
                 if m:
@@ -595,17 +715,71 @@ def generate_scaffold_intermediates(
                 pass
 
     # 4. 杂化交联不对称多酚/多胺衍生库 (Cross-linked hybrid diphenols/diamines)
-    for lk_name, lk_str in [("亚甲基", "C"), ("异丙基", "C(C)(C)"), ("六氟异丙基", "C(C(F)(F)F)(C(F)(F)F)"), ("砜基", "S(=O)(=O)"), ("醚键", "O")]:
-        for r_grp in r_groups:
-            if len(intermediates) >= max_intermediates:
-                break
-            r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
-            # 苯酚-桥-萘酚
-            smi_hybrid_p = f"Oc1ccc{r_str}c({lk_str}c2ccc3ccccc3c2O)c1"
-            smi_hybrid_a = f"Nc1ccc{r_str}c({lk_str}c2ccc3ccccc3c2N)c1"
-            for s, name_desc, role in [(smi_hybrid_p, f"苯-萘杂化双酚 ({lk_name})", "resin"), (smi_hybrid_a, f"苯-萘杂化双胺 ({lk_name})", "hardener")]:
+    hybrid_linker_map = [
+        ("methylene", "亚甲基", "C"),
+        ("isopropylidene", "异丙基", "C(C)(C)"),
+        ("hexafluoroisopropylidene", "六氟异丙基", "C(C(F)(F)F)(C(F)(F)F)"),
+        ("sulfone", "砜基", "S(=O)(=O)"),
+        ("ether", "醚键", "O"),
+    ]
+    if _ring_enabled("benzene", "naphthalene_14"):
+        for lk_id, lk_name, lk_str in hybrid_linker_map:
+            if not _linker_enabled(lk_id):
+                continue
+            for r_grp in r_groups:
+                if len(intermediates) >= max_intermediates:
+                    break
+                r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
+                # 苯酚-桥-萘酚
+                smi_hybrid_p = f"Oc1cc{r_str}c({lk_str}c2ccc3ccccc3c2O)cc1"
+                smi_hybrid_a = f"Nc1cc{r_str}c({lk_str}c2ccc3ccccc3c2N)cc1"
+                for s, name_desc, role in [(smi_hybrid_p, f"苯-萘杂化双酚 ({lk_name})", "resin"), (smi_hybrid_a, f"苯-萘杂化双胺 ({lk_name})", "hardener")]:
+                    try:
+                        m = Chem.MolFromSmiles(s)
+                        if m:
+                            Chem.SanitizeMol(m)
+                            cs = Chem.MolToSmiles(m, canonical=True)
+                            if cs not in seen_smiles:
+                                seen_smiles.add(cs)
+                                intermediates.append(
+                                    PrecursorCore(
+                                        core_id=f"gen_hyb_{hashlib.md5(cs.encode()).hexdigest()[:8]}",
+                                        name=f"{name_desc} ({r_grp.name})",
+                                        category="不对称杂化母核",
+                                        role=role,
+                                        smiles=cs,
+                                        description=f"不对称多环芳香衍生母核",
+                                        default_selected=True,
+                                    )
+                                )
+                    except Exception:
+                        pass
+
+    # 5. 多元羧酸衍生母核 (include_acids)：缩水甘油酯树脂 + 环状酸酐固化剂双路线
+    # 邻位/1,2位二酸可经 R07a/R07b 分子内脱水成环酐，间/对位与全取代型走缩水甘油酯路线
+    if include_acids:
+        acid_cores = [
+            ("phthalic_gen", "邻苯二甲酸型", "O=C(O)c1cc{r}ccc1C(=O)O"),
+            ("isophthalic_gen", "间苯二甲酸型", "O=C(O)c1cc{r}cc(C(=O)O)c1"),
+            ("terephthalic_gen", "对苯二甲酸型", "O=C(O)c1ccc(C(=O)O)c{r}c1"),
+            ("trimellitic_gen", "偏苯三甲酸型", "O=C(O)c1ccc(C(=O)O)c(C(=O)O){r}c1"),
+            ("trimesic_gen", "均苯三甲酸型", "O=C(O)c1cc(C(=O)O){r}cc(C(=O)O)c1"),
+            ("pyromellitic_gen", "均苯四甲酸型", "O=C(O)c1cc(C(=O)O){r}c(C(=O)O)cc1C(=O)O"),
+            ("naphthalene_diacid", "萘二甲酸型", "O=C(O)c1cc{r}c2cc(C(=O)O)ccc2c1"),
+            ("btda_gen", "二苯酮四甲酸型", "O=C(O)c1ccc(C(=O)c2ccc(C(=O)O)c(C(=O)O)c2)cc1C(=O)O"),
+            ("thpa_gen", "四氢邻苯二甲酸型", "O=C(O)C1CC=CCC1C(=O)O"),
+            ("hpa_gen", "六氢邻苯二甲酸型", "O=C(O)C1CCCCC1C(=O)O"),
+        ]
+        for c_id, c_name, tmpl in acid_cores:
+            for r_grp in r_groups:
+                if len(intermediates) >= max_intermediates:
+                    break
+                r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
+                if "{r}" not in tmpl and r_str:
+                    continue
+                smi = tmpl.replace("{r}", r_str)
                 try:
-                    m = Chem.MolFromSmiles(s)
+                    m = Chem.MolFromSmiles(smi)
                     if m:
                         Chem.SanitizeMol(m)
                         cs = Chem.MolToSmiles(m, canonical=True)
@@ -613,12 +787,12 @@ def generate_scaffold_intermediates(
                             seen_smiles.add(cs)
                             intermediates.append(
                                 PrecursorCore(
-                                    core_id=f"gen_hyb_{hashlib.md5(cs.encode()).hexdigest()[:8]}",
-                                    name=f"{name_desc} ({r_grp.name})",
-                                    category="不对称杂化母核",
-                                    role=role,
+                                    core_id=f"gen_acid_{hashlib.md5(cs.encode()).hexdigest()[:8]}",
+                                    name=f"{c_name}母核 ({r_grp.name})",
+                                    category="多元羧酸衍生母核",
+                                    role="resin",
                                     smiles=cs,
-                                    description=f"不对称多环芳香衍生母核",
+                                    description=f"基于 {c_name} 的多元羧酸衍生前驱体（缩水甘油酯/环酐双路线）",
                                     default_selected=True,
                                 )
                             )
@@ -770,11 +944,24 @@ def parse_and_extract_custom_precursors(
                 if can_smi in seen_smiles:
                     continue
 
-                # 自动判别角色与分类
-                has_n = any(atom.GetSymbol() == "N" for atom in mol.GetAtoms())
-                has_o = any(atom.GetSymbol() == "O" for atom in mol.GetAtoms())
-                role = "hardener" if has_n and not has_o else ("resin" if has_o else "both")
-                cat = "自建提取多胺" if role == "hardener" else "自建提取多酚/多酸"
+                # 按官能团判别角色（不能用 N/O 元素有无判断：醚键 O 会让 ODA/Jeffamine
+                # 等二胺被误判为树脂）
+                patt_nh = Chem.MolFromSmarts("[NX3;H2,H1;!$(NC=O)]")
+                patt_phenol = Chem.MolFromSmarts("[cX3][OX2H]")
+                patt_acid = Chem.MolFromSmarts("[CX3](=O)[OX2H1]")
+                has_amine = bool(patt_nh and mol.HasSubstructMatch(patt_nh))
+                has_phenol = bool(patt_phenol and mol.HasSubstructMatch(patt_phenol))
+                has_acid = bool(patt_acid and mol.HasSubstructMatch(patt_acid))
+                if has_amine and not (has_phenol or has_acid):
+                    role = "hardener"
+                    cat = "自建提取多胺"
+                elif (has_phenol or has_acid) and not has_amine:
+                    role = "resin"
+                    cat = "自建提取多酚/多酸"
+                else:
+                    # 氨基酚/醇胺等双活性母核：树脂与固化剂路线均可参与
+                    role = "both"
+                    cat = "自建提取双活性母核"
 
                 seen_smiles.add(can_smi)
                 core_id = f"custom_{hashlib.md5(can_smi.encode()).hexdigest()[:8]}"
@@ -840,10 +1027,12 @@ def _count_reactive_sites(mol, role: str, warhead: str) -> tuple[int, str]:
         "alkene": "C=C",
         "cyanate": "OC#N",
         "maleimide": "N1C(=O)C=CC1=O",
-        "benzoxazine": "O1CNc2ccccc21",
+        # N-H/N-取代苯并噁嗪通用：O-CH2-N-CH2 与芳环稠合的六元环
+        "benzoxazine": "[OX2]1[CX4][NX3][CX4][c]2[c]1cccc2",
         "primary_amine": "[NX3;H2;!$(NC=O)]",
         "secondary_amine": "[NX3;H1;!$(NC=O)]",
-        "anhydride": "C(=O)OC(=O)",
+        "phenol_oh": "[cX3][OX2H]",
+        "thiol": "[SX2H]",
     }
 
     # 1. 环氧树脂体系
@@ -876,12 +1065,13 @@ def _count_reactive_sites(mol, role: str, warhead: str) -> tuple[int, str]:
         count = len(mol.GetSubstructMatches(patt_alk))
         return count, "propargyl"
 
-    # 6. 固化剂体系：多胺与酸酐
-    if role == "hardener" or "胺" in warhead or "酸酐" in warhead:
-        patt_anh = Chem.MolFromSmarts(patterns["anhydride"])
-        if patt_anh and mol.HasSubstructMatch(patt_anh):
-            count = len(mol.GetSubstructMatches(patt_anh)) * 2
-            return count, "anhydride"
+    # 6. 固化剂体系：酸酐、多胺、多元酚、硫醇、咪唑
+    hardener_tokens = ("胺", "酸酐", "酚", "硫醇", "咪唑", "活性氢")
+    if role == "hardener" or any(t in warhead for t in hardener_tokens):
+        # 酸酐：1 个酸酐基团对应 1 个环氧基（1:1 化学计量），兼容芳构化表示
+        n_anh = count_anhydride_groups(mol)
+        if n_anh > 0:
+            return n_anh, "anhydride"
 
         total_active_h = 0
         patt_p_nh = Chem.MolFromSmarts(patterns["primary_amine"])
@@ -893,6 +1083,31 @@ def _count_reactive_sites(mol, role: str, warhead: str) -> tuple[int, str]:
 
         if total_active_h > 0:
             return total_active_h, "amine"
+
+        # 酚羟基型固化剂（酚醛/多元酚）：按酚羟基数
+        patt_ph = Chem.MolFromSmarts(patterns["phenol_oh"])
+        if patt_ph:
+            n_ph = len(mol.GetSubstructMatches(patt_ph))
+            if n_ph > 0:
+                return n_ph, "phenol"
+
+        # 硫醇型固化剂：按巯基数
+        patt_sh = Chem.MolFromSmarts(patterns["thiol"])
+        if patt_sh:
+            n_sh = len(mol.GetSubstructMatches(patt_sh))
+            if n_sh > 0:
+                return n_sh, "thiol"
+
+        # 咪唑催化型固化剂：按咪唑环数（催化机制，1 个即可启动）
+        patt_im1 = Chem.MolFromSmarts("n1cc[nH]c1")
+        patt_im2 = Chem.MolFromSmarts("n1cncc1")
+        n_im = 0
+        if patt_im1:
+            n_im += len(mol.GetSubstructMatches(patt_im1))
+        if patt_im2:
+            n_im += len(mol.GetSubstructMatches(patt_im2))
+        if n_im > 0:
+            return n_im, "imidazole"
 
     return 0, "other"
 
@@ -915,35 +1130,99 @@ def calculate_stoichiometry(mol, role: str, warhead: str) -> dict[str, Any]:
 
 
 def _apply_reaction_exhaustively(mol, rxn) -> list:
-    """Apply a Reaction SMARTS to all available reaction sites efficiently with canonical deduplication."""
+    """Apply a Reaction SMARTS to all available reaction sites efficiently with canonical deduplication.
+
+    语义约定：只返回真正发生反应的产物（完全取代终产物）。
+    - 底物若不匹配该反应，返回空列表（绝不允许未反应底物冒充反应产物入库）；
+    - 每轮只保留反应过的分子，部分取代的中间体被丢弃，确保官能度统计准确。
+    """
     current_mols = [mol]
     seen_in_expansion = set()
+    reacted_ever = False
 
     for _ in range(4):
         next_mols = []
-        reacted_any = False
         for m in current_mols:
             try:
                 products = rxn.RunReactants((m,))
-                if products:
-                    reacted_any = True
-                    for prod_tuple in products:
-                        prod = prod_tuple[0]
-                        try:
-                            can_smi = Chem.MolToSmiles(prod, canonical=True)
-                            if can_smi not in seen_in_expansion:
-                                seen_in_expansion.add(can_smi)
-                                Chem.SanitizeMol(prod)
-                                next_mols.append(prod)
-                        except Exception:
-                            continue
             except Exception:
-                pass
-        if not reacted_any or not next_mols:
+                continue
+            for prod_tuple in products:
+                prod = prod_tuple[0]
+                try:
+                    Chem.SanitizeMol(prod)
+                    can_smi = Chem.MolToSmiles(prod, canonical=True)
+                    if can_smi in seen_in_expansion:
+                        continue
+                    seen_in_expansion.add(can_smi)
+                    next_mols.append(prod)
+                    reacted_ever = True
+                except Exception:
+                    continue
+        if not next_mols:
             break
         current_mols = next_mols
 
-    return current_mols
+    return current_mols if reacted_ever else []
+
+
+def _precursor_matches_reaction(parent_mol, rxn) -> bool:
+    """用反应物侧 SMARTS 模板实测底物是否真的能反应，替代按类别字符串猜测的预过滤。"""
+    try:
+        for reactant_template in rxn.GetReactants():
+            if (
+                reactant_template is not None
+                and reactant_template.GetNumAtoms() > 0
+                and parent_mol.HasSubstructMatch(reactant_template)
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _min_functionality_for_type(resin_type: str, min_functionality: int) -> int:
+    """按化学体系放宽官能度下限：
+    - 单酸酐固化剂（MTHPA/HHPA/NMA 型）是工业标准品，1 个酸酐基对应 1 个环氧基；
+    - 咪唑为催化型固化剂，1 个咪唑环即可启动固化；
+    其余体系（环氧/胺/酚/硫醇等）维持用户设定下限。
+    """
+    if resin_type in ("anhydride", "imidazole"):
+        return 1
+    return min_functionality
+
+
+def _make_product_record(
+    mol,
+    can_smi: str,
+    role: str,
+    resin_type: str,
+    precursor: PrecursorCore,
+    reaction_id: str,
+    reaction_name: str,
+    functionality: int,
+    equivalent_weight: float,
+    mw: float,
+    sa: float,
+) -> CombinatorialProduct:
+    return CombinatorialProduct(
+        product_smiles=can_smi,
+        role=role,
+        resin_type=resin_type,
+        precursor_id=precursor.core_id,
+        precursor_name=precursor.name,
+        precursor_smiles=precursor.smiles,
+        reaction_id=reaction_id,
+        reaction_name=reaction_name,
+        functionality=functionality,
+        equivalent_weight=equivalent_weight,
+        molecular_weight=mw,
+        sa_score=round(sa, 2),
+        heavy_atoms=int(mol.GetNumHeavyAtoms()),
+        rotatable_bonds=int(Descriptors.NumRotatableBonds(mol)),
+        aromatic_rings=int(Descriptors.NumAromaticRings(mol)),
+        formula=rdMolDescriptors.CalcMolFormula(mol),
+    )
 
 
 def _process_single_precursor_reactions(
@@ -970,50 +1249,57 @@ def _process_single_precursor_reactions(
     except Exception:
         return []
 
-    # 1. 天然固化剂母核直接继承
-    if precursor.role == "hardener" and any(r.reaction_id == "native_hardener_retain" for r in reactions):
+    # 1. 天然固化剂母核直接继承 (R12) —— 多胺/酸酐/双氰胺/咪唑/硫醇类母核原样入库
+    if precursor.role in ("hardener", "both") and any(r.reaction_id == "native_hardener_retain" for r in reactions):
         stoich = calculate_stoichiometry(parent_mol, "hardener", precursor.category)
-        if stoich["functionality"] >= min_functionality:
+        min_req = _min_functionality_for_type(stoich["resin_type"], min_functionality)
+        if (
+            stoich["functionality"] >= min_req
+            and mw_range[0] <= stoich["mw"] <= mw_range[1]
+        ):
             can_smi = Chem.MolToSmiles(parent_mol, canonical=True)
             if can_smi not in seen:
                 seen.add(can_smi)
                 sa = _calculate_sascore(parent_mol)
-                local_results.append(
-                    CombinatorialProduct(
-                        product_smiles=can_smi,
-                        role="hardener",
-                        resin_type=stoich["resin_type"],
-                        precursor_id=precursor.core_id,
-                        precursor_name=precursor.name,
-                        precursor_smiles=precursor.smiles,
-                        reaction_id="native_hardener_retain",
-                        reaction_name="天然固化剂母核",
-                        functionality=stoich["functionality"],
-                        equivalent_weight=stoich["equivalent_weight"],
-                        molecular_weight=stoich["mw"],
-                        sa_score=round(sa, 2),
-                        heavy_atoms=int(parent_mol.GetNumHeavyAtoms()),
-                        rotatable_bonds=int(Descriptors.NumRotatableBonds(parent_mol)),
-                        aromatic_rings=int(Descriptors.NumAromaticRings(parent_mol)),
-                        formula=rdMolDescriptors.CalcMolFormula(parent_mol),
+                if sa <= max_sa_score:
+                    local_results.append(
+                        _make_product_record(
+                            parent_mol, can_smi, "hardener", stoich["resin_type"], precursor,
+                            "native_hardener_retain", "天然固化剂母核直接继承",
+                            stoich["functionality"], stoich["equivalent_weight"], stoich["mw"], sa,
+                        )
                     )
-                )
 
-    # 2. 遍历多通道合成反应进行衍生
+    # 2. 多元酚/酚醛固化剂直接继承 (R14) —— 酚羟基型固化剂路线
+    if precursor.role in ("resin", "both") and any(r.reaction_id == "phenolic_hardener_retain" for r in reactions):
+        stoich_ph = calculate_stoichiometry(parent_mol, "hardener", "多元酚羟基固化剂")
+        if (
+            stoich_ph["resin_type"] == "phenol"
+            and stoich_ph["functionality"] >= min_functionality
+            and mw_range[0] <= stoich_ph["mw"] <= mw_range[1]
+        ):
+            can_smi = Chem.MolToSmiles(parent_mol, canonical=True)
+            if can_smi not in seen:
+                seen.add(can_smi)
+                sa = _calculate_sascore(parent_mol)
+                if sa <= max_sa_score:
+                    local_results.append(
+                        _make_product_record(
+                            parent_mol, can_smi, "hardener", "phenol", precursor,
+                            "phenolic_hardener_retain", "多元酚/酚醛固化剂直接继承",
+                            stoich_ph["functionality"], stoich_ph["equivalent_weight"], stoich_ph["mw"], sa,
+                        )
+                    )
+
+    # 3. 遍历多通道合成反应进行衍生
     for rxn_def, rxn in compiled_reactions:
         if is_cancelled():
             break
 
-        # 反应物匹配预过滤
-        if rxn_def.reaction_id == "glycidyl_amination":
-            if "胺" not in precursor.category and precursor.role != "hardener" and "N" not in precursor.smiles:
-                continue
-        elif rxn_def.chemical_system in ("epoxy", "cyanate", "benzoxazine", "propargyl"):
-            if "酚" not in precursor.category and precursor.role != "resin" and "O" not in precursor.smiles:
-                continue
-        elif rxn_def.chemical_system in ("bmi", "amine"):
-            if "胺" not in precursor.category and precursor.role != "hardener" and "N" not in precursor.smiles:
-                continue
+        # 预过滤：用反应物侧 SMARTS 实测底物能否反应（取代按类别字符串猜测，
+        # 避免脂肪胺被芳香模板放行后原样穿透成“假树脂”）
+        if not _precursor_matches_reaction(parent_mol, rxn):
+            continue
 
         try:
             candidate_mols = _apply_reaction_exhaustively(parent_mol, rxn)
@@ -1041,7 +1327,8 @@ def _process_single_precursor_reactions(
 
             target_role = rxn_def.target_role if rxn_def.target_role != "both" else precursor.role
             stoich = calculate_stoichiometry(prod_mol, target_role, rxn_def.expected_warhead)
-            if stoich["functionality"] < min_functionality:
+            min_req = _min_functionality_for_type(stoich["resin_type"], min_functionality)
+            if stoich["functionality"] < min_req:
                 continue
 
             if not (mw_range[0] <= stoich["mw"] <= mw_range[1]):
@@ -1157,6 +1444,8 @@ def run_combinatorial_monomer_design(
     seen_smiles = set()
 
     # 3. 多核并发正交展开
+    # 注意：为保证结果绝对可复现，并发模式下先完整收集全部产物，
+    # 统一按 canonical SMILES 排序后再截断；不允许按线程完成顺序"先到先得"。
     from .task_manager import is_cancelled
     if workers > 1 and len(precursors) > 10:
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -1176,27 +1465,12 @@ def run_combinatorial_monomer_design(
                 if is_cancelled():
                     logs.append("🛑 检测到用户后台终止指令，正在安全退出计算...")
                     break
-                if len(results) >= max_total_products:
-                    # 立即取消尚未执行的线程任务，防止后台无限占用计算资源
-                    for f in futures:
-                        if not f.done():
-                            f.cancel()
-                    break
                 try:
                     p_res = fut.result()
                     for item in p_res:
-                        if is_cancelled():
-                            break
-                        if len(results) >= max_total_products:
-                            break
                         if item.product_smiles not in seen_smiles:
                             seen_smiles.add(item.product_smiles)
                             results.append(item)
-                            if len(results) >= max_total_products:
-                                for f in futures:
-                                    if not f.done():
-                                        f.cancel()
-                                break
                 except Exception:
                     pass
     else:
@@ -1204,8 +1478,6 @@ def run_combinatorial_monomer_design(
         for precursor in precursors:
             if is_cancelled():
                 logs.append("🛑 检测到用户后台终止指令，正在安全退出计算...")
-                break
-            if len(results) >= max_total_products:
                 break
             p_res = _process_single_precursor_reactions(
                 precursor,
@@ -1218,15 +1490,12 @@ def run_combinatorial_monomer_design(
             for item in p_res:
                 if is_cancelled():
                     break
-                if len(results) >= max_total_products:
-                    break
                 if item.product_smiles not in seen_smiles:
                     seen_smiles.add(item.product_smiles)
                     results.append(item)
-                    if len(results) >= max_total_products:
-                        break
 
-    # 严格截断保证绝对不超过上限
+    # 确定性排序后再截断：相同输入参数必然得到相同产物集合
+    results.sort(key=lambda r: (r.product_smiles, r.reaction_id, r.precursor_id))
     if len(results) > max_total_products:
         results = results[:max_total_products]
 
