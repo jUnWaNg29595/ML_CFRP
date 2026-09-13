@@ -141,15 +141,15 @@ def render_status_sidebar(tracker: FeatureEngineeringTracker):
         return
     
     st.markdown("---")
-    st.markdown("### 📋 特征工程状态")
-    
-    col1, col2, col3 = st.columns(3)
-    col1.metric("✅", stats.get('success', 0))
-    col2.metric("⚠️", stats.get('warning', 0))
-    col3.metric("❌", stats.get('error', 0))
-    
+    total = len(steps)
+    s_c = stats.get('success', 0)
+    w_c = stats.get('warning', 0)
+    e_c = stats.get('error', 0)
+    # 精简为单行摘要（原三列 metric 在侧边栏占用过大且信息密度低）
+    st.caption(f"📋 特征工程: ✅{s_c} ⚠️{w_c} ❌{e_c} · 共 {total} 条")
+
     recent = steps[-5:][::-1]
-    with st.expander(f"最近操作 ({len(steps)} 条)", expanded=False):
+    with st.expander("最近操作", expanded=False):
         for s in recent:
             icon = {"success": "✅", "warning": "⚠️", "error": "❌"}.get(s.get('status', 'success'), "❓")
             st.caption(f"{icon} [{s.get('timestamp', '')}] {s.get('operation', '')}")
@@ -203,7 +203,7 @@ def render_status_panel(tracker: FeatureEngineeringTracker):
             st.rerun()
 
 
-def render_data_export_panel(data: pd.DataFrame = None, tracker: Optional[FeatureEngineeringTracker] = None):
+def render_data_export_panel(data: pd.DataFrame = None, tracker: Optional[FeatureEngineeringTracker] = None, key_prefix: str = ""):
     """数据导出面板"""
     if data is None or (hasattr(data, 'empty') and data.empty):
         st.warning("⚠️ 没有可导出的数据")
@@ -217,9 +217,9 @@ def render_data_export_panel(data: pd.DataFrame = None, tracker: Optional[Featur
     
     col1, col2 = st.columns(2)
     with col1:
-        fmt = st.selectbox("导出格式", ["CSV", "Excel (.xlsx)", "JSON"], key="export_fmt")
+        fmt = st.selectbox("导出格式", ["CSV", "Excel (.xlsx)", "JSON"], key=f"{key_prefix}export_fmt")
     with col2:
-        idx = st.checkbox("包含索引", value=False, key="export_idx")
+        idx = st.checkbox("包含索引", value=False, key=f"{key_prefix}export_idx")
     
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     

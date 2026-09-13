@@ -110,11 +110,6 @@ with st.sidebar:
         active_task_lock = bool(get_task_manager().get_active_tasks())
 
         st.markdown("---")
-        _render_sidebar_portal_panel()
-        _render_network_proxy_panel(active_task_lock)
-        _render_portal_ai_service_panel(active_task_lock)
-
-        st.markdown("---")
         st.markdown("### 📊 数据状态")
 
         # 优先获取 processed_data (清洗/处理后的数据)
@@ -129,22 +124,44 @@ with st.sidebar:
             status_label = "✅ 当前数据 (已清洗)" if current_df is not None else "✅ 原始数据"
             st.success(f"{status_label}\n\n**{display_df.shape[0]} 行 × {display_df.shape[1]} 列**")
 
-            # 2. 显示分子特征状态
+            # 2. 特征分类统计（与特征选择页的分类结果同步；无缓存时回退到提取记录）
+            fc = st.session_state.get('feature_classification')
+            if isinstance(fc, dict) and fc.get("molecular"):
+                mol_names = set(fc.get("molecular", []))
+                orig_names = set(fc.get("original", []))
+            else:
+                mol_names = set(st.session_state.get('molecular_feature_names', []))
+                orig_names = set()
+
             if st.session_state.get('molecular_features') is not None:
                 mf = st.session_state.molecular_features
                 st.info(f"🧬 分子特征: {mf.shape[1]} 个")
+            elif mol_names:
+                st.info(f"🧬 分子特征: {len(mol_names)} 个")
 
-            # 3. 显示特征选择状态
+            # 3. 显示特征选择状态（含分子/原始分类细分）
             feature_cols = st.session_state.get('feature_cols')
             target_col = st.session_state.get('target_col')
 
             if feature_cols:
-                st.info(f"🎯 已选特征 (X): {len(feature_cols)} 个")
+                if mol_names:
+                    mol_in_x = sum(1 for c in feature_cols if c in mol_names)
+                    orig_in_x = len(feature_cols) - mol_in_x
+                    st.info(f"🎯 已选特征 (X): {len(feature_cols)} 个（🧬 分子 {mol_in_x} · 原始 {orig_in_x}）")
+                else:
+                    st.info(f"🎯 已选特征 (X): {len(feature_cols)} 个")
 
             if target_col:
                 st.caption(f"🎯 目标变量 (Y): {target_col}")
         else:
             st.warning("⚠️ 未加载数据")
+
+        # 📥 数据导出（从状态条记录页提升至侧边栏）
+        # 注意：此处不能用 @st.fragment——侧边栏内多个 fragment 组合会导致
+        # 后续 fragment（网络代理面板）的输出被静默丢弃（实测复现）。
+        if display_df is not None:
+            with st.expander("📥 数据导出", expanded=False):
+                render_data_export_panel(display_df, tracker, key_prefix="sb_")
 
         # 清除缓存按钮
         st.markdown("---")
@@ -203,6 +220,13 @@ with st.sidebar:
 
         # [增强] 在侧边栏始终显示状态条入口（即使暂无记录，也避免"功能存在但界面不显示"）
         render_status_sidebar(st.session_state.get('fe_tracker', None))
+
+        # 低频管理面板（用户预测门户/网络代理/AI 服务）移至侧边栏靠下位置
+        st.markdown("---")
+        _render_sidebar_portal_panel()
+        _render_network_proxy_panel(active_task_lock)
+        _render_portal_ai_service_panel(active_task_lock)
+
         if active_task_lock:
             st.caption("🔒 主页面操作已锁定；请使用上方后台任务控制停止或等待完成。")
 

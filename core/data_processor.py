@@ -408,7 +408,7 @@ class AdvancedDataCleaner:
 
         return self.cleaned_data
 
-    def detect_outliers(self, method='iqr', threshold=1.5, columns=None, min_outlier_ratio=0.01):
+    def detect_outliers(self, method='iqr', threshold=1.5, columns=None, min_outlier_ratio=0.01, min_outlier_count=0):
         """
         检测异常值
 
@@ -448,7 +448,7 @@ class AdvancedDataCleaner:
 
             # 只报告异常值比例超过阈值的列
             outlier_ratio = count / len(data) if len(data) > 0 else 0
-            if count > 0 and outlier_ratio >= min_outlier_ratio:
+            if count > 0 and (outlier_ratio >= min_outlier_ratio or (min_outlier_count > 0 and count >= min_outlier_count)):
                 outliers[col] = {
                     '异常值数量': int(count),
                     '异常值比例': f'{outlier_ratio:.2%}',

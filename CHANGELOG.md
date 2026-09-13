@@ -45,6 +45,8 @@
 ## [Unreleased]
 
 ### 新增
+- 手机/窄屏适配：新增 ≤820px 媒体查询样式块——主内容区收紧留白、标题字号降级、输入控件 16px 防 iOS 聚焦缩放、按钮触控目标 ≥44px、侧边栏抽屉 84vw、数据表格/结构图/绘图高度自适应、页面级 tabs 横向滑动、防横向溢出
+
 - 模型训练页新增鲁棒损失选项（训练中自动压制目标异常样本影响，无需剔除数据）：XGBoost/LightGBM 新增 Objective (Loss) 选项（reg:squarederror / reg:pseudohubererror / reg:absoluteerror；regression / huber / regression_l1），人工神经网络新增 Loss Function 选项（mse / huber / mae，含旧模型反序列化兼容）；Huber 在残差超过 δ 后自动由平方转线性惩罚、MAE 全程线性，异常样本影响被自动压低，默认值与历史行为一致，仅影响训练目标、测试集评估不变；含异常点数据的对比验证中 Huber 相对 MSE 稳定取得更低测试 RMSE
 - 模型训练页新增「内部验证集（早停用）」配置块：自动（默认，训练样本 ≥ 20 条时划出 15%，与历史行为一致）/ 自定义比例（5%~40%，验证样本不足 4 条自动回退）/ 关闭（全部训练样本参与拟合）三种模式；仅对支持早停的模型（XGBoost/LightGBM/CatBoost 及 FT-Transformer/Transformer+BNN/Transformer+PINN/GNN+Transformer 融合）生效，其他模型显示明确提示；切分尊重分组/分层划分策略，避免配方组同时出现在拟合与验证两侧
 

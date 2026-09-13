@@ -2252,6 +2252,68 @@ CUSTOM_CSS = """
     /* 图片容器高度固定，防止页面抖动 */
     div[data-testid="stImage"] { min-height: 400px; display: flex; align-items: center; justify-content: center; }
     .stPlotlyChart { min-height: 400px; }
+
+    /* ============ 手机 / 窄屏适配 (≤ 820px) ============ */
+    @media (max-width: 820px) {
+      /* 主内容区收紧留白，占满屏宽 */
+      .block-container {
+        padding: 0.8rem 0.7rem 4.5rem !important;
+        max-width: 100% !important;
+      }
+
+      /* 标题降级（!important 覆盖首页横幅等 inline 字号） */
+      .stApp h1 { font-size: 1.35rem !important; line-height: 1.3 !important; }
+      .stApp h2 { font-size: 1.15rem !important; }
+      .stApp h3 { font-size: 1.02rem !important; }
+
+      /* iOS 聚焦防自动放大：输入控件字号 ≥ 16px */
+      .stApp input,
+      .stApp textarea,
+      .stApp [data-baseweb="select"] > div,
+      .stApp [data-baseweb="input"] > div {
+        font-size: 16px !important;
+      }
+
+      /* 触控目标加高（≥44px 拇指友好） */
+      .stButton > button,
+      .stDownloadButton > button,
+      .stFormSubmitButton > button {
+        min-height: 44px;
+      }
+
+      /* 侧边栏抽屉展开时占大部分屏宽，便于触控操作 */
+      [data-testid="stSidebar"] {
+        width: 84vw !important;
+        min-width: 84vw !important;
+      }
+
+      /* 表格给足触控滚动空间 */
+      [data-testid="stDataFrame"] { min-height: 260px; }
+
+      /* 固定最小高度在窄屏减小（结构图 / 绘图） */
+      div[data-testid="stImage"] { min-height: 240px !important; }
+      .stPlotlyChart { min-height: 280px; }
+
+      /* 页面级 tabs 超宽时横向滑动而非换行挤压 */
+      .stTabs [data-baseweb="tab-list"] {
+        flex-wrap: nowrap !important;
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+      }
+      .stTabs [data-baseweb="tab-list"]::-webkit-scrollbar { display: none; }
+
+      /* metric 卡片 / expander 间距收紧 */
+      [data-testid="stMetric"] { padding: 0.5rem 0.6rem !important; }
+      [data-testid="stExpander"] { margin-top: 0.35rem; }
+
+      /* 自定义渐变统计卡片内边距收紧 */
+      .metric-card { padding: 12px 10px !important; }
+
+      /* 防横向溢出，长词/长列名换行 */
+      .stApp { overflow-x: hidden; }
+      .stMarkdown, .stMarkdown p { overflow-wrap: break-word; }
+    }
 </style>
 """
 
@@ -6239,7 +6301,7 @@ def page_data_cleaning():
                 threshold = st.slider("阈值", 1.0, 5.0, 1.5 if method == "iqr" else 3.0)
 
             with col2:
-                handle_method = st.selectbox("处理方法", ["clip", "replace_median", "remove"])
+                handle_method = st.selectbox("处理方法", ["clip", "replace_median", "remove"], index=2)
                 # 添加最小异常值比例控制
                 min_outlier_ratio = st.slider(
                     "最小异常值比例 (%)",
@@ -6247,20 +6309,34 @@ def page_data_cleaning():
                     step=0.1,
                     help="只报告异常值比例超过此阈值的列，避免误报"
                 ) / 100.0
+                min_outlier_count = st.number_input(
+                    "最小异常值数量（个，0=不限）",
+                    min_value=0, max_value=100000, value=0, step=1,
+                    key="outlier_min_count",
+                    help="设置后，异常值个数达到该数量的列也会被报告/处理（与比例条件二选一满足即可）"
+                )
                 # 添加处理范围选择
                 outlier_scope = st.radio(
                     "处理范围",
                     ["全部数值列", "指定列"],
+                    index=1,
                     horizontal=True,
-                    key="outlier_scope"
+                    key="outlier_scope",
+                    help="默认针对目标特征列检测/处理异常值，避免误伤其他数值列"
                 )
         
             selected_cols_for_outlier = None
             if outlier_scope == "指定列" and numeric_cols_all:
+                # 默认选中目标特征列（若其为数值列），否则回退前 5 个数值列
+                _target_col = st.session_state.get('target_col')
+                if _target_col and _target_col in numeric_cols_all:
+                    _default_outlier_cols = [_target_col]
+                else:
+                    _default_outlier_cols = numeric_cols_all[:min(5, len(numeric_cols_all))]
                 selected_cols_for_outlier = st.multiselect(
                     "选择要处理的列",
                     options=numeric_cols_all,
-                    default=numeric_cols_all[:min(5, len(numeric_cols_all))],
+                    default=_default_outlier_cols,
                     key="outlier_cols_select"
                 )
 
@@ -6279,10 +6355,11 @@ def page_data_cleaning():
                     method=method,
                     threshold=threshold,
                     columns=detect_cols,
-                    min_outlier_ratio=min_outlier_ratio
+                    min_outlier_ratio=min_outlier_ratio,
+                    min_outlier_count=int(min_outlier_count)
                 )
                 if outliers:
-                    st.warning(f"检测到 {len(outliers)} 列存在显著异常值（异常值比例 ≥ {min_outlier_ratio:.1%}）")
+                    st.warning(f"检测到 {len(outliers)} 列存在显著异常值（比例 ≥ {min_outlier_ratio:.1%} 或数量 ≥ {int(min_outlier_count)} 个）")
                     st.json(outliers)
                 else:
                     st.success(f"✅ 未检测到显著异常值（异常值比例 < {min_outlier_ratio:.1%}）")
@@ -8770,9 +8847,7 @@ def page_molecular_features():
     st.title("🧬 分子特征提取")
     _render_molecular_feature_clear_restore_control()
 
-    if st.session_state.pop("feature_extraction_just_completed", False):
-        summary = st.session_state.get("latest_extraction_summary", {})
-        st.success(f"✅ 特征提取成功！已完成 {summary.get('n_features', 0)} 个特征提取并写回数据集，新生成的结构列（如 crosslink_product_structure）已同步至下方待选列表。")
+    # 提取成功反馈已改为提取按钮原地的 st.success + st.toast（不再整页刷新）
 
     with st.expander("🔗 跨表配方数据融合工具 (若当前为目标性能窄表，可一键关联母宽表补全 PHR / 当量 / 机理特征)", expanded=False):
         from core.formulation_fusion_ui import render_formulation_fusion_ui
@@ -8822,18 +8897,22 @@ def page_molecular_features():
     # 过滤掉已提取的分子特征列
     text_cols = [c for c in text_cols if not _is_extracted_feature_col(c)]
 
-    # [调试] 显示所有列的数据类型
-    with st.expander("🔍 调试：查看所有列的数据类型", expanded=False):
-        if st.checkbox("加载列数据类型明细", value=False, key="show_col_dtypes_debug_chk"):
-            dtype_info = []
-            for col in df.columns:
-                dtype_info.append({
-                    "列名": col,
-                    "数据类型": str(df[col].dtype),
-                    "是否为文本": df[col].dtype == 'object',
-                    "是否被过滤": _is_extracted_feature_col(col)
-                })
-            st.dataframe(pd.DataFrame(dtype_info), width="stretch", height=300)
+    # [调试] 显示所有列的数据类型（fragment 化：展开/勾选只局部刷新，不触发全页重跑）
+    @st.fragment
+    def _render_dtype_debug_panel():
+        with st.expander("🔍 调试：查看所有列的数据类型", expanded=False):
+            if st.checkbox("加载列数据类型明细", value=False, key="show_col_dtypes_debug_chk"):
+                dtype_info = []
+                for col in df.columns:
+                    dtype_info.append({
+                        "列名": col,
+                        "数据类型": str(df[col].dtype),
+                        "是否为文本": df[col].dtype == 'object',
+                        "是否被过滤": _is_extracted_feature_col(col)
+                    })
+                st.dataframe(pd.DataFrame(dtype_info), width="stretch", height=300)
+
+    _render_dtype_debug_panel()
     
     # 智能检测：基于列名和内容判断
     def _detect_smiles_cols_smart(df_in, exclude_features=True):
@@ -13320,8 +13399,12 @@ def page_molecular_features():
                     "dual": bool(hardener_list),
                     "method": extraction_method,
                 }
-                st.session_state["feature_extraction_just_completed"] = True
-                st.rerun()
+                st.success(
+                    f"✅ 特征提取成功！新增 {features_df.shape[1]} 个特征并写回数据集"
+                    f"（{df.shape[1]} → {merged_df.shape[1]} 列）。"
+                    "结果已同步至下方「已提取特征管理」面板，可在其中勾选并入数据集。"
+                )
+                st.toast(f"✅ 特征提取完成：新增 {features_df.shape[1]} 个特征", icon="✅")
             else:
                 st.error("❌ 未能提取任何特征：当前选择的 SMILES 列可能全部为空/无效，或 3D 构象生成全部失败。")
                 _record_single_workflow_failure(
