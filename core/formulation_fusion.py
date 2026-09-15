@@ -262,6 +262,11 @@ class FormulationFusionEngine:
     ) -> Dict[str, Any]:
         """
         通过【正则模式 + RDKit化学内容抽样验证】，100% 确保列角色推断准确无误
+
+        [添加剂感知修复] 纯化学内容验证会把含环氧的活性稀释剂列自动判为“树脂”、
+        含胺的增韧剂列判为“固化剂”、甚至将产物列（crosslink_product_*，历史
+        产物含环氧）判为原料，造成自引用污染。因此先按列名排除添加剂/衍生列，
+        它们的小分子处理由反应提取链内部的添加剂分诊（P2/P3）负责。
         """
         roles = {
             "resins": [],       # [(列名, 序号, 检测说明)]
@@ -271,12 +276,23 @@ class FormulationFusionEngine:
             "eew_cols": [],     # 当量列
         }
 
+        # 添加剂/衍生输出列排除表（不做树脂/固化剂角色判定）
+        _excluded_col_re = re.compile(
+            r"(small_additive|additive|diluent|toughener|filler|catalyst|accelerator|"
+            r"initiator|compatibilizer|pigment|solvent|crosslink_|mech_|"
+            r"product_smiles|product_structure|product_bigsmiles|rdkit_|mordred_|"
+            r"fp_|descriptor_)",
+            re.I,
+        )
+
         text_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
         num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
         # 1. 扫描树脂列
         for c in text_cols:
             c_low = str(c).lower()
+            if _excluded_col_re.search(c_low):
+                continue
             is_name_match = bool(re.search(r"resin|epoxy", c_low)) and ("structure" in c_low or "smiles" in c_low or re.search(r"_\d+$", c_low))
             # 抽样化学内容验证
             sample_has_epoxy = self._sample_has_substructure(df[c], self.pat_epoxy)
@@ -288,6 +304,8 @@ class FormulationFusionEngine:
         for c in text_cols:
             c_low = str(c).lower()
             if c in [r[0] for r in roles["resins"]]:
+                continue
+            if _excluded_col_re.search(c_low):
                 continue
             is_name_match = bool(re.search(r"cur|hardener|amine", c_low)) and ("structure" in c_low or "smiles" in c_low or re.search(r"_\d+$", c_low))
             sample_has_curer = (

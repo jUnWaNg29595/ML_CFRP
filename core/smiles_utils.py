@@ -392,8 +392,27 @@ def _repair_incomplete_aromatic_proxy(smiles: str) -> Optional[str]:
     s = clean_smiles_raw_string(smiles)
     if not s:
         return None
-    updated = re.sub(r"([cnops])\((c(?:%\d{2}|\d))\)(?![A-Za-z0-9])", r"\1\1(\2)", s)
-    updated = re.sub(r"([cnops])(?P<ring>%\d{2}|\d)(?![A-Za-z0-9])", r"\1\1\g<ring>", updated)
+
+    def _ring_token_paired(text: str, token: str) -> bool:
+        # 环闭合数字在整个字符串中出现 >=2 次即为已成对（合法闭环），
+        # 只有孤立的悬挂数字才是本修复函数的目标。
+        return re.findall(r"%\d{2}|\d", text).count(token) >= 2
+
+    def _sub_paren(match: re.Match) -> str:
+        hetero, ring = match.group(1), match.group(2)
+        token = ring[1:]
+        if not _ring_token_paired(s, token):
+            return f"{hetero}{hetero}({ring})"
+        return match.group(0)
+
+    def _sub_terminal(match: re.Match) -> str:
+        atom, token = match.group(1), match.group("ring")
+        if not _ring_token_paired(s, token):
+            return f"{atom}{atom}{token}"
+        return match.group(0)
+
+    updated = re.sub(r"([cnops])\((c(?:%\d{2}|\d))\)(?![A-Za-z0-9])", _sub_paren, s)
+    updated = re.sub(r"([cnops])(?P<ring>%\d{2}|\d)(?![A-Za-z0-9])", _sub_terminal, updated)
     return updated if updated != s else None
 
 
@@ -681,11 +700,23 @@ def bigsmiles_to_smiles(bigsmiles_str: str) -> Optional[str]:
         except Exception:
             pass
 
+    # 采样代理可能拼接出无法严格解析的芳环（如 7 元“苯环”），
+    # 必须先严格校验，无效时回退启发式重复单元代理，
+    # 避免把不可解析字符串透传给下游特征提取。
     sampled_proxy = _bigsmiles_sampled_to_smiles(s)
+    sampled_out = None
     if sampled_proxy:
-        return _best_effort_polymer_proxy(sampled_proxy) or sampled_proxy
+        sampled_out = _best_effort_polymer_proxy(sampled_proxy) or sampled_proxy
+        if _strictly_parseable(sampled_out):
+            return sampled_out
 
-    return _bigsmiles_heuristic_to_smiles(s)
+    heuristic_out = _bigsmiles_heuristic_to_smiles(s)
+    if _strictly_parseable(heuristic_out):
+        return heuristic_out
+
+    # 两条路径都无法严格解析时保留旧行为：返回最优非空候选，
+    # 让下游 normalize/repair 链仍有修复机会。
+    return sampled_out or heuristic_out
 
 
 def convert_to_smiles(text, fmt: str = "auto") -> Optional[str]:
@@ -711,6 +742,14 @@ def convert_to_smiles(text, fmt: str = "auto") -> Optional[str]:
             return bigsmiles_to_smiles(s)
         return s
     return None
+
+
+def _strictly_parseable(smiles) -> bool:
+    """SMILES 能否被 RDKit 严格解析（含 KEKULIZE 消毒）。"""
+    if not smiles or not RDKIT_AVAILABLE:
+        return False
+    probe = parse_smiles_quiet(smiles)
+    return probe is not None and probe.GetNumAtoms() >= 1
 
 
 def normalize_chemical_string(
@@ -750,13 +789,16 @@ def normalize_chemical_string(
 
     if repair:
         fixed = smart_repair_smiles(s, keep_largest_frag=keep_largest_frag)
-        if fixed:
+        # smart_repair 的宽松路径可能返回无法严格解析的 SMILES
+        #（如跳过 KEKULIZE 后残留的 7 元"芳环"），若直接采信会阻断
+        # aggressive 回退并导致最终解析失败，因此先校验再采信。
+        if fixed and _strictly_parseable(fixed):
             return fixed
         try:
             aggressive = aggressive_repair_smiles(s, keep_largest_frag=keep_largest_frag)
         except Exception:
             aggressive = None
-        if aggressive:
+        if aggressive and _strictly_parseable(aggressive):
             return aggressive
         return None
 

@@ -5188,6 +5188,7 @@ def _render_global_task_lock(page):
     c_lock1, c_lock2 = st.columns([3, 1])
     with c_lock1:
         st.caption("若后台实际已没有在计算（例如任务中断或发生过异常），可点击右侧直接一键清除死锁并恢复页面。")
+        st.caption("💡 长任务运行期间请勿刷新页面或反复操作：刷新/交互可能中断当前运行；提取结果已按阶段自动快照，恢复后可继续。")
     with c_lock2:
         if st.button("🔓 强制解除锁定", key="btn_force_unlock_all_tasks", type="primary", use_container_width=True):
             task_mgr.cancel_all_tasks(force=True)
@@ -8836,6 +8837,94 @@ def page_feature_registry():
         preferred_service_id=preferred_service_id,
     )
 
+# ============================================================
+# [保护] 分子特征提取任务守护
+# 长耗时提取的稳定性保护：
+#   1) 提取开始时在后台任务管理器登记受管任务：侧边栏可见、可点“停止”取消
+#      （提取器内部会检查取消标志，在批次边界安全中止）；
+#   2) 任务活动期间全局控件锁定，减少误触；任何非 fragment 交互都会中断
+#      当前脚本运行（fastReruns 机制），锁定可显著降低误中断概率；
+#   3) 捕获中断异常（Stop/Rerun）把任务标记为失败/取消并重新抛出，
+#      避免残留“活动任务”把页面锁死；
+#   4) 抑制紧随其后的重复点击（排队重跑），避免二次全量提取。
+# 仅当点击两个提取按钮时才登记任务，常规浏览零额外开销。
+# ============================================================
+_MF_TASK_LAST_FINISH = {}
+_MF_DUP_CLICK_WINDOW_SEC = 20.0
+
+
+def _mark_molecular_feature_run_requested():
+    """提取按钮 on_click：在脚本重跑前记录本次请求。"""
+    st.session_state["_mf_extract_run_requested"] = True
+
+
+def _mark_mf_import_run_requested():
+    """导入流程按钮 on_click：在脚本重跑前记录本次请求。"""
+    st.session_state["_mf_import_run_requested"] = True
+
+
+def _molecular_feature_task_guard(page_func):
+    """Keep a molecular-feature extraction run intact across Streamlit reruns."""
+    @functools.wraps(page_func)
+    def _guarded_page():
+        manager = get_task_manager()
+        session_key = str(st.session_state.get("_sid") or "default")
+        task_key = f"molecular_feature_extract:{session_key}"
+
+        extract_requested = bool(st.session_state.pop("_mf_extract_run_requested", False))
+        import_requested = bool(st.session_state.pop("_mf_import_run_requested", False))
+
+        if not (extract_requested or import_requested):
+            # 清理可能残留的放行标志（例如上一次页面在按钮前提前 return）
+            st.session_state.pop("_mf_extract_allow", None)
+            st.session_state.pop("_mf_import_allow", None)
+            return page_func()
+
+        # 抑制重复点击：同一任务键刚结束（<20秒）时忽略排队重跑引发的二次触发
+        last_finished = _MF_TASK_LAST_FINISH.get(task_key)
+        if last_finished is not None and (time.time() - last_finished) < _MF_DUP_CLICK_WINDOW_SEC:
+            st.toast("已忽略重复的提取点击（上一次提取刚刚完成）", icon="⏳")
+            return page_func()
+
+        task_id, task_created = manager.acquire_task(
+            name="分子特征提取",
+            task_type="molecular_feature",
+            task_key=task_key,
+        )
+        st.session_state["_mf_task_id"] = task_id
+        if not task_created:
+            task = manager.get_task_snapshot(task_id)
+            st.warning("已有分子特征提取正在运行，本次重复点击已忽略。")
+            if task is not None and task.message:
+                st.info(task.message)
+            st.session_state.pop("_mf_extract_allow", None)
+            st.session_state.pop("_mf_import_allow", None)
+            return page_func()
+
+        clear_cancel()
+        manager.start_task(task_id)
+        # 统一走会话标志驱动提取：排队重跑中 st.button 返回值不可靠
+        st.session_state["_mf_extract_allow"] = extract_requested
+        st.session_state["_mf_import_allow"] = import_requested
+        try:
+            result = page_func()
+        except BaseException as exc:
+            _MF_TASK_LAST_FINISH[task_key] = time.time()
+            manager.complete_task(
+                task_id,
+                success=False,
+                error_message=f"运行被中断：{type(exc).__name__}",
+            )
+            raise
+        else:
+            _MF_TASK_LAST_FINISH[task_key] = time.time()
+            manager.complete_task(task_id, success=True)
+            return result
+
+    return _guarded_page
+
+
+@_molecular_feature_task_guard
 def page_molecular_features():
     """分子特征提取页面 - 完整还原5种方法 + 分子指纹 (适配双组分)"""
     from core.molecular_feature_workflow import (
@@ -11376,12 +11465,15 @@ def page_molecular_features():
                 import_workflow = None
                 st.error(f"❌ 无法解析提取流程：{exc}")
 
-        run_imported_workflow = st.button(
+        st.button(
             "🚀 按导入流程一键提取",
             type="primary",
             disabled=import_payload is None or import_workflow is None or bool(import_missing_cols),
             key="mf_run_imported_workflow",
+            on_click=_mark_mf_import_run_requested,
         )
+        # [保护] 由任务守护统一放行：排队重跑中直接读按钮返回值会重复触发提取
+        run_imported_workflow = bool(st.session_state.pop("_mf_import_allow", False))
 
         if run_imported_workflow:
             progress_bar = st.progress(0.0)
@@ -11493,7 +11585,13 @@ def page_molecular_features():
     col_btn1, col_btn2 = st.columns([1, 4])
 
     with col_btn1:
-        run_extraction = st.button("🚀 开始提取分子特征", type="primary")
+        st.button(
+            "🚀 开始提取分子特征",
+            type="primary",
+            on_click=_mark_molecular_feature_run_requested,
+        )
+        # [保护] 由任务守护统一放行：排队重跑中直接读按钮返回值会重复触发提取
+        run_extraction = bool(st.session_state.pop("_mf_extract_allow", False))
 
     with col_btn2:
         if st.button("🗑️ 清除已提取特征"):
@@ -12200,6 +12298,11 @@ def page_molecular_features():
                     "method": "batch",
                 }
                 st.success(f"🎉 批量提取完成！共从 {len(batch_smiles_cols)} 列提取了 {len(all_batch_feature_names)} 个特征（累计 {len(combined_mol_names)} 个分子特征）")
+                # [保护] 提取结果立即落盘快照：即使会话随后断开，恢复后特征也已持久化
+                try:
+                    _save_session_snapshot_async()
+                except Exception:
+                    pass
                 
                 # 显示特征预览
                 st.markdown("### 📋 提取的特征预览")
@@ -13371,6 +13474,11 @@ def page_molecular_features():
                 except Exception as workflow_error:
                     st.warning(f"⚠️ 分子特征流程记录失败：{workflow_error}")
                 st.success(f"✅ 成功提取 {len(features_df)} 个样本的 {features_df.shape[1]} 个分子特征")
+                # [保护] 提取结果立即落盘快照：即使会话随后断开，恢复后特征也已持久化
+                try:
+                    _save_session_snapshot_async()
+                except Exception:
+                    pass
                 progress_bar.progress(100)
                 try:
                     timing_text = " | ".join(

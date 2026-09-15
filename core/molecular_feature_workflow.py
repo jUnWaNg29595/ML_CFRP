@@ -222,10 +222,17 @@ def get_feature_component_column_options(
             ]
 
     opposite_role = "hardener" if target_role == "resin" else "resin"
+    # 选项列表契约：中立列（如 additive_smiles_*）需保留在手动选择列表中；
+    # 但派生输出列（crosslink_product_* / *_product_smiles 等）永远不是合法输入，
+    # 必须排除，否则成品会作为原料被重新提取（自引用污染）。
+    _DERIVED_OUTPUT_COL_RE = re.compile(
+        r"(crosslink_product|_product_smiles|_product_structure|product_bigsmiles)", re.I
+    )
     filtered = [
         column
         for column in base
-        if _feature_component_role_score(column, target_role)
+        if not _DERIVED_OUTPUT_COL_RE.search(str(column))
+        and _feature_component_role_score(column, target_role)
         >= _feature_component_role_score(column, opposite_role)
     ]
     return sorted(_feature_component_columns(filtered), key=_feature_component_natural_key)

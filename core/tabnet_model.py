@@ -129,6 +129,8 @@ class TabNetRegressor(BaseEstimator, RegressorMixin):
         }
 
         # 添加学习率调度器（如果未指定）
+        # 注意：torch>=2.4 已移除所有 lr_scheduler 的 verbose 参数，
+        # 传入 verbose 会导致 TypeError: ... got an unexpected keyword argument 'verbose'
         if self.scheduler_fn is None and self.scheduler_params is None:
             import torch
             model_params['scheduler_fn'] = torch.optim.lr_scheduler.ReduceLROnPlateau
@@ -137,14 +139,16 @@ class TabNetRegressor(BaseEstimator, RegressorMixin):
                 'factor': 0.5,
                 'patience': 10,
                 'min_lr': 1e-5,
-                'verbose': True
             }
         else:
             # 只在非None时添加这些参数
             if self.scheduler_fn is not None:
                 model_params['scheduler_fn'] = self.scheduler_fn
             if self.scheduler_params is not None:
-                model_params['scheduler_params'] = self.scheduler_params
+                # 过滤掉 verbose，兼容 torch>=2.4（旧配置文件里可能还带这个参数）
+                model_params['scheduler_params'] = {
+                    k: v for k, v in self.scheduler_params.items() if k != 'verbose'
+                }
 
         # 只在非None时添加optimizer_fn
         if self.optimizer_fn is not None:

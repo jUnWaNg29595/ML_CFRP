@@ -3,6 +3,13 @@
 address = "0.0.0.0"
 port = 8501
 
+# [保护] 断连会话保留时长（默认120秒）。切换窗口/短暂离开时避免会话被回收，
+# 长耗时的特征提取与模型训练不会因为离开一会儿就丢失进程。
+disconnectedSessionTTL = 3600
+
+# [性能] 启用 websocket 压缩：降低大表格/大页面传输与重连时的卡顿
+enableWebsocketCompression = true
+
 # 性能优化配置
 maxUploadSize = 500
 maxMessageSize = 500
