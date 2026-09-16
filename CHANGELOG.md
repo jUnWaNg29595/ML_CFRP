@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+### 修复
+- 模型训练页：点击下载按钮（训练结果 PNG/CSV、导出模型等）或任意控件后整页重跑，导致训练结果区（指标卡/图表/表格/各类下载按钮）整体消失，"点一下下载其他按钮都不见了"：
+  - 将手动训练结果渲染逻辑提取为 `_render_manual_training_results(res, cv_res, persist_run)`；训练完成时以 `persist_run=True` 调用（含保存训练记录、自动导出模型、内存清理等副作用），任何交互触发整页重跑后自动以 `persist_run=False` 恢复渲染（零副作用，不重复保存训练记录/不重复导出模型）
+  - 分类模型结果区同理：`_render_binary_classification_results` 新增 `persist_run` 参数，重跑恢复时跳过训练记录落盘
+  - 顺带修复：结果渲染代码引用了页面作用域从未定义的 `feature_cols`，NameError 被外层 `except` 静默吞掉，导致 parity/residual 图从未写入训练记录 extra_figs；现在显式从 session_state 取值
+
 ### 性能
 - TabPFN 等黑盒模型 SHAP 提速约两个数量级（实测 200 样本默认参数从外推 ~53 分钟降至 ~22 秒，RTX 2080 Ti）：
   - 新增「跨样本批量置换 SHAP」快速路径（`core/model_interpreter.py`）：每个样本每轮置换仅需 2M+1 次评估，并把一批样本的 coalition 行合并成少量大 batch 一次性调用 `model.predict`，避免 KernelExplainer 逐样本、每次都重跑 TabPFN 完整训练上下文前向（含 8 个 ensemble 成员）的开销

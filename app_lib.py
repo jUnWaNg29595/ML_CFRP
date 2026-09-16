@@ -3966,6 +3966,220 @@ def _cached_corr_with_target(df: pd.DataFrame, numeric_cols: tuple, target: str)
         return pd.Series(dtype=float)
     return df[cols].corrwith(df[target]).abs().sort_values(ascending=False)
 
+
+def _ensure_cjk_plot_font() -> None:
+    """为 matplotlib 配置可用的中文字体（Windows 常见中文字体优先），避免特征名显示为方框。"""
+    try:
+        from matplotlib import font_manager as _fm
+        preferred = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC",
+                     "Source Han Sans SC", "PingFang SC", "Arial Unicode MS"]
+        installed = {f.name for f in _fm.fontManager.ttflist}
+        chosen = [name for name in preferred if name in installed]
+        if chosen:
+            current = list(plt.rcParams.get("font.sans-serif", []))
+            plt.rcParams["font.sans-serif"] = chosen + [f for f in current if f not in chosen]
+        plt.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        pass
+
+
+def _wrap_tick_label(text: str, width: int = 12) -> str:
+    """将过长的坐标轴标签按宽度折行，避免相邻标签相互重叠。"""
+    text = str(text)
+    if len(text) <= width:
+        return text
+    try:
+        import textwrap
+        return "\n".join(textwrap.wrap(text, width=width, break_long_words=True))
+    except Exception:
+        return text
+
+
+_PEARSON_ANALYSIS_GUIDE = """
+**这张图怎么读？**
+
+- **a. 所有指标相关性矩阵**：每个气泡代表一对特征之间的 Pearson 相关系数 r（范围 −1 ~ 1）。
+    - **气泡越大，|r| 越大**（相关性越强）；🔴 红色 = 正相关，🔵 蓝色 = 负相关，与右侧色条一致。
+    - 星号为强度分级标记：`*` 表示 |r| > 0.3、`**` 表示 |r| > 0.5、`***` 表示 |r| > 0.7（衡量相关强度，**不是**统计显著性检验 p 值）。
+    - 对角线为特征与自身比较，r 恒等于 1。
+- **b. 高相关计数 (|r| ≥ 0.7)**：统计每个特征与其他特征之间强相关的对数（红 = 正相关，蓝 = 负相关）。**计数越高，说明该特征与其他特征的冗余越严重**。
+- **c. 筛选后的指标 (|r| < 0.7)**：从左到右保留“未与更靠前特征强相关”的特征，得到低冗余子集（每一组高相关特征只保留最先出现的一个）。
+
+**怎么用？**
+
+1. 先看 **b**：计数最高的特征最可能引入多重共线性，结合领域知识在强相关特征对中保留物理意义更明确的一个；
+2. 用 **c** 给出的低相关特征子集直接尝试建模，对 PLS / 线性回归 / 岭回归等模型更友好；
+3. 0.7 为常用经验阈值：树模型（随机森林、XGBoost 等）对共线性不敏感，可适当放宽；小样本高维数据建议更严格（如 0.6）；
+4. 更系统的特征筛选请前往【特征选择】页。
+"""
+
+
+def _draw_pearson_bubble_matrix(ax, corr_matrix: pd.DataFrame, label_width: int = 12,
+                                base_fontsize: float = 8.0, cmap=None, norm=None) -> None:
+    """在指定 Axes 上绘制 Pearson 相关性气泡矩阵。
+
+    气泡半径与 sqrt(|r|) 成正比（r=1 时约 0.42 个格宽，留出间隙避免相邻气泡重叠）；
+    颜色统一由 RdBu_r 色条决定（红 = 正相关，蓝 = 负相关），与 colorbar 保持一致；
+    星号为强度分级标记（|r|>0.3 → *，>0.5 → **，>0.7 → ***），并非 p 值显著性检验。
+    """
+    from matplotlib.patches import Circle
+
+    if cmap is None:
+        cmap = plt.get_cmap("RdBu_r")
+    if norm is None:
+        norm = plt.Normalize(vmin=-1, vmax=1)
+
+    n = len(corr_matrix)
+    fontsize = base_fontsize if n <= 25 else max(5.5, base_fontsize - 0.08 * (n - 25))
+    if n > 15:
+        # 特征较多时：y 轴标签多行折行会纵向重叠、x 轴标签折行后旋转 90° 也会横向挤压，
+        # 故统一改为单行截断（超出部分用 … 表示），保证标签互不重叠
+        y_labels = [str(c) if len(str(c)) <= label_width else str(c)[:label_width] + "…"
+                    for c in corr_matrix.columns]
+        x_labels = [str(c) if len(str(c)) <= 18 else str(c)[:18] + "…"
+                    for c in corr_matrix.columns]
+    else:
+        y_labels = [_wrap_tick_label(c, label_width) for c in corr_matrix.columns]
+        x_labels = y_labels
+
+    for i in range(n):
+        for j in range(n):
+            r = corr_matrix.iloc[i, j]
+            if pd.isna(r):
+                continue
+            r = float(r)
+            radius = max(0.42 * np.sqrt(abs(r)), 0.02)
+            ax.add_patch(Circle(
+                (j, n - 1 - i),
+                radius=radius,
+                facecolor=cmap(norm(r)),
+                edgecolor="#8a8a8a",
+                linewidth=0.5,
+            ))
+            if i == j:
+                ax.text(j, n - 1 - i, "1", ha="center", va="center",
+                        fontsize=fontsize - 1, color="white", fontweight="bold")
+                continue
+            abs_r = abs(r)
+            if abs_r > 0.7:
+                mark, mark_color = "***", "white"
+            elif abs_r > 0.5:
+                mark, mark_color = "**", "white"
+            elif abs_r > 0.3:
+                mark, mark_color = "*", "#333333"
+            else:
+                continue
+            ax.text(j, n - 1 - i, mark, ha="center", va="center",
+                    fontsize=fontsize, fontweight="bold", color=mark_color)
+
+    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_ylim(-0.5, n - 0.5)
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    # 特征较多时 45° 旋转的长标签会相互重叠并侵入 y 轴标签区域，改用 90° 垂直排布
+    if n > 15:
+        ax.set_xticklabels(x_labels, rotation=90, ha="center", fontsize=fontsize)
+    else:
+        ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=fontsize)
+    ax.set_yticklabels(y_labels[::-1], fontsize=fontsize)
+    ax.set_aspect("equal")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(length=0)
+    ax.grid(True, alpha=0.15, linestyle="--", linewidth=0.5)
+
+
+def _build_pearson_overview_figure(corr_matrix: pd.DataFrame, high_threshold: float = 0.7,
+                                   max_keep: int = 18):
+    """构建 Pearson 相关性综合分析三联图（气泡矩阵 + 高相关计数 + 指标筛选）。
+
+    布局使用 constrained_layout 自动分配子图间距，避免总标题、子图标题与轴标签互相重叠；
+    三个面板统一使用 RdBu_r 配色，保证气泡颜色与色条一致。
+    返回 (figure, features_to_keep)；有效特征不足 2 个时返回 (None, [])。
+    """
+    _ensure_cjk_plot_font()
+
+    corr_matrix = corr_matrix.dropna(how="all").dropna(axis=1, how="all")
+    n = len(corr_matrix)
+    if n < 2:
+        return None, []
+
+    cmap = plt.get_cmap("RdBu_r")
+    norm = plt.Normalize(vmin=-1, vmax=1)
+
+    fig = plt.figure(figsize=(14.0, 7.2), constrained_layout=True)
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.5, 0.95, 1.05])
+
+    # ---- a. 全量气泡矩阵 + 色条 ----
+    ax1 = fig.add_subplot(gs[0])
+    ax1.set_title("a. 所有指标相关性矩阵", fontsize=12.5, fontweight="bold", pad=10)
+    _draw_pearson_bubble_matrix(ax1, corr_matrix, cmap=cmap, norm=norm)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax1, fraction=0.046, pad=0.02)
+    cbar.set_label("Pearson r", fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+
+    # ---- b. 高相关计数 ----
+    ax2 = fig.add_subplot(gs[1])
+    ax2.set_title(f"b. 高相关计数\n(|r| ≥ {high_threshold})", fontsize=12, fontweight="bold", pad=10)
+    high_counts = {}
+    for col in corr_matrix.columns:
+        series = corr_matrix[col]
+        pos_count = int(((series >= high_threshold) & (series < 1.0)).sum())
+        neg_count = int((series <= -high_threshold).sum())
+        high_counts[col] = (pos_count, neg_count)
+    top_features = sorted(high_counts.items(), key=lambda kv: kv[1][0] + kv[1][1], reverse=True)[:15]
+    if not top_features or all((kv[1][0] + kv[1][1]) == 0 for kv in top_features):
+        ax2.text(0.5, 0.5, "无 |r| ≥ 0.7 的特征对", ha="center", va="center",
+                 transform=ax2.transAxes, fontsize=10, color="#666666")
+        ax2.set_xticks([])
+        ax2.set_yticks([])
+    else:
+        names = [_wrap_tick_label(kv[0], 16) for kv in top_features]
+        pos_vals = [kv[1][0] for kv in top_features]
+        neg_vals = [-kv[1][1] for kv in top_features]
+        y_pos = np.arange(len(names), dtype=float)
+        ax2.barh(y_pos, pos_vals, height=0.62, color="#C0392B",
+                 label=f"正相关 (r ≥ {high_threshold})")
+        ax2.barh(y_pos, neg_vals, height=0.62, color="#2E5FA3",
+                 label=f"负相关 (r ≤ -{high_threshold})")
+        for y, pv, nv in zip(y_pos, pos_vals, neg_vals):
+            if pv:
+                ax2.text(pv + 0.12, y, str(int(pv)), va="center", ha="left",
+                         fontsize=7.5, color="#C0392B")
+            if nv:
+                ax2.text(nv - 0.12, y, str(int(-nv)), va="center", ha="right",
+                         fontsize=7.5, color="#2E5FA3")
+        ax2.set_yticks(y_pos)
+        ax2.set_yticklabels(names, fontsize=8)
+        ax2.invert_yaxis()
+        ax2.axvline(0, color="black", linewidth=0.8)
+        ax2.set_xlabel("高相关特征对数量", fontsize=9)
+        ax2.tick_params(axis="x", labelsize=8)
+        ax2.margins(x=0.15)
+        ax2.legend(fontsize=7.5, loc="lower right", framealpha=0.9)
+        ax2.grid(axis="x", alpha=0.3, linestyle="--", linewidth=0.5)
+
+    # ---- c. 筛选后的低相关指标 ----
+    ax3 = fig.add_subplot(gs[2])
+    ax3.set_title(f"c. 筛选后的指标\n(剔除 |r| ≥ {high_threshold} 的冗余特征)",
+                  fontsize=12, fontweight="bold", pad=10)
+    triu_mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
+    high_corr_mask = (corr_matrix.abs() >= high_threshold) & triu_mask
+    features_to_keep = [col for col in corr_matrix.columns if not high_corr_mask[col].any()]
+    if len(features_to_keep) < 2:
+        mean_abs = corr_matrix.abs().mean(axis=1).sort_values()
+        features_to_keep = mean_abs.index[: max(2, min(8, n))].tolist()
+    features_to_keep = features_to_keep[:max_keep]
+    selected_corr = corr_matrix.loc[features_to_keep, features_to_keep]
+    _draw_pearson_bubble_matrix(ax3, selected_corr, label_width=10, base_fontsize=7.5,
+                                cmap=cmap, norm=norm)
+
+    fig.suptitle("Pearson 相关性综合分析：气泡矩阵 · 高相关计数 · 指标筛选",
+                 fontsize=14.5, fontweight="bold")
+    return fig, features_to_keep
+
 @st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: _df_cache_key})
 def _cached_distribution_fig(df: pd.DataFrame, max_cols: int = 15):
     explorer = EnhancedDataExplorer(df)
@@ -5664,164 +5878,41 @@ def page_data_explore():
                         "data_explore_correlation",
                     )
 
-                # ============ 新增：Pearson相关性综合分析 ============
+                # ============ Pearson相关性综合分析 ============
                 st.markdown("---")
                 st.markdown("### 📊 Pearson相关性综合分析")
 
                 if st.checkbox("显示综合相关性分析", value=False, key="show_pearson_analysis"):
                     try:
-                        import matplotlib.pyplot as plt
-                        import seaborn as sns
-                        from matplotlib.patches import Circle
+                        if len(selected_cols) > 30:
+                            st.warning(
+                                f"当前选择 {len(selected_cols)} 个特征，气泡矩阵的标签会比较拥挤；"
+                                "建议将上方“最多显示特征数”调整到 25~30 以内，或改用【按目标相关性Top-K】模式。"
+                            )
 
-                        # 计算相关性矩阵
                         corr_matrix = df_corr[selected_cols].corr()
+                        fig_pearson, features_to_keep = _build_pearson_overview_figure(corr_matrix)
 
-                        # 创建图表
-                        fig_pearson = plt.figure(figsize=(18, 6))
-                        gs = fig_pearson.add_gridspec(1, 3, width_ratios=[2, 1, 1.2], wspace=0.3)
+                        if fig_pearson is None:
+                            st.info("有效数值特征不足 2 个，无法绘制 Pearson 综合分析图。")
+                        else:
+                            _show_mpl_fig_fullwidth(fig_pearson)
+                            _render_figure_export_controls(
+                                fig_pearson,
+                                corr_matrix.reset_index(),
+                                "pearson_correlation",
+                                "data_explore_pearson",
+                            )
 
-                        # a. 所有指标相关性矩阵（气泡图）
-                        ax1 = fig_pearson.add_subplot(gs[0])
-                        ax1.set_title('a. All indicators', fontsize=12, fontweight='bold', pad=15)
+                            st.markdown("#### 📖 结果解读")
+                            st.markdown(_PEARSON_ANALYSIS_GUIDE)
 
-                        n = len(corr_matrix)
-                        for i in range(n):
-                            for j in range(n):
-                                corr_val = corr_matrix.iloc[i, j]
-
-                                # 圆圈大小和颜色
-                                size = abs(corr_val) * 500
-                                if corr_val > 0:
-                                    color = plt.cm.Blues(abs(corr_val))
-                                else:
-                                    color = plt.cm.Greens(abs(corr_val))
-
-                                circle = Circle((j, n-1-i), radius=np.sqrt(size)/50,
-                                              facecolor=color, edgecolor='white', linewidth=0.5)
-                                ax1.add_patch(circle)
-
-                                # 显著性标记
-                                if abs(corr_val) > 0.7 and i != j:
-                                    ax1.text(j, n-1-i, '***', ha='center', va='center',
-                                           fontsize=8, fontweight='bold')
-                                elif abs(corr_val) > 0.5 and i != j:
-                                    ax1.text(j, n-1-i, '**', ha='center', va='center',
-                                           fontsize=8)
-                                elif abs(corr_val) > 0.3 and i != j:
-                                    ax1.text(j, n-1-i, '*', ha='center', va='center',
-                                           fontsize=8)
-
-                        ax1.set_xlim(-0.5, n-0.5)
-                        ax1.set_ylim(-0.5, n-0.5)
-                        ax1.set_xticks(range(n))
-                        ax1.set_yticks(range(n))
-                        ax1.set_xticklabels(corr_matrix.columns, rotation=45, ha='right', fontsize=8)
-                        ax1.set_yticklabels(corr_matrix.columns[::-1], fontsize=8)
-                        ax1.set_aspect('equal')
-                        ax1.grid(True, alpha=0.2, linestyle='--')
-
-                        # 添加颜色条
-                        sm = plt.cm.ScalarMappable(cmap='RdBu_r', norm=plt.Normalize(vmin=-1, vmax=1))
-                        sm.set_array([])
-                        cbar = plt.colorbar(sm, ax=ax1, fraction=0.046, pad=0.04)
-                        cbar.set_label('Correlation', fontsize=9)
-
-                        # b. 高相关性计数（r ≥ 0.7）
-                        ax2 = fig_pearson.add_subplot(gs[1])
-                        ax2.set_title('b. High correlation counts\n(r ≥ 0.7)', fontsize=11, fontweight='bold', pad=15)
-
-                        # 统计每个特征的高相关性数量
-                        high_corr_counts = {}
-                        for col in corr_matrix.columns:
-                            pos_count = ((corr_matrix[col] >= 0.7) & (corr_matrix[col] < 1.0)).sum()
-                            neg_count = (corr_matrix[col] <= -0.7).sum()
-                            high_corr_counts[col] = {'positive': pos_count, 'negative': neg_count}
-
-                        # 排序
-                        sorted_features = sorted(high_corr_counts.items(),
-                                               key=lambda x: x[1]['positive'] + x[1]['negative'],
-                                               reverse=True)[:15]
-
-                        features = [f[0] for f in sorted_features]
-                        pos_counts = [f[1]['positive'] for f in sorted_features]
-                        neg_counts = [-f[1]['negative'] for f in sorted_features]
-
-                        y_pos = np.arange(len(features))
-                        ax2.barh(y_pos, pos_counts, color='#4A90E2', label='Positive (r ≥ 0.7)')
-                        ax2.barh(y_pos, neg_counts, color='#50C878', label='Negative (r ≤ -0.7)')
-
-                        ax2.set_yticks(y_pos)
-                        ax2.set_yticklabels([f[:15] for f in features], fontsize=8)
-                        ax2.set_xlabel('Count', fontsize=9)
-                        ax2.axvline(x=0, color='black', linewidth=0.8)
-                        ax2.legend(fontsize=8, loc='lower right')
-                        ax2.grid(axis='x', alpha=0.3, linestyle='--')
-
-                        # c. 筛选后的指标（r < 0.7）
-                        ax3 = fig_pearson.add_subplot(gs[2])
-                        ax3.set_title('c. Selected indicators\n(r < 0.7)', fontsize=11, fontweight='bold', pad=15)
-
-                        # 筛选低相关性的特征
-                        mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
-                        high_corr_mask = (np.abs(corr_matrix) >= 0.7) & mask
-
-                        # 找出需要保留的特征（没有高相关性的）
-                        features_to_keep = []
-                        for col in corr_matrix.columns:
-                            if not high_corr_mask[col].any():
-                                features_to_keep.append(col)
-
-                        if len(features_to_keep) < 2:
-                            features_to_keep = corr_matrix.columns[:min(8, len(corr_matrix.columns))].tolist()
-
-                        selected_corr = corr_matrix.loc[features_to_keep, features_to_keep]
-
-                        # 绘制筛选后的矩阵
-                        n_sel = len(selected_corr)
-                        for i in range(n_sel):
-                            for j in range(n_sel):
-                                corr_val = selected_corr.iloc[i, j]
-                                size = abs(corr_val) * 400
-
-                                if corr_val > 0:
-                                    color = plt.cm.Blues(abs(corr_val))
-                                else:
-                                    color = plt.cm.Greens(abs(corr_val))
-
-                                circle = Circle((j, n_sel-1-i), radius=np.sqrt(size)/40,
-                                              facecolor=color, edgecolor='white', linewidth=0.5)
-                                ax3.add_patch(circle)
-
-                                if abs(corr_val) > 0.5 and i != j:
-                                    ax3.text(j, n_sel-1-i, '**', ha='center', va='center',
-                                           fontsize=7)
-
-                        ax3.set_xlim(-0.5, n_sel-0.5)
-                        ax3.set_ylim(-0.5, n_sel-0.5)
-                        ax3.set_xticks(range(n_sel))
-                        ax3.set_yticks(range(n_sel))
-                        ax3.set_xticklabels([f[:10] for f in selected_corr.columns],
-                                           rotation=45, ha='right', fontsize=7)
-                        ax3.set_yticklabels([f[:10] for f in selected_corr.columns[::-1]], fontsize=7)
-                        ax3.set_aspect('equal')
-                        ax3.grid(True, alpha=0.2, linestyle='--')
-
-                        plt.suptitle('Pearson相关性分析 - 气泡热图 + 筛选指标',
-                                   fontsize=14, fontweight='bold', y=0.98)
-                        plt.tight_layout()
-
-                        st.pyplot(fig_pearson, width="stretch")
-                        _render_figure_export_controls(
-                            fig_pearson,
-                            corr_matrix.reset_index(),
-                            "pearson_correlation",
-                            "data_explore_pearson",
-                        )
-
-                        # 显示筛选建议
-                        st.info(f"💡 建议保留的低相关性特征（{len(features_to_keep)}个）: {', '.join(features_to_keep[:10])}")
-
+                            keep_preview = "、".join(features_to_keep[:10])
+                            keep_suffix = " …" if len(features_to_keep) > 10 else ""
+                            st.info(
+                                f"💡 筛选结果：建议保留 {len(features_to_keep)} 个低相关特征"
+                                f" → {keep_preview}{keep_suffix}"
+                            )
                     except Exception as e:
                         st.error(f"生成Pearson分析图失败: {e}")
 
@@ -14686,6 +14777,7 @@ def _render_binary_classification_results(
     cv_folds: int | None = None,
     cv_repeats: int | None = None,
     feature_contract_context: dict | None = None,
+    persist_run: bool = True,
 ):
     st.markdown("### 分类指标（Test）")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -14832,80 +14924,81 @@ def _render_binary_classification_results(
         if not oof_df.empty:
             extra_tables["cv_oof_predictions"] = oof_df
 
-    try:
-        manager = TrainingRunManager()
-        meta = {
-            "task_kind": "classification",
-            "model_name": model_name,
-            "target_col": target_col,
-            "accuracy": float(res.get("accuracy", 0.0)),
-            "balanced_accuracy": float(res.get("balanced_accuracy", 0.0)),
-            "precision": float(res.get("precision", 0.0)),
-            "recall": float(res.get("recall", 0.0)),
-            "f1": float(res.get("f1", 0.0)),
-            "train_accuracy": train_accuracy,
-            "train_precision": train_precision,
-            "train_recall": train_recall,
-            "train_f1": train_f1,
-            "roc_auc": None if res.get("roc_auc") is None or not np.isfinite(res.get("roc_auc")) else float(res.get("roc_auc")),
-            "log_loss": None if res.get("log_loss") is None or not np.isfinite(res.get("log_loss")) else float(res.get("log_loss")),
-            "train_time": float(res.get("train_time", 0.0)),
-            "split_strategy": str(res.get("split_strategy", "")),
-            "test_size": float(test_size),
-            "random_state": int(random_state),
-            "params": params or {},
-            "n_samples": int(len(res.get("y_train", [])) + len(res.get("y_test", []))),
-            "n_train": int(len(res.get("y_train", []))),
-            "n_test": int(len(res.get("y_test", []))),
-            "n_features": int(len(feature_cols or [])),
-            "class_labels": class_labels,
-            "positive_label": positive_label,
-        }
-        if cv_res is not None:
-            meta.update(
-                {
-                    "cv_strategy": str(cv_strategy or ""),
-                    "cv_folds": int(cv_folds or 0),
-                    "cv_repeats": int(cv_repeats or 0),
-                    "cv_accuracy_mean": float(cv_res.get("cv_accuracy_mean", 0.0)),
-                    "cv_accuracy_std": float(cv_res.get("cv_accuracy_std", 0.0)),
-                    "cv_f1_mean": float(cv_res.get("cv_f1_mean", 0.0)),
-                    "cv_f1_std": float(cv_res.get("cv_f1_std", 0.0)),
-                    "cv_roc_auc_mean": None if cv_res.get("cv_roc_auc_mean") is None or not np.isfinite(cv_res.get("cv_roc_auc_mean")) else float(cv_res.get("cv_roc_auc_mean")),
-                    "oof_accuracy": float(cv_res.get("oof_accuracy", 0.0)),
-                    "oof_f1": float(cv_res.get("oof_f1", 0.0)),
-                    "oof_roc_auc": None if cv_res.get("oof_roc_auc") is None or not np.isfinite(cv_res.get("oof_roc_auc")) else float(cv_res.get("oof_roc_auc")),
-                }
+    if persist_run:
+        try:
+            manager = TrainingRunManager()
+            meta = {
+                "task_kind": "classification",
+                "model_name": model_name,
+                "target_col": target_col,
+                "accuracy": float(res.get("accuracy", 0.0)),
+                "balanced_accuracy": float(res.get("balanced_accuracy", 0.0)),
+                "precision": float(res.get("precision", 0.0)),
+                "recall": float(res.get("recall", 0.0)),
+                "f1": float(res.get("f1", 0.0)),
+                "train_accuracy": train_accuracy,
+                "train_precision": train_precision,
+                "train_recall": train_recall,
+                "train_f1": train_f1,
+                "roc_auc": None if res.get("roc_auc") is None or not np.isfinite(res.get("roc_auc")) else float(res.get("roc_auc")),
+                "log_loss": None if res.get("log_loss") is None or not np.isfinite(res.get("log_loss")) else float(res.get("log_loss")),
+                "train_time": float(res.get("train_time", 0.0)),
+                "split_strategy": str(res.get("split_strategy", "")),
+                "test_size": float(test_size),
+                "random_state": int(random_state),
+                "params": params or {},
+                "n_samples": int(len(res.get("y_train", [])) + len(res.get("y_test", []))),
+                "n_train": int(len(res.get("y_train", []))),
+                "n_test": int(len(res.get("y_test", []))),
+                "n_features": int(len(feature_cols or [])),
+                "class_labels": class_labels,
+                "positive_label": positive_label,
+            }
+            if cv_res is not None:
+                meta.update(
+                    {
+                        "cv_strategy": str(cv_strategy or ""),
+                        "cv_folds": int(cv_folds or 0),
+                        "cv_repeats": int(cv_repeats or 0),
+                        "cv_accuracy_mean": float(cv_res.get("cv_accuracy_mean", 0.0)),
+                        "cv_accuracy_std": float(cv_res.get("cv_accuracy_std", 0.0)),
+                        "cv_f1_mean": float(cv_res.get("cv_f1_mean", 0.0)),
+                        "cv_f1_std": float(cv_res.get("cv_f1_std", 0.0)),
+                        "cv_roc_auc_mean": None if cv_res.get("cv_roc_auc_mean") is None or not np.isfinite(cv_res.get("cv_roc_auc_mean")) else float(cv_res.get("cv_roc_auc_mean")),
+                        "oof_accuracy": float(cv_res.get("oof_accuracy", 0.0)),
+                        "oof_f1": float(cv_res.get("oof_f1", 0.0)),
+                        "oof_roc_auc": None if cv_res.get("oof_roc_auc") is None or not np.isfinite(cv_res.get("oof_roc_auc")) else float(cv_res.get("oof_roc_auc")),
+                    }
+                )
+            effective_feature_cols = _resolve_effective_feature_cols(
+                train_result=res,
+                selected_feature_cols=feature_cols,
+                model=res.get("model"),
+                pipeline=res.get("pipeline"),
+            )[0] or list(feature_cols or [])
+            summary = manager.save_run(
+                model_name=model_name,
+                metadata=meta,
+                history_df=None,
+                curve_fig=None,
+                extra_figs=extra_figs,
+                extra_tables=extra_tables,
+                model=res.get("model"),
+                pipeline=res.get("pipeline"),
+                scaler=res.get("scaler"),
+                imputer=res.get("imputer"),
+                feature_cols=effective_feature_cols,
+                target_col=target_col,
+                extra={
+                    **_current_molecular_feature_artifact_extra(),
+                    **_current_melting_point_artifact_extra(target_col),
+                },
+                contract_context=feature_contract_context,
             )
-        effective_feature_cols = _resolve_effective_feature_cols(
-            train_result=res,
-            selected_feature_cols=feature_cols,
-            model=res.get("model"),
-            pipeline=res.get("pipeline"),
-        )[0] or list(feature_cols or [])
-        summary = manager.save_run(
-            model_name=model_name,
-            metadata=meta,
-            history_df=None,
-            curve_fig=None,
-            extra_figs=extra_figs,
-            extra_tables=extra_tables,
-            model=res.get("model"),
-            pipeline=res.get("pipeline"),
-            scaler=res.get("scaler"),
-            imputer=res.get("imputer"),
-            feature_cols=effective_feature_cols,
-            target_col=target_col,
-            extra={
-                **_current_molecular_feature_artifact_extra(),
-                **_current_melting_point_artifact_extra(target_col),
-            },
-            contract_context=feature_contract_context,
-        )
-        st.session_state.last_training_run_id = summary.run_id
-        st.caption(f"已保存训练记录：{summary.run_id}")
-    except Exception as save_exc:
-        st.warning(f"训练记录保存失败：{save_exc}")
+            st.session_state.last_training_run_id = summary.run_id
+            st.caption(f"已保存训练记录：{summary.run_id}")
+        except Exception as save_exc:
+            st.warning(f"训练记录保存失败：{save_exc}")
 
 def _lock_current_training_contract(frame, feature_cols, target_col, workflow=None):
     """Resolve and freeze the approved registry/manifest for one training session."""
@@ -16194,6 +16287,758 @@ def page_model_training():
 
     st.markdown("---")
 
+    def _render_manual_training_results(res, cv_res, persist_run=False):
+        """渲染手动训练结果区（指标卡 / 图表 / 表格 / 各类下载按钮）。
+
+        persist_run=True：训练刚完成，额外保存训练记录、自动导出模型并做内存清理；
+        persist_run=False：下载等交互触发整页重跑后恢复展示，只渲染 UI，零副作用，
+        不会重复保存训练记录或重复导出模型文件。
+        """
+        st.session_state["_manual_training_results_rendered"] = True
+        # [修复] 页面作用域从未定义过 feature_cols，原代码在 extra_tables 处引用会抛
+        # NameError 并被外层 except 吞掉，导致 parity/residual 图从未写入训练记录；
+        # 此处显式从 session_state 取值，顺带修复该问题。
+        feature_cols = st.session_state.get('feature_cols') or []
+        y_pred_test = res['y_pred_test'] if 'y_pred_test' in res else res.get('y_pred')
+
+        extra_figs = {}
+        extra_tables = {}
+        fig_parity = None
+        fig_paper = None
+        fig_oof = None
+        fig_resid = None
+        pred_test_df = None
+        pred_train_df = None
+        paper_export_df = None
+        oof_df = None
+
+        # --- 指标 ---
+        st.markdown("### 📌 单次划分（Test）指标")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("R² (Test)", f"{res['r2']:.4f}")
+        m2.metric("RMSE (Test)", f"{res['rmse']:.4f}")
+        m3.metric("MAE (Test)", f"{res['mae']:.4f}")
+        m4.metric("Train Time (s)", f"{res.get('train_time', 0):.2f}")
+        if res.get("best_iteration") is not None:
+            st.caption(f"Early stopping: best_iter={res.get('best_iteration')} | best_score={res.get('best_score')}")
+
+        # 内部验证集（早停）指标卡片
+        validation_set_info = res.get("validation_set") or {}
+        if validation_set_info:
+            _vs_metrics = validation_set_info.get("metrics") or {}
+            _vs_effective = str(validation_set_info.get("effective", "off"))
+            _vs_mode_labels = {"auto": "自动启用", "custom": "自定义启用", "off": "未启用"}
+            st.markdown("### 🧪 内部验证集（早停）")
+            _vs_c1, _vs_c2, _vs_c3, _vs_c4 = st.columns(4)
+            _vs_c1.metric(
+                "状态",
+                _vs_mode_labels.get(_vs_effective, _vs_effective),
+            )
+            _vs_c2.metric("验证样本数", str(validation_set_info.get("sample_count", 0) or 0))
+            if _vs_metrics:
+                _vs_c3.metric("验证 R²", f"{float(_vs_metrics.get('r2', float('nan'))):.4f}")
+                _vs_c4.metric("验证 RMSE", f"{float(_vs_metrics.get('rmse', float('nan'))):.4f}")
+            else:
+                _vs_c3.metric("验证 R²", "-")
+                _vs_c4.metric("验证 RMSE", "-")
+            if validation_set_info.get("reason"):
+                st.warning(f"⚠️ {validation_set_info.get('reason')}")
+            elif _vs_effective != "off":
+                _vs_note_parts = [
+                    f"从训练集内部划出 {float(validation_set_info.get('val_size') or 0):.0%}"
+                    "（自动模式：训练样本 ≥ 20 条时划出 15%），仅用于早停与训练曲线，测试集评估不受影响。"
+                ]
+                if validation_set_info.get("best_iteration") is not None:
+                    _vs_note_parts.append(f"模型最优迭代轮次：{validation_set_info.get('best_iteration')}。")
+                st.caption(" ".join(_vs_note_parts))
+
+        balance_result = res.get("target_balance") or {}
+        if balance_result:
+            method_labels = {
+                "sample_weight": "sample_weight 直接加权",
+                "weighted_resample": "训练集内分层加权抽样",
+                "disabled": "未应用（样本不足或无法分箱）",
+            }
+            st.markdown("### ⚖️ 目标分布平衡诊断")
+            st.write(
+                f"实际方式：{method_labels.get(balance_result.get('method'), balance_result.get('method', '未知'))}；"
+                f"训练样本：{balance_result.get('train_sample_count', 0)}；"
+                f"拟合样本：{balance_result.get('fit_sample_count', 0)}；"
+                f"内部验证样本：{balance_result.get('early_stopping_validation_count', 0)}"
+            )
+            if balance_result.get("fallback_reason"):
+                st.warning(f"目标平衡未完全应用：{balance_result['fallback_reason']}")
+            interval_metrics = res.get("test_bin_metrics") or []
+            if interval_metrics:
+                display_interval_metrics = pd.DataFrame(interval_metrics).rename(
+                    columns={
+                        "bin": "目标区间",
+                        "sample_count": "样本数",
+                        "r2": "R²",
+                        "rmse": "RMSE",
+                        "mae": "MAE",
+                    }
+                )
+                st.dataframe(
+                    display_interval_metrics,
+                    width="stretch",
+                    hide_index=True,
+                )
+
+        st.markdown("### 🖼️ 论文风结果图")
+        try:
+            if fig_paper is None:
+                visualizer = Visualizer()
+                fig_paper, paper_export_df, _ = visualizer.plot_paper_style_parity_train_test(
+                    res.get('y_train', []),
+                    res.get('y_pred_train', []),
+                    res.get('y_test', []),
+                    y_pred_test,
+                    target_name=target_col,
+                )
+            _show_mpl_fig_fullwidth(fig_paper)
+            paper_png_bytes = fig_to_png_bytes(fig_paper)
+            paper_csv_bytes = b""
+            if paper_export_df is not None and not paper_export_df.empty:
+                paper_csv_bytes = paper_export_df.to_csv(index=False).encode("utf-8-sig")
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button(
+                    "📥 下载论文风图 PNG",
+                    data=paper_png_bytes,
+                    file_name=f"{model_name}_paper_style_parity.png",
+                    mime="image/png",
+                )
+            with dl2:
+                st.download_button(
+                    "📥 下载论文风图 CSV",
+                    data=paper_csv_bytes,
+                    file_name=f"{model_name}_paper_style_parity.csv",
+                    mime="text/csv",
+                    disabled=not bool(paper_csv_bytes),
+                )
+        except Exception as e:
+            st.info(f"论文风结果图生成失败，已跳过：{e}")
+
+        fold_df = None
+        if cv_res is not None:
+            st.markdown("### 🧪 交叉验证（CV）指标")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("CV R² (mean±std)", f"{cv_res['cv_r2_mean']:.4f} ± {cv_res['cv_r2_std']:.4f}")
+            c2.metric("OOF RMSE", f"{cv_res['oof_rmse']:.4f}")
+            c3.metric("OOF MAE", f"{cv_res['oof_mae']:.4f}")
+
+            # 折分数表
+            fold_df = pd.DataFrame({
+                "fold_r2": cv_res.get("fold_r2", []),
+                "fold_rmse": cv_res.get("fold_rmse", []),
+                "fold_mae": cv_res.get("fold_mae", []),
+            })
+            st.dataframe(fold_df, width="stretch", height=200)
+            fold_balance_df = pd.DataFrame(cv_res.get("fold_target_balance", []))
+            if not fold_balance_df.empty:
+                fold_balance_columns = [
+                    column
+                    for column in [
+                        "method",
+                        "fit_sample_count",
+                        "train_sample_count",
+                        "fallback_reason",
+                    ]
+                    if column in fold_balance_df.columns
+                ]
+                if fold_balance_columns:
+                    st.caption("各折目标平衡方式")
+                    st.dataframe(
+                        fold_balance_df[fold_balance_columns],
+                        width="stretch",
+                        hide_index=True,
+                    )
+
+        def _compute_metrics(y_true, y_pred):
+            try:
+                y_true_arr = np.asarray(y_true).ravel()
+                y_pred_arr = np.asarray(y_pred).ravel()
+                mask = np.isfinite(y_true_arr) & np.isfinite(y_pred_arr)
+                y_true_arr = y_true_arr[mask]
+                y_pred_arr = y_pred_arr[mask]
+                if y_true_arr.size == 0:
+                    return {}
+                return {
+                    "r2": float(r2_score(y_true_arr, y_pred_arr)),
+                    "rmse": float(np.sqrt(mean_squared_error(y_true_arr, y_pred_arr))),
+                    "mae": float(mean_absolute_error(y_true_arr, y_pred_arr)),
+                }
+            except Exception:
+                return {}
+
+        train_metrics = _compute_metrics(res.get('y_train', []), res.get('y_pred_train', []))
+        test_metrics = _compute_metrics(res.get('y_test', []), y_pred_test)
+
+        melting_point_metrics = None
+        if str(target_col or '').strip() == 'mp_c':
+            try:
+                from core.melting_point_training import build_melting_point_split_metrics
+
+                melting_point_metrics = build_melting_point_split_metrics(
+                    df,
+                    train_indices=res.get('train_indices'),
+                    test_indices=res.get('test_indices'),
+                    y_train=res.get('y_train', []),
+                    y_pred_train=res.get('y_pred_train', []),
+                    y_test=res.get('y_test', []),
+                    y_pred_test=y_pred_test,
+                )
+                st.session_state["melting_point_metrics"] = melting_point_metrics
+                extra_tables['melting_point_split_metrics'] = pd.DataFrame(
+                    [
+                        {
+                            'split': split_name,
+                            'subset': 'overall',
+                            **(split_payload.get('metrics') or {}),
+                        }
+                        for split_name, split_payload in melting_point_metrics.items()
+                        if isinstance(split_payload, dict) and 'metrics' in split_payload
+                    ]
+                )
+                st.markdown('### 🌡️ 熔点分层指标（°C）')
+                metric_rows = []
+                for split_name in ('train', 'test'):
+                    split_payload = melting_point_metrics.get(split_name) or {}
+                    overall = split_payload.get('metrics') or {}
+                    metric_rows.append({
+                        '数据集': '训练集' if split_name == 'train' else '测试集',
+                        '有效样本数': overall.get('n', 0),
+                        'MAE': overall.get('mae'),
+                        'RMSE': overall.get('rmse'),
+                        'R²': overall.get('r2'),
+                    })
+                    for role, values in (split_payload.get('roles') or {}).items():
+                        metric_rows.append({
+                            '数据集': f"{'训练集' if split_name == 'train' else '测试集'} / 角色:{role}",
+                            '有效样本数': values.get('n', 0),
+                            'MAE': values.get('mae'),
+                            'RMSE': values.get('rmse'),
+                            'R²': values.get('r2'),
+                        })
+                    for hardener_class, values in (split_payload.get('hardener_classes') or {}).items():
+                        metric_rows.append({
+                            '数据集': f"{'训练集' if split_name == 'train' else '测试集'} / 固化剂:{hardener_class}",
+                            '有效样本数': values.get('n', 0),
+                            'MAE': values.get('mae'),
+                            'RMSE': values.get('rmse'),
+                            'R²': values.get('r2'),
+                        })
+                if metric_rows:
+                    st.dataframe(pd.DataFrame(metric_rows), width='stretch', hide_index=True)
+            except Exception as melting_point_metric_error:
+                st.warning(f'熔点分层指标生成失败，已保留总体指标：{melting_point_metric_error}')
+
+        try:
+            pred_test_df = pd.DataFrame({
+                "y_true": res.get('y_test', []),
+                "y_pred": y_pred_test,
+            })
+            pred_test_df["residual"] = pred_test_df["y_true"] - pred_test_df["y_pred"]
+
+            # 不再将全部特征列拷贝到预测结果中（13000x160 会导致内存翻倍和 Streamlit 崩溃）
+
+            pred_train_df = pd.DataFrame({
+                "y_true": res.get('y_train', []),
+                "y_pred": res.get('y_pred_train', []),
+            })
+            pred_train_df["residual"] = pred_train_df["y_true"] - pred_train_df["y_pred"]
+
+            extra_tables["predictions_test"] = pred_test_df
+            extra_tables["predictions_train"] = pred_train_df
+            extra_tables.update(
+                _build_split_snapshot_tables(
+                    res.get('X_train'),
+                    res.get('X_test'),
+                    res.get('y_train'),
+                    res.get('y_test'),
+                    # [关键修复] 此处原引用未定义的 feature_cols 变量，触发 NameError
+                    # 且被 except 静默吞掉，导致训练记录从未保存 split_X_train.csv，
+                    # 后续从训练记录加载模型做 SHAP 时无法恢复带真实列名的切分数据。
+                    # 改为使用训练结果 X_train 的真实列名（与快照数据严格同宽）。
+                    feature_cols=(
+                        list(res['X_train'].columns)
+                        if isinstance(res.get('X_train'), pd.DataFrame)
+                        else None
+                    ),
+                    target_col=target_col,
+                    X_train_raw=res.get('X_train_raw'),
+                    X_test_raw=res.get('X_test_raw'),
+                )
+            )
+
+            if fold_df is not None and not fold_df.empty:
+                extra_tables["cv_folds"] = fold_df
+
+            if cv_res is not None and "oof_true" in cv_res and "oof_pred" in cv_res:
+                oof_df = pd.DataFrame({
+                    "y_true": cv_res.get("oof_true", []),
+                    "y_pred": cv_res.get("oof_pred", []),
+                })
+                oof_df["residual"] = oof_df["y_true"] - oof_df["y_pred"]
+                extra_tables["cv_oof_predictions"] = oof_df
+
+            if feature_cols:
+                extra_tables["feature_cols"] = pd.DataFrame({"feature": list(feature_cols)})
+
+            visualizer = Visualizer()
+            fig_parity, _ = visualizer.plot_parity_train_test(
+                res.get('y_train', []),
+                res.get('y_pred_train', []),
+                res.get('y_test', []),
+                y_pred_test,
+                target_name=target_col,
+            )
+            fig_paper, paper_export_df, _ = visualizer.plot_paper_style_parity_train_test(
+                res.get('y_train', []),
+                res.get('y_pred_train', []),
+                res.get('y_test', []),
+                y_pred_test,
+                target_name=target_col,
+            )
+            fig_resid, _ = visualizer.plot_residuals(
+                res.get('y_test', []),
+                y_pred_test,
+                model_name=model_name,
+            )
+            if cv_res is not None and "oof_true" in cv_res and "oof_pred" in cv_res:
+                fig_oof, _ = visualizer.plot_predictions_vs_true(
+                    cv_res.get("oof_true", []),
+                    cv_res.get("oof_pred", []),
+                    model_name=f"{model_name} (OOF)",
+                )
+
+            if fig_parity is not None:
+                extra_figs["parity_train_test"] = fig_parity
+            if fig_paper is not None:
+                extra_figs["paper_style_parity"] = fig_paper
+            if fig_resid is not None:
+                extra_figs["residuals_test"] = fig_resid
+            if fig_oof is not None:
+                extra_figs["parity_oof"] = fig_oof
+        except Exception:
+            pass
+
+        # --- [增强] 所有模型的训练曲线 + 训练记录落盘 ---
+        try:
+            history = res.get('training_history') or {}
+            fig_curve, hist_export_df = plot_history(history, title=f"{model_name} Training Curves")
+
+            st.markdown("### 📉 训练曲线（统一科研级风格）")
+            _show_mpl_fig_fullwidth(fig_curve)
+
+            if hist_export_df is not None and not hist_export_df.empty:
+                with st.expander("🧾 查看训练曲线数据", expanded=False):
+                    st.dataframe(hist_export_df, width="stretch", height=240)
+                    st.download_button(
+                        "📥 导出训练曲线 CSV",
+                        hist_export_df.to_csv(index=False).encode("utf-8-sig"),
+                        f"{model_name}_training_history.csv",
+                        "text/csv",
+                        key="download_training_history_csv",
+                    )
+
+            # --- [优化] PCA 适用域与降维分布可视化（默认折叠/按需渲染，提升主流程加载速度） ---
+            st.markdown("### 🌐 PCA 适用域与化学空间分布")
+            show_pca_plot = st.checkbox(
+                "📈 展开并渲染 PCA 适用域与化学空间分布图",
+                value=False,
+                key=f"show_pca_plot_trained_{model_name}",
+                help="勾选后现场执行 PCA 降维并绘制 2D 化学空间凸包（Applicability Domain）与方差贡献图；默认折叠以保持页面轻量流畅。",
+            )
+            if show_pca_plot:
+                try:
+                    from core.applicability_domain import ApplicabilityDomainAnalyzer
+
+                    # 获取训练集数据
+                    X_train_for_pca = res.get('X_train')
+                    y_train_for_pca = res.get('y_train')
+
+                    if X_train_for_pca is not None and len(X_train_for_pca) > 3:
+                        with st.spinner("正在计算主成分并渲染 PCA 适用域分布图..."):
+                            pca_analyzer = ApplicabilityDomainAnalyzer(X_train_for_pca, n_components=2)
+                            pca_analyzer.fit()
+
+                            fig_pca = pca_analyzer.visualize_domain(X_new=None, y_train=y_train_for_pca, figsize=(12, 7.5))
+                            _show_mpl_fig_fullwidth(fig_pca)
+
+                            st.caption("💡 PCA适用域可视化展示训练数据在低维空间的分布，凸包表示模型可靠适用域（Applicability Domain），颜色表示目标值大小。")
+                    else:
+                        st.info("训练样本数量不足，跳过 PCA 可视化")
+                except Exception as e:
+                    st.warning(f"PCA 可视化生成失败: {e}")
+            else:
+                st.caption("💡 提示：如需查看训练集在二维主成分空间的聚类与适用域凸包边界，请勾选上方开关展开渲染。")
+
+            # 保存一次训练 Run（指标+参数+曲线）
+            if persist_run:
+                manager = TrainingRunManager()
+                best_score = res.get("best_score")
+                try:
+                    if best_score is not None:
+                        best_score = float(best_score)
+                except Exception:
+                    pass
+                meta = {
+                    "model_name": model_name,
+                    "r2": float(res.get('r2', 0)),
+                    "rmse": float(res.get('rmse', 0)),
+                    "mae": float(res.get('mae', 0)),
+                    "train_r2": train_metrics.get("r2"),
+                    "train_rmse": train_metrics.get("rmse"),
+                    "train_mae": train_metrics.get("mae"),
+                    "test_r2": test_metrics.get("r2"),
+                    "test_rmse": test_metrics.get("rmse"),
+                    "test_mae": test_metrics.get("mae"),
+                    "train_time": float(res.get('train_time', 0)),
+                    "split_strategy": str(res.get('split_strategy', '')),
+                    "test_size": float(test_size),
+                    "random_state": int(random_state),
+                    "params": params or {},
+                    "n_samples": int(len(res.get('y_train', [])) + len(res.get('y_test', []))),
+                    "n_train": int(len(res.get('y_train', []))),
+                    "n_test": int(len(res.get('y_test', []))),
+                    "n_features": int(len(st.session_state.get('feature_cols') or [])),
+                    "target_col": target_col,
+                    "best_iteration": res.get("best_iteration"),
+                    "best_score": best_score,
+                    "val_mode": str((res.get("validation_set") or {}).get("mode", val_mode)),
+                    "val_effective": str((res.get("validation_set") or {}).get("effective", "off")),
+                    "val_size": float((res.get("validation_set") or {}).get("val_size", 0.0) or 0.0),
+                    "val_sample_count": int((res.get("validation_set") or {}).get("sample_count", 0) or 0),
+                }
+                if melting_point_metrics is not None:
+                    meta['melting_point_metrics'] = melting_point_metrics
+                    meta['melting_point_train_indices'] = list(
+                        (melting_point_metrics.get('train') or {}).get('positions') or []
+                    )
+                    meta['melting_point_test_indices'] = list(
+                        (melting_point_metrics.get('test') or {}).get('positions') or []
+                    )
+                    try:
+                        from core.melting_point_screening import build_melting_point_artifact_extra
+
+                        mp_quality_policy = (
+                            'high_quality_and_optional_low_quality'
+                            if has_melting_point_handoff and include_low_quality
+                            else 'high_quality_only'
+                        )
+                        workflow_value = st.session_state.get('molecular_feature_workflow')
+                        workflow_hash = (
+                            workflow_value.get('workflow_hash')
+                            if isinstance(workflow_value, dict)
+                            else getattr(workflow_value, 'workflow_hash', None)
+                        )
+                        meta['melting_point_source'] = build_melting_point_artifact_extra(
+                            df,
+                            workflow_hash=workflow_hash,
+                            quality_policy=mp_quality_policy,
+                        )
+                    except Exception:
+                        meta['melting_point_source'] = {
+                            'dataset_row_count': int(len(df)),
+                            'quality_policy': mp_quality_policy,
+                        }
+                if cv_res is not None:
+                    meta.update(
+                        {
+                            "cv_strategy": str(cv_strategy),
+                            "cv_folds": int(cv_folds),
+                            "cv_repeats": int(cv_repeats),
+                            "cv_r2_mean": float(cv_res.get("cv_r2_mean", 0)),
+                            "cv_r2_std": float(cv_res.get("cv_r2_std", 0)),
+                            "oof_rmse": float(cv_res.get("oof_rmse", 0)),
+                            "oof_mae": float(cv_res.get("oof_mae", 0)),
+                            "fold_r2": [float(v) for v in cv_res.get("fold_r2", [])],
+                            "fold_rmse": [float(v) for v in cv_res.get("fold_rmse", [])],
+                            "fold_mae": [float(v) for v in cv_res.get("fold_mae", [])],
+                        }
+                    )
+                effective_feature_cols = _resolve_effective_feature_cols(
+                    train_result=res,
+                    selected_feature_cols=st.session_state.get('feature_cols') or [],
+                    model=res.get('model'),
+                    pipeline=res.get('pipeline'),
+                )[0] or list(st.session_state.get('feature_cols') or [])
+                summary = manager.save_run(
+                    model_name=model_name,
+                    metadata=meta,
+                    history_df=hist_export_df,
+                    curve_fig=fig_curve,
+                    extra_figs=extra_figs,
+                    extra_tables=extra_tables,
+                    model=res.get('model'),
+                    pipeline=res.get('pipeline'),
+                    scaler=res.get('scaler'),
+                    imputer=res.get('imputer'),
+                    feature_cols=effective_feature_cols,
+                    target_col=target_col,
+                    extra={**_current_molecular_feature_artifact_extra(), **_current_melting_point_artifact_extra(target_col)},
+                    contract_context=training_feature_contract_context,
+                )
+                st.session_state.last_training_run_id = summary.run_id
+                st.caption(f"🗂️ 已保存训练记录: {summary.run_id}（可在【📈 训练记录】查看）")
+
+                # --- [新增] 训练完成后自动导出模型文件 + 分子特征提取流程 ---
+                st.session_state.last_export_model_path = None
+                st.session_state.last_export_feature_process_path = None
+                st.session_state.last_export_model_bytes = None
+                st.session_state.last_export_feature_process_bytes = None
+                st.session_state.last_export_status = {
+                    "ok": False,
+                    "state": "in_progress",
+                    "run_id": summary.run_id if summary else None,
+                }
+                try:
+                    from core.model_io import (
+                        create_model_artifact_bytes,
+                        process_pls_to_artifact_extra,
+                        workflow_to_artifact_extra,
+                    )
+                    import datetime
+
+                    # 组装 extra 信息：用于加载模型时提示需要哪些特征/分子特征流程
+                    _extra = {
+                        'app_name': APP_NAME,
+                        'app_version': VERSION,
+                        'exported_at': datetime.datetime.now().isoformat(),
+                        'training_run_id': summary.run_id if summary else None,
+                        'compute_device_pref': st.session_state.get('compute_device', 'auto'),
+                        'molecular_feature_config': st.session_state.get('molecular_feature_config'),
+                        'molecular_feature_workflow': st.session_state.get('molecular_feature_workflow'),
+                        'molecular_feature_trace': st.session_state.get('molecular_feature_trace', []),
+                        'post_feature_mapping_default': st.session_state.get('post_feature_mapping_default'),
+                        'feature_mask': (
+                            _coerce_feature_mask(
+                                st.session_state.get('feature_mask')
+                            ).tolist()
+                            if _coerce_feature_mask(
+                                st.session_state.get('feature_mask')
+                            ) is not None
+                            else None
+                        ),
+                    }
+                    _extra.update(
+                        workflow_to_artifact_extra(
+                            st.session_state.get('molecular_feature_workflow')
+                        )
+                    )
+                    _extra.update(
+                        process_pls_to_artifact_extra(
+                            st.session_state.get('process_pls_workflow')
+                        )
+                    )
+                    # 如果有 FE tracker，也一并导出
+                    _tracker = st.session_state.get('fe_tracker', None)
+                    if _tracker is not None:
+                        try:
+                            _extra['feature_engineering_log'] = json.loads(_tracker.export_log_to_json())
+                        except Exception:
+                            _extra['feature_engineering_log'] = _tracker.export_log()
+                    _extra['effective_feature_cols'] = effective_feature_cols
+                    _extra.update(_current_melting_point_artifact_extra(target_col))
+                    _tr = st.session_state.get("train_result") or {}
+                    _processed_ref = st.session_state.get("processed_data")
+                    if _processed_ref is None:
+                        _processed_ref = st.session_state.get("data")
+                    _extra.update(
+                        _build_screening_reference_export(
+                            _tr,
+                            effective_feature_cols,
+                            session_x_train_raw=st.session_state.get("X_train_raw"),
+                            session_x_train=st.session_state.get("X_train"),
+                            processed_data=_processed_ref,
+                            target_col=target_col,
+                            molecular_feature_config=st.session_state.get("molecular_feature_config"),
+                        )
+                    )
+
+                    # [关键修复] 使用get_current_model()获取模型
+                    current_model = get_current_model()
+                    model_bytes = create_model_artifact_bytes(
+                        model=current_model,
+                        pipeline=st.session_state.get('pipeline', None),
+                        feature_cols=effective_feature_cols,
+                        target_col=target_col,
+                        model_name=model_name,
+                        extra=_extra,
+                        contract_context=training_feature_contract_context,
+                    )
+
+                    run_dir = summary.path if summary else manager.base_dir
+                    os.makedirs(run_dir, exist_ok=True)
+                    safe_name = ''.join([c if c.isalnum() else '_' for c in str(model_name)])
+                    export_model_path = os.path.join(run_dir, f"model_{safe_name}.joblib")
+                    with open(export_model_path, 'wb') as f:
+                        f.write(model_bytes)
+
+                    # 分子特征/特征列流程导出
+                    process_payload = {
+                        'app_name': APP_NAME,
+                        'app_version': VERSION,
+                        'exported_at': datetime.datetime.now().isoformat(),
+                        'training_run_id': summary.run_id if summary else None,
+                        'model_name': model_name,
+                        'target_col': target_col,
+                        'required_features': effective_feature_cols,
+                        'molecular_feature_config': st.session_state.get('molecular_feature_config'),
+                        'molecular_feature_workflow': st.session_state.get('molecular_feature_workflow'),
+                        'molecular_feature_trace': st.session_state.get('molecular_feature_trace', []),
+                        'post_feature_mapping_default': st.session_state.get('post_feature_mapping_default'),
+                        'feature_mask': (
+                            _coerce_feature_mask(
+                                st.session_state.get('feature_mask')
+                            ).tolist()
+                            if _coerce_feature_mask(
+                                st.session_state.get('feature_mask')
+                            ) is not None
+                            else None
+                        ),
+                    }
+                    process_payload.update(_current_melting_point_artifact_extra(target_col))
+                    process_payload.update(
+                        workflow_to_artifact_extra(
+                            st.session_state.get('molecular_feature_workflow')
+                        )
+                    )
+                    process_payload.update(
+                        process_pls_to_artifact_extra(
+                            st.session_state.get('process_pls_workflow')
+                        )
+                    )
+                    process_bytes = json.dumps(process_payload, ensure_ascii=False, indent=2).encode('utf-8')
+                    export_proc_path = os.path.join(run_dir, 'feature_process.json')
+                    with open(export_proc_path, 'wb') as f:
+                        f.write(process_bytes)
+
+                    st.session_state.last_export_model_path = export_model_path
+                    st.session_state.last_export_feature_process_path = export_proc_path
+                    st.session_state.last_export_model_bytes = model_bytes
+                    st.session_state.last_export_feature_process_bytes = process_bytes
+                    st.session_state._trained_model_artifact = model_bytes
+                    st.session_state._trained_process_artifact = process_bytes
+                    st.session_state._trained_model_name = os.path.basename(export_model_path)
+                    st.session_state.last_export_status = {
+                        "ok": True,
+                        "state": "completed",
+                        "run_id": summary.run_id if summary else None,
+                        "model_path": export_model_path,
+                        "feature_process_path": export_proc_path,
+                    }
+
+                    # [去重] 下载入口统一收敛到下方常驻的【📦 导出训练好的模型】，
+                    # 此处仅提示文件已自动保存到训练记录目录，避免同一页出现两套下载按钮
+                    st.caption(
+                        f"📦 模型文件已自动保存至训练记录目录：`{export_model_path}`\n\n"
+                        f"📥 下载请用下方【📦 导出训练好的模型（.joblib）】（已包含同一文件与 feature_process.json）"
+                    )
+                except Exception as export_exc:
+                    export_message = f"自动导出失败：{export_exc}"
+                    st.session_state.last_export_status = {
+                        "ok": False,
+                        "state": "failed",
+                        "run_id": summary.run_id if summary else None,
+                        "error": str(export_exc),
+                    }
+                    st.error(export_message)
+                    print(f"Warning: {export_message}")
+
+        except Exception:
+            pass
+
+        if persist_run:
+            # [修复] 清理 joblib 临时文件，防止内存泄漏和崩溃
+            try:
+                import gc
+                import shutil
+                import tempfile
+                from joblib.externals.loky import get_reusable_executor
+
+                # 强制关闭 joblib 的进程池
+                get_reusable_executor().shutdown(wait=True, kill_workers=True)
+
+                # 清理临时目录中的 joblib 文件
+                temp_dir = tempfile.gettempdir()
+                for item in os.listdir(temp_dir):
+                    if 'joblib_memmapping_folder' in item:
+                        try:
+                            item_path = os.path.join(temp_dir, item)
+                            if os.path.isdir(item_path):
+                                shutil.rmtree(item_path, ignore_errors=True)
+                        except Exception:
+                            pass
+
+                # 强制垃圾回收
+                gc.collect()
+            except Exception:
+                pass
+
+        # --- [新增] TFS 网络结构 Summary ---
+        if model_name == "TensorFlow Sequential":
+            try:
+                summary_str = ""
+                # [关键修复] 使用get_current_model()获取模型
+                current_model = get_current_model()
+                if current_model and hasattr(current_model, "get_model_summary_str"):
+                    summary_str = current_model.get_model_summary_str() or ""
+                if summary_str.strip():
+                    with st.expander("🧾 TFS 网络结构（Model Summary）", expanded=False):
+                        st.code(summary_str)
+            except Exception:
+                pass
+
+        # --- 结果表格与导出 ---
+        st.markdown("### 📈 测试集预测结果详情")
+        res_df = pd.DataFrame({
+            "真实值": res['y_test'],
+            "预测值": y_pred_test
+        })
+        res_df["残差"] = res_df["真实值"] - res_df["预测值"]
+
+        t1, t2 = st.columns([3, 1])
+        with t1:
+            st.dataframe(res_df, width="stretch", height=200)
+        with t2:
+            csv = res_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 导出结果 CSV", csv, "predictions_test.csv", "text/csv")
+
+        # --- 可视化 ---
+        st.markdown("### 📉 性能可视化")
+        if cv_res is not None:
+            tab_a, tab_b = st.tabs(["残差分析", "CV (OOF)"])
+            with tab_a:
+                # [优化] 去掉列挤压，全宽渲染，避免图被压缩到半宽容器里显小
+                if fig_resid is None:
+                    visualizer = Visualizer()
+                    fig_resid, _ = visualizer.plot_residuals(
+                        res['y_test'],
+                        y_pred_test,
+                        model_name=model_name,
+                    )
+                _show_mpl_fig_fullwidth(fig_resid)
+            with tab_b:
+                if fig_oof is None:
+                    visualizer = Visualizer()
+                    fig_oof, _ = visualizer.plot_predictions_vs_true(
+                        cv_res['oof_true'],
+                        cv_res['oof_pred'],
+                        model_name=f"{model_name} (OOF)"
+                    )
+                _show_mpl_fig_fullwidth(fig_oof)
+        else:
+            if fig_resid is None:
+                visualizer = Visualizer()
+                fig_resid, _ = visualizer.plot_residuals(
+                    res['y_test'],
+                    y_pred_test,
+                    model_name=model_name,
+                )
+            _show_mpl_fig_fullwidth(fig_resid)
     # 按钮区
     c_btn1, c_btn2 = st.columns(2)
 
@@ -16767,744 +17612,7 @@ def page_model_training():
                         return
 
 
-                    y_pred_test = res['y_pred_test'] if 'y_pred_test' in res else res.get('y_pred')
-
-                    extra_figs = {}
-                    extra_tables = {}
-                    fig_parity = None
-                    fig_paper = None
-                    fig_oof = None
-                    fig_resid = None
-                    pred_test_df = None
-                    pred_train_df = None
-                    paper_export_df = None
-                    oof_df = None
-
-                    # --- 指标 ---
-                    st.markdown("### 📌 单次划分（Test）指标")
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("R² (Test)", f"{res['r2']:.4f}")
-                    m2.metric("RMSE (Test)", f"{res['rmse']:.4f}")
-                    m3.metric("MAE (Test)", f"{res['mae']:.4f}")
-                    m4.metric("Train Time (s)", f"{res.get('train_time', 0):.2f}")
-                    if res.get("best_iteration") is not None:
-                        st.caption(f"Early stopping: best_iter={res.get('best_iteration')} | best_score={res.get('best_score')}")
-
-                    # 内部验证集（早停）指标卡片
-                    validation_set_info = res.get("validation_set") or {}
-                    if validation_set_info:
-                        _vs_metrics = validation_set_info.get("metrics") or {}
-                        _vs_effective = str(validation_set_info.get("effective", "off"))
-                        _vs_mode_labels = {"auto": "自动启用", "custom": "自定义启用", "off": "未启用"}
-                        st.markdown("### 🧪 内部验证集（早停）")
-                        _vs_c1, _vs_c2, _vs_c3, _vs_c4 = st.columns(4)
-                        _vs_c1.metric(
-                            "状态",
-                            _vs_mode_labels.get(_vs_effective, _vs_effective),
-                        )
-                        _vs_c2.metric("验证样本数", str(validation_set_info.get("sample_count", 0) or 0))
-                        if _vs_metrics:
-                            _vs_c3.metric("验证 R²", f"{float(_vs_metrics.get('r2', float('nan'))):.4f}")
-                            _vs_c4.metric("验证 RMSE", f"{float(_vs_metrics.get('rmse', float('nan'))):.4f}")
-                        else:
-                            _vs_c3.metric("验证 R²", "-")
-                            _vs_c4.metric("验证 RMSE", "-")
-                        if validation_set_info.get("reason"):
-                            st.warning(f"⚠️ {validation_set_info.get('reason')}")
-                        elif _vs_effective != "off":
-                            _vs_note_parts = [
-                                f"从训练集内部划出 {float(validation_set_info.get('val_size') or 0):.0%}"
-                                "（自动模式：训练样本 ≥ 20 条时划出 15%），仅用于早停与训练曲线，测试集评估不受影响。"
-                            ]
-                            if validation_set_info.get("best_iteration") is not None:
-                                _vs_note_parts.append(f"模型最优迭代轮次：{validation_set_info.get('best_iteration')}。")
-                            st.caption(" ".join(_vs_note_parts))
-
-                    balance_result = res.get("target_balance") or {}
-                    if balance_result:
-                        method_labels = {
-                            "sample_weight": "sample_weight 直接加权",
-                            "weighted_resample": "训练集内分层加权抽样",
-                            "disabled": "未应用（样本不足或无法分箱）",
-                        }
-                        st.markdown("### ⚖️ 目标分布平衡诊断")
-                        st.write(
-                            f"实际方式：{method_labels.get(balance_result.get('method'), balance_result.get('method', '未知'))}；"
-                            f"训练样本：{balance_result.get('train_sample_count', 0)}；"
-                            f"拟合样本：{balance_result.get('fit_sample_count', 0)}；"
-                            f"内部验证样本：{balance_result.get('early_stopping_validation_count', 0)}"
-                        )
-                        if balance_result.get("fallback_reason"):
-                            st.warning(f"目标平衡未完全应用：{balance_result['fallback_reason']}")
-                        interval_metrics = res.get("test_bin_metrics") or []
-                        if interval_metrics:
-                            display_interval_metrics = pd.DataFrame(interval_metrics).rename(
-                                columns={
-                                    "bin": "目标区间",
-                                    "sample_count": "样本数",
-                                    "r2": "R²",
-                                    "rmse": "RMSE",
-                                    "mae": "MAE",
-                                }
-                            )
-                            st.dataframe(
-                                display_interval_metrics,
-                                width="stretch",
-                                hide_index=True,
-                            )
-
-                    st.markdown("### 🖼️ 论文风结果图")
-                    try:
-                        if fig_paper is None:
-                            visualizer = Visualizer()
-                            fig_paper, paper_export_df, _ = visualizer.plot_paper_style_parity_train_test(
-                                res.get('y_train', []),
-                                res.get('y_pred_train', []),
-                                res.get('y_test', []),
-                                y_pred_test,
-                                target_name=target_col,
-                            )
-                        _show_mpl_fig_fullwidth(fig_paper)
-                        paper_png_bytes = fig_to_png_bytes(fig_paper)
-                        paper_csv_bytes = b""
-                        if paper_export_df is not None and not paper_export_df.empty:
-                            paper_csv_bytes = paper_export_df.to_csv(index=False).encode("utf-8-sig")
-                        dl1, dl2 = st.columns(2)
-                        with dl1:
-                            st.download_button(
-                                "📥 下载论文风图 PNG",
-                                data=paper_png_bytes,
-                                file_name=f"{model_name}_paper_style_parity.png",
-                                mime="image/png",
-                            )
-                        with dl2:
-                            st.download_button(
-                                "📥 下载论文风图 CSV",
-                                data=paper_csv_bytes,
-                                file_name=f"{model_name}_paper_style_parity.csv",
-                                mime="text/csv",
-                                disabled=not bool(paper_csv_bytes),
-                            )
-                    except Exception as e:
-                        st.info(f"论文风结果图生成失败，已跳过：{e}")
-
-                    fold_df = None
-                    if cv_res is not None:
-                        st.markdown("### 🧪 交叉验证（CV）指标")
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("CV R² (mean±std)", f"{cv_res['cv_r2_mean']:.4f} ± {cv_res['cv_r2_std']:.4f}")
-                        c2.metric("OOF RMSE", f"{cv_res['oof_rmse']:.4f}")
-                        c3.metric("OOF MAE", f"{cv_res['oof_mae']:.4f}")
-
-                        # 折分数表
-                        fold_df = pd.DataFrame({
-                            "fold_r2": cv_res.get("fold_r2", []),
-                            "fold_rmse": cv_res.get("fold_rmse", []),
-                            "fold_mae": cv_res.get("fold_mae", []),
-                        })
-                        st.dataframe(fold_df, width="stretch", height=200)
-                        fold_balance_df = pd.DataFrame(cv_res.get("fold_target_balance", []))
-                        if not fold_balance_df.empty:
-                            fold_balance_columns = [
-                                column
-                                for column in [
-                                    "method",
-                                    "fit_sample_count",
-                                    "train_sample_count",
-                                    "fallback_reason",
-                                ]
-                                if column in fold_balance_df.columns
-                            ]
-                            if fold_balance_columns:
-                                st.caption("各折目标平衡方式")
-                                st.dataframe(
-                                    fold_balance_df[fold_balance_columns],
-                                    width="stretch",
-                                    hide_index=True,
-                                )
-
-                    def _compute_metrics(y_true, y_pred):
-                        try:
-                            y_true_arr = np.asarray(y_true).ravel()
-                            y_pred_arr = np.asarray(y_pred).ravel()
-                            mask = np.isfinite(y_true_arr) & np.isfinite(y_pred_arr)
-                            y_true_arr = y_true_arr[mask]
-                            y_pred_arr = y_pred_arr[mask]
-                            if y_true_arr.size == 0:
-                                return {}
-                            return {
-                                "r2": float(r2_score(y_true_arr, y_pred_arr)),
-                                "rmse": float(np.sqrt(mean_squared_error(y_true_arr, y_pred_arr))),
-                                "mae": float(mean_absolute_error(y_true_arr, y_pred_arr)),
-                            }
-                        except Exception:
-                            return {}
-
-                    train_metrics = _compute_metrics(res.get('y_train', []), res.get('y_pred_train', []))
-                    test_metrics = _compute_metrics(res.get('y_test', []), y_pred_test)
-
-                    melting_point_metrics = None
-                    if str(target_col or '').strip() == 'mp_c':
-                        try:
-                            from core.melting_point_training import build_melting_point_split_metrics
-
-                            melting_point_metrics = build_melting_point_split_metrics(
-                                df,
-                                train_indices=res.get('train_indices'),
-                                test_indices=res.get('test_indices'),
-                                y_train=res.get('y_train', []),
-                                y_pred_train=res.get('y_pred_train', []),
-                                y_test=res.get('y_test', []),
-                                y_pred_test=y_pred_test,
-                            )
-                            st.session_state["melting_point_metrics"] = melting_point_metrics
-                            extra_tables['melting_point_split_metrics'] = pd.DataFrame(
-                                [
-                                    {
-                                        'split': split_name,
-                                        'subset': 'overall',
-                                        **(split_payload.get('metrics') or {}),
-                                    }
-                                    for split_name, split_payload in melting_point_metrics.items()
-                                    if isinstance(split_payload, dict) and 'metrics' in split_payload
-                                ]
-                            )
-                            st.markdown('### 🌡️ 熔点分层指标（°C）')
-                            metric_rows = []
-                            for split_name in ('train', 'test'):
-                                split_payload = melting_point_metrics.get(split_name) or {}
-                                overall = split_payload.get('metrics') or {}
-                                metric_rows.append({
-                                    '数据集': '训练集' if split_name == 'train' else '测试集',
-                                    '有效样本数': overall.get('n', 0),
-                                    'MAE': overall.get('mae'),
-                                    'RMSE': overall.get('rmse'),
-                                    'R²': overall.get('r2'),
-                                })
-                                for role, values in (split_payload.get('roles') or {}).items():
-                                    metric_rows.append({
-                                        '数据集': f"{'训练集' if split_name == 'train' else '测试集'} / 角色:{role}",
-                                        '有效样本数': values.get('n', 0),
-                                        'MAE': values.get('mae'),
-                                        'RMSE': values.get('rmse'),
-                                        'R²': values.get('r2'),
-                                    })
-                                for hardener_class, values in (split_payload.get('hardener_classes') or {}).items():
-                                    metric_rows.append({
-                                        '数据集': f"{'训练集' if split_name == 'train' else '测试集'} / 固化剂:{hardener_class}",
-                                        '有效样本数': values.get('n', 0),
-                                        'MAE': values.get('mae'),
-                                        'RMSE': values.get('rmse'),
-                                        'R²': values.get('r2'),
-                                    })
-                            if metric_rows:
-                                st.dataframe(pd.DataFrame(metric_rows), width='stretch', hide_index=True)
-                        except Exception as melting_point_metric_error:
-                            st.warning(f'熔点分层指标生成失败，已保留总体指标：{melting_point_metric_error}')
-
-                    try:
-                        pred_test_df = pd.DataFrame({
-                            "y_true": res.get('y_test', []),
-                            "y_pred": y_pred_test,
-                        })
-                        pred_test_df["residual"] = pred_test_df["y_true"] - pred_test_df["y_pred"]
-
-                        # 不再将全部特征列拷贝到预测结果中（13000x160 会导致内存翻倍和 Streamlit 崩溃）
-
-                        pred_train_df = pd.DataFrame({
-                            "y_true": res.get('y_train', []),
-                            "y_pred": res.get('y_pred_train', []),
-                        })
-                        pred_train_df["residual"] = pred_train_df["y_true"] - pred_train_df["y_pred"]
-
-                        extra_tables["predictions_test"] = pred_test_df
-                        extra_tables["predictions_train"] = pred_train_df
-                        extra_tables.update(
-                            _build_split_snapshot_tables(
-                                res.get('X_train'),
-                                res.get('X_test'),
-                                res.get('y_train'),
-                                res.get('y_test'),
-                                # [关键修复] 此处原引用未定义的 feature_cols 变量，触发 NameError
-                                # 且被 except 静默吞掉，导致训练记录从未保存 split_X_train.csv，
-                                # 后续从训练记录加载模型做 SHAP 时无法恢复带真实列名的切分数据。
-                                # 改为使用训练结果 X_train 的真实列名（与快照数据严格同宽）。
-                                feature_cols=(
-                                    list(res['X_train'].columns)
-                                    if isinstance(res.get('X_train'), pd.DataFrame)
-                                    else None
-                                ),
-                                target_col=target_col,
-                                X_train_raw=res.get('X_train_raw'),
-                                X_test_raw=res.get('X_test_raw'),
-                            )
-                        )
-
-                        if fold_df is not None and not fold_df.empty:
-                            extra_tables["cv_folds"] = fold_df
-
-                        if cv_res is not None and "oof_true" in cv_res and "oof_pred" in cv_res:
-                            oof_df = pd.DataFrame({
-                                "y_true": cv_res.get("oof_true", []),
-                                "y_pred": cv_res.get("oof_pred", []),
-                            })
-                            oof_df["residual"] = oof_df["y_true"] - oof_df["y_pred"]
-                            extra_tables["cv_oof_predictions"] = oof_df
-
-                        if feature_cols:
-                            extra_tables["feature_cols"] = pd.DataFrame({"feature": list(feature_cols)})
-
-                        visualizer = Visualizer()
-                        fig_parity, _ = visualizer.plot_parity_train_test(
-                            res.get('y_train', []),
-                            res.get('y_pred_train', []),
-                            res.get('y_test', []),
-                            y_pred_test,
-                            target_name=target_col,
-                        )
-                        fig_paper, paper_export_df, _ = visualizer.plot_paper_style_parity_train_test(
-                            res.get('y_train', []),
-                            res.get('y_pred_train', []),
-                            res.get('y_test', []),
-                            y_pred_test,
-                            target_name=target_col,
-                        )
-                        fig_resid, _ = visualizer.plot_residuals(
-                            res.get('y_test', []),
-                            y_pred_test,
-                            model_name=model_name,
-                        )
-                        if cv_res is not None and "oof_true" in cv_res and "oof_pred" in cv_res:
-                            fig_oof, _ = visualizer.plot_predictions_vs_true(
-                                cv_res.get("oof_true", []),
-                                cv_res.get("oof_pred", []),
-                                model_name=f"{model_name} (OOF)",
-                            )
-
-                        if fig_parity is not None:
-                            extra_figs["parity_train_test"] = fig_parity
-                        if fig_paper is not None:
-                            extra_figs["paper_style_parity"] = fig_paper
-                        if fig_resid is not None:
-                            extra_figs["residuals_test"] = fig_resid
-                        if fig_oof is not None:
-                            extra_figs["parity_oof"] = fig_oof
-                    except Exception:
-                        pass
-
-                    # --- [增强] 所有模型的训练曲线 + 训练记录落盘 ---
-                    try:
-                        history = res.get('training_history') or {}
-                        fig_curve, hist_export_df = plot_history(history, title=f"{model_name} Training Curves")
-
-                        st.markdown("### 📉 训练曲线（统一科研级风格）")
-                        _show_mpl_fig_fullwidth(fig_curve)
-
-                        if hist_export_df is not None and not hist_export_df.empty:
-                            with st.expander("🧾 查看训练曲线数据", expanded=False):
-                                st.dataframe(hist_export_df, width="stretch", height=240)
-                                st.download_button(
-                                    "📥 导出训练曲线 CSV",
-                                    hist_export_df.to_csv(index=False).encode("utf-8-sig"),
-                                    f"{model_name}_training_history.csv",
-                                    "text/csv",
-                                    key="download_training_history_csv",
-                                )
-
-                        # --- [优化] PCA 适用域与降维分布可视化（默认折叠/按需渲染，提升主流程加载速度） ---
-                        st.markdown("### 🌐 PCA 适用域与化学空间分布")
-                        show_pca_plot = st.checkbox(
-                            "📈 展开并渲染 PCA 适用域与化学空间分布图",
-                            value=False,
-                            key=f"show_pca_plot_trained_{model_name}",
-                            help="勾选后现场执行 PCA 降维并绘制 2D 化学空间凸包（Applicability Domain）与方差贡献图；默认折叠以保持页面轻量流畅。",
-                        )
-                        if show_pca_plot:
-                            try:
-                                from core.applicability_domain import ApplicabilityDomainAnalyzer
-
-                                # 获取训练集数据
-                                X_train_for_pca = res.get('X_train')
-                                y_train_for_pca = res.get('y_train')
-
-                                if X_train_for_pca is not None and len(X_train_for_pca) > 3:
-                                    with st.spinner("正在计算主成分并渲染 PCA 适用域分布图..."):
-                                        pca_analyzer = ApplicabilityDomainAnalyzer(X_train_for_pca, n_components=2)
-                                        pca_analyzer.fit()
-
-                                        fig_pca = pca_analyzer.visualize_domain(X_new=None, y_train=y_train_for_pca, figsize=(12, 7.5))
-                                        _show_mpl_fig_fullwidth(fig_pca)
-
-                                        st.caption("💡 PCA适用域可视化展示训练数据在低维空间的分布，凸包表示模型可靠适用域（Applicability Domain），颜色表示目标值大小。")
-                                else:
-                                    st.info("训练样本数量不足，跳过 PCA 可视化")
-                            except Exception as e:
-                                st.warning(f"PCA 可视化生成失败: {e}")
-                        else:
-                            st.caption("💡 提示：如需查看训练集在二维主成分空间的聚类与适用域凸包边界，请勾选上方开关展开渲染。")
-
-                        # 保存一次训练 Run（指标+参数+曲线）
-                        manager = TrainingRunManager()
-                        best_score = res.get("best_score")
-                        try:
-                            if best_score is not None:
-                                best_score = float(best_score)
-                        except Exception:
-                            pass
-                        meta = {
-                            "model_name": model_name,
-                            "r2": float(res.get('r2', 0)),
-                            "rmse": float(res.get('rmse', 0)),
-                            "mae": float(res.get('mae', 0)),
-                            "train_r2": train_metrics.get("r2"),
-                            "train_rmse": train_metrics.get("rmse"),
-                            "train_mae": train_metrics.get("mae"),
-                            "test_r2": test_metrics.get("r2"),
-                            "test_rmse": test_metrics.get("rmse"),
-                            "test_mae": test_metrics.get("mae"),
-                            "train_time": float(res.get('train_time', 0)),
-                            "split_strategy": str(res.get('split_strategy', '')),
-                            "test_size": float(test_size),
-                            "random_state": int(random_state),
-                            "params": params or {},
-                            "n_samples": int(len(res.get('y_train', [])) + len(res.get('y_test', []))),
-                            "n_train": int(len(res.get('y_train', []))),
-                            "n_test": int(len(res.get('y_test', []))),
-                            "n_features": int(len(st.session_state.get('feature_cols') or [])),
-                            "target_col": target_col,
-                            "best_iteration": res.get("best_iteration"),
-                            "best_score": best_score,
-                            "val_mode": str((res.get("validation_set") or {}).get("mode", val_mode)),
-                            "val_effective": str((res.get("validation_set") or {}).get("effective", "off")),
-                            "val_size": float((res.get("validation_set") or {}).get("val_size", 0.0) or 0.0),
-                            "val_sample_count": int((res.get("validation_set") or {}).get("sample_count", 0) or 0),
-                        }
-                        if melting_point_metrics is not None:
-                            meta['melting_point_metrics'] = melting_point_metrics
-                            meta['melting_point_train_indices'] = list(
-                                (melting_point_metrics.get('train') or {}).get('positions') or []
-                            )
-                            meta['melting_point_test_indices'] = list(
-                                (melting_point_metrics.get('test') or {}).get('positions') or []
-                            )
-                            try:
-                                from core.melting_point_screening import build_melting_point_artifact_extra
-
-                                mp_quality_policy = (
-                                    'high_quality_and_optional_low_quality'
-                                    if has_melting_point_handoff and include_low_quality
-                                    else 'high_quality_only'
-                                )
-                                workflow_value = st.session_state.get('molecular_feature_workflow')
-                                workflow_hash = (
-                                    workflow_value.get('workflow_hash')
-                                    if isinstance(workflow_value, dict)
-                                    else getattr(workflow_value, 'workflow_hash', None)
-                                )
-                                meta['melting_point_source'] = build_melting_point_artifact_extra(
-                                    df,
-                                    workflow_hash=workflow_hash,
-                                    quality_policy=mp_quality_policy,
-                                )
-                            except Exception:
-                                meta['melting_point_source'] = {
-                                    'dataset_row_count': int(len(df)),
-                                    'quality_policy': mp_quality_policy,
-                                }
-                        if cv_res is not None:
-                            meta.update(
-                                {
-                                    "cv_strategy": str(cv_strategy),
-                                    "cv_folds": int(cv_folds),
-                                    "cv_repeats": int(cv_repeats),
-                                    "cv_r2_mean": float(cv_res.get("cv_r2_mean", 0)),
-                                    "cv_r2_std": float(cv_res.get("cv_r2_std", 0)),
-                                    "oof_rmse": float(cv_res.get("oof_rmse", 0)),
-                                    "oof_mae": float(cv_res.get("oof_mae", 0)),
-                                    "fold_r2": [float(v) for v in cv_res.get("fold_r2", [])],
-                                    "fold_rmse": [float(v) for v in cv_res.get("fold_rmse", [])],
-                                    "fold_mae": [float(v) for v in cv_res.get("fold_mae", [])],
-                                }
-                            )
-                        effective_feature_cols = _resolve_effective_feature_cols(
-                            train_result=res,
-                            selected_feature_cols=st.session_state.get('feature_cols') or [],
-                            model=res.get('model'),
-                            pipeline=res.get('pipeline'),
-                        )[0] or list(st.session_state.get('feature_cols') or [])
-                        summary = manager.save_run(
-                            model_name=model_name,
-                            metadata=meta,
-                            history_df=hist_export_df,
-                            curve_fig=fig_curve,
-                            extra_figs=extra_figs,
-                            extra_tables=extra_tables,
-                            model=res.get('model'),
-                            pipeline=res.get('pipeline'),
-                            scaler=res.get('scaler'),
-                            imputer=res.get('imputer'),
-                            feature_cols=effective_feature_cols,
-                            target_col=target_col,
-                            extra={**_current_molecular_feature_artifact_extra(), **_current_melting_point_artifact_extra(target_col)},
-                            contract_context=training_feature_contract_context,
-                        )
-                        st.session_state.last_training_run_id = summary.run_id
-                        st.caption(f"🗂️ 已保存训练记录: {summary.run_id}（可在【📈 训练记录】查看）")
-
-                        # --- [新增] 训练完成后自动导出模型文件 + 分子特征提取流程 ---
-                        st.session_state.last_export_model_path = None
-                        st.session_state.last_export_feature_process_path = None
-                        st.session_state.last_export_model_bytes = None
-                        st.session_state.last_export_feature_process_bytes = None
-                        st.session_state.last_export_status = {
-                            "ok": False,
-                            "state": "in_progress",
-                            "run_id": summary.run_id if summary else None,
-                        }
-                        try:
-                            from core.model_io import (
-                                create_model_artifact_bytes,
-                                process_pls_to_artifact_extra,
-                                workflow_to_artifact_extra,
-                            )
-                            import datetime
-
-                            # 组装 extra 信息：用于加载模型时提示需要哪些特征/分子特征流程
-                            _extra = {
-                                'app_name': APP_NAME,
-                                'app_version': VERSION,
-                                'exported_at': datetime.datetime.now().isoformat(),
-                                'training_run_id': summary.run_id if summary else None,
-                                'compute_device_pref': st.session_state.get('compute_device', 'auto'),
-                                'molecular_feature_config': st.session_state.get('molecular_feature_config'),
-                                'molecular_feature_workflow': st.session_state.get('molecular_feature_workflow'),
-                                'molecular_feature_trace': st.session_state.get('molecular_feature_trace', []),
-                                'post_feature_mapping_default': st.session_state.get('post_feature_mapping_default'),
-                                'feature_mask': (
-                                    _coerce_feature_mask(
-                                        st.session_state.get('feature_mask')
-                                    ).tolist()
-                                    if _coerce_feature_mask(
-                                        st.session_state.get('feature_mask')
-                                    ) is not None
-                                    else None
-                                ),
-                            }
-                            _extra.update(
-                                workflow_to_artifact_extra(
-                                    st.session_state.get('molecular_feature_workflow')
-                                )
-                            )
-                            _extra.update(
-                                process_pls_to_artifact_extra(
-                                    st.session_state.get('process_pls_workflow')
-                                )
-                            )
-                            # 如果有 FE tracker，也一并导出
-                            _tracker = st.session_state.get('fe_tracker', None)
-                            if _tracker is not None:
-                                try:
-                                    _extra['feature_engineering_log'] = json.loads(_tracker.export_log_to_json())
-                                except Exception:
-                                    _extra['feature_engineering_log'] = _tracker.export_log()
-                            _extra['effective_feature_cols'] = effective_feature_cols
-                            _extra.update(_current_melting_point_artifact_extra(target_col))
-                            _tr = st.session_state.get("train_result") or {}
-                            _processed_ref = st.session_state.get("processed_data")
-                            if _processed_ref is None:
-                                _processed_ref = st.session_state.get("data")
-                            _extra.update(
-                                _build_screening_reference_export(
-                                    _tr,
-                                    effective_feature_cols,
-                                    session_x_train_raw=st.session_state.get("X_train_raw"),
-                                    session_x_train=st.session_state.get("X_train"),
-                                    processed_data=_processed_ref,
-                                    target_col=target_col,
-                                    molecular_feature_config=st.session_state.get("molecular_feature_config"),
-                                )
-                            )
-
-                            # [关键修复] 使用get_current_model()获取模型
-                            current_model = get_current_model()
-                            model_bytes = create_model_artifact_bytes(
-                                model=current_model,
-                                pipeline=st.session_state.get('pipeline', None),
-                                feature_cols=effective_feature_cols,
-                                target_col=target_col,
-                                model_name=model_name,
-                                extra=_extra,
-                                contract_context=training_feature_contract_context,
-                            )
-
-                            run_dir = summary.path if summary else manager.base_dir
-                            os.makedirs(run_dir, exist_ok=True)
-                            safe_name = ''.join([c if c.isalnum() else '_' for c in str(model_name)])
-                            export_model_path = os.path.join(run_dir, f"model_{safe_name}.joblib")
-                            with open(export_model_path, 'wb') as f:
-                                f.write(model_bytes)
-
-                            # 分子特征/特征列流程导出
-                            process_payload = {
-                                'app_name': APP_NAME,
-                                'app_version': VERSION,
-                                'exported_at': datetime.datetime.now().isoformat(),
-                                'training_run_id': summary.run_id if summary else None,
-                                'model_name': model_name,
-                                'target_col': target_col,
-                                'required_features': effective_feature_cols,
-                                'molecular_feature_config': st.session_state.get('molecular_feature_config'),
-                                'molecular_feature_workflow': st.session_state.get('molecular_feature_workflow'),
-                                'molecular_feature_trace': st.session_state.get('molecular_feature_trace', []),
-                                'post_feature_mapping_default': st.session_state.get('post_feature_mapping_default'),
-                                'feature_mask': (
-                                    _coerce_feature_mask(
-                                        st.session_state.get('feature_mask')
-                                    ).tolist()
-                                    if _coerce_feature_mask(
-                                        st.session_state.get('feature_mask')
-                                    ) is not None
-                                    else None
-                                ),
-                            }
-                            process_payload.update(_current_melting_point_artifact_extra(target_col))
-                            process_payload.update(
-                                workflow_to_artifact_extra(
-                                    st.session_state.get('molecular_feature_workflow')
-                                )
-                            )
-                            process_payload.update(
-                                process_pls_to_artifact_extra(
-                                    st.session_state.get('process_pls_workflow')
-                                )
-                            )
-                            process_bytes = json.dumps(process_payload, ensure_ascii=False, indent=2).encode('utf-8')
-                            export_proc_path = os.path.join(run_dir, 'feature_process.json')
-                            with open(export_proc_path, 'wb') as f:
-                                f.write(process_bytes)
-
-                            st.session_state.last_export_model_path = export_model_path
-                            st.session_state.last_export_feature_process_path = export_proc_path
-                            st.session_state.last_export_model_bytes = model_bytes
-                            st.session_state.last_export_feature_process_bytes = process_bytes
-                            st.session_state._trained_model_artifact = model_bytes
-                            st.session_state._trained_process_artifact = process_bytes
-                            st.session_state._trained_model_name = os.path.basename(export_model_path)
-                            st.session_state.last_export_status = {
-                                "ok": True,
-                                "state": "completed",
-                                "run_id": summary.run_id if summary else None,
-                                "model_path": export_model_path,
-                                "feature_process_path": export_proc_path,
-                            }
-
-                            # [去重] 下载入口统一收敛到下方常驻的【📦 导出训练好的模型】，
-                            # 此处仅提示文件已自动保存到训练记录目录，避免同一页出现两套下载按钮
-                            st.caption(
-                                f"📦 模型文件已自动保存至训练记录目录：`{export_model_path}`\n\n"
-                                f"📥 下载请用下方【📦 导出训练好的模型（.joblib）】（已包含同一文件与 feature_process.json）"
-                            )
-                        except Exception as export_exc:
-                            export_message = f"自动导出失败：{export_exc}"
-                            st.session_state.last_export_status = {
-                                "ok": False,
-                                "state": "failed",
-                                "run_id": summary.run_id if summary else None,
-                                "error": str(export_exc),
-                            }
-                            st.error(export_message)
-                            print(f"Warning: {export_message}")
-
-                    except Exception:
-                        pass
-
-                    # [修复] 清理 joblib 临时文件，防止内存泄漏和崩溃
-                    try:
-                        import gc
-                        import shutil
-                        import tempfile
-                        from joblib.externals.loky import get_reusable_executor
-
-                        # 强制关闭 joblib 的进程池
-                        get_reusable_executor().shutdown(wait=True, kill_workers=True)
-
-                        # 清理临时目录中的 joblib 文件
-                        temp_dir = tempfile.gettempdir()
-                        for item in os.listdir(temp_dir):
-                            if 'joblib_memmapping_folder' in item:
-                                try:
-                                    item_path = os.path.join(temp_dir, item)
-                                    if os.path.isdir(item_path):
-                                        shutil.rmtree(item_path, ignore_errors=True)
-                                except Exception:
-                                    pass
-
-                        # 强制垃圾回收
-                        gc.collect()
-                    except Exception:
-                        pass
-
-                    # --- [新增] TFS 网络结构 Summary ---
-                    if model_name == "TensorFlow Sequential":
-                        try:
-                            summary_str = ""
-                            # [关键修复] 使用get_current_model()获取模型
-                            current_model = get_current_model()
-                            if current_model and hasattr(current_model, "get_model_summary_str"):
-                                summary_str = current_model.get_model_summary_str() or ""
-                            if summary_str.strip():
-                                with st.expander("🧾 TFS 网络结构（Model Summary）", expanded=False):
-                                    st.code(summary_str)
-                        except Exception:
-                            pass
-
-                    # --- 结果表格与导出 ---
-                    st.markdown("### 📈 测试集预测结果详情")
-                    res_df = pd.DataFrame({
-                        "真实值": res['y_test'],
-                        "预测值": y_pred_test
-                    })
-                    res_df["残差"] = res_df["真实值"] - res_df["预测值"]
-
-                    t1, t2 = st.columns([3, 1])
-                    with t1:
-                        st.dataframe(res_df, width="stretch", height=200)
-                    with t2:
-                        csv = res_df.to_csv(index=False).encode('utf-8')
-                        st.download_button("📥 导出结果 CSV", csv, "predictions_test.csv", "text/csv")
-
-                    # --- 可视化 ---
-                    st.markdown("### 📉 性能可视化")
-                    if cv_res is not None:
-                        tab_a, tab_b = st.tabs(["残差分析", "CV (OOF)"])
-                        with tab_a:
-                            # [优化] 去掉列挤压，全宽渲染，避免图被压缩到半宽容器里显小
-                            if fig_resid is None:
-                                visualizer = Visualizer()
-                                fig_resid, _ = visualizer.plot_residuals(
-                                    res['y_test'],
-                                    y_pred_test,
-                                    model_name=model_name,
-                                )
-                            _show_mpl_fig_fullwidth(fig_resid)
-                        with tab_b:
-                            if fig_oof is None:
-                                visualizer = Visualizer()
-                                fig_oof, _ = visualizer.plot_predictions_vs_true(
-                                    cv_res['oof_true'],
-                                    cv_res['oof_pred'],
-                                    model_name=f"{model_name} (OOF)"
-                                )
-                            _show_mpl_fig_fullwidth(fig_oof)
-                    else:
-                        if fig_resid is None:
-                            visualizer = Visualizer()
-                            fig_resid, _ = visualizer.plot_residuals(
-                                res['y_test'],
-                                y_pred_test,
-                                model_name=model_name,
-                            )
-                        _show_mpl_fig_fullwidth(fig_resid)
+                    _render_manual_training_results(res=res, cv_res=cv_res, persist_run=True)
 
                 except Exception as e:
                     cancelled_by_user = _is_user_cancelled_error(e) or is_cancelled()
@@ -17708,6 +17816,50 @@ def page_model_training():
                     else:
                         st.warning("⚠️ 暂无可下载的模型文件，请先运行模型训练。")
                         st.info("提示：若使用深度学习模型（TF/自定义网络），joblib 序列化可能失败。可改用【导出训练脚本】在目标环境复现训练。")
+
+    # ============ [修复] 下载/交互触发整页重跑后，恢复上次训练结果展示 ============
+    # st.download_button（如下载训练结果 PNG/CSV）等任何控件交互都会触发 Streamlit
+    # 整页重跑；结果区（指标卡/图/表/下载按钮）原本只在「🚀 开始训练」按钮的分支内
+    # 渲染，重跑后整块消失，表现为"点一下下载，页面上其他操作按钮全都不见了"。
+    # 本轮脚本若没有重新训练（也未渲染过结果区），这里基于 session_state 中持久化的
+    # 训练结果重新渲染结果区；persist_run=False 保证不会重复保存训练记录/导出模型。
+    _skip_restore = st.session_state.pop("_manual_training_results_rendered", False)
+    _saved_train_result = st.session_state.get("train_result")
+    _is_classification_result = (
+        isinstance(_saved_train_result, dict)
+        and str(_saved_train_result.get("task_kind", "")) == "classification"
+    )
+    if (
+        not _skip_restore
+        and isinstance(_saved_train_result, dict)
+        and (_is_classification_result or _saved_train_result.get("r2") is not None)
+    ):
+        _saved_cv_result = st.session_state.get("cv_result")
+        # 与训练时保持一致的模型名，避免用户切换下拉框后图例/文件名错乱
+        model_name = st.session_state.get("model_name") or model_name
+        try:
+            if _is_classification_result:
+                _render_binary_classification_results(
+                    res=_saved_train_result,
+                    cv_res=_saved_cv_result,
+                    model_name=model_name,
+                    target_col=target_col,
+                    params=st.session_state.get("manual_params") or {},
+                    test_size=test_size,
+                    random_state=random_state,
+                    feature_cols=st.session_state.get("feature_cols") or [],
+                    feature_contract_context=st.session_state.get("training_feature_contract_context"),
+                    persist_run=False,
+                )
+            else:
+                _render_manual_training_results(
+                    res=_saved_train_result,
+                    cv_res=_saved_cv_result,
+                    persist_run=False,
+                )
+        except Exception as _restore_exc:
+            st.warning(f"恢复上次训练结果显示失败（不影响已保存数据）：{_restore_exc}")
+
 
     # ============ 独立的异常样本检测功能（在训练代码块外） ============
     st.markdown("---")
@@ -28545,4 +28697,4 @@ def _page_batch_structure_check() -> None:
     st.caption(f"图片位于结果目录：{output_dir}；移动结果表时请保留同目录下的 PNG 文件。")
 
 # 转移期命名空间完整导出（含下划线名），页面与测试从本库取全部符号。
-__all__ = [ "AIServiceConfig", "APP_NAME", "AdvancedDataCleaner", "AdvancedMolecularFeatureExtractor", "ApplicabilityDomainAnalyzer", "AutoGluonWrapper", "CACHE_DIR", "CLASSIFICATION_MODEL_NAMES", "CUSTOM_CSS", "CancellableProcessPoolExecutor", "CancellableThreadPoolExecutor", "DATA_DIR", "DEFAULT_OPTUNA_TRIALS", "DEFAULT_RANDOM_STATE", "DEFAULT_TEST_SIZE", "DataEnhancer", "EnhancedDataExplorer", "EnhancedModelTrainer", "FeatureEngineeringTracker", "GRAPH_MODEL_NAMES", "HyperparameterOptimizer", "InverseDesigner", "MANUAL_TUNING_PARAMS", "MODEL_PARAMETERS", "MODEL_SCOPE_GUIDE", "MinMaxScaler", "NAVIGATION_PAGES", "OptimizationEvaluationConfig", "OptimizationProgress", "Optional", "POST_FEATURE_COMPUTED_DEFINITIONS", "Path", "PortalAIClient", "PortalAIError", "RAW_FRAME_MODEL_NAMES", "RDKitFeatureExtractor", "RECOMMENDED_PRESETS", "REGRESSION_BALANCE_DEFAULTS", "RobustScaler", "SESSION_SNAPSHOT_DIR", "SESSION_SNAPSHOT_VERSION", "SHAPCache", "SimpleNamespace", "SmartFeatureSelector", "SmartSparseDataSelector", "SparseDataHandler", "StandardScaler", "TanimotoADAnalyzer", "ThreadPoolExecutor", "TrainingRunManager", "USER_DATA_DB", "VERSION", "Visualizer", "XGBoostModelCache", "_Chem", "_HEAVY_PRELOAD_MODULES", "_IMAGE_CLIPBOARD_COMPONENT", "_IMAGE_CLIPBOARD_COMPONENT_PATH", "_SNAPSHOT_DF_KEYS", "_SNAPSHOT_META_KEYS", "_SNAPSHOT_META_TTL_SEC", "_TABPFN_HF_REPO", "_THREAD_COUNT", "_align_input_dataframe_to_required_features", "_apply_feature_mask_to_feature_cols", "_build_feature_alignment_report", "_build_image_preview", "_build_prediction_molecular_baseline", "_build_screening_reference_export", "_build_split_snapshot_tables", "_cached_basic_stats", "_cached_boxplot_fig", "_cached_corr_fig", "_cached_corr_with_target", "_cached_csv_bytes", "_cached_distribution_fig", "_cached_duplicate_count", "_cached_excel_bytes", "_cached_high_corr_pairs", "_cached_high_repetition_columns", "_cached_missing_by_column", "_cached_missing_fig", "_cached_numeric_describe", "_cached_pseudo_numeric_columns", "_cached_read_uploaded_table", "_cached_render_structure", "_clear_feature_classification_cache", "_clear_molecular_feature_session_metadata", "_clear_molecular_features_from_session", "_clear_post_feature_mapping_session_metadata", "_clear_process_pls_session_metadata", "_coerce_feature_frame", "_coerce_feature_mask", "_coerce_target_array", "_collect_autosave_payload", "_collect_molecular_feature_columns", "_configure_safe_console_output", "_configure_thread_limits", "_count_missing_like", "_current_melting_point_artifact_extra", "_current_molecular_feature_artifact_extra", "_decode_clipboard_image_payload", "_deduplicate_feature_list", "_deduplicate_feature_list_normalized", "_df_cache_key", "_ensure_tabpfn_license_ready", "_extract_artifact_final_feature_names", "_extract_pipeline_feature_mask", "_get_cached_cleaner", "_get_expected_model_feature_count", "_get_gnn_featurizer", "_get_or_create_session_id", "_get_snapshot_save_executor", "_get_snapshot_save_gate", "_image_clipboard_component", "_infer_binary_target_info", "_invalidate_post_feature_mapping_if_changed", "_is_recent_snapshot", "_is_user_cancelled_error", "_load_new_base_dataset", "_load_saved_split_tables", "_load_snapshot_meta", "_load_snapshot_meta_throttled", "_load_structure_visualization_apis", "_lock_current_training_contract", "_mark_virtual_screening_run_requested", "_maybe_auto_restore", "_maybe_autosave_session", "_normalize_feature_name", "_normalize_meta_value", "_oplog_init", "_page_batch_structure_check", "_page_smiles_to_structure_image", "_page_virtual_screening_formula", "_post_feature_mapping_catalog_fingerprint", "_post_feature_mapping_model_fingerprint", "_post_feature_mapping_snapshot_for_screening", "_preload_heavy_libraries", "_prepare_post_feature_mapping_for_prediction", "_quick_rdkit_parse_stats", "_reconstruct_split_from_current_data", "_register_source_feature_names", "_render_binary_classification_results", "_render_data_explore_preview", "_render_figure_export_controls", "_render_global_task_lock", "_render_molecular_feature_clear_restore_control", "_render_molecule_design_engine", "_render_network_proxy_panel", "_render_portal_ai_service_panel", "_render_post_feature_mapping_panel", "_render_prediction_feature_check_panel", "_render_prediction_molecular_input_panel", "_render_sidebar_compute_panel", "_render_sidebar_portal_panel", "_render_sidebar_session_panel", "_render_structure_result", "_render_training_emergency_stop_panel", "_resolve_effective_feature_cols", "_resolve_feature_mask", "_resolve_imported_molecular_feature_workflow", "_resolve_prediction_feature_cols", "_restore_molecular_feature_metadata", "_restore_post_feature_mapping_metadata", "_restore_process_pls_metadata", "_restore_session_snapshot", "_restore_versioned_molecular_feature_metadata", "_run_imported_molecular_feature_workflow", "_safe_structure_image_path", "_save_session_snapshot", "_save_session_snapshot_async", "_should_restore_value", "_show_mpl_fig_fullwidth", "_snapshot_paths", "_structure_result_text", "_structure_visualization_output_root", "_suggest_similar_feature_names", "_tabpfn_license_name_via_mirror", "_tabpfn_preflight_check", "_virtual_screening_task_guard", "_write_autosave_payload", "analyze_group_distribution", "append_runtime_debug", "apply_mapping", "as_completed", "assert_training_context", "audit_training_result", "base64", "binascii", "build_export_zip", "build_feature_name_pie_data", "build_feature_pie_data", "build_group_series", "build_manual_mapping_choices", "build_post_feature_catalog", "build_request_url", "build_shap_importance_df", "build_single_row_source_frame", "cancel_all_background_tasks", "catalog_fingerprint", "classify_feature_for_pie", "clear_cancel", "collect_workflow_source_columns", "commit_mapping_form_draft", "components", "copy", "create_mapping_draft", "create_quick_export_button", "dataframe_to_csv_bytes", "dataframe_to_excel_bytes", "datetime", "default_ai_config", "ensure_emergency_stop_server", "exportable_ai_config", "feature_values_or_empty", "fig_to_html", "fig_to_png_bytes", "figure_to_bytes", "functools", "generate_training_script_code", "generate_tuning_suggestions", "get_active_task_count", "get_current_model", "get_feature_review_ai_client", "get_formulation_group_options", "get_shap_cache", "get_task_manager", "get_task_summary", "get_xgboost_cache", "hashlib", "init_session_state", "io", "is_cancelled", "is_port_open", "json", "key_fingerprint", "load_ai_config", "load_data_file", "load_shap_export_frame", "locale", "lock_training_contract", "log_fe_step", "logging", "mapping_snapshot", "mapping_snapshot_restore_policy", "mp", "multiprocessing", "normalize_endpoint_path", "normalize_mapping", "np", "oplog", "oplog_clear", "oplog_render", "os", "page_active_learning", "page_data_cleaning", "page_data_enhancement", "page_data_explore", "page_data_upload", "page_feature_registry", "page_feature_selection", "page_formulation_fusion", "page_home", "page_hyperparameter_optimization", "page_image_to_smiles", "page_model_imputation", "page_model_interpretation", "page_model_training", "page_molecular_feature_reproduction", "page_molecular_features", "page_prediction", "page_smiles_structure_tools", "page_status_log", "page_structure_recognition", "page_title_with_refresh", "page_training_records", "page_virtual_screening", "pd", "pickle", "plot_history", "plt", "portal_health_label", "portal_process_status", "prepare_manual_training_params", "prepare_regression_optimization", "preview_dataframe", "re", "redacted_ai_config", "render_data_export_panel", "render_export_section", "render_feature_registry_page", "render_melting_point_dataset_panel", "render_shap_importance_outputs", "render_sidebar", "render_status_panel", "render_status_sidebar", "render_task_control_expander", "render_task_manager_ui", "render_top_status_bar", "resolve_data_source", "resolve_navigation_page", "resolve_prediction_feature_contract", "run_xgboost_shap_subprocess", "run_xgboost_surface_subprocess", "sanitize_feature_columns", "sanitize_preview_columns", "save_ai_config", "select_training_context_for_model", "show_robust_feature_selection", "st", "start_prediction_portal", "stop_prediction_portal", "subprocess", "sys", "threading", "time", "traceback", "uuid", "validate_ai_config", "validate_mapping", "validate_mapping_for_prediction", "validate_single_row_source_values", "warnings", "workflow_requires_manual_molecular_input", "zipfile", "_PARSER_STATUS_LABELS", "_render_structure_notices", "_structure_warning_lines", "_structure_svg_text" ]
+__all__ = [ "AIServiceConfig", "APP_NAME", "AdvancedDataCleaner", "AdvancedMolecularFeatureExtractor", "ApplicabilityDomainAnalyzer", "AutoGluonWrapper", "CACHE_DIR", "CLASSIFICATION_MODEL_NAMES", "CUSTOM_CSS", "CancellableProcessPoolExecutor", "CancellableThreadPoolExecutor", "DATA_DIR", "DEFAULT_OPTUNA_TRIALS", "DEFAULT_RANDOM_STATE", "DEFAULT_TEST_SIZE", "DataEnhancer", "EnhancedDataExplorer", "EnhancedModelTrainer", "FeatureEngineeringTracker", "GRAPH_MODEL_NAMES", "HyperparameterOptimizer", "InverseDesigner", "MANUAL_TUNING_PARAMS", "MODEL_PARAMETERS", "MODEL_SCOPE_GUIDE", "MinMaxScaler", "NAVIGATION_PAGES", "OptimizationEvaluationConfig", "OptimizationProgress", "Optional", "POST_FEATURE_COMPUTED_DEFINITIONS", "Path", "PortalAIClient", "PortalAIError", "RAW_FRAME_MODEL_NAMES", "RDKitFeatureExtractor", "RECOMMENDED_PRESETS", "REGRESSION_BALANCE_DEFAULTS", "RobustScaler", "SESSION_SNAPSHOT_DIR", "SESSION_SNAPSHOT_VERSION", "SHAPCache", "SimpleNamespace", "SmartFeatureSelector", "SmartSparseDataSelector", "SparseDataHandler", "StandardScaler", "TanimotoADAnalyzer", "ThreadPoolExecutor", "TrainingRunManager", "USER_DATA_DB", "VERSION", "Visualizer", "XGBoostModelCache", "_Chem", "_HEAVY_PRELOAD_MODULES", "_IMAGE_CLIPBOARD_COMPONENT", "_IMAGE_CLIPBOARD_COMPONENT_PATH", "_SNAPSHOT_DF_KEYS", "_SNAPSHOT_META_KEYS", "_SNAPSHOT_META_TTL_SEC", "_TABPFN_HF_REPO", "_THREAD_COUNT", "_align_input_dataframe_to_required_features", "_apply_feature_mask_to_feature_cols", "_build_feature_alignment_report", "_build_image_preview", "_build_pearson_overview_figure", "_build_prediction_molecular_baseline", "_build_screening_reference_export", "_build_split_snapshot_tables", "_cached_basic_stats", "_cached_boxplot_fig", "_cached_corr_fig", "_cached_corr_with_target", "_cached_csv_bytes", "_cached_distribution_fig", "_cached_duplicate_count", "_cached_excel_bytes", "_cached_high_corr_pairs", "_cached_high_repetition_columns", "_cached_missing_by_column", "_cached_missing_fig", "_cached_numeric_describe", "_cached_pseudo_numeric_columns", "_cached_read_uploaded_table", "_cached_render_structure", "_clear_feature_classification_cache", "_clear_molecular_feature_session_metadata", "_clear_molecular_features_from_session", "_clear_post_feature_mapping_session_metadata", "_clear_process_pls_session_metadata", "_coerce_feature_frame", "_coerce_feature_mask", "_coerce_target_array", "_collect_autosave_payload", "_collect_molecular_feature_columns", "_configure_safe_console_output", "_configure_thread_limits", "_count_missing_like", "_current_melting_point_artifact_extra", "_current_molecular_feature_artifact_extra", "_decode_clipboard_image_payload", "_deduplicate_feature_list", "_draw_pearson_bubble_matrix", "_deduplicate_feature_list_normalized", "_df_cache_key", "_ensure_cjk_plot_font", "_ensure_tabpfn_license_ready", "_extract_artifact_final_feature_names", "_extract_pipeline_feature_mask", "_get_cached_cleaner", "_get_expected_model_feature_count", "_get_gnn_featurizer", "_get_or_create_session_id", "_get_snapshot_save_executor", "_get_snapshot_save_gate", "_image_clipboard_component", "_infer_binary_target_info", "_invalidate_post_feature_mapping_if_changed", "_is_recent_snapshot", "_is_user_cancelled_error", "_load_new_base_dataset", "_load_saved_split_tables", "_load_snapshot_meta", "_load_snapshot_meta_throttled", "_load_structure_visualization_apis", "_lock_current_training_contract", "_mark_virtual_screening_run_requested", "_maybe_auto_restore", "_maybe_autosave_session", "_normalize_feature_name", "_normalize_meta_value", "_oplog_init", "_page_batch_structure_check", "_page_smiles_to_structure_image", "_page_virtual_screening_formula", "_post_feature_mapping_catalog_fingerprint", "_post_feature_mapping_model_fingerprint", "_post_feature_mapping_snapshot_for_screening", "_preload_heavy_libraries", "_prepare_post_feature_mapping_for_prediction", "_quick_rdkit_parse_stats", "_reconstruct_split_from_current_data", "_register_source_feature_names", "_render_binary_classification_results", "_render_data_explore_preview", "_render_figure_export_controls", "_render_global_task_lock", "_render_molecular_feature_clear_restore_control", "_render_molecule_design_engine", "_render_network_proxy_panel", "_render_portal_ai_service_panel", "_render_post_feature_mapping_panel", "_render_prediction_feature_check_panel", "_render_prediction_molecular_input_panel", "_render_sidebar_compute_panel", "_render_sidebar_portal_panel", "_render_sidebar_session_panel", "_render_structure_result", "_render_training_emergency_stop_panel", "_resolve_effective_feature_cols", "_resolve_feature_mask", "_resolve_imported_molecular_feature_workflow", "_resolve_prediction_feature_cols", "_restore_molecular_feature_metadata", "_restore_post_feature_mapping_metadata", "_restore_process_pls_metadata", "_restore_session_snapshot", "_restore_versioned_molecular_feature_metadata", "_run_imported_molecular_feature_workflow", "_safe_structure_image_path", "_save_session_snapshot", "_save_session_snapshot_async", "_should_restore_value", "_show_mpl_fig_fullwidth", "_snapshot_paths", "_structure_result_text", "_structure_visualization_output_root", "_suggest_similar_feature_names", "_tabpfn_license_name_via_mirror", "_tabpfn_preflight_check", "_virtual_screening_task_guard", "_wrap_tick_label", "_write_autosave_payload", "analyze_group_distribution", "append_runtime_debug", "apply_mapping", "as_completed", "assert_training_context", "audit_training_result", "base64", "binascii", "build_export_zip", "build_feature_name_pie_data", "build_feature_pie_data", "build_group_series", "build_manual_mapping_choices", "build_post_feature_catalog", "build_request_url", "build_shap_importance_df", "build_single_row_source_frame", "cancel_all_background_tasks", "catalog_fingerprint", "classify_feature_for_pie", "clear_cancel", "collect_workflow_source_columns", "commit_mapping_form_draft", "components", "copy", "create_mapping_draft", "create_quick_export_button", "dataframe_to_csv_bytes", "dataframe_to_excel_bytes", "datetime", "default_ai_config", "ensure_emergency_stop_server", "exportable_ai_config", "feature_values_or_empty", "fig_to_html", "fig_to_png_bytes", "figure_to_bytes", "functools", "generate_training_script_code", "generate_tuning_suggestions", "get_active_task_count", "get_current_model", "get_feature_review_ai_client", "get_formulation_group_options", "get_shap_cache", "get_task_manager", "get_task_summary", "get_xgboost_cache", "hashlib", "init_session_state", "io", "is_cancelled", "is_port_open", "json", "key_fingerprint", "load_ai_config", "load_data_file", "load_shap_export_frame", "locale", "lock_training_contract", "log_fe_step", "logging", "mapping_snapshot", "mapping_snapshot_restore_policy", "mp", "multiprocessing", "normalize_endpoint_path", "normalize_mapping", "np", "oplog", "oplog_clear", "oplog_render", "os", "page_active_learning", "page_data_cleaning", "page_data_enhancement", "page_data_explore", "page_data_upload", "page_feature_registry", "page_feature_selection", "page_formulation_fusion", "page_home", "page_hyperparameter_optimization", "page_image_to_smiles", "page_model_imputation", "page_model_interpretation", "page_model_training", "page_molecular_feature_reproduction", "page_molecular_features", "page_prediction", "page_smiles_structure_tools", "page_status_log", "page_structure_recognition", "page_title_with_refresh", "page_training_records", "page_virtual_screening", "pd", "pickle", "plot_history", "plt", "portal_health_label", "portal_process_status", "prepare_manual_training_params", "prepare_regression_optimization", "preview_dataframe", "re", "redacted_ai_config", "render_data_export_panel", "render_export_section", "render_feature_registry_page", "render_melting_point_dataset_panel", "render_shap_importance_outputs", "render_sidebar", "render_status_panel", "render_status_sidebar", "render_task_control_expander", "render_task_manager_ui", "render_top_status_bar", "resolve_data_source", "resolve_navigation_page", "resolve_prediction_feature_contract", "run_xgboost_shap_subprocess", "run_xgboost_surface_subprocess", "sanitize_feature_columns", "sanitize_preview_columns", "save_ai_config", "select_training_context_for_model", "show_robust_feature_selection", "st", "start_prediction_portal", "stop_prediction_portal", "subprocess", "sys", "threading", "time", "traceback", "uuid", "validate_ai_config", "validate_mapping", "validate_mapping_for_prediction", "validate_single_row_source_values", "warnings", "workflow_requires_manual_molecular_input", "zipfile", "_PARSER_STATUS_LABELS", "_PEARSON_ANALYSIS_GUIDE", "_render_structure_notices", "_structure_warning_lines", "_structure_svg_text" ]
