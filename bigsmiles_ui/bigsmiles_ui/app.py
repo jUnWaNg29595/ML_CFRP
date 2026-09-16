@@ -53,7 +53,23 @@ def _result_text(result: RenderResult) -> str:
         f"警告信息：{result.warning_message}",
         f"渲染器：{result.renderer}",
     ]
+    disclaimers = getattr(result, "disclaimers", ()) or ()
+    if disclaimers:
+        lines.append("固定说明：" + "；".join(str(item) for item in disclaimers))
     return "\n".join(lines)
+
+
+def _show_result_notices(st, result: RenderResult) -> None:
+    """固定免责说明与真正需要处理的问题分开展示。"""
+    issues = [part.strip() for part in str(result.warning_message or "").split("；") if part.strip()]
+    if issues:
+        if len(issues) == 1:
+            st.warning(issues[0])
+        else:
+            st.warning("需要注意：\n\n" + "\n".join(f"- {item}" for item in issues))
+    disclaimers = [str(item).strip() for item in (getattr(result, "disclaimers", ()) or ()) if str(item).strip()]
+    if disclaimers:
+        st.caption("ℹ️ " + "；".join(disclaimers))
 
 
 def _show_single_tab(st) -> None:
@@ -67,9 +83,20 @@ def _show_single_tab(st) -> None:
     type_map = {"自动识别": "auto", "SMILES": "smiles", "BigSMILES": "bigsmiles"}
     col1, col2 = st.columns(2)
     with col1:
-        image_width = st.number_input("图片宽度", min_value=200, max_value=3000, value=1000, step=50)
+        image_width = st.number_input("图片宽度", min_value=200, max_value=3000, value=1200, step=50)
     with col2:
-        image_height = st.number_input("图片高度", min_value=200, max_value=3000, value=700, step=50)
+        image_height = st.number_input("图片高度上限", min_value=200, max_value=3000, value=1600, step=50)
+    quality_col1, quality_col2 = st.columns(2)
+    with quality_col1:
+        supersample_label = st.selectbox("输出清晰度", ["2x 超采样（推荐）", "1x 标准", "3x 超采样"], index=0)
+    with quality_col2:
+        auto_fit = st.checkbox("自适应画布（自动裁掉多余留白）", value=True)
+    layout_col1, layout_col2 = st.columns(2)
+    with layout_col1:
+        split_components = st.checkbox("多组分（.）拆分展示", value=True)
+    with layout_col2:
+        expand_repeat_units = st.checkbox("BigSMILES 展开重复单元画完整骨架", value=True)
+    supersample_map = {"1x 标准": 1.0, "2x 超采样（推荐）": 2.0, "3x 超采样": 3.0}
     sample = st.checkbox("生成代表性采样链段示意图（RDKit 片段整体复制，不代表真实链长）", value=False)
     repeat_units = 5
     random_seed = 42
@@ -85,6 +112,10 @@ def _show_single_tab(st) -> None:
             random_seed=int(random_seed),
             image_width=int(image_width),
             image_height=int(image_height),
+            supersample=float(supersample_map[supersample_label]),
+            auto_fit=bool(auto_fit),
+            split_components=bool(split_components),
+            expand_repeat_units=bool(expand_repeat_units),
         )
         result = render_structure(raw, output_dir, options)
         if result.parse_status == "valid" and result.draw_status == "rendered":
@@ -97,25 +128,45 @@ def _show_single_tab(st) -> None:
             st.error(format_result_summary(result))
         if result.error_message:
             st.error(result.error_message)
-        if result.warning_message:
-            st.warning(result.warning_message)
+        if result.warning_message or getattr(result, "disclaimers", ()):
+            _show_result_notices(st, result)
         if result.normalized_structure:
             st.code(result.normalized_structure, language="text")
         if result.main_image_path:
             image_path = output_dir / result.main_image_path
             if image_path.exists():
-                st.image(str(image_path), caption="主图：重复单元/连接模式视图或普通分子图")
+                svg_path = output_dir / result.svg_path if result.svg_path else None
+                if svg_path is not None and svg_path.exists():
+                    st.image(
+                        svg_path.read_text(encoding="utf-8"),
+                        caption="主图：矢量化 SVG，可自由缩放",
+                        width="stretch",
+                    )
+                else:
+                    st.image(
+                        str(image_path),
+                        caption="主图：重复单元/连接模式视图或普通分子图",
+                        width="stretch",
+                    )
                 st.download_button(
-                    "下载主图",
+                    "下载主图 PNG",
                     data=image_path.read_bytes(),
                     file_name=image_path.name,
                     mime="image/png",
                     key="download_main_image",
                 )
+                if svg_path is not None and svg_path.exists():
+                    st.download_button(
+                        "下载主图 SVG（矢量）",
+                        data=svg_path.read_bytes(),
+                        file_name=svg_path.name,
+                        mime="image/svg+xml",
+                        key="download_main_svg",
+                    )
         if result.sample_image_path:
             image_path = output_dir / result.sample_image_path
             if image_path.exists():
-                st.image(str(image_path), caption="代表性采样链段图")
+                st.image(str(image_path), caption="代表性采样链段图", width="stretch")
                 st.download_button(
                     "下载采样图",
                     data=image_path.read_bytes(),
@@ -197,7 +248,7 @@ def _show_batch_tab(st) -> None:
     status.success(
         f"完成：共 {len(result_frame)} 行；有效 {counts['valid']}；无效 {counts['invalid']}；空值 {counts['empty']}。"
     )
-    st.dataframe(result_frame.head(100), use_container_width=True)
+    st.dataframe(result_frame.head(100), width="stretch")
     st.download_button(
         "下载结果表",
         data=output_path.read_bytes(),

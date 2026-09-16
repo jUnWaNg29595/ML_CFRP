@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import os
+# 必须在科学计算库加载前设置：conda 的 sklearn 经 MKL 间接加载 Intel Fortran 运行库
+# libifcoremd.dll，其默认注册的 Ctrl+C 处理器会打印 forrtl: error (200) 并卡死退出，
+# 导致 Streamlit 按 Ctrl+C 关不掉。设为 1 可禁用该处理器（Intel 官方开关）。
+os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
+
 import copy
 import base64
 import json

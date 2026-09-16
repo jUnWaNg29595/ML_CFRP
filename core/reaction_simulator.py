@@ -125,7 +125,7 @@ def _junction_site_count(mol):
 
 
 def _graph_invariants_from_mol(mol):
-    # 图论网络不变量：图直径 / 平均最短路径 / Wiener指数 / 环数
+    # 图论网络不变量（相对值口径）：平均最短路径 / 环密度
     if not NETWORKX_AVAILABLE:
         return {}
     out = {}
@@ -142,28 +142,25 @@ def _graph_invariants_from_mol(mol):
         if G.number_of_nodes() == 0:
             return out
         comps = list(nx.connected_components(G))
-        diameters = []
         apls = []
-        wiener = 0
         for c in comps:
             sg = G.subgraph(c)
             nn = sg.number_of_nodes()
             if nn < 2:
                 continue
-            try:
-                diameters.append(nx.diameter(sg))
-            except Exception:
-                pass
             paths = dict(nx.all_pairs_shortest_path_length(sg))
             total = 0
             for _src, dists in paths.items():
                 total += sum(dists.values())
-            wiener += total
             apls.append(total / (nn * (nn - 1)))
-        out['product_graph_diameter'] = float(max(diameters)) if diameters else 0.0
+        # 相对值口径：仅保留强度量（平均最短路径、环密度）；
+        # 图直径 / Wiener 指数随实现物采样规模漂移，不再输出
+        n_heavy_graph = float(G.number_of_nodes())
         out['product_graph_avg_path_length'] = float(np.mean(apls)) if apls else 0.0
-        out['product_wiener_index'] = float(wiener)
-        out['product_cyclomatic_number'] = float(mol.GetNumBonds() - mol.GetNumHeavyAtoms() + len(comps))
+        if n_heavy_graph > 0:
+            out['product_cyclomatic_density'] = float(
+                mol.GetNumBonds() - mol.GetNumHeavyAtoms() + len(comps)
+            ) / n_heavy_graph
     except Exception:
         pass
     return out
@@ -190,14 +187,11 @@ def _compute_product_3d_descriptors(smiles):
             cid = AllChem.EmbedMolecule(mol, params)
         if cid == -1:
             return out
-        out['product_3d_radius_of_gyration'] = float(rdMolDescriptors.CalcRadiusOfGyration(mol))
-        out['product_3d_pmi1'] = float(rdMolDescriptors.CalcPMI1(mol))
-        out['product_3d_pmi2'] = float(rdMolDescriptors.CalcPMI2(mol))
-        out['product_3d_pmi3'] = float(rdMolDescriptors.CalcPMI3(mol))
+        # 相对值口径：仅保留无量纲形状描述符（NPR 为归一化 PMI 比值、Spherocity ∈ [0,1]）；
+        # 回转半径 / PMI 绝对值 / LabuteASA 随实现物尺寸漂移，不再输出
         out['product_3d_npr1'] = float(rdMolDescriptors.CalcNPR1(mol))
         out['product_3d_npr2'] = float(rdMolDescriptors.CalcNPR2(mol))
         out['product_3d_spherocity'] = float(rdMolDescriptors.CalcSpherocityIndex(mol))
-        out['product_3d_labute_asa'] = float(rdMolDescriptors.CalcLabuteASA(mol))
     except Exception:
         return {}
     return out
@@ -213,40 +207,50 @@ def _compute_product_descriptors(smiles, include_3d=True):
         try:
             mol = Chem.MolFromSmiles(smiles)
             if mol is not None:
-                out['product_mol_weight'] = float(Descriptors.MolWt(mol))
-                out['product_num_atoms'] = float(mol.GetNumAtoms())
-                out['product_num_heavy_atoms'] = float(mol.GetNumHeavyAtoms())
+                n_heavy = float(mol.GetNumHeavyAtoms())
+                n_bonds = float(mol.GetNumBonds())
+
+                def _density(count: float) -> float:
+                    return (float(count) / n_heavy) if n_heavy > 0 else 0.0
+
+                # 内部量（不进入特征表）：供聚合度/转化率等相对指标计算
+                out['internal_product_mol_weight'] = float(Descriptors.MolWt(mol))
                 rb = _desc_safe(mol, 'NumRotatableBonds')
-                out['product_num_rotatable_bonds'] = float(rb) if rb is not None else 0.0
-                out['product_tpsa'] = float(Descriptors.TPSA(mol))
+                rb_count = float(rb) if rb is not None else 0.0
+
+                # 强度量/无量纲描述符（尺寸无关，直接保留）
                 out['product_logp'] = float(Descriptors.MolLogP(mol))
-                out['product_molar_refractivity'] = float(Descriptors.MolMR(mol))
-                out['product_num_h_donors'] = float(Descriptors.NumHDonors(mol))
-                out['product_num_h_acceptors'] = float(Descriptors.NumHAcceptors(mol))
-                out['product_num_rings'] = float(Descriptors.RingCount(mol))
-                out['product_num_aromatic_rings'] = float(Descriptors.NumAromaticRings(mol))
-                out['product_num_aliphatic_rings'] = float(Descriptors.NumAliphaticRings(mol))
                 out['product_fraction_csp3'] = float(Descriptors.FractionCSP3(mol))
-                out['product_num_saturated_rings'] = float(Descriptors.NumSaturatedRings(mol))
-                out['product_num_heteroatoms'] = float(Descriptors.NumHeteroatoms(mol))
-                # 官能团（交联相关）
-                out['product_num_hydroxyl'] = float(len(mol.GetSubstructMatches(Chem.MolFromSmarts('[OH]'))))
-                out['product_num_amine'] = float(len(mol.GetSubstructMatches(Chem.MolFromSmarts('[NX3;H2,H1,H0]'))))
-                out['product_num_ether'] = float(len(mol.GetSubstructMatches(Chem.MolFromSmarts('[OD2]([#6])[#6]'))))
-                # Layer1: 固化专用结构特征
-                out['product_residual_epoxide'] = float(_epoxide_count_of_mol(mol))
-                out['product_num_junction_sites'] = float(_junction_site_count(mol))
-                # Layer2: 拓扑指数
+                # 环系密度（刚性链段结构，每重原子）
+                out['product_ring_density'] = _density(Descriptors.RingCount(mol))
+                out['product_aromatic_ring_density'] = _density(Descriptors.NumAromaticRings(mol))
+                out['product_aliphatic_ring_density'] = _density(Descriptors.NumAliphaticRings(mol))
+                out['product_saturated_ring_density'] = _density(Descriptors.NumSaturatedRings(mol))
+                # 极性/亲水密度（每重原子）
+                out['product_h_donor_density'] = _density(Descriptors.NumHDonors(mol))
+                out['product_h_acceptor_density'] = _density(Descriptors.NumHAcceptors(mol))
+                out['product_tpsa_density'] = _density(Descriptors.TPSA(mol))
+                out['product_molar_refractivity_density'] = _density(Descriptors.MolMR(mol))
+                out['product_heteroatom_fraction'] = _density(Descriptors.NumHeteroatoms(mol))
+                # 柔性链段占比（每总键数）
+                out['product_rotatable_bond_ratio'] = (rb_count / n_bonds) if n_bonds > 0 else 0.0
+                # 交联相关官能团密度（每重原子）
+                out['product_hydroxyl_density'] = _density(len(mol.GetSubstructMatches(Chem.MolFromSmarts('[OH]'))))
+                out['product_amine_density'] = _density(len(mol.GetSubstructMatches(Chem.MolFromSmarts('[NX3;H2,H1,H0]'))))
+                out['product_ether_density'] = _density(len(mol.GetSubstructMatches(Chem.MolFromSmarts('[OD2]([#6])[#6]'))))
+                residual_epoxide_count = float(_epoxide_count_of_mol(mol))
+                out['product_residual_epoxide_density'] = _density(residual_epoxide_count)
+                out['internal_residual_epoxide_count'] = residual_epoxide_count
+                out['product_junction_site_density'] = _density(_junction_site_count(mol))
+                # Layer2: 无量纲拓扑形状指数（Kappa/HallKierAlpha/BalabanJ/E-state 极值均尺寸无关）
+                # 注：Chi 连接性指数与 BertzCT 随实现物规模增长，已移除
                 for k, nm in [('product_kappa1', 'Kappa1'), ('product_kappa2', 'Kappa2'), ('product_kappa3', 'Kappa3'),
-                              ('product_chi0n', 'Chi0n'), ('product_chi1n', 'Chi1n'), ('product_chi2n', 'Chi2n'),
-                              ('product_chi3n', 'Chi3n'), ('product_chi4n', 'Chi4n'),
-                              ('product_balaban_j', 'BalabanJ'), ('product_bertz_ct', 'BertzCT'),
-                              ('product_hall_kier_alpha', 'HallKierAlpha'),
+                              ('product_balaban_j', 'BalabanJ'), ('product_hall_kier_alpha', 'HallKierAlpha'),
                               ('product_max_estate', 'MaxEStateIndex'), ('product_min_estate', 'MinEStateIndex')]:
                     v = _desc_safe(mol, nm)
                     if v is not None:
                         out[k] = v
-                # Layer5: 图论不变量
+                # Layer5: 图论不变量（仅强度量：平均最短路径、环密度）
                 out.update(_graph_invariants_from_mol(mol))
         except Exception:
             return {}
@@ -2350,12 +2354,13 @@ class CrosslinkedFeatureExtractor:
                 features['product_smiles'] = product_smi
                 features['product_structure'] = product_bigsmi or product_smi
                 prod_desc = _compute_product_descriptors(product_smi, include_3d=True)
+                # 内部量不进入特征表：仅用于转化率相对化计算
+                residual_count = float(prod_desc.pop('internal_residual_epoxide_count', 0.0) or 0.0)
+                prod_desc.pop('internal_product_mol_weight', None)
                 features.update(prod_desc)
-                features.setdefault('product_remaining_epoxide', prod_desc.get('product_residual_epoxide', 0.0))
-                features.setdefault('product_hydroxyl_count', prod_desc.get('product_num_hydroxyl', 0.0))
                 # 转化率代理（枢纽活性氢消耗近似，夹取到[0,1]）
                 if features['epoxide_count'] > 0:
-                    consumed = max(0.0, features['epoxide_count'] - prod_desc.get('product_residual_epoxide', 0.0))
+                    consumed = max(0.0, features['epoxide_count'] - residual_count)
                     features['estimated_conversion'] = min(1.0, consumed / features['epoxide_count'])
                 else:
                     features['estimated_conversion'] = 0.0
@@ -2875,47 +2880,12 @@ class MulticomponentCrosslinkedFeatureExtractor:
 
             weighted_curer_func += curer_func * curer_weight
 
-        features['weighted_epoxy_functionality'] = weighted_epoxy_func
-        features['weighted_curer_functionality'] = weighted_curer_func
+        # [已移除] weighted_epoxy/curer_functionality：单体加权官能度属机理特征家族，
+        # 与产物相对值口径不符；官能度信息已由反应产物层面的 junction_site_density 等承载
         features['stoichiometry_r'] = stoichiometry_r
 
-        # 1.5 注入高分子物理交联网络与多组分动力学特征（复用常驻引擎与分子缓存）
-        try:
-            if not hasattr(self, '_mechanism_engine') or self._mechanism_engine is None:
-                from core.epoxy_mechanism_features import EpoxyMechanismEngine
-                self._mechanism_engine = EpoxyMechanismEngine(verbose=self.verbose)
-            _engine = self._mechanism_engine
-            _res_items = []
-            for smi, w in resin_components:
-                c_key = f"R|{smi}"
-                if hasattr(self, '_mol_prop_cache') and c_key in self._mol_prop_cache:
-                    p = dict(self._mol_prop_cache[c_key])
-                else:
-                    p = _engine.calc_single_molecule_properties(smi, is_resin=True)
-                    if hasattr(self, '_mol_prop_cache'):
-                        self._mol_prop_cache[c_key] = p
-                p['weight'] = w
-                _res_items.append(p)
-            _cur_items = []
-            for smi, w in curer_components:
-                c_key = f"H|{smi}"
-                if hasattr(self, '_mol_prop_cache') and c_key in self._mol_prop_cache:
-                    p = dict(self._mol_prop_cache[c_key])
-                else:
-                    p = _engine.calc_single_molecule_properties(smi, is_resin=False)
-                    if hasattr(self, '_mol_prop_cache'):
-                        self._mol_prop_cache[c_key] = p
-                p['weight'] = w
-                _cur_items.append(p)
-            _mech = _engine.compute_formulation_mechanism_features(
-                _res_items, _cur_items, given_r_value=stoichiometry_r
-            )
-            for k, v in _mech.items():
-                clean_k = k.replace('mech_', '')
-                features[clean_k] = v
-        except Exception as e:
-            if self.verbose:
-                print(f"⚠️ 机理特征注入跳过: {e}")
+        # [已移除] 机理特征注入：mech_weighted_* / stoich_* / alpha_* 等与单体绝对值
+        # 重复且违背产物相对值口径，多组分管线不再输出这些特征
 
         # 2. 估算转化率
         if target_conversion is None and auto_estimate_conversion:
@@ -3012,14 +2982,16 @@ class MulticomponentCrosslinkedFeatureExtractor:
                 # 提取产物扩展物理/化学特征（2D拓扑 + 交联位点 + 图论 + 3D构象）
                 if smiles_result:
                     extended_features = self._extract_extended_product_features(smiles_result)
+                    extended_features.pop('internal_residual_epoxide_count', None)
                     features.update(extended_features)
                     try:
                         mol_r = Chem.MolFromSmiles(reaction_result.get('main_resin', '') or '')
                         mw_r = Descriptors.MolWt(mol_r) if mol_r is not None else 0.0
-                        if mw_r > 0 and extended_features.get('product_mol_weight'):
-                            features['product_degree_of_polymerization'] = extended_features['product_mol_weight'] / mw_r
+                        if mw_r > 0 and extended_features.get('internal_product_mol_weight'):
+                            features['product_degree_of_polymerization'] = extended_features['internal_product_mol_weight'] / mw_r
                     except Exception:
                         pass
+                    features.pop('internal_product_mol_weight', None)
 
             elif reaction_method == 'combinatorial':
                 # 方案2：组合反应法
@@ -3066,15 +3038,17 @@ class MulticomponentCrosslinkedFeatureExtractor:
                 # 提取扩展的产物特征（2D拓扑 + 交联位点 + 图论 + 3D构象）
                 if smiles_result:
                     extended_features = self._extract_extended_product_features(smiles_result)
+                    extended_features.pop('internal_residual_epoxide_count', None)
                     features.update(extended_features)
                     try:
                         main_r_smi_dp, _ = max(resin_components, key=lambda x: x[1])
                         mol_r = Chem.MolFromSmiles(main_r_smi_dp or '')
                         mw_r = Descriptors.MolWt(mol_r) if mol_r is not None else 0.0
-                        if mw_r > 0 and extended_features.get('product_mol_weight'):
-                            features['product_degree_of_polymerization'] = extended_features['product_mol_weight'] / mw_r
+                        if mw_r > 0 and extended_features.get('internal_product_mol_weight'):
+                            features['product_degree_of_polymerization'] = extended_features['internal_product_mol_weight'] / mw_r
                     except Exception:
                         pass
+                    features.pop('internal_product_mol_weight', None)
 
         except Exception as e:
             if self.verbose:

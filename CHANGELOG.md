@@ -5,6 +5,17 @@
 本文档格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/),
 并且本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 性能
+- TabPFN 等黑盒模型 SHAP 提速约两个数量级（实测 200 样本默认参数从外推 ~53 分钟降至 ~22 秒，RTX 2080 Ti）：
+  - 新增「跨样本批量置换 SHAP」快速路径（`core/model_interpreter.py`）：每个样本每轮置换仅需 2M+1 次评估，并把一批样本的 coalition 行合并成少量大 batch 一次性调用 `model.predict`，避免 KernelExplainer 逐样本、每次都重跑 TabPFN 完整训练上下文前向（含 8 个 ensemble 成员）的开销
+  - 适用于 TabPFN、TabNet、FT-Transformer、人工神经网络、BNN/Transformer 系列等无专用 Explainer 的黑盒模型；失败时自动回退到原 KernelExplainer 路径
+  - 置换轮数复用 UI「Kernel nsamples」预算自适应（1~4 轮）；加和一致性（效率公理）达机器精度，重要性排序与 KernelSHAP 的 Spearman 相关系数 0.987
+  - 特征数 ≥300 时的 UI 警告对已启用加速的模型追加提示
+- 新增回归测试 `tests/test_batched_permutation_shap.py`（线性解析解、效率公理、分块/分批不变性、快速路径选择逻辑）
+
+---
 ## [1.6.0] - 2026-09-13
 
 ### 变更

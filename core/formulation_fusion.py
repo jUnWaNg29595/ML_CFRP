@@ -422,7 +422,6 @@ class FormulationFusionEngine:
         curing_type_filter: Optional[str] = "external_hardener",
         mode: str = "qspr_clean",
         drop_metadata: bool = True,
-        enrich_mechanism: bool = True,
         base_df: Optional[pd.DataFrame] = None
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
@@ -434,7 +433,6 @@ class FormulationFusionEngine:
             curing_type_filter: 固化体系筛选值 (如 'external_hardener', 若为 None 或 'all' 则不筛选)
             mode: 清洗模式 ('qspr_clean': 紧凑标准 QSPR 模式; 'comprehensive': 全息保留模式)
             drop_metadata: 是否强制剔除元数据、格式列和无预测价值的列
-            enrich_mechanism: 是否自动计算并注入 18 项物理交联机理特征
             base_df: 原始窄表 (用于提取原窄表拥有的测试条件列等)
         """
         stats: Dict[str, Any] = {
@@ -446,7 +444,6 @@ class FormulationFusionEngine:
             "mode": mode,
             "dropped_columns_sample": [],
             "resin_3_included": False,
-            "mechanism_features_count": 0,
         }
 
         out_df = df.copy()
@@ -457,19 +454,11 @@ class FormulationFusionEngine:
                 out_df = out_df[out_df["curing_type_standard"] == curing_type_filter].copy()
                 stats["filtered_rows"] = len(out_df)
 
-        # 2. 如果开启机理特征计算且尚未计算
-        if enrich_mechanism:
-            has_mech = any(c.startswith("mech_") for c in out_df.columns)
-            if not has_mech:
-                try:
-                    from core.epoxy_mechanism_features import EpoxyMechanismEngine
-                    mech_engine = EpoxyMechanismEngine()
-                    out_df = mech_engine.enrich_dataframe(out_df)
-                except Exception:
-                    pass
-
+        # 2. 彻底剥离机理特征列 (mech_*)：融合流程已废弃机理特征注入，
+        #    同时清洗旧宽表中可能残留的 mech_* 列，防止其进入训练矩阵
         mech_cols = [c for c in out_df.columns if c.startswith("mech_")]
-        stats["mechanism_features_count"] = len(mech_cols)
+        if mech_cols:
+            out_df = out_df.drop(columns=mech_cols)
 
         # 3. 定义无意义元数据列判定规则
         def is_useless_metadata_col(c: str) -> bool:

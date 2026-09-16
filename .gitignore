@@ -85,6 +85,9 @@ results/
 .pi/
 .pytest_cache/
 
+# frp 隧道配置（含 token / secretKey，禁止上传）
+frp*.conf
+
 # 依赖快照（主 requirements.txt 已保留）
 requirements-actual.txt
 requirements-batch1.txt

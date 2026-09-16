@@ -81,4 +81,4 @@ def test_crosslink_extractor_product_epoxide_free():
     assert _epoxide_count(feats["product_smiles"]) == 0
     structure = str(feats.get("product_structure"))
     assert structure.startswith("{") and "[$]" in structure
-    assert feats.get("product_residual_epoxide") == 0.0
+    assert feats.get("product_residual_epoxide_density") == 0.0

@@ -1113,12 +1113,14 @@ try:
         EnhancedModelInterpreter,
         compute_xgboost_native_shap,
         resolve_feature_names_for_matrix,
+        BATCHED_PERMUTATION_MODELS,
     )
 except Exception as _shap_err:
     ModelInterpreter = None
     EnhancedModelInterpreter = None
     compute_xgboost_native_shap = None
     resolve_feature_names_for_matrix = None
+    BATCHED_PERMUTATION_MODELS = set()
     import warnings
     warnings.warn(f'SHAP 模块导入失败，模型解释功能将受限: {_shap_err}')
 
@@ -5182,6 +5184,22 @@ def _render_global_task_lock(page):
     if not active_tasks:
         return False
 
+    # [保护] 分子特征提取的锁定策略（按用户要求）：
+    #   - 点击“提取按钮”触发的运行（含重复点击）不锁定页面，由页面守护给出提示；
+    #   - 只有离开分子特征页面、或本次交互不是提取按钮（误触发其它控件，
+    #     导致提取界面消失）时才锁定提示。
+    if str(page).strip() == _MF_PAGE_TITLE and (
+        _mf_request_fresh(st.session_state, "_mf_extract_run_requested")
+        or _mf_request_fresh(st.session_state, "_mf_import_run_requested")
+    ):
+        mf_key = _mf_task_key()
+        active_tasks = [
+            t for t in active_tasks
+            if not (t.task_key == mf_key and str(getattr(t, "task_type", "")) == "molecular_feature")
+        ]
+        if not active_tasks:
+            return False
+
     # 检查任务是否由于之前崩溃或异常终止而处于“假死/僵尸”状态（超时未更新）
     # 同时提供一键解锁按钮，避免任务管理器单例残留死锁页面
     st.warning("🔒 检测到后台任务锁定标记，主页面控件已暂时锁定。")
@@ -5189,6 +5207,8 @@ def _render_global_task_lock(page):
     with c_lock1:
         st.caption("若后台实际已没有在计算（例如任务中断或发生过异常），可点击右侧直接一键清除死锁并恢复页面。")
         st.caption("💡 长任务运行期间请勿刷新页面或反复操作：刷新/交互可能中断当前运行；提取结果已按阶段自动快照，恢复后可继续。")
+        if any(str(getattr(t, "task_type", "")) == "molecular_feature" for t in active_tasks):
+            st.caption("🧬 分子特征提取仍在运行，但其页面界面已因交互中断：可等待其完成，或点击右侧强制清除后重新提取。")
     with c_lock2:
         if st.button("🔓 强制解除锁定", key="btn_force_unlock_all_tasks", type="primary", use_container_width=True):
             task_mgr.cancel_all_tasks(force=True)
@@ -6427,10 +6447,18 @@ def page_data_cleaning():
 
             st.markdown("---")
             st.markdown("### 🎯 自定义阈值过滤")
-            st.info("💡 适用于删除接近0或不合理的值（如模量 < 0.5 GPa）")
+            st.info("💡 适用于删除接近0或不合理的值（如模量 < 0.5 GPa），也可按分位数比例保留样本（如保留中间 80%）")
 
             col_t1, col_t2 = st.columns(2)
             with col_t1:
+                # 默认选中目标特征列（若其为数值列）；未设置或列已失效时回退第一个数值列
+                _cur_threshold_col = st.session_state.get("threshold_filter_col")
+                if _cur_threshold_col not in numeric_cols_all:
+                    _threshold_target = st.session_state.get('target_col')
+                    if _threshold_target in numeric_cols_all:
+                        st.session_state["threshold_filter_col"] = _threshold_target
+                    elif numeric_cols_all:
+                        st.session_state["threshold_filter_col"] = numeric_cols_all[0]
                 threshold_col = st.selectbox(
                     "选择要过滤的列",
                     options=numeric_cols_all,
@@ -6440,7 +6468,7 @@ def page_data_cleaning():
             with col_t2:
                 filter_type = st.radio(
                     "过滤类型",
-                    ["删除小于阈值", "删除大于阈值", "删除区间外"],
+                    ["删除小于阈值", "删除大于阈值", "删除区间外", "按比例保留"],
                     horizontal=False,
                     key="threshold_filter_type"
                 )
@@ -6463,7 +6491,7 @@ def page_data_cleaning():
                     key="max_threshold"
                 )
                 st.caption(f"将删除 {threshold_col} > {max_threshold} 的样本")
-            else:  # 删除区间外
+            elif filter_type == "删除区间外":
                 col_min, col_max = st.columns(2)
                 with col_min:
                     min_threshold = st.number_input(
@@ -6482,6 +6510,43 @@ def page_data_cleaning():
                         key="range_max"
                     )
                 st.caption(f"将保留 {min_threshold} ≤ {threshold_col} ≤ {max_threshold} 的样本")
+            else:  # 按比例保留
+                col_p1, col_p2 = st.columns(2)
+                with col_p1:
+                    keep_pct = st.slider(
+                        "保留比例",
+                        min_value=5,
+                        max_value=99,
+                        value=80,
+                        step=1,
+                        format="%d%%",
+                        key="threshold_keep_pct",
+                        help="按所选特征的分位数保留一定比例的样本"
+                    )
+                with col_p2:
+                    keep_part = st.radio(
+                        "保留部分",
+                        ["中间段", "最高值段", "最低值段"],
+                        horizontal=True,
+                        key="threshold_keep_part",
+                        help="中间段：去除两端极端值；最高值段：保留数值最大的样本；最低值段：保留数值最小的样本"
+                    )
+                if threshold_col is None:
+                    st.caption("⚠️ 无可用数值列")
+                elif df[threshold_col].notna().sum() == 0:
+                    st.caption("⚠️ 该列当前没有有效数值，无法按比例过滤")
+                else:
+                    _p_ratio = keep_pct / 100.0
+                    if keep_part == "中间段":
+                        _q_lo = df[threshold_col].quantile((1 - _p_ratio) / 2)
+                        _q_hi = df[threshold_col].quantile((1 + _p_ratio) / 2)
+                        st.caption(f"将保留中间 {keep_pct}% 的样本：{_q_lo:.4g} ≤ {threshold_col} ≤ {_q_hi:.4g}")
+                    elif keep_part == "最高值段":
+                        _q_lo = df[threshold_col].quantile(1 - _p_ratio)
+                        st.caption(f"将保留数值最大的 {keep_pct}% 样本（{threshold_col} ≥ {_q_lo:.4g}）")
+                    else:  # 最低值段
+                        _q_hi = df[threshold_col].quantile(_p_ratio)
+                        st.caption(f"将保留数值最小的 {keep_pct}% 样本（{threshold_col} ≤ {_q_hi:.4g}）")
 
             if st.button("🔧 执行阈值过滤", type="primary", key="apply_threshold_filter"):
                 if threshold_col not in df.columns:
@@ -6489,35 +6554,68 @@ def page_data_cleaning():
                 else:
                     df_before = df.copy()
                     n_before = len(df_before)
+                    df_filtered = None
+                    _filter_params = {"column": threshold_col, "filter_type": filter_type}
 
                     if filter_type == "删除小于阈值":
                         df_filtered = df_before[df_before[threshold_col] >= min_threshold].reset_index(drop=True)
                         desc = f"删除 {threshold_col} < {min_threshold}"
+                        _filter_params["min"] = float(min_threshold)
                     elif filter_type == "删除大于阈值":
                         df_filtered = df_before[df_before[threshold_col] <= max_threshold].reset_index(drop=True)
                         desc = f"删除 {threshold_col} > {max_threshold}"
-                    else:  # 删除区间外
+                        _filter_params["max"] = float(max_threshold)
+                    elif filter_type == "删除区间外":
                         df_filtered = df_before[
                             (df_before[threshold_col] >= min_threshold) &
                             (df_before[threshold_col] <= max_threshold)
                         ].reset_index(drop=True)
                         desc = f"保留 {min_threshold} ≤ {threshold_col} ≤ {max_threshold}"
+                        _filter_params["min"] = float(min_threshold)
+                        _filter_params["max"] = float(max_threshold)
+                    else:  # 按比例保留
+                        _s = df_before[threshold_col]
+                        _p_ratio = keep_pct / 100.0
+                        _q_lo = _q_hi = None
+                        if keep_part == "中间段":
+                            _q_lo, _q_hi = _s.quantile((1 - _p_ratio) / 2), _s.quantile((1 + _p_ratio) / 2)
+                        elif keep_part == "最高值段":
+                            _q_lo = _s.quantile(1 - _p_ratio)
+                        else:  # 最低值段
+                            _q_hi = _s.quantile(_p_ratio)
 
-                    n_after = len(df_filtered)
-                    n_removed = n_before - n_after
+                        if (_q_lo is not None and pd.isna(_q_lo)) or (_q_hi is not None and pd.isna(_q_hi)):
+                            st.error(f"❌ 列 '{threshold_col}' 无有效数值，无法按比例过滤")
+                        elif keep_part == "中间段":
+                            df_filtered = df_before[(_s >= _q_lo) & (_s <= _q_hi)].reset_index(drop=True)
+                            desc = f"按比例保留中间 {keep_pct}%（{_q_lo:.4g} ≤ {threshold_col} ≤ {_q_hi:.4g}）"
+                        elif keep_part == "最高值段":
+                            df_filtered = df_before[_s >= _q_lo].reset_index(drop=True)
+                            desc = f"按比例保留数值最大的 {keep_pct}%（{threshold_col} ≥ {_q_lo:.4g}）"
+                        else:  # 最低值段
+                            df_filtered = df_before[_s <= _q_hi].reset_index(drop=True)
+                            desc = f"按比例保留数值最小的 {keep_pct}%（{threshold_col} ≤ {_q_hi:.4g}）"
+                        _filter_params.update({
+                            "keep_ratio": float(keep_pct) / 100.0,
+                            "keep_part": keep_part,
+                            "min": float(_q_lo) if _q_lo is not None else None,
+                            "max": float(_q_hi) if _q_hi is not None else None,
+                        })
 
-                    st.session_state.processed_data = df_filtered
-                    log_fe_step(
-                        operation="自定义阈值过滤",
-                        description=desc,
-                        params={"column": threshold_col, "filter_type": filter_type,
-                               "min": min_threshold if filter_type != "删除大于阈值" else None,
-                               "max": max_threshold if filter_type != "删除小于阈值" else None},
-                        input_df=df_before,
-                        output_df=df_filtered,
-                        message=f"删除 {n_removed} 行"
-                    )
-                    st.success(f"✅ 阈值过滤完成：删除 {n_removed} 行（{n_before} → {n_after}）")
+                    if df_filtered is not None:
+                        n_after = len(df_filtered)
+                        n_removed = n_before - n_after
+
+                        st.session_state.processed_data = df_filtered
+                        log_fe_step(
+                            operation="自定义阈值过滤",
+                            description=desc,
+                            params=_filter_params,
+                            input_df=df_before,
+                            output_df=df_filtered,
+                            message=f"删除 {n_removed} 行"
+                        )
+                        st.success(f"✅ 阈值过滤完成：删除 {n_removed} 行（{n_before} → {n_after}）")
         _clean_frag_7()
                 # st.rerun() removed - auto-rerun on button click
 
@@ -8120,6 +8218,19 @@ def page_data_cleaning():
             if _balance_summary:
                 st.success(_balance_summary.get("title", "✅ 平衡执行完成！已更新数据集。"))
                 _bs = _balance_summary.get("stats") or {}
+                _cp = _bs.get("combo_protection") or {}
+                if _cp.get("enabled"):
+                    st.caption(
+                        f"🛡️ 组合多样性保护：预留 {_cp.get('reserved_samples', 0)} 条样本，"
+                        f"保住 {len(_cp.get('protected_combos', []))}/{_cp.get('n_at_risk_combos', 0)} 个风险组合。"
+                    )
+                    if _cp.get("unprotected_combos"):
+                        st.warning(
+                            f"⚠️ 有 {len(_cp['unprotected_combos'])} 个风险组合因削减名额(上限)不足未能完整保留，"
+                            "建议调大「每个配方体系的最大保留样本数」或减少保护组合列数量。"
+                        )
+                elif _cp.get("note"):
+                    st.caption(f"ℹ️ {_cp['note']}")
                 if _bs.get("total_after") is not None:
                     s_c1, s_c2, s_c3 = st.columns(3)
                     s_c1.metric(
@@ -8146,6 +8257,7 @@ def page_data_cleaning():
                 get_formulation_group_options,
                 build_group_series,
                 analyze_group_distribution,
+                detect_formulation_columns,
             )
 
             # 模式选择
@@ -8277,6 +8389,76 @@ def page_data_cleaning():
                             )
                             bin_strategy_selected = "quantile" if "Quantile" in bin_strategy_label else "uniform"
 
+                    # —— 🛡️ 组合多样性保护（防误伤）：单列分组削减高频分子时保护稀有组合 ——
+                    _detected_form_cols = detect_formulation_columns(df)
+                    _all_chem_cols = _detected_form_cols["resin"] + _detected_form_cols["hardener"] + _detected_form_cols["additive"]
+                    _auto_protect_cols = [c for c in _all_chem_cols if c not in selected_group_cols]
+
+                    st.markdown("#### 🛡️ 组合多样性保护 (防误伤)")
+                    st.caption(
+                        "按【仅固化剂】或【仅树脂】等单列分组削减高频分子时，随机抽删会连带清空与该分子搭配的稀有组合"
+                        "（如某稀有树脂只与该高频固化剂搭配 → 该组合被整体删除，组合多样性受损）。"
+                        "开启保护后，将为「仅存在于被削减配方中」的风险组合预留最低配额；"
+                        "在未被削减配方中已有完整保留的组合不占用名额。"
+                    )
+                    enable_combo_protect = st.checkbox(
+                        "启用组合多样性保护 (推荐，防止误伤稀有组合)",
+                        value=True,
+                        key="bal_enable_combo_protect",
+                    )
+                    protect_combo_cols_final = []
+                    min_samples_per_combo_final = 1
+                    if enable_combo_protect:
+                        protect_combo_cols_final = st.multiselect(
+                            "保护组合的构成列 (组合键)",
+                            options=[c for c in df.columns if c not in selected_group_cols],
+                            default=_auto_protect_cols,
+                            key="bal_protect_combo_cols",
+                            help="这些列的取值共同定义一个「组合」(如 树脂+助剂)。默认自动选用除分组列外的全部化学组分列。",
+                        )
+                        if protect_combo_cols_final:
+                            _combo_preview = (
+                                df[protect_combo_cols_final].fillna("<missing>").astype(str).agg(" || ".join, axis=1)
+                                if len(protect_combo_cols_final) > 1
+                                else df[protect_combo_cols_final[0]].fillna("<missing>").astype(str)
+                            )
+                            _combo_vc = _combo_preview.value_counts()
+                            _capped_ids = {g for g, c in current_groups.value_counts().items() if int(c) > int(limit_per_group)}
+                            _combo_group_map = {}
+                            for _cid, _gval in zip(_combo_preview.to_numpy(), current_groups.to_numpy()):
+                                _combo_group_map.setdefault(_cid, set()).add(_gval)
+                            _at_risk = {
+                                cid: gset
+                                for cid, gset in _combo_group_map.items()
+                                if gset and gset.issubset(_capped_ids)
+                            }
+
+                            pc1, pc2 = st.columns([1, 2])
+                            with pc1:
+                                min_samples_per_combo_final = st.number_input(
+                                    "每个风险组合最低保留样本数",
+                                    min_value=1,
+                                    max_value=20,
+                                    value=1,
+                                    step=1,
+                                    key="bal_min_per_combo",
+                                    help="被削减配方中，每个风险组合至少保留这么多条样本（名额优先保障最稀有的组合）。",
+                                )
+                            with pc2:
+                                st.metric("🚨 风险组合数 (无保护将随高频分子一起被清空)", len(_at_risk))
+                            if _at_risk:
+                                with st.expander(f"查看 {len(_at_risk)} 个风险组合明细", expanded=False):
+                                    _risk_rows = [
+                                        {
+                                            "组合 (组合键取值)": (str(cid)[:80] + ("…" if len(str(cid)) > 80 else "")),
+                                            "总样本数": int(_combo_vc.get(cid, 0)),
+                                            "涉及配方数": len(gset),
+                                            "所在配方均超上限": "是",
+                                        }
+                                        for cid, gset in sorted(_at_risk.items(), key=lambda kv: -_combo_vc.get(kv[0], 0))
+                                    ]
+                                    st.dataframe(pd.DataFrame(_risk_rows), width="stretch", hide_index=True)
+
                     # 预览将被移除的样本数
                     est_removed = sum(max(0, count - int(limit_per_group)) for count in current_groups.value_counts().values)
                     st.caption(f"预计平衡后将从 {len(df)} 样本减少至约 {len(df) - est_removed} 样本（削减 {est_removed} 条优势配方冗余样本）。")
@@ -8298,6 +8480,8 @@ def page_data_cleaning():
                                 bin_strategy=bin_strategy_selected,
                                 stratify_mode="within_group",
                                 random_state=42,
+                                protect_combo_cols=protect_combo_cols_final if (enable_combo_protect and protect_combo_cols_final) else None,
+                                min_samples_per_combo=int(min_samples_per_combo_final),
                             )
                             st.session_state.processed_data = cleaned_df
                             st.session_state["_data_cleaner_cache"] = {"df_id": id(cleaned_df), "cleaner": active_cleaner}
@@ -8307,6 +8491,11 @@ def page_data_cleaning():
                                 description=(
                                     f"按配方体系 [{', '.join(selected_group_cols)}] 平衡，单配方上限 {limit_per_group}"
                                     + (f"，按目标 [{target_col_selected}] {target_bins_selected}分箱分层抽样" if enable_target_strat else "")
+                                    + (
+                                        f"，组合多样性保护 [{', '.join(protect_combo_cols_final)}] 每风险组合≥{int(min_samples_per_combo_final)}"
+                                        if enable_combo_protect and protect_combo_cols_final
+                                        else ""
+                                    )
                                 ),
                                 params={
                                     "group_cols": selected_group_cols,
@@ -8314,6 +8503,8 @@ def page_data_cleaning():
                                     "target_col": target_col_selected if enable_target_strat else None,
                                     "n_bins": int(target_bins_selected) if enable_target_strat else None,
                                     "stratify_mode": "within_group",
+                                    "protect_combo_cols": protect_combo_cols_final if (enable_combo_protect and protect_combo_cols_final) else None,
+                                    "min_samples_per_combo": int(min_samples_per_combo_final) if (enable_combo_protect and protect_combo_cols_final) else None,
                                 },
                                 input_df=df_before,
                                 output_df=cleaned_df,
@@ -8842,25 +9033,122 @@ def page_feature_registry():
 # 长耗时提取的稳定性保护：
 #   1) 提取开始时在后台任务管理器登记受管任务：侧边栏可见、可点“停止”取消
 #      （提取器内部会检查取消标志，在批次边界安全中止）；
-#   2) 任务活动期间全局控件锁定，减少误触；任何非 fragment 交互都会中断
-#      当前脚本运行（fastReruns 机制），锁定可显著降低误中断概率；
-#   3) 捕获中断异常（Stop/Rerun）把任务标记为失败/取消并重新抛出，
-#      避免残留“活动任务”把页面锁死；
-#   4) 抑制紧随其后的重复点击（排队重跑），避免二次全量提取。
+#   2) 提取运行期间两个提取按钮自动禁用：重复点击不会产生新重跑，
+#      也就不会中断正在运行的长任务（fastReruns 下任何交互都会中断当前运行）；
+#   3) 全局锁定策略（按用户要求调整）：点击提取按钮不再锁定页面，
+#      只在“离开分子特征页面”或“误触发其它控件导致提取界面消失”时才锁定；
+#   4) 捕获中断异常把任务标记为失败/取消并重新抛出，避免残留“活动任务”把页面锁死；
+#      页面自身触发的重跑（RerunException）按正常完成处理；
+#   5) 抑制紧随其后的重复点击（20 秒窗口），避免二次全量提取。
 # 仅当点击两个提取按钮时才登记任务，常规浏览零额外开销。
 # ============================================================
 _MF_TASK_LAST_FINISH = {}
 _MF_DUP_CLICK_WINDOW_SEC = 20.0
+_MF_PAGE_TITLE = "🧬 分子特征"          # 与 app.py 中 st.Page(title=...) 保持一致
+_MF_REQUEST_TTL_SEC = 15.0               # 请求标记有效期：丢弃被中断的旧请求，避免误触发提取
+_MF_OWNER_ALIVE = {}                     # task_id -> bool（进程级：会话状态在重跑中可能被 fork 读不到最新值）
+_MF_BUTTON_SLOTS_KEY = "_mf_button_slots"  # 本次运行绘制的提取按钮占位符（提取结束后重绘为可用）
+
+try:  # 页面自身调用 st.rerun()/st.switch_page() 时抛出的异常
+    from streamlit.runtime.scriptrunner_utils.exceptions import RerunException as _MF_RerunException
+except Exception:  # pragma: no cover - 兼容旧版 Streamlit
+    class _MF_RerunException(Exception):
+        """RerunException 兼容占位（旧版 Streamlit 无此类）。"""
 
 
 def _mark_molecular_feature_run_requested():
-    """提取按钮 on_click：在脚本重跑前记录本次请求。"""
-    st.session_state["_mf_extract_run_requested"] = True
+    """提取按钮 on_click：在脚本重跑前记录本次请求（带时间戳，便于判断新鲜度）。"""
+    st.session_state["_mf_extract_run_requested"] = time.time()
 
 
 def _mark_mf_import_run_requested():
-    """导入流程按钮 on_click：在脚本重跑前记录本次请求。"""
-    st.session_state["_mf_import_run_requested"] = True
+    """导入流程按钮 on_click：在脚本重跑前记录本次请求（带时间戳）。"""
+    st.session_state["_mf_import_run_requested"] = time.time()
+
+
+def _mf_ts_fresh(value) -> bool:
+    """请求时间戳是否仍在有效期内（刚点击）。"""
+    try:
+        return value is not None and (time.time() - float(value)) <= _MF_REQUEST_TTL_SEC
+    except Exception:
+        return False
+
+
+def _mf_request_fresh(state, key: str) -> bool:
+    """会话中该请求标记是否存在且新鲜（供全局锁定判定使用）。"""
+    try:
+        return _mf_ts_fresh(state.get(key))
+    except Exception:
+        return False
+
+
+def _mf_task_key() -> str:
+    """本会话的分子特征提取任务键。"""
+    return f"molecular_feature_extract:{st.session_state.get('_sid') or 'default'}"
+
+
+def _mf_extract_running() -> bool:
+    """本会话是否仍有正在运行的分子特征提取（用于禁用提取按钮，避免重复点击中断长任务）。"""
+    try:
+        key = _mf_task_key()
+        for task in get_task_manager().get_active_tasks():
+            if (task.task_key == key
+                    and str(getattr(task, "task_type", "")) == "molecular_feature"
+                    and _MF_OWNER_ALIVE.get(task.task_id)):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _mf_draw_extract_button(slot, kind: str, disabled_extra: bool = False):
+    """在占位符中绘制提取按钮：运行中禁用并改标签；空闲时恢复为可点击状态。"""
+    running = _mf_extract_running()
+    if kind == "import":
+        idle_label = "🚀 按导入流程一键提取"
+        on_click = _mark_mf_import_run_requested
+        idle_key, running_key = "mf_import_btn_idle", "mf_import_btn_running"
+    else:
+        idle_label = "🚀 开始提取分子特征"
+        on_click = _mark_molecular_feature_run_requested
+        idle_key, running_key = "mf_extract_btn_idle", "mf_extract_btn_running"
+    with slot.container():
+        st.button(
+            "⏳ 提取中（请稍候）" if running else idle_label,
+            type="primary",
+            disabled=bool(running or disabled_extra),
+            on_click=on_click,
+            key=running_key if running else idle_key,
+        )
+
+
+def _mf_extract_button_slot(slot_key: str, kind: str, disabled_extra: bool = False):
+    """绘制提取按钮并登记占位符，供提取结束后（守护 finally）重绘为可用状态。"""
+    slot = st.empty()
+    token = st.session_state.get("_mf_run_token")
+    if token is not None:
+        registry = st.session_state.get(_MF_BUTTON_SLOTS_KEY)
+        if not isinstance(registry, dict) or registry.get("token") != token:
+            registry = {"token": token, "items": {}}
+            st.session_state[_MF_BUTTON_SLOTS_KEY] = registry
+        registry["items"][slot_key] = (slot, kind, bool(disabled_extra))
+    _mf_draw_extract_button(slot, kind, disabled_extra)
+    return slot
+
+
+def _mf_restore_extract_buttons(run_token):
+    """提取结束后把本次运行的按钮重绘为可用状态（占位符覆盖原位置，避免界面停留在“提取中”）。"""
+    try:
+        registry = st.session_state.pop(_MF_BUTTON_SLOTS_KEY, None)
+    except Exception:
+        return
+    if not isinstance(registry, dict) or registry.get("token") != run_token:
+        return
+    for slot, kind, disabled_extra in (registry.get("items") or {}).values():
+        try:
+            _mf_draw_extract_button(slot, kind, disabled_extra)
+        except Exception:
+            continue
 
 
 def _molecular_feature_task_guard(page_func):
@@ -8868,11 +9156,14 @@ def _molecular_feature_task_guard(page_func):
     @functools.wraps(page_func)
     def _guarded_page():
         manager = get_task_manager()
-        session_key = str(st.session_state.get("_sid") or "default")
-        task_key = f"molecular_feature_extract:{session_key}"
+        task_key = _mf_task_key()
+        # 本次运行的令牌：用于校验按钮占位符登记是否属于本次运行（避免旧运行残留）
+        run_token = uuid.uuid4().hex
+        st.session_state["_mf_run_token"] = run_token
 
-        extract_requested = bool(st.session_state.pop("_mf_extract_run_requested", False))
-        import_requested = bool(st.session_state.pop("_mf_import_run_requested", False))
+        # [保护] 请求标记带时间戳：过期的旧请求（上一次运行未到达页面就被中断）丢弃
+        extract_requested = _mf_ts_fresh(st.session_state.pop("_mf_extract_run_requested", None))
+        import_requested = _mf_ts_fresh(st.session_state.pop("_mf_import_run_requested", None))
 
         if not (extract_requested or import_requested):
             # 清理可能残留的放行标志（例如上一次页面在按钮前提前 return）
@@ -8903,11 +9194,18 @@ def _molecular_feature_task_guard(page_func):
 
         clear_cancel()
         manager.start_task(task_id)
+        # 提取运行标记：按钮禁用 + 全局锁定豁免的判断依据（finally 中清除）
+        _MF_OWNER_ALIVE[task_id] = True
         # 统一走会话标志驱动提取：排队重跑中 st.button 返回值不可靠
         st.session_state["_mf_extract_allow"] = extract_requested
         st.session_state["_mf_import_allow"] = import_requested
         try:
             result = page_func()
+        except _MF_RerunException:
+            # 页面自身请求重跑（例如提取完成后的界面刷新）：按正常完成处理，不标记为中断
+            _MF_TASK_LAST_FINISH[task_key] = time.time()
+            manager.complete_task(task_id, success=True)
+            raise
         except BaseException as exc:
             _MF_TASK_LAST_FINISH[task_key] = time.time()
             manager.complete_task(
@@ -8920,6 +9218,10 @@ def _molecular_feature_task_guard(page_func):
             _MF_TASK_LAST_FINISH[task_key] = time.time()
             manager.complete_task(task_id, success=True)
             return result
+        finally:
+            _MF_OWNER_ALIVE.pop(task_id, None)
+            # 提取结束：把本次运行的按钮重绘为可用状态（避免界面停留在“提取中”）
+            _mf_restore_extract_buttons(run_token)
 
     return _guarded_page
 
@@ -10721,9 +11023,10 @@ def page_molecular_features():
                     **生成的额外特征包括：**
                     - `crosslink_estimated_conversion`: 自动估算的转化率
                     - `crosslink_product_structure`: 产物结构（BigSMILES优先，否则SMILES）
-                    - `crosslink_product_mol_weight`: 交联产物分子量
-                    - `crosslink_product_num_atoms`: 产物原子数
-                    - `crosslink_product_tpsa`: 产物拓扑极性表面积
+                    - `crosslink_product_rotatable_bond_ratio`: 链柔性指数 (可旋转键/总键数)
+                    - `crosslink_product_aromatic_ring_density`: 刚性链段密度 (芳环数/重原子数)
+                    - `crosslink_product_tpsa_density`: 极性表面积密度 (TPSA/重原子数)
+                    - `crosslink_product_junction_site_density`: 交联位点密度 (位点数/重原子数)
                     - `crosslink_n_combinations`: 反应组合数（仅组合反应法）
                     """)
 
@@ -11115,171 +11418,6 @@ def page_molecular_features():
                 key="confirm_molecular_feature_source_role_conflict",
             )
 
-        def _workflow_method_params(batch=False):
-            params = {
-                "skip_ionic_compounds": bool(skip_ionic_compounds),
-                "ionic_filter_behavior": (
-                    "clear_source_cells"
-                    if batch
-                    else "exclude_rows_preserve_source_rows"
-                ),
-            }
-            if "分子指纹" in extraction_method:
-                params.update({
-                    "fp_type": str(fp_type),
-                    "fp_bits": int(fp_bits),
-                    "fp_radius": int(fp_radius),
-                    "fp_use_chirality": bool(fp_use_chirality),
-                    "fp_use_features": bool(fp_use_features),
-                })
-                if not batch:
-                    params["drop_all_zero_bits"] = bool(drop_all_zero_bits)
-            elif "RDKit 并行版" in extraction_method:
-                params.update({
-                    "n_jobs": int(n_jobs),
-                    "batch_size": int(batch_size),
-                    "fast_mode": bool(fast_mode),
-                })
-            elif "Mordred" in extraction_method:
-                params.update({
-                    "mordred_batch_size": int(mordred_batch_size),
-                    "mordred_ignore_3d": bool(mordred_ignore_3d),
-                    "mordred_n_jobs": int(mordred_n_jobs),
-                })
-            elif "3D构象" in extraction_method:
-                params.update({
-                    "rdkit3d_coulomb_top_k": int(rdkit3d_coulomb_top_k),
-                    "rdkit3d_n_jobs": rdkit3d_n_jobs,
-                })
-                if not batch:
-                    params.update({
-                        "keep_all_rows_3d": bool(keep_all_rows_3d),
-                    })
-            elif "TDA拓扑" in extraction_method:
-                params.update({
-                    "tda_maxdim": int(tda_maxdim),
-                    "tda_use_pim": bool(tda_use_pim),
-                    "tda_pim_pixels": int(tda_pim_pixels),
-                    "tda_pim_spread": float(tda_pim_spread),
-                })
-                if not batch:
-                    params.update({
-                        "tda_add_hs": bool(tda_add_hs),
-                        "tda_max_points": (
-                            None
-                            if str(tda_max_points) == "不限制"
-                            else int(tda_max_points)
-                        ),
-                        "tda_do_optimize": bool(tda_do_optimize),
-                    })
-            elif "Transformer Embedding" in extraction_method:
-                params.update({
-                    "lm_model_name": str(lm_model_name),
-                    "lm_pooling": str(lm_pooling),
-                    "lm_max_length": int(lm_max_length),
-                    "lm_batch_size": int(lm_batch_size),
-                    "lm_trust_remote_code": bool(lm_trust_remote_code),
-                })
-            elif "图神经网络" in extraction_method:
-                params.update({
-                    "gnn_model_type": str(gnn_model_type),
-                    "gnn_batch_size": int(gnn_batch_size),
-                    "gnn_chunk_size": int(gnn_chunk_size),
-                    "gnn_add_hs": bool(gnn_add_hs),
-                    "gnn_pooling": str(gnn_pooling),
-                    "gnn_seed": int(gnn_seed),
-                    "gnn_num_workers": int(gnn_num_workers),
-                    "gnn_cache_graphs": bool(gnn_cache_graphs),
-                    "gnn_cache_size": int(gnn_cache_size),
-                    "gnn_weights_path": str(gnn_weights_path).strip(),
-                    "gnn_hidden_dim": gnn_hidden_dim,
-                    "gnn_num_layers": gnn_num_layers,
-                    "gnn_dropout": gnn_dropout,
-                    "gnn_gat_heads": gnn_gat_heads,
-                    "gnn_num_timesteps": gnn_num_timesteps,
-                    "gnn_output_dim": gnn_output_dim,
-                    "gnn_use_dual_gpu": bool(gnn_use_dual_gpu),
-                    "gnn_bigsmiles_mode": str(gnn_bigsmiles_mode),
-                    "gnn_bigsmiles_num_samples": int(gnn_bigsmiles_num_samples),
-                    "gnn_bigsmiles_min_repeat_units": int(
-                        gnn_bigsmiles_min_repeat_units
-                    ),
-                    "gnn_bigsmiles_max_repeat_units": int(
-                        gnn_bigsmiles_max_repeat_units
-                    ),
-                })
-            elif "ML力场" in extraction_method:
-                params.update({
-                    "ani_batch_size": int(ani_batch_size),
-                    "ani_cpu_workers": int(ani_cpu_workers),
-                })
-            elif "快速力场" in extraction_method:
-                params.update({
-                    "ff_mode": str(ff_mode),
-                    "ff_max_iters": int(ff_max_iters),
-                    "ff_minimize": bool(ff_minimize),
-                    "ff_per_mol_timeout_s": int(ff_per_mol_timeout_s),
-                    "ff_max_heavy_atoms": int(ff_max_heavy_atoms),
-                    "ff_max_fragments": int(ff_max_fragments),
-                    "ff_keep_largest_fragment": bool(ff_keep_largest_fragment),
-                    "ff_skip_opt_above_atoms": int(ff_skip_opt_above_atoms),
-                    "ff_n_jobs": int(ff_n_jobs),
-                })
-            elif "xTB" in extraction_method:
-                params.update({
-                    "xtb_path": str(xtb_path).strip() or "xtb",
-                    "xtb_method": str(xtb_method),
-                    "xtb_run_mode": str(xtb_run_mode),
-                    "xtb_charge": int(xtb_charge),
-                    "xtb_uhf": int(xtb_uhf),
-                    "xtb_timeout_s": int(xtb_timeout_s),
-                    "xtb_max_iters": int(xtb_max_iters),
-                    "xtb_total_timeout_s": int(xtb_total_timeout_s),
-                    "xtb_max_heavy_atoms": int(xtb_max_heavy_atoms),
-                    "xtb_max_fragments": int(xtb_max_fragments),
-                    "xtb_keep_largest_fragment": bool(xtb_keep_largest_fragment),
-                    "xtb_cache_size": int(xtb_cache_size),
-                    "xtb_n_jobs": int(xtb_n_jobs),
-                    "xtb_random_state": 42,
-                })
-            elif "FGD" in extraction_method:
-                params.update({
-                    "fgd_multi_label": bool(fgd_multi_label),
-                    "fgd_keep_largest_frag": bool(fgd_keep_largest_frag),
-                    "fgd_count_features": bool(fgd_count_features),
-                    "fgd_cache_size": int(fgd_cache_size),
-                })
-            elif "环氧树脂" in extraction_method:
-                params.update({
-                    "phr_col": phr_col,
-                    "stoich_mode": stoich_mode,
-                    "enable_reaction_simulation": bool(enable_reaction_simulation),
-                    "multicomp_reaction_method": multicomp_reaction_method,
-                })
-            return params
-
-        def _workflow_semantic_params(polymer_string_features=False):
-            return {
-                "append_polymer_string_features": bool(polymer_string_features),
-                "append_polymer_semantic_features": bool(
-                    append_polymer_semantic_features
-                ),
-                "append_ionic_semantic_features": bool(
-                    append_ionic_semantic_features
-                ),
-                "bigsmiles_semantic_num_samples": int(
-                    bigsmiles_semantic_num_samples
-                ),
-                "bigsmiles_semantic_min_repeat_units": int(
-                    bigsmiles_semantic_min_repeat_units
-                ),
-                "bigsmiles_semantic_max_repeat_units": int(
-                    bigsmiles_semantic_max_repeat_units
-                ),
-                "bigsmiles_semantic_random_state": 17,
-                "preserve_duplicate_columns": True,
-            }
-
         st.markdown("---")
 
         # ---- [fragment 末尾] 把当前全部设置写入快照，供页面主体读取 ----
@@ -11287,6 +11425,172 @@ def page_molecular_features():
         st.session_state["molfeat_settings"] = {name: _loc[name] for name in _MF_SETTING_VARS if name in _loc}
 
     _render_mf_method_and_params()
+
+    def _workflow_method_params(batch=False):
+        params = {
+            "skip_ionic_compounds": bool(skip_ionic_compounds),
+            "ionic_filter_behavior": (
+                "clear_source_cells"
+                if batch
+                else "exclude_rows_preserve_source_rows"
+            ),
+        }
+        if "分子指纹" in extraction_method:
+            params.update({
+                "fp_type": str(fp_type),
+                "fp_bits": int(fp_bits),
+                "fp_radius": int(fp_radius),
+                "fp_use_chirality": bool(fp_use_chirality),
+                "fp_use_features": bool(fp_use_features),
+            })
+            if not batch:
+                params["drop_all_zero_bits"] = bool(drop_all_zero_bits)
+        elif "RDKit 并行版" in extraction_method:
+            params.update({
+                "n_jobs": int(n_jobs),
+                "batch_size": int(batch_size),
+                "fast_mode": bool(fast_mode),
+            })
+        elif "Mordred" in extraction_method:
+            params.update({
+                "mordred_batch_size": int(mordred_batch_size),
+                "mordred_ignore_3d": bool(mordred_ignore_3d),
+                "mordred_n_jobs": int(mordred_n_jobs),
+            })
+        elif "3D构象" in extraction_method:
+            params.update({
+                "rdkit3d_coulomb_top_k": int(rdkit3d_coulomb_top_k),
+                "rdkit3d_n_jobs": rdkit3d_n_jobs,
+            })
+            if not batch:
+                params.update({
+                    "keep_all_rows_3d": bool(keep_all_rows_3d),
+                })
+        elif "TDA拓扑" in extraction_method:
+            params.update({
+                "tda_maxdim": int(tda_maxdim),
+                "tda_use_pim": bool(tda_use_pim),
+                "tda_pim_pixels": int(tda_pim_pixels),
+                "tda_pim_spread": float(tda_pim_spread),
+            })
+            if not batch:
+                params.update({
+                    "tda_add_hs": bool(tda_add_hs),
+                    "tda_max_points": (
+                        None
+                        if str(tda_max_points) == "不限制"
+                        else int(tda_max_points)
+                    ),
+                    "tda_do_optimize": bool(tda_do_optimize),
+                })
+        elif "Transformer Embedding" in extraction_method:
+            params.update({
+                "lm_model_name": str(lm_model_name),
+                "lm_pooling": str(lm_pooling),
+                "lm_max_length": int(lm_max_length),
+                "lm_batch_size": int(lm_batch_size),
+                "lm_trust_remote_code": bool(lm_trust_remote_code),
+            })
+        elif "图神经网络" in extraction_method:
+            params.update({
+                "gnn_model_type": str(gnn_model_type),
+                "gnn_batch_size": int(gnn_batch_size),
+                "gnn_chunk_size": int(gnn_chunk_size),
+                "gnn_add_hs": bool(gnn_add_hs),
+                "gnn_pooling": str(gnn_pooling),
+                "gnn_seed": int(gnn_seed),
+                "gnn_num_workers": int(gnn_num_workers),
+                "gnn_cache_graphs": bool(gnn_cache_graphs),
+                "gnn_cache_size": int(gnn_cache_size),
+                "gnn_weights_path": str(gnn_weights_path).strip(),
+                "gnn_hidden_dim": gnn_hidden_dim,
+                "gnn_num_layers": gnn_num_layers,
+                "gnn_dropout": gnn_dropout,
+                "gnn_gat_heads": gnn_gat_heads,
+                "gnn_num_timesteps": gnn_num_timesteps,
+                "gnn_output_dim": gnn_output_dim,
+                "gnn_use_dual_gpu": bool(gnn_use_dual_gpu),
+                "gnn_bigsmiles_mode": str(gnn_bigsmiles_mode),
+                "gnn_bigsmiles_num_samples": int(gnn_bigsmiles_num_samples),
+                "gnn_bigsmiles_min_repeat_units": int(
+                    gnn_bigsmiles_min_repeat_units
+                ),
+                "gnn_bigsmiles_max_repeat_units": int(
+                    gnn_bigsmiles_max_repeat_units
+                ),
+            })
+        elif "ML力场" in extraction_method:
+            params.update({
+                "ani_batch_size": int(ani_batch_size),
+                "ani_cpu_workers": int(ani_cpu_workers),
+            })
+        elif "快速力场" in extraction_method:
+            params.update({
+                "ff_mode": str(ff_mode),
+                "ff_max_iters": int(ff_max_iters),
+                "ff_minimize": bool(ff_minimize),
+                "ff_per_mol_timeout_s": int(ff_per_mol_timeout_s),
+                "ff_max_heavy_atoms": int(ff_max_heavy_atoms),
+                "ff_max_fragments": int(ff_max_fragments),
+                "ff_keep_largest_fragment": bool(ff_keep_largest_fragment),
+                "ff_skip_opt_above_atoms": int(ff_skip_opt_above_atoms),
+                "ff_n_jobs": int(ff_n_jobs),
+            })
+        elif "xTB" in extraction_method:
+            params.update({
+                "xtb_path": str(xtb_path).strip() or "xtb",
+                "xtb_method": str(xtb_method),
+                "xtb_run_mode": str(xtb_run_mode),
+                "xtb_charge": int(xtb_charge),
+                "xtb_uhf": int(xtb_uhf),
+                "xtb_timeout_s": int(xtb_timeout_s),
+                "xtb_max_iters": int(xtb_max_iters),
+                "xtb_total_timeout_s": int(xtb_total_timeout_s),
+                "xtb_max_heavy_atoms": int(xtb_max_heavy_atoms),
+                "xtb_max_fragments": int(xtb_max_fragments),
+                "xtb_keep_largest_fragment": bool(xtb_keep_largest_fragment),
+                "xtb_cache_size": int(xtb_cache_size),
+                "xtb_n_jobs": int(xtb_n_jobs),
+                "xtb_random_state": 42,
+            })
+        elif "FGD" in extraction_method:
+            params.update({
+                "fgd_multi_label": bool(fgd_multi_label),
+                "fgd_keep_largest_frag": bool(fgd_keep_largest_frag),
+                "fgd_count_features": bool(fgd_count_features),
+                "fgd_cache_size": int(fgd_cache_size),
+            })
+        elif "环氧树脂" in extraction_method:
+            params.update({
+                "phr_col": phr_col,
+                "stoich_mode": stoich_mode,
+                "enable_reaction_simulation": bool(enable_reaction_simulation),
+                "multicomp_reaction_method": multicomp_reaction_method,
+            })
+        return params
+
+    def _workflow_semantic_params(polymer_string_features=False):
+        return {
+            "append_polymer_string_features": bool(polymer_string_features),
+            "append_polymer_semantic_features": bool(
+                append_polymer_semantic_features
+            ),
+            "append_ionic_semantic_features": bool(
+                append_ionic_semantic_features
+            ),
+            "bigsmiles_semantic_num_samples": int(
+                bigsmiles_semantic_num_samples
+            ),
+            "bigsmiles_semantic_min_repeat_units": int(
+                bigsmiles_semantic_min_repeat_units
+            ),
+            "bigsmiles_semantic_max_repeat_units": int(
+                bigsmiles_semantic_max_repeat_units
+            ),
+            "bigsmiles_semantic_random_state": 17,
+            "preserve_duplicate_columns": True,
+        }
+
 
     # ---- 从 fragment 设置快照恢复全部参数局部变量（保持下游提取流程代码不变） ----
     _mf_settings = st.session_state.get("molfeat_settings") or {}
@@ -11465,12 +11769,10 @@ def page_molecular_features():
                 import_workflow = None
                 st.error(f"❌ 无法解析提取流程：{exc}")
 
-        st.button(
-            "🚀 按导入流程一键提取",
-            type="primary",
-            disabled=import_payload is None or import_workflow is None or bool(import_missing_cols),
-            key="mf_run_imported_workflow",
-            on_click=_mark_mf_import_run_requested,
+        _mf_extract_button_slot(
+            "import",
+            "import",
+            disabled_extra=(import_payload is None or import_workflow is None or bool(import_missing_cols)),
         )
         # [保护] 由任务守护统一放行：排队重跑中直接读按钮返回值会重复触发提取
         run_imported_workflow = bool(st.session_state.pop("_mf_import_allow", False))
@@ -11585,11 +11887,9 @@ def page_molecular_features():
     col_btn1, col_btn2 = st.columns([1, 4])
 
     with col_btn1:
-        st.button(
-            "🚀 开始提取分子特征",
-            type="primary",
-            on_click=_mark_molecular_feature_run_requested,
-        )
+        # [保护] 提取运行期间按钮禁用：重复点击不产生重跑，避免中断正在运行的长任务；
+        # 提取结束后由任务守护在同一占位符重绘为可用状态（避免界面停留在“提取中”）。
+        _mf_extract_button_slot("main", "main")
         # [保护] 由任务守护统一放行：排队重跑中直接读按钮返回值会重复触发提取
         run_extraction = bool(st.session_state.pop("_mf_extract_allow", False))
 
@@ -17750,8 +18050,14 @@ def page_model_interpretation():
         )
 
         if n_features >= 300:
+            # [性能优化] TabPFN 等黑盒模型已走批量置换 SHAP 快速路径，不再受 KernelExplainer 拖慢
             st.warning(
                 f"当前特征数量为 {n_features}。若模型不是树/线性模型，SHAP（尤其 KernelExplainer）可能非常慢甚至卡住。建议使用【快速模式】。"
+                + (
+                    " （提示：TabPFN 等黑盒模型已自动启用批量置换 SHAP 加速，仍可尝试。）"
+                    if (model_name or "") in BATCHED_PERMUTATION_MODELS
+                    else ""
+                )
             )
 
         # ---------- SHAP ----------
@@ -27690,7 +27996,19 @@ def page_structure_recognition() -> None:
     return page_smiles_structure_tools()
 
 @st.cache_data(show_spinner=False, max_entries=128)
-def _cached_render_structure(raw: str, requested_type: str, sample: bool, repeat_units: int, random_seed: int, image_width: int, image_height: int):
+def _cached_render_structure(
+    raw: str,
+    requested_type: str,
+    sample: bool,
+    repeat_units: int,
+    random_seed: int,
+    image_width: int,
+    image_height: int,
+    supersample: float = 2.0,
+    auto_fit: bool = True,
+    split_components: bool = True,
+    expand_repeat_units: bool = True,
+):
     RenderOptions, _RenderResult, render_structure, *_ = _load_structure_visualization_apis()
     options = RenderOptions(
         requested_type=requested_type,
@@ -27699,8 +28017,25 @@ def _cached_render_structure(raw: str, requested_type: str, sample: bool, repeat
         random_seed=int(random_seed),
         image_width=int(image_width),
         image_height=int(image_height),
+        supersample=float(supersample),
+        auto_fit=bool(auto_fit),
+        split_components=bool(split_components),
+        expand_repeat_units=bool(expand_repeat_units),
+        emit_svg=True,
     )
-    output_dir = _structure_visualization_output_root() / "single"
+    # 不同渲染选项的同一条结构会命中同一个文件名，因此把选项指纹放进子目录，
+    # 避免切换画质/布局后缓存的旧结果把新图覆盖（或反之）。
+    digest = hashlib.sha256(
+        repr(
+            (
+                requested_type, bool(sample), int(repeat_units), int(random_seed),
+                int(image_width), int(image_height), float(supersample),
+                bool(auto_fit), bool(split_components), bool(expand_repeat_units),
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:8]
+    output_dir = _structure_visualization_output_root() / "single" / digest
+    output_dir.mkdir(parents=True, exist_ok=True)
     result = render_structure(raw, output_dir, options)
     return result, str(output_dir)
 
@@ -27721,26 +28056,85 @@ def _safe_structure_image_path(output_dir: Path, relative_path: str) -> Path | N
         return None
     return candidate if candidate.is_file() else None
 
+#: 官方 BigSMILES 解析器状态的中文说明。
+_PARSER_STATUS_LABELS = {
+    "accepted": "已通过（Olsen Lab 官方解析器）",
+    "rejected": "已拒绝该表达式（当前结果来自平台保守检查）",
+    "unavailable": "不可用（未安装或无可调用入口）",
+}
+
+
 def _structure_result_text(result) -> str:
-    return "\n".join(
-        [
-            f"原始结构：{result.raw_string}",
-            f"识别类型：{result.detected_type}",
-            f"解析状态：{result.parse_status}",
-            f"规范化结构：{result.normalized_structure}",
-            f"绘图状态：{result.draw_status}",
-            f"错误信息：{result.error_message}",
-            f"警告信息：{result.warning_message}",
-            f"渲染器：{result.renderer}",
-        ]
-    )
+    lines = [
+        f"原始结构：{result.raw_string}",
+        f"识别类型：{result.detected_type}",
+        f"解析状态：{result.parse_status}",
+        f"规范化结构：{result.normalized_structure}",
+        f"绘图状态：{result.draw_status}",
+        f"错误信息：{result.error_message}",
+        f"警告信息：{result.warning_message}",
+        f"渲染器：{result.renderer}",
+    ]
+    parser_status = getattr(result, "parser_status", "")
+    if parser_status:
+        lines.append(f"官方解析器：{_PARSER_STATUS_LABELS.get(parser_status, parser_status)}")
+    disclaimers = getattr(result, "disclaimers", ()) or ()
+    if disclaimers:
+        lines.append("固定说明：" + "；".join(str(item) for item in disclaimers))
+    return "\n".join(lines)
+
+
+def _structure_warning_lines(message) -> list[str]:
+    """把渲染器用「；」拼接的警告拆成条目，便于在界面上分行展示。"""
+    return [part.strip() for part in re.split(r"[；;]", str(message or "")) if part.strip()]
+
+
+def _render_structure_notices(result) -> None:
+    """固定免责说明降级为说明文字，真正需要用户处理的问题才用警告条幅。
+
+    两条信息混在一个条幅里时，用户会先看到大段免责说明，反而忽略「该怎么改」。
+    """
+    issues = _structure_warning_lines(result.warning_message)
+    if issues:
+        if len(issues) == 1:
+            st.warning(issues[0])
+        else:
+            st.warning("需要注意：\n\n" + "\n".join(f"- {item}" for item in issues))
+    disclaimers = [
+        str(item).strip()
+        for item in (getattr(result, "disclaimers", ()) or ())
+        if str(item).strip()
+    ]
+    if disclaimers:
+        st.caption("ℹ️ " + "；".join(disclaimers))
+
+
+def _structure_svg_text(output_dir: Path, relative_path: str) -> str:
+    """读取渲染器输出的矢量 SVG；任何异常都退化为空串（调用方回退到 PNG）。"""
+    path = _safe_structure_image_path(output_dir, relative_path)
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
 
 def _render_structure_result(result, output_dir: Path, *, key_prefix: str) -> None:
     """Render common status, normalized text, previews, and downloads for one result."""
+    parser_rejected = getattr(result, "parser_status", "") == "rejected"
     if result.parse_status == "valid" and result.draw_status == "rendered":
-        st.success(
-            f"解析成功；类型：{result.detected_type}；绘图器：{result.renderer or '未解析'}"
-        )
+        if parser_rejected:
+            # 不能说“解析成功”：官方解析器实际拒绝了这条表达式，
+            # 当前图是本平台保守检查画出来的，必须说清楚。
+            st.warning(
+                "结构已绘制，但官方 BigSMILES 解析器未接受该表达式；"
+                f"当前结果来自平台保守检查，仅供结构核对。绘图器：{result.renderer or '未解析'}"
+            )
+        else:
+            st.success(
+                f"解析成功；类型：{result.detected_type}；绘图器：{result.renderer or '未解析'}"
+            )
     elif result.parse_status == "valid":
         st.warning(
             f"结构可解析，但绘图未完全成功；类型：{result.detected_type}；"
@@ -27756,8 +28150,7 @@ def _render_structure_result(result, output_dir: Path, *, key_prefix: str) -> No
         st.code(result.normalized_structure, language="text")
     if result.error_message and result.parse_status == "valid":
         st.error(result.error_message)
-    if result.warning_message:
-        st.warning(result.warning_message)
+    _render_structure_notices(result)
 
     image_items = (
         ("主图", result.main_image_path, "主结构图"),
@@ -27767,14 +28160,36 @@ def _render_structure_result(result, output_dir: Path, *, key_prefix: str) -> No
         image_path = _safe_structure_image_path(output_dir, relative_path)
         if image_path is None:
             continue
-        st.image(str(image_path), caption=caption, width=640)
-        st.download_button(
-            f"下载{label}",
-            data=image_path.read_bytes(),
-            file_name=image_path.name,
-            mime="image/png",
-            key=f"{key_prefix}_{label}",
-        )
+        svg_text = ""
+        if label == "主图" and getattr(result, "svg_path", ""):
+            svg_text = _structure_svg_text(output_dir, result.svg_path)
+        if svg_text:
+            # 矢量图铺满容器：无论屏幕多宽、放大多少倍都不会模糊。
+            st.image(svg_text, caption=f"{caption}（矢量 SVG，可自由缩放）", width="stretch")
+        else:
+            st.image(str(image_path), caption=caption, width="stretch")
+
+        download_cols = st.columns(2 if svg_text else 1)
+        with download_cols[0]:
+            st.download_button(
+                f"下载{label} PNG",
+                data=image_path.read_bytes(),
+                file_name=image_path.name,
+                mime="image/png",
+                key=f"{key_prefix}_{label}_png",
+                width="stretch",
+            )
+        if svg_text:
+            svg_path = _safe_structure_image_path(output_dir, result.svg_path)
+            with download_cols[1]:
+                st.download_button(
+                    f"下载{label} SVG（矢量）",
+                    data=svg_text.encode("utf-8"),
+                    file_name=(svg_path.name if svg_path else "structure.svg"),
+                    mime="image/svg+xml",
+                    key=f"{key_prefix}_{label}_svg",
+                    width="stretch",
+                )
 
     st.download_button(
         "下载结构检查文本",
@@ -27782,6 +28197,7 @@ def _render_structure_result(result, output_dir: Path, *, key_prefix: str) -> No
         file_name="结构检查结果.txt",
         mime="text/plain",
         key=f"{key_prefix}_text",
+        width="stretch",
     )
 
 def _page_smiles_to_structure_image(*, render_result: bool = True) -> None:
@@ -27809,19 +28225,54 @@ def _page_smiles_to_structure_image(*, render_result: bool = True) -> None:
                 "图片宽度 (px)",
                 min_value=200,
                 max_value=3000,
-                value=600,
+                value=1200,
                 step=50,
                 key="structure_visualization_width",
-                help="默认 600px 兼顾清晰度与瞬间渲染速度；若需高清大图可适当调大",
+                help="输出图像的宽度。默认 1200px，铺满页面时依然清晰",
             )
         with size_col2:
             image_height = st.number_input(
-                "图片高度 (px)",
+                "图片高度上限 (px)",
                 min_value=200,
                 max_value=3000,
-                value=400,
+                value=1600,
                 step=50,
                 key="structure_visualization_height",
+                help="开启“自适应画布”时只是上限（普通分子几乎碰不到）；关闭时就是固定高度",
+            )
+
+        quality_col1, quality_col2 = st.columns(2)
+        with quality_col1:
+            supersample_label = st.selectbox(
+                "输出清晰度",
+                ["2x 超采样（推荐）", "1x 标准", "3x 超采样"],
+                index=0,
+                key="structure_visualization_supersample",
+                help="按倍数渲染后再铺满页面，倍数越高笔画越锐利、文件越大",
+            )
+        with quality_col2:
+            auto_fit = st.checkbox(
+                "自适应画布（自动裁掉多余留白）",
+                value=True,
+                key="structure_visualization_auto_fit",
+                help="按分子实际长宽比决定画布高度，长条分子不再被压成小小一条",
+            )
+        supersample_map = {"1x 标准": 1.0, "2x 超采样（推荐）": 2.0, "3x 超采样": 3.0}
+
+        layout_col1, layout_col2 = st.columns(2)
+        with layout_col1:
+            split_components = st.checkbox(
+                "多组分（.）拆分展示",
+                value=True,
+                key="structure_visualization_split_components",
+                help="把 树脂.固化剂 这类结构按组分分别绘制，并附一张整体视图",
+            )
+        with layout_col2:
+            expand_repeat_units = st.checkbox(
+                "BigSMILES 展开重复单元画完整骨架",
+                value=True,
+                key="structure_visualization_expand_repeat",
+                help="把 {重复单元} 真正接进外部骨架并高亮，避免只看到 {R1} 占位符",
             )
 
         sample = st.checkbox(
@@ -27868,6 +28319,10 @@ def _page_smiles_to_structure_image(*, render_result: bool = True) -> None:
                         int(random_seed),
                         int(image_width),
                         int(image_height),
+                        float(supersample_map[supersample_label]),
+                        bool(auto_fit),
+                        bool(split_components),
+                        bool(expand_repeat_units),
                     )
                     st.session_state["structure_visualization_single_result"] = result
                     st.session_state["structure_visualization_single_output_dir"] = output_dir_str
@@ -27943,6 +28398,47 @@ def _page_batch_structure_check() -> None:
         key="structure_visualization_batch_type",
     )
     type_map = {"自动识别": "auto", "SMILES": "smiles", "BigSMILES": "bigsmiles"}
+
+    batch_layout_col1, batch_layout_col2 = st.columns(2)
+    with batch_layout_col1:
+        batch_split_components = st.checkbox(
+            "多组分（.）拆分展示",
+            value=True,
+            key="structure_visualization_batch_split_components",
+            help="把 树脂.固化剂 这类结构按组分分别绘制，并附一张整体视图",
+        )
+    with batch_layout_col2:
+        batch_expand_repeat = st.checkbox(
+            "BigSMILES 展开重复单元画完整骨架",
+            value=True,
+            key="structure_visualization_batch_expand_repeat",
+            help="把 {重复单元} 真正接进外部骨架，避免只看到 {R1} 占位符",
+        )
+
+    batch_size_col1, batch_size_col2 = st.columns(2)
+    with batch_size_col1:
+        batch_width = st.number_input(
+            "批量图片宽度 (px)",
+            min_value=200,
+            max_value=3000,
+            value=1000,
+            step=50,
+            key="structure_visualization_batch_width",
+        )
+    with batch_size_col2:
+        batch_supersample_label = st.selectbox(
+            "批量输出清晰度",
+            ["2x 超采样（推荐）", "1x 标准（最快）", "3x 超采样（最慢）"],
+            index=0,
+            key="structure_visualization_batch_supersample",
+            help="行数很多时建议用 1x；倍数越高单张图越大、整批耗时越长",
+        )
+    batch_supersample_map = {
+        "1x 标准（最快）": 1.0,
+        "2x 超采样（推荐）": 2.0,
+        "3x 超采样（最慢）": 3.0,
+    }
+
     sample = st.checkbox(
         "生成代表性采样链段示意图",
         value=False,
@@ -27995,6 +28491,13 @@ def _page_batch_structure_check() -> None:
         render_sample_chain=sample,
         repeat_units=int(repeat_units),
         random_seed=int(random_seed),
+        image_width=int(batch_width),
+        image_height=1600,
+        supersample=float(batch_supersample_map[batch_supersample_label]),
+        auto_fit=True,
+        split_components=bool(batch_split_components),
+        expand_repeat_units=bool(batch_expand_repeat),
+        emit_svg=False,
     )
     progress = st.progress(0, text="准备开始")
     status = st.empty()
@@ -28041,6 +28544,5 @@ def _page_batch_structure_check() -> None:
     )
     st.caption(f"图片位于结果目录：{output_dir}；移动结果表时请保留同目录下的 PNG 文件。")
 
-
 # 转移期命名空间完整导出（含下划线名），页面与测试从本库取全部符号。
-__all__ = [ "AIServiceConfig", "APP_NAME", "AdvancedDataCleaner", "AdvancedMolecularFeatureExtractor", "ApplicabilityDomainAnalyzer", "AutoGluonWrapper", "CACHE_DIR", "CLASSIFICATION_MODEL_NAMES", "CUSTOM_CSS", "CancellableProcessPoolExecutor", "CancellableThreadPoolExecutor", "DATA_DIR", "DEFAULT_OPTUNA_TRIALS", "DEFAULT_RANDOM_STATE", "DEFAULT_TEST_SIZE", "DataEnhancer", "EnhancedDataExplorer", "EnhancedModelTrainer", "FeatureEngineeringTracker", "GRAPH_MODEL_NAMES", "HyperparameterOptimizer", "InverseDesigner", "MANUAL_TUNING_PARAMS", "MODEL_PARAMETERS", "MODEL_SCOPE_GUIDE", "MinMaxScaler", "NAVIGATION_PAGES", "OptimizationEvaluationConfig", "OptimizationProgress", "Optional", "POST_FEATURE_COMPUTED_DEFINITIONS", "Path", "PortalAIClient", "PortalAIError", "RAW_FRAME_MODEL_NAMES", "RDKitFeatureExtractor", "RECOMMENDED_PRESETS", "REGRESSION_BALANCE_DEFAULTS", "RobustScaler", "SESSION_SNAPSHOT_DIR", "SESSION_SNAPSHOT_VERSION", "SHAPCache", "SimpleNamespace", "SmartFeatureSelector", "SmartSparseDataSelector", "SparseDataHandler", "StandardScaler", "TanimotoADAnalyzer", "ThreadPoolExecutor", "TrainingRunManager", "USER_DATA_DB", "VERSION", "Visualizer", "XGBoostModelCache", "_Chem", "_HEAVY_PRELOAD_MODULES", "_IMAGE_CLIPBOARD_COMPONENT", "_IMAGE_CLIPBOARD_COMPONENT_PATH", "_SNAPSHOT_DF_KEYS", "_SNAPSHOT_META_KEYS", "_SNAPSHOT_META_TTL_SEC", "_TABPFN_HF_REPO", "_THREAD_COUNT", "_align_input_dataframe_to_required_features", "_apply_feature_mask_to_feature_cols", "_build_feature_alignment_report", "_build_image_preview", "_build_prediction_molecular_baseline", "_build_screening_reference_export", "_build_split_snapshot_tables", "_cached_basic_stats", "_cached_boxplot_fig", "_cached_corr_fig", "_cached_corr_with_target", "_cached_csv_bytes", "_cached_distribution_fig", "_cached_duplicate_count", "_cached_excel_bytes", "_cached_high_corr_pairs", "_cached_high_repetition_columns", "_cached_missing_by_column", "_cached_missing_fig", "_cached_numeric_describe", "_cached_pseudo_numeric_columns", "_cached_read_uploaded_table", "_cached_render_structure", "_clear_feature_classification_cache", "_clear_molecular_feature_session_metadata", "_clear_molecular_features_from_session", "_clear_post_feature_mapping_session_metadata", "_clear_process_pls_session_metadata", "_coerce_feature_frame", "_coerce_feature_mask", "_coerce_target_array", "_collect_autosave_payload", "_collect_molecular_feature_columns", "_configure_safe_console_output", "_configure_thread_limits", "_count_missing_like", "_current_melting_point_artifact_extra", "_current_molecular_feature_artifact_extra", "_decode_clipboard_image_payload", "_deduplicate_feature_list", "_deduplicate_feature_list_normalized", "_df_cache_key", "_ensure_tabpfn_license_ready", "_extract_artifact_final_feature_names", "_extract_pipeline_feature_mask", "_get_cached_cleaner", "_get_expected_model_feature_count", "_get_gnn_featurizer", "_get_or_create_session_id", "_get_snapshot_save_executor", "_get_snapshot_save_gate", "_image_clipboard_component", "_infer_binary_target_info", "_invalidate_post_feature_mapping_if_changed", "_is_recent_snapshot", "_is_user_cancelled_error", "_load_new_base_dataset", "_load_saved_split_tables", "_load_snapshot_meta", "_load_snapshot_meta_throttled", "_load_structure_visualization_apis", "_lock_current_training_contract", "_mark_virtual_screening_run_requested", "_maybe_auto_restore", "_maybe_autosave_session", "_normalize_feature_name", "_normalize_meta_value", "_oplog_init", "_page_batch_structure_check", "_page_smiles_to_structure_image", "_page_virtual_screening_formula", "_post_feature_mapping_catalog_fingerprint", "_post_feature_mapping_model_fingerprint", "_post_feature_mapping_snapshot_for_screening", "_preload_heavy_libraries", "_prepare_post_feature_mapping_for_prediction", "_quick_rdkit_parse_stats", "_reconstruct_split_from_current_data", "_register_source_feature_names", "_render_binary_classification_results", "_render_data_explore_preview", "_render_figure_export_controls", "_render_global_task_lock", "_render_molecular_feature_clear_restore_control", "_render_molecule_design_engine", "_render_network_proxy_panel", "_render_portal_ai_service_panel", "_render_post_feature_mapping_panel", "_render_prediction_feature_check_panel", "_render_prediction_molecular_input_panel", "_render_sidebar_compute_panel", "_render_sidebar_portal_panel", "_render_sidebar_session_panel", "_render_structure_result", "_render_training_emergency_stop_panel", "_resolve_effective_feature_cols", "_resolve_feature_mask", "_resolve_imported_molecular_feature_workflow", "_resolve_prediction_feature_cols", "_restore_molecular_feature_metadata", "_restore_post_feature_mapping_metadata", "_restore_process_pls_metadata", "_restore_session_snapshot", "_restore_versioned_molecular_feature_metadata", "_run_imported_molecular_feature_workflow", "_safe_structure_image_path", "_save_session_snapshot", "_save_session_snapshot_async", "_should_restore_value", "_show_mpl_fig_fullwidth", "_snapshot_paths", "_structure_result_text", "_structure_visualization_output_root", "_suggest_similar_feature_names", "_tabpfn_license_name_via_mirror", "_tabpfn_preflight_check", "_virtual_screening_task_guard", "_write_autosave_payload", "analyze_group_distribution", "append_runtime_debug", "apply_mapping", "as_completed", "assert_training_context", "audit_training_result", "base64", "binascii", "build_export_zip", "build_feature_name_pie_data", "build_feature_pie_data", "build_group_series", "build_manual_mapping_choices", "build_post_feature_catalog", "build_request_url", "build_shap_importance_df", "build_single_row_source_frame", "cancel_all_background_tasks", "catalog_fingerprint", "classify_feature_for_pie", "clear_cancel", "collect_workflow_source_columns", "commit_mapping_form_draft", "components", "copy", "create_mapping_draft", "create_quick_export_button", "dataframe_to_csv_bytes", "dataframe_to_excel_bytes", "datetime", "default_ai_config", "ensure_emergency_stop_server", "exportable_ai_config", "feature_values_or_empty", "fig_to_html", "fig_to_png_bytes", "figure_to_bytes", "functools", "generate_training_script_code", "generate_tuning_suggestions", "get_active_task_count", "get_current_model", "get_feature_review_ai_client", "get_formulation_group_options", "get_shap_cache", "get_task_manager", "get_task_summary", "get_xgboost_cache", "hashlib", "init_session_state", "io", "is_cancelled", "is_port_open", "json", "key_fingerprint", "load_ai_config", "load_data_file", "load_shap_export_frame", "locale", "lock_training_contract", "log_fe_step", "logging", "mapping_snapshot", "mapping_snapshot_restore_policy", "mp", "multiprocessing", "normalize_endpoint_path", "normalize_mapping", "np", "oplog", "oplog_clear", "oplog_render", "os", "page_active_learning", "page_data_cleaning", "page_data_enhancement", "page_data_explore", "page_data_upload", "page_feature_registry", "page_feature_selection", "page_formulation_fusion", "page_home", "page_hyperparameter_optimization", "page_image_to_smiles", "page_model_imputation", "page_model_interpretation", "page_model_training", "page_molecular_feature_reproduction", "page_molecular_features", "page_prediction", "page_smiles_structure_tools", "page_status_log", "page_structure_recognition", "page_title_with_refresh", "page_training_records", "page_virtual_screening", "pd", "pickle", "plot_history", "plt", "portal_health_label", "portal_process_status", "prepare_manual_training_params", "prepare_regression_optimization", "preview_dataframe", "re", "redacted_ai_config", "render_data_export_panel", "render_export_section", "render_feature_registry_page", "render_melting_point_dataset_panel", "render_shap_importance_outputs", "render_sidebar", "render_status_panel", "render_status_sidebar", "render_task_control_expander", "render_task_manager_ui", "render_top_status_bar", "resolve_data_source", "resolve_navigation_page", "resolve_prediction_feature_contract", "run_xgboost_shap_subprocess", "run_xgboost_surface_subprocess", "sanitize_feature_columns", "sanitize_preview_columns", "save_ai_config", "select_training_context_for_model", "show_robust_feature_selection", "st", "start_prediction_portal", "stop_prediction_portal", "subprocess", "sys", "threading", "time", "traceback", "uuid", "validate_ai_config", "validate_mapping", "validate_mapping_for_prediction", "validate_single_row_source_values", "warnings", "workflow_requires_manual_molecular_input", "zipfile" ]
+__all__ = [ "AIServiceConfig", "APP_NAME", "AdvancedDataCleaner", "AdvancedMolecularFeatureExtractor", "ApplicabilityDomainAnalyzer", "AutoGluonWrapper", "CACHE_DIR", "CLASSIFICATION_MODEL_NAMES", "CUSTOM_CSS", "CancellableProcessPoolExecutor", "CancellableThreadPoolExecutor", "DATA_DIR", "DEFAULT_OPTUNA_TRIALS", "DEFAULT_RANDOM_STATE", "DEFAULT_TEST_SIZE", "DataEnhancer", "EnhancedDataExplorer", "EnhancedModelTrainer", "FeatureEngineeringTracker", "GRAPH_MODEL_NAMES", "HyperparameterOptimizer", "InverseDesigner", "MANUAL_TUNING_PARAMS", "MODEL_PARAMETERS", "MODEL_SCOPE_GUIDE", "MinMaxScaler", "NAVIGATION_PAGES", "OptimizationEvaluationConfig", "OptimizationProgress", "Optional", "POST_FEATURE_COMPUTED_DEFINITIONS", "Path", "PortalAIClient", "PortalAIError", "RAW_FRAME_MODEL_NAMES", "RDKitFeatureExtractor", "RECOMMENDED_PRESETS", "REGRESSION_BALANCE_DEFAULTS", "RobustScaler", "SESSION_SNAPSHOT_DIR", "SESSION_SNAPSHOT_VERSION", "SHAPCache", "SimpleNamespace", "SmartFeatureSelector", "SmartSparseDataSelector", "SparseDataHandler", "StandardScaler", "TanimotoADAnalyzer", "ThreadPoolExecutor", "TrainingRunManager", "USER_DATA_DB", "VERSION", "Visualizer", "XGBoostModelCache", "_Chem", "_HEAVY_PRELOAD_MODULES", "_IMAGE_CLIPBOARD_COMPONENT", "_IMAGE_CLIPBOARD_COMPONENT_PATH", "_SNAPSHOT_DF_KEYS", "_SNAPSHOT_META_KEYS", "_SNAPSHOT_META_TTL_SEC", "_TABPFN_HF_REPO", "_THREAD_COUNT", "_align_input_dataframe_to_required_features", "_apply_feature_mask_to_feature_cols", "_build_feature_alignment_report", "_build_image_preview", "_build_prediction_molecular_baseline", "_build_screening_reference_export", "_build_split_snapshot_tables", "_cached_basic_stats", "_cached_boxplot_fig", "_cached_corr_fig", "_cached_corr_with_target", "_cached_csv_bytes", "_cached_distribution_fig", "_cached_duplicate_count", "_cached_excel_bytes", "_cached_high_corr_pairs", "_cached_high_repetition_columns", "_cached_missing_by_column", "_cached_missing_fig", "_cached_numeric_describe", "_cached_pseudo_numeric_columns", "_cached_read_uploaded_table", "_cached_render_structure", "_clear_feature_classification_cache", "_clear_molecular_feature_session_metadata", "_clear_molecular_features_from_session", "_clear_post_feature_mapping_session_metadata", "_clear_process_pls_session_metadata", "_coerce_feature_frame", "_coerce_feature_mask", "_coerce_target_array", "_collect_autosave_payload", "_collect_molecular_feature_columns", "_configure_safe_console_output", "_configure_thread_limits", "_count_missing_like", "_current_melting_point_artifact_extra", "_current_molecular_feature_artifact_extra", "_decode_clipboard_image_payload", "_deduplicate_feature_list", "_deduplicate_feature_list_normalized", "_df_cache_key", "_ensure_tabpfn_license_ready", "_extract_artifact_final_feature_names", "_extract_pipeline_feature_mask", "_get_cached_cleaner", "_get_expected_model_feature_count", "_get_gnn_featurizer", "_get_or_create_session_id", "_get_snapshot_save_executor", "_get_snapshot_save_gate", "_image_clipboard_component", "_infer_binary_target_info", "_invalidate_post_feature_mapping_if_changed", "_is_recent_snapshot", "_is_user_cancelled_error", "_load_new_base_dataset", "_load_saved_split_tables", "_load_snapshot_meta", "_load_snapshot_meta_throttled", "_load_structure_visualization_apis", "_lock_current_training_contract", "_mark_virtual_screening_run_requested", "_maybe_auto_restore", "_maybe_autosave_session", "_normalize_feature_name", "_normalize_meta_value", "_oplog_init", "_page_batch_structure_check", "_page_smiles_to_structure_image", "_page_virtual_screening_formula", "_post_feature_mapping_catalog_fingerprint", "_post_feature_mapping_model_fingerprint", "_post_feature_mapping_snapshot_for_screening", "_preload_heavy_libraries", "_prepare_post_feature_mapping_for_prediction", "_quick_rdkit_parse_stats", "_reconstruct_split_from_current_data", "_register_source_feature_names", "_render_binary_classification_results", "_render_data_explore_preview", "_render_figure_export_controls", "_render_global_task_lock", "_render_molecular_feature_clear_restore_control", "_render_molecule_design_engine", "_render_network_proxy_panel", "_render_portal_ai_service_panel", "_render_post_feature_mapping_panel", "_render_prediction_feature_check_panel", "_render_prediction_molecular_input_panel", "_render_sidebar_compute_panel", "_render_sidebar_portal_panel", "_render_sidebar_session_panel", "_render_structure_result", "_render_training_emergency_stop_panel", "_resolve_effective_feature_cols", "_resolve_feature_mask", "_resolve_imported_molecular_feature_workflow", "_resolve_prediction_feature_cols", "_restore_molecular_feature_metadata", "_restore_post_feature_mapping_metadata", "_restore_process_pls_metadata", "_restore_session_snapshot", "_restore_versioned_molecular_feature_metadata", "_run_imported_molecular_feature_workflow", "_safe_structure_image_path", "_save_session_snapshot", "_save_session_snapshot_async", "_should_restore_value", "_show_mpl_fig_fullwidth", "_snapshot_paths", "_structure_result_text", "_structure_visualization_output_root", "_suggest_similar_feature_names", "_tabpfn_license_name_via_mirror", "_tabpfn_preflight_check", "_virtual_screening_task_guard", "_write_autosave_payload", "analyze_group_distribution", "append_runtime_debug", "apply_mapping", "as_completed", "assert_training_context", "audit_training_result", "base64", "binascii", "build_export_zip", "build_feature_name_pie_data", "build_feature_pie_data", "build_group_series", "build_manual_mapping_choices", "build_post_feature_catalog", "build_request_url", "build_shap_importance_df", "build_single_row_source_frame", "cancel_all_background_tasks", "catalog_fingerprint", "classify_feature_for_pie", "clear_cancel", "collect_workflow_source_columns", "commit_mapping_form_draft", "components", "copy", "create_mapping_draft", "create_quick_export_button", "dataframe_to_csv_bytes", "dataframe_to_excel_bytes", "datetime", "default_ai_config", "ensure_emergency_stop_server", "exportable_ai_config", "feature_values_or_empty", "fig_to_html", "fig_to_png_bytes", "figure_to_bytes", "functools", "generate_training_script_code", "generate_tuning_suggestions", "get_active_task_count", "get_current_model", "get_feature_review_ai_client", "get_formulation_group_options", "get_shap_cache", "get_task_manager", "get_task_summary", "get_xgboost_cache", "hashlib", "init_session_state", "io", "is_cancelled", "is_port_open", "json", "key_fingerprint", "load_ai_config", "load_data_file", "load_shap_export_frame", "locale", "lock_training_contract", "log_fe_step", "logging", "mapping_snapshot", "mapping_snapshot_restore_policy", "mp", "multiprocessing", "normalize_endpoint_path", "normalize_mapping", "np", "oplog", "oplog_clear", "oplog_render", "os", "page_active_learning", "page_data_cleaning", "page_data_enhancement", "page_data_explore", "page_data_upload", "page_feature_registry", "page_feature_selection", "page_formulation_fusion", "page_home", "page_hyperparameter_optimization", "page_image_to_smiles", "page_model_imputation", "page_model_interpretation", "page_model_training", "page_molecular_feature_reproduction", "page_molecular_features", "page_prediction", "page_smiles_structure_tools", "page_status_log", "page_structure_recognition", "page_title_with_refresh", "page_training_records", "page_virtual_screening", "pd", "pickle", "plot_history", "plt", "portal_health_label", "portal_process_status", "prepare_manual_training_params", "prepare_regression_optimization", "preview_dataframe", "re", "redacted_ai_config", "render_data_export_panel", "render_export_section", "render_feature_registry_page", "render_melting_point_dataset_panel", "render_shap_importance_outputs", "render_sidebar", "render_status_panel", "render_status_sidebar", "render_task_control_expander", "render_task_manager_ui", "render_top_status_bar", "resolve_data_source", "resolve_navigation_page", "resolve_prediction_feature_contract", "run_xgboost_shap_subprocess", "run_xgboost_surface_subprocess", "sanitize_feature_columns", "sanitize_preview_columns", "save_ai_config", "select_training_context_for_model", "show_robust_feature_selection", "st", "start_prediction_portal", "stop_prediction_portal", "subprocess", "sys", "threading", "time", "traceback", "uuid", "validate_ai_config", "validate_mapping", "validate_mapping_for_prediction", "validate_single_row_source_values", "warnings", "workflow_requires_manual_molecular_input", "zipfile", "_PARSER_STATUS_LABELS", "_render_structure_notices", "_structure_warning_lines", "_structure_svg_text" ]

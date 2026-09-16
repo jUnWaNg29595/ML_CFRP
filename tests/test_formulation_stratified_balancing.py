@@ -112,3 +112,118 @@ def test_formulation_stratified_invalid_inputs():
             stratify_mode="by_target_with_group_cap",
             target_col=None,
         )
+
+
+def test_combo_protection_rescues_rare_combination():
+    """单列(仅固化剂)平衡 + 组合多样性保护：
+    高频固化剂 DDS 内部包含大量 E51 与少量 RareResin；RareResin 只与 DDS 搭配出现。
+    无保护时随机抽删可能把 RareResin 组合整体清除；开启保护后必须至少保留 min_samples_per_combo 条。"""
+    n_e51_dds, n_rare_dds, n_e51_ddm = 60, 20, 10
+    df = pd.DataFrame({
+        "resin": ["E51"] * n_e51_dds + ["RareResin"] * n_rare_dds + ["E51"] * n_e51_ddm,
+        "hardener": ["DDS"] * (n_e51_dds + n_rare_dds) + ["DDM"] * n_e51_ddm,
+        "Tg": np.concatenate([
+            np.linspace(120, 220, n_e51_dds),
+            np.linspace(180, 240, n_rare_dds),
+            np.linspace(100, 150, n_e51_ddm),
+        ]),
+        "id": range(n_e51_dds + n_rare_dds + n_e51_ddm),
+    })
+
+    cleaner = AdvancedDataCleaner(df)
+    cleaned, stats = cleaner.balance_formulation_stratified(
+        group_cols=["hardener"],  # 仅固化剂
+        max_samples_per_group=15,
+        target_col="Tg",
+        n_bins=5,
+        stratify_mode="within_group",
+        random_state=42,
+        protect_combo_cols=["resin"],
+        min_samples_per_combo=1,
+    )
+
+    # 保护已生效：RareResin 组合仅存在于被削减的 DDS 组中，属于风险组合并获预留
+    cp = stats["combo_protection"]
+    assert cp["enabled"] is True
+    assert cp["n_at_risk_combos"] == 1  # 仅 RareResin；E51 在未削减的 DDM 组中有完整保留
+    assert "RareResin" in cp["protected_combos"]
+    assert cp["reserved_samples"] >= 1
+
+    # 名额不超标：DDS 组总量仍为 cap=15，DDM 组完整保留
+    dds_kept = cleaned[cleaned["hardener"] == "DDS"]
+    assert len(dds_kept) == 15
+    assert len(cleaned[cleaned["hardener"] == "DDM"]) == n_e51_ddm
+    # 关键断言：稀有组合未被误伤灭绝
+    assert len(cleaned[cleaned["resin"] == "RareResin"]) >= 1
+
+    # 同种子可复现
+    cleaner2 = AdvancedDataCleaner(df)
+    cleaned2, _ = cleaner2.balance_formulation_stratified(
+        group_cols=["hardener"],
+        max_samples_per_group=15,
+        target_col="Tg",
+        n_bins=5,
+        stratify_mode="within_group",
+        random_state=42,
+        protect_combo_cols=["resin"],
+        min_samples_per_combo=1,
+    )
+    pd.testing.assert_frame_equal(cleaned, cleaned2)
+
+
+def test_combo_protection_budget_shortfall_recorded():
+    """削减名额不足以覆盖全部风险组合时：按全局最稀有优先预留，其余记入 unprotected_combos。"""
+    n_e51_dds, n_rare, n_e51_ddm = 40, 2, 3  # DDM 组 3 条 ≤ cap，不削减 → E51 非风险组合
+    rare_resins = [f"R{i}" for i in range(5)]  # 5 个稀有树脂各 2 条，均只与 DDS 搭配
+    df = pd.DataFrame({
+        "resin": ["E51"] * n_e51_dds + rare_resins * n_rare + ["E51"] * n_e51_ddm,
+        "hardener": ["DDS"] * (n_e51_dds + 5 * n_rare) + ["DDM"] * n_e51_ddm,
+        "id": range(n_e51_dds + 5 * n_rare + n_e51_ddm),
+    })
+
+    cleaner = AdvancedDataCleaner(df)
+    cleaned, stats = cleaner.balance_formulation_stratified(
+        group_cols=["hardener"],
+        max_samples_per_group=3,  # cap=3 < 5 个风险组合，名额不够
+        stratify_mode="within_group",
+        random_state=42,
+        protect_combo_cols=["resin"],
+        min_samples_per_combo=1,
+    )
+
+    cp = stats["combo_protection"]
+    assert cp["enabled"] is True
+    assert cp["n_at_risk_combos"] == 5
+    assert cp["reserved_samples"] == 3  # 名额全部分配给最稀有的前 3 个组合
+    assert len(cp["protected_combos"]) == 3
+    assert len(cp["unprotected_combos"]) == 2  # 剩余 2 个记入未保护清单
+    assert len(cleaned[cleaned["hardener"] == "DDS"]) == 3
+
+
+def test_combo_protection_ignored_for_duplicate_cols_or_mode():
+    """保护列与分组列重复、或使用 by_target_with_group_cap 模式时，保护自动忽略并在 stats 中给出说明。"""
+    df = pd.DataFrame({
+        "resin": ["E51"] * 50 + ["CYD128"] * 10,
+        "hardener": ["DDS"] * 50 + ["DDM"] * 10,
+        "Tg": np.linspace(100, 200, 60),
+    })
+
+    cleaner = AdvancedDataCleaner(df)
+    _, stats = cleaner.balance_formulation_stratified(
+        group_cols=["hardener"],
+        max_samples_per_group=10,
+        stratify_mode="within_group",
+        protect_combo_cols=["hardener"],  # 与分组列重复 → 无组合差异
+    )
+    assert stats["combo_protection"]["enabled"] is False
+    assert "note" in stats["combo_protection"]
+
+    _, stats2 = cleaner.balance_formulation_stratified(
+        group_cols=["hardener"],
+        target_col="Tg",
+        stratify_mode="by_target_with_group_cap",
+        max_per_group_per_bin=5,
+        protect_combo_cols=["resin"],  # 仅 within_group 模式支持
+    )
+    assert stats2["combo_protection"]["enabled"] is False
+    assert "note" in stats2["combo_protection"]

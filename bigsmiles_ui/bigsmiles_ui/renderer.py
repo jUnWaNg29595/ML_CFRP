@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import io
 import math
 import re
 from dataclasses import dataclass
@@ -9,9 +10,10 @@ from pathlib import Path
 from typing import Literal
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageChops, ImageDraw, ImageFont
 except Exception:  # pragma: no cover - 由结果对象给出缺少绘图依赖的提示
     Image = None
+    ImageChops = None
     ImageDraw = None
     ImageFont = None
 
@@ -62,6 +64,20 @@ class RenderOptions:
     random_seed: int = 42
     image_width: int = 1000
     image_height: int = 700
+    # ----------------------------------------------------------------
+    # 画质与展示选项（新增，默认值与旧行为保持一致）
+    # ----------------------------------------------------------------
+    #: 超采样倍数。1.0 表示与 image_width/height 完全一致；2.0 表示按两倍像素
+    #: 渲染，笔画更细、边缘更锐利，浏览器缩小时依然清晰。
+    supersample: float = 1.0
+    #: 是否根据分子二维布局的长宽比自动收紧画布（把多余留白裁掉）。
+    auto_fit: bool = False
+    #: 是否把顶层 "." 连接的多组分拆成独立面板（并附一张整体视图）。
+    split_components: bool = True
+    #: 是否把 BigSMILES 的 {重复单元} 就地展开成一张连通的完整骨架图。
+    expand_repeat_units: bool = True
+    #: 纯 SMILES 路径是否额外输出矢量 SVG。
+    emit_svg: bool = True
 
     def __post_init__(self) -> None:
         requested = str(self.requested_type).strip().lower()
@@ -73,6 +89,8 @@ class RenderOptions:
             raise ValueError("图片宽度必须在 200 到 3000 之间")
         if not 200 <= int(self.image_height) <= 3000:
             raise ValueError("图片高度必须在 200 到 3000 之间")
+        if not 1.0 <= float(self.supersample) <= 4.0:
+            raise ValueError("超采样倍数必须在 1.0 到 4.0 之间")
 
 
 @dataclass
@@ -87,6 +105,14 @@ class RenderResult:
     error_message: str = ""
     warning_message: str = ""
     renderer: str = ""
+    #: 纯 SMILES 路径下与主图同名的矢量 SVG 相对路径（无则空串）。
+    #: 故意不进入 to_scalar_dict，避免破坏批量结果表的固定列契约。
+    svg_path: str = ""
+    #: 与具体输入无关的固定免责说明；与真实问题分开，避免互相淹没。
+    #: 同样不进入 to_scalar_dict。
+    disclaimers: tuple[str, ...] = ()
+    #: 官方 BigSMILES 解析器状态：accepted / rejected / unavailable / ""（未走该路径）。
+    parser_status: str = ""
 
     def to_scalar_dict(self) -> dict[str, object]:
         values: dict[str, object] = {
@@ -153,36 +179,581 @@ def _invalid_result(raw: str, detected_type: str, message: str, renderer: str) -
     )
 
 
+# ---------------------------------------------------------------------------
+# 画布工具：超采样、自适应画布、多面板 PNG + SVG 双输出
+# ---------------------------------------------------------------------------
+
+#: SMILES 文本原子 token 统计（用于把展开后的字符区间映射为原子下标）。
+_SMILES_ATOM_TOKEN_RE = re.compile(r"\[[^\]]*\]|Br|Cl|B|C|N|O|P|S|F|I|b|c|n|o|p|s")
+#: RDKit 高亮色（0~1 浮点 RGB）。
+_HIGHLIGHT_COLOUR = (1.0, 0.86, 0.36)
+#: SVG 里的中文字体栈（RDKit 无法渲染 CJK，所以文字一律由我们自己输出）。
+_SVG_FONT_STACK = (
+    "'Microsoft YaHei','PingFang SC','Noto Sans CJK SC','Source Han Sans SC',"
+    "'WenQuanYi Zen Hei','Heiti SC',sans-serif"
+)
+
+
+def _draw_api():
+    """返回 ``rdMolDraw2D``；RDKit 不可用时返回 None。"""
+    if Draw is None or Chem is None:
+        return None
+    try:
+        from rdkit.Chem.Draw import rdMolDraw2D
+    except Exception:
+        return None
+    return rdMolDraw2D
+
+
+def _supersample_scale(options: RenderOptions) -> float:
+    try:
+        value = float(getattr(options, "supersample", 1.0) or 1.0)
+    except Exception:
+        return 1.0
+    return max(1.0, min(4.0, value))
+
+
+def _scaled(value: float, scale: float) -> int:
+    return int(round(float(value) * scale))
+
+
+def _prepare_drawable(molecule):
+    """复制分子并补齐二维坐标，避免污染调用方对象。"""
+    if Chem is None or molecule is None:
+        return molecule
+    drawable = Chem.Mol(molecule)
+    if rdDepictor is not None:
+        try:
+            rdDepictor.Compute2DCoords(drawable, canonOrient=True)
+        except Exception:
+            pass
+    return drawable
+
+
+def _molecule_aspect_ratio(molecule) -> float | None:
+    """二维坐标包围盒的宽高比；无法判断时返回 None。"""
+    drawable = _prepare_drawable(molecule)
+    if drawable is None:
+        return None
+    try:
+        conformer = drawable.GetConformer()
+    except Exception:
+        return None
+    xs: list[float] = []
+    ys: list[float] = []
+    for index in range(drawable.GetNumAtoms()):
+        point = conformer.GetAtomPosition(index)
+        xs.append(point.x)
+        ys.append(point.y)
+    if not xs:
+        return None
+    width = max(xs) - min(xs)
+    height = max(ys) - min(ys)
+    if width <= 1e-6 or height <= 1e-6:
+        return None
+    return width / height
+
+
+def _fit_canvas_size(molecules: list, options: RenderOptions) -> tuple[int, int]:
+    """按分子二维布局的长宽比收紧画布，避免小分子被大片留白淹没。
+
+    仅在 ``options.auto_fit`` 打开时生效；此时 ``image_height`` 被当作上限。
+    """
+    width = int(options.image_width)
+    height = int(options.image_height)
+    if not getattr(options, "auto_fit", False) or not molecules:
+        return width, height
+    aspects = [value for value in (_molecule_aspect_ratio(mol) for mol in molecules) if value]
+    if not aspects:
+        return width, height
+    # 原子坐标不含原子标签与氢原子文字，留 18% 余量后再交给 RDKit 的 padding。
+    fitted = int(round(width / (min(aspects) * 1.18)))
+    return width, max(200, min(height, fitted))
+
+
+def _configure_draw_options(drawer, scale: float) -> None:
+    """统一控制留白、线宽与字号，保证放大后依然锐利、紧凑。"""
+    try:
+        draw_options = drawer.drawOptions()
+    except Exception:
+        return
+    settings = (
+        ("padding", 0.02),
+        ("bondLineWidth", max(1.6, 2.0 * scale)),
+        ("minFontSize", max(11.0, 13.0 * scale)),
+        ("maxFontSize", max(15.0, 20.0 * scale)),
+        ("legendFontSize", max(14.0, 17.0 * scale)),
+        ("highlightRadius", 0.42),
+        ("highlightColour", _HIGHLIGHT_COLOUR),
+    )
+    for name, value in settings:
+        try:
+            setattr(draw_options, name, value)
+        except Exception:
+            continue
+
+
+def _molecule_png(molecule, pixel_size: tuple[float, float], scale: float, highlights=()) -> "Image.Image | None":
+    """在给定像素尺寸内用 RDKit Cairo 绘制单个分子，返回 PIL 图像。
+
+    ``pixel_size`` 已经是设备像素（调用方已乘过 ``scale``），这里只把 ``scale``
+    用于线宽/字号等绘制参数。
+    """
+    draw_module = _draw_api()
+    if draw_module is None or Image is None or molecule is None:
+        return None
+    width = max(120, int(round(float(pixel_size[0]))))
+    height = max(120, int(round(float(pixel_size[1]))))
+    try:
+        drawer = draw_module.MolDraw2DCairo(width, height)
+        _configure_draw_options(drawer, scale)
+        drawer.DrawMolecule(
+            _prepare_drawable(molecule),
+            highlightAtoms=list(highlights) or None,
+        )
+        drawer.FinishDrawing()
+        payload = drawer.GetDrawingText()
+    except Exception:
+        return None
+    try:
+        return Image.open(io.BytesIO(payload)).convert("RGB")
+    except Exception:
+        return None
+
+
+def _molecule_svg_fragment(molecule, pixel_size: tuple[float, float], scale: float, highlights=()) -> str:
+    """返回可嵌入外层 SVG 的分子图形片段（不含 xml 声明与根 svg 标签）。"""
+    draw_module = _draw_api()
+    if draw_module is None or molecule is None:
+        return ""
+    width = max(120, int(round(float(pixel_size[0]))))
+    height = max(120, int(round(float(pixel_size[1]))))
+    try:
+        drawer = draw_module.MolDraw2DSVG(width, height)
+        _configure_draw_options(drawer, scale)
+        drawer.DrawMolecule(
+            _prepare_drawable(molecule),
+            highlightAtoms=list(highlights) or None,
+        )
+        drawer.FinishDrawing()
+        document = drawer.GetDrawingText()
+    except Exception:
+        return ""
+    match = re.search(r"<svg[^>]*>", document)
+    if not match:
+        return ""
+    body = document[match.end():]
+    end = body.rfind("</svg>")
+    return body[:end] if end >= 0 else ""
+
+
+def _svg_escape(text: str) -> str:
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _svg_text(x: float, y: float, text: str, *, size: int, color: str, bold: bool = False) -> str:
+    weight = "700" if bold else "400"
+    return (
+        f"<text x='{x:.1f}' y='{y:.1f}' font-size='{int(size)}px' font-weight='{weight}' "
+        f"fill='{color}' font-family=\"{_SVG_FONT_STACK}\">{_svg_escape(text)}</text>"
+    )
+
+
+def _rgb_to_hex(colour) -> str:
+    try:
+        red, green, blue = (int(channel) for channel in colour)
+    except Exception:
+        return "#f8fafc"
+    return f"#{max(0, min(255, red)):02x}{max(0, min(255, green)):02x}{max(0, min(255, blue)):02x}"
+
+
+@dataclass
+class _Panel:
+    """一个面板：标题、脚注、可选分子与高亮原子。"""
+
+    title: str = ""
+    note: str = ""
+    molecule: object | None = None
+    highlight_atoms: tuple[int, ...] = ()
+    fill: tuple[int, int, int] = (248, 250, 252)
+    outline: tuple[int, int, int] = (150, 160, 170)
+    title_color: tuple[int, int, int] = (70, 80, 90)
+    empty_text: str = "该片段无法由 RDKit 解析"
+    empty_color: tuple[int, int, int] = (170, 60, 50)
+
+
+def _panel_heights(rows: list[list[_Panel]], usable_width: float, gap: float, inner_pad: float,
+                   title_h: float, note_h: float, min_cell_h: float, max_cell_h: float) -> tuple[list[float], list[float]]:
+    """按每行内容的长宽比计算行高，避免宽分子被正方形面板压小。"""
+    heights: list[float] = []
+    widths: list[float] = []
+    for row in rows:
+        count = max(1, len(row))
+        cell_w = (usable_width - gap * (count - 1)) / count
+        widths.append(cell_w)
+        inner_w = max(80.0, cell_w - 2 * inner_pad)
+        aspects = [
+            value
+            for value in (_molecule_aspect_ratio(panel.molecule) for panel in row)
+            if value
+        ]
+        if not aspects:
+            heights.append(max(min_cell_h, title_h + note_h + inner_w * 0.5 + 2 * inner_pad))
+            continue
+        # 几何均值：宽分子与紧凑分子同处一行时取折中高度，既不会把宽分子压小，
+        # 也不会为紧凑分子留下大片空白。
+        mean_aspect = math.exp(sum(math.log(max(0.5, min(12.0, a))) for a in aspects) / len(aspects))
+        content_h = inner_w / mean_aspect
+        heights.append(
+            max(min_cell_h, min(max_cell_h, title_h + note_h + 2 * inner_pad + content_h))
+        )
+    return heights, widths
+
+
+def _compose_panel_figure(
+    rows: list[list[_Panel]],
+    output_png: Path,
+    *,
+    title: str = "",
+    subtitle: str = "",
+    footer: str = "",
+    width: int = 1000,
+    scale: float = 1.0,
+    output_svg: Path | None = None,
+    min_cell_h: float = 200.0,
+    max_cell_h: float = 460.0,
+) -> tuple[int, int]:
+    """把若干行面板合成一张 PNG（并可选输出同版式的 SVG）。
+
+    高度按内容自适应（不再强行填满调用方给的画布），因此不会出现“分子很小”
+    或面板被裁掉的情况。返回实际生成的像素尺寸。
+    """
+    if Image is None or ImageDraw is None:
+        raise RuntimeError("当前 Python 环境未安装 Pillow，无法合成结构图")
+    rows = [row for row in rows if row]
+    if not rows:
+        raise ValueError("没有可绘制的面板")
+
+    margin_x = _scaled(32, scale)
+    gap = _scaled(18, scale)
+    inner_pad = _scaled(14, scale)
+    title_h = _scaled(38, scale) if any(panel.title for row in rows for panel in row) else 0
+    note_h = _scaled(30, scale) if any(panel.note for row in rows for panel in row) else 0
+    header_h = _scaled(92, scale) if (title or subtitle) else _scaled(18, scale)
+    footer_h = _scaled(48, scale) if footer else _scaled(18, scale)
+
+    total_w = _scaled(width, scale)
+    usable_w = max(200.0, total_w - 2 * margin_x)
+    row_heights, _ = _panel_heights(
+        rows, usable_w, gap, inner_pad, title_h, note_h,
+        _scaled(min_cell_h, scale), _scaled(max_cell_h, scale),
+    )
+    total_h = int(round(header_h + sum(row_heights) + gap * (len(rows) - 1) + footer_h))
+
+    image = Image.new("RGB", (total_w, total_h), "white")
+    draw = ImageDraw.Draw(image)
+    title_font = _load_schematic_font(int(25 * scale), bold=True)
+    subtitle_font = _load_schematic_font(int(13 * scale))
+    label_font = _load_schematic_font(int(16 * scale), bold=True)
+    note_font = _load_schematic_font(int(13 * scale))
+    empty_font = _load_schematic_font(int(13 * scale))
+
+    if title:
+        draw.text((margin_x, _scaled(18, scale)), title, fill=(28, 45, 60), font=title_font)
+    if subtitle:
+        draw.text((margin_x, _scaled(54, scale)), subtitle, fill=(80, 90, 100), font=subtitle_font)
+
+    svg_parts: list[str] = []
+    if output_svg is not None:
+        svg_parts.append("<?xml version='1.0' encoding='UTF-8'?>")
+        svg_parts.append(
+            f"<svg xmlns='http://www.w3.org/2000/svg' width='{total_w}px' height='{total_h}px' "
+            f"viewBox='0 0 {total_w} {total_h}'>"
+        )
+        svg_parts.append(f"<rect width='{total_w}' height='{total_h}' fill='#ffffff'/>")
+        if title:
+            svg_parts.append(_svg_text(margin_x, _scaled(18, scale) + 25 * scale, title,
+                                       size=25 * scale, color="#1c2d3c", bold=True))
+        if subtitle:
+            svg_parts.append(_svg_text(margin_x, _scaled(54, scale) + 14 * scale, subtitle,
+                                       size=13 * scale, color="#505a64"))
+
+    cursor_y = float(header_h)
+    for row, cell_h in zip(rows, row_heights):
+        count = max(1, len(row))
+        cell_w = (usable_w - gap * (count - 1)) / count
+        for column, panel in enumerate(row):
+            left = margin_x + column * (cell_w + gap)
+            top = cursor_y
+            right, bottom = left + cell_w, top + cell_h
+            draw.rounded_rectangle(
+                (left, top, right, bottom), radius=max(6, int(10 * scale)),
+                fill=panel.fill, outline=panel.outline, width=max(2, int(2 * scale)),
+            )
+            if output_svg is not None:
+                svg_parts.append(
+                    f"<rect x='{left:.1f}' y='{top:.1f}' width='{cell_w:.1f}' height='{cell_h:.1f}' "
+                    f"rx='{max(6, int(10 * scale))}' fill='{_rgb_to_hex(panel.fill)}' "
+                    f"stroke='{_rgb_to_hex(panel.outline)}' stroke-width='{max(2, int(2 * scale))}'/>"
+                )
+            if panel.title:
+                draw.text((left + inner_pad, top + _scaled(8, scale)), panel.title,
+                          fill=panel.title_color, font=label_font)
+                if output_svg is not None:
+                    svg_parts.append(_svg_text(
+                        left + inner_pad, top + _scaled(8, scale) + 16 * scale, panel.title,
+                        size=16 * scale, color=_rgb_to_hex(panel.title_color), bold=True,
+                    ))
+
+            inner_w = max(120.0, cell_w - 2 * inner_pad)
+            inner_h = max(100.0, cell_h - title_h - note_h - inner_pad)
+            inner_x = left + inner_pad
+            inner_y = top + title_h
+            if panel.molecule is not None:
+                molecule_image = _molecule_png(
+                    panel.molecule, (inner_w, inner_h), scale, panel.highlight_atoms
+                )
+                if molecule_image is not None:
+                    image.paste(molecule_image, (int(inner_x), int(inner_y)))
+                if output_svg is not None:
+                    fragment = _molecule_svg_fragment(
+                        panel.molecule, (inner_w, inner_h), scale, panel.highlight_atoms
+                    )
+                    if fragment:
+                        svg_parts.append(f"<g transform='translate({inner_x:.1f},{inner_y:.1f})'>")
+                        svg_parts.append(fragment)
+                        svg_parts.append("</g>")
+            else:
+                draw.text((left + inner_pad, top + cell_h / 2), panel.empty_text,
+                          fill=panel.empty_color, font=empty_font)
+                if output_svg is not None:
+                    svg_parts.append(_svg_text(
+                        left + inner_pad, top + cell_h / 2, panel.empty_text,
+                        size=13 * scale, color=_rgb_to_hex(panel.empty_color),
+                    ))
+            if panel.note:
+                draw.text((left + inner_pad, bottom - note_h), panel.note,
+                          fill=(96, 105, 115), font=note_font)
+                if output_svg is not None:
+                    svg_parts.append(_svg_text(
+                        left + inner_pad, bottom - note_h + 13 * scale, panel.note,
+                        size=13 * scale, color="#606973",
+                    ))
+        cursor_y += cell_h + gap
+
+    if footer:
+        draw.text((margin_x, total_h - _scaled(34, scale)), footer, fill=(90, 90, 90), font=note_font)
+        if output_svg is not None:
+            svg_parts.append(_svg_text(
+                margin_x, total_h - _scaled(34, scale) + 13 * scale, footer,
+                size=13 * scale, color="#5a5a5a",
+            ))
+
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_png, format="PNG")
+    if output_svg is not None:
+        svg_parts.append("</svg>")
+        try:
+            output_svg.parent.mkdir(parents=True, exist_ok=True)
+            output_svg.write_text("\n".join(svg_parts), encoding="utf-8")
+        except Exception:
+            pass
+    return total_w, total_h
+
+
+def _molecule_caption(molecule) -> str:
+    """分子式 + 相对分子质量（用于多组分面板脚注）。"""
+    if molecule is None:
+        return ""
+    try:
+        from rdkit.Chem import rdMolDescriptors
+
+        formula = rdMolDescriptors.CalcMolFormula(molecule)
+        weight = rdMolDescriptors.CalcExactMolWt(molecule)
+        return f"{formula} · MW {weight:.2f}"
+    except Exception:
+        return ""
+
+
+def _render_smiles_grid(
+    components: list,
+    whole_molecule,
+    output_dir: Path,
+    options: RenderOptions,
+    image_name: str,
+) -> tuple[bool, str]:
+    """多组分（顶层 "." 连接）结构图：逐组分面板 + 整体视图。
+
+    返回 ``(是否成功, SVG 相对路径)``。所有中文都由 Pillow/自建 SVG 输出，
+    因为 RDKit 自身无法绘制 CJK 字形。
+    """
+    scale = _supersample_scale(options)
+    panels: list[_Panel] = []
+    for index, molecule in enumerate(components):
+        panels.append(
+            _Panel(
+                title=f"组分 {index + 1} / {len(components)}",
+                note=_molecule_caption(molecule),
+                molecule=molecule,
+                fill=(246, 249, 253),
+                outline=(83, 116, 150),
+                title_color=(45, 82, 125),
+            )
+        )
+    rows: list[list[_Panel]] = []
+    per_row = 3 if len(panels) >= 3 else max(1, len(panels))
+    for start in range(0, len(panels), per_row):
+        rows.append(panels[start:start + per_row])
+    rows.append(
+        [
+            _Panel(
+                title=f"整体视图（{len(components)} 个组分，以 . 连接）",
+                note=_molecule_caption(whole_molecule),
+                molecule=whole_molecule,
+                fill=(255, 250, 229),
+                outline=(0, 121, 107),
+                title_color=(0, 105, 92),
+            )
+        ]
+    )
+    svg_name = Path(image_name).with_suffix(".svg").name if options.emit_svg else None
+    try:
+        _compose_panel_figure(
+            rows,
+            output_dir / image_name,
+            title=f"多组分结构图（{len(components)} 个组分）",
+            subtitle="按顶层“.”拆分：每个组分单独成图，最后一行是全部组分的整体布局。",
+            width=int(options.image_width),
+            scale=scale,
+            output_svg=(output_dir / svg_name) if svg_name else None,
+        )
+    except Exception:
+        return False, ""
+    return True, (svg_name or "")
+
+
+def _content_bbox(image, background=(255, 255, 255)):
+    """返回非背景内容的包围盒；全白时返回 None。"""
+    if Image is None or ImageChops is None:
+        return None
+    try:
+        background_image = Image.new("RGB", image.size, background)
+        return ImageChops.difference(image.convert("RGB"), background_image).getbbox()
+    except Exception:
+        return None
+
+
+def _trim_content(image, margin: int = 0):
+    """裁掉四周留白（保留 ``margin`` 像素白边）。"""
+    box = _content_bbox(image)
+    if box is None:
+        return image
+    left, top, right, bottom = box
+    return image.crop(
+        (
+            max(0, left - margin),
+            max(0, top - margin),
+            min(image.width, right + margin),
+            min(image.height, bottom + margin),
+        )
+    )
+
+
+def _render_single_smiles(
+    molecule,
+    options: RenderOptions,
+) -> tuple["Image.Image | None", tuple[int, int]]:
+    """单分子高清渲染。
+
+    开启 ``auto_fit`` 时采用两遍法：先按估算长宽比试画一次，量出真实内容包围盒，
+    再按真实长宽比重画。这样原子标签、氢原子文字都会计入，分子能真正填满画布，
+    而不是被正方形画布掏空。
+    """
+    scale = _supersample_scale(options)
+    width = int(options.image_width)
+    max_height = int(options.image_height)
+    if not getattr(options, "auto_fit", False):
+        image = _molecule_png(molecule, (width * scale, max_height * scale), scale)
+        return image, (width, max_height)
+
+    probe_height = _fit_canvas_size([molecule], options)[1]
+    probe = _molecule_png(molecule, (width * scale, probe_height * scale), scale)
+    if probe is None:
+        return None, (width, max_height)
+
+    box = _content_bbox(probe)
+    if box is None:
+        return probe, (width, probe_height)
+    left, top, right, bottom = box
+    content_area = max(0, right - left) * max(0, bottom - top)
+    if content_area < 0.03 * float(probe.width * probe.height):
+        # 内容极小（如单原子、“[Na+].[Cl-]”），强行拉满只会得到一张巨大的字号；
+        # 此时回退到用户给定的画布尺寸。
+        image = _molecule_png(molecule, (width * scale, max_height * scale), scale)
+        return image or probe, (width, max_height)
+
+    true_aspect = (right - left) / max(1, bottom - top)
+    fitted_height = int(round(width / max(0.05, true_aspect)))
+    fitted_height = max(200, min(max_height, fitted_height))
+    if abs(fitted_height - probe_height) <= 2:
+        return probe, (width, probe_height)
+    image = _molecule_png(molecule, (width * scale, fitted_height * scale), scale)
+    if image is None:
+        return probe, (width, probe_height)
+    return image, (width, fitted_height)
+
+
 def _render_molecules(
     molecules: list,
     output_path: Path,
     options: RenderOptions,
     legends: list[str] | None = None,
 ) -> None:
+    """单分子/多分子图像输出（保留旧签名，内部改走高清 Cairo 通道）。"""
     if not molecules:
         raise ValueError("没有可绘制的分子对象")
     if Draw is None:
         raise RuntimeError("当前 Python 环境未安装 RDKit，无法绘图")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = int(options.image_width), int(options.image_height)
     if len(molecules) == 1:
-        image = Draw.MolToImage(
-            molecules[0],
-            size=(int(options.image_width), int(options.image_height)),
-            kekulize=False,
-        )
-    else:
-        sub_size = (
-            max(200, int(options.image_width / min(len(molecules), 4))),
-            max(200, int(options.image_height / 2)),
-        )
-        image = Draw.MolsToGridImage(
-            molecules,
-            molsPerRow=min(len(molecules), 4),
-            subImgSize=sub_size,
-            legends=legends,
-            useSVG=False,
-        )
+        image, _size = _render_single_smiles(molecules[0], options)
+        if image is not None:
+            image.save(output_path, format="PNG")
+            return
+    image = Draw.MolsToGridImage(
+        molecules,
+        molsPerRow=min(len(molecules), 4),
+        subImgSize=(max(200, width // min(len(molecules), 4)), max(200, height // 2)),
+        legends=legends,
+        useSVG=False,
+    )
     image.save(output_path, format="PNG")
+
+
+def _smiles_components(cleaned: str, molecule) -> list:
+    """按顶层 "." 拆分并逐个解析；任何一段解析失败则退化为整体。"""
+    if Chem is None or molecule is None:
+        return [molecule] if molecule is not None else []
+    pieces = [part for part in _split_top_level(cleaned, ".") if part.strip()]
+    if len(pieces) < 2:
+        return [molecule]
+    parsed: list = []
+    for piece in pieces:
+        try:
+            component = Chem.MolFromSmiles(piece)
+        except Exception:
+            component = None
+        if component is None:
+            return [molecule]
+        parsed.append(component)
+    return parsed
 
 
 def _render_smiles(raw: str, output_dir: Path, options: RenderOptions) -> RenderResult:
@@ -200,9 +771,42 @@ def _render_smiles(raw: str, output_dir: Path, options: RenderOptions) -> Render
         normalized = Chem.MolToSmiles(molecule, canonical=True)
     except Exception as exc:
         return _invalid_result(raw, "smiles", f"SMILES 规范化失败：{exc}", renderer)
+
     image_name = _hash_name(cleaned, "main")
+    warnings: list[str] = []
+    components = _smiles_components(cleaned, molecule) if options.split_components else [molecule]
+    use_grid = len(components) > 1 and options.split_components
+    svg_name = ""
     try:
-        _render_molecules([molecule], output_dir / image_name, options)
+        if use_grid:
+            ok, svg_name = _render_smiles_grid(components, molecule, output_dir, options, image_name)
+            if not ok:
+                use_grid = False
+                components = [molecule]
+        if not use_grid:
+            scale = _supersample_scale(options)
+            image, (size_w, size_h) = _render_single_smiles(molecule, options)
+            if image is None:
+                raise RuntimeError("RDKit 绘图通道不可用")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            image.save(output_dir / image_name, format="PNG")
+            if options.emit_svg:
+                fragment = _molecule_svg_fragment(
+                    molecule, (size_w * scale, size_h * scale), scale
+                )
+                if fragment:
+                    candidate = Path(image_name).with_suffix(".svg").name
+                    svg_document = (
+                        "<?xml version='1.0' encoding='UTF-8'?>\n"
+                        f"<svg xmlns='http://www.w3.org/2000/svg' width='{size_w * scale:.0f}px' "
+                        f"height='{size_h * scale:.0f}px' viewBox='0 0 {size_w * scale:.0f} {size_h * scale:.0f}'>\n"
+                        f"<rect width='100%' height='100%' fill='#ffffff'/>\n{fragment}\n</svg>\n"
+                    )
+                    try:
+                        (output_dir / candidate).write_text(svg_document, encoding="utf-8")
+                        svg_name = candidate
+                    except Exception:
+                        svg_name = ""
     except Exception as exc:
         return RenderResult(
             raw_string=raw,
@@ -213,6 +817,11 @@ def _render_smiles(raw: str, output_dir: Path, options: RenderOptions) -> Render
             error_message=f"SMILES 已解析，但绘图失败：{exc}",
             renderer=renderer,
         )
+
+    if use_grid:
+        warnings.append(
+            f"检测到 {len(components)} 个顶层组分（以 . 连接）：已逐组分出图并附整体视图"
+        )
     return RenderResult(
         raw_string=raw,
         detected_type="smiles",
@@ -220,7 +829,9 @@ def _render_smiles(raw: str, output_dir: Path, options: RenderOptions) -> Render
         normalized_structure=normalized,
         main_image_path=image_name,
         draw_status="rendered",
+        warning_message="；".join(warnings),
         renderer=renderer,
+        svg_path=svg_name,
     )
 
 
@@ -232,6 +843,7 @@ class _BigSMILESParse:
     renderer: str
     warning: str = ""
     error: str = ""
+    parser_status: str = ""
 
 
 def _balanced_bigsmiles(text: str) -> bool:
@@ -814,47 +1426,136 @@ def _render_bigsmiles_sample_algorithmic(
     return True
 
 
-def _try_package_parse(text: str) -> tuple[bool, str, str, str]:
+#: 第三方解析库异常在界面上的展示上限（字符）。
+_LIBRARY_ERROR_LIMIT = 200
+
+
+def _summarize_library_error(message: object) -> str:
+    """把第三方 BigSMILES 解析库的异常压成一句可直接阅读的人话。
+
+    Olsen Lab 的 ``bigsmiles`` 库失败时会把「整段原始输入回显 + 逐 token dump」塞进
+    异常信息（``Parsing failed on '{...}'.\n\tIssue with token ...``）：输入稍长就会把
+    界面刷成一屏乱码。这里剥掉输入回显、折叠换行，并限制长度。
+    """
+    text = re.sub(r"\s+", " ", str(message or "")).strip()
+    if not text:
+        return ""
+    marker = "Parsing failed on '"
+    start = text.find(marker)
+    if start >= 0:
+        end = text.find("'", start + len(marker))
+        if end >= 0:
+            reason = text[end + 1 :].lstrip(" .")
+            if reason:
+                text = reason
+    if len(text) > _LIBRARY_ERROR_LIMIT:
+        text = text[: _LIBRARY_ERROR_LIMIT - 1].rstrip() + "…"
+    return text
+
+
+def _diagnose_bigsmiles_syntax(text: str) -> list[str]:
+    """给出「照着改就能过」的语法建议，而不是把解析库的原始异常丢给用户。"""
+    hints: list[str] = []
+    compact = re.sub(r"\s+", "", text)
+
+    empty_brackets = compact.count("[]")
+    if empty_brackets:
+        hints.append(
+            f"检测到 {empty_brackets} 处空方括号 []：方括号内必须写内容，"
+            "BigSMILES 连接端应写成 [<]、[>] 或 [$]，dummy 原子用 [*]"
+        )
+
+    missing_end_group = False
+    index = 0
+    while index < len(compact):
+        if compact[index] != "{":
+            index += 1
+            continue
+        close = _find_matching_token(compact, index, "{", "}")
+        if close is None:
+            break
+        for alternative in _split_bigsmiles_alternatives(compact[index + 1 : close]):
+            if not _CONNECTOR_TOKEN_RE.match(alternative):
+                missing_end_group = True
+                break
+        index = close + 1
+    if missing_end_group:
+        hints.append(
+            "随机对象 {…} 没有声明端基：官方规范要求写成 {[>][<]重复单元[>][<]}，"
+            "只写 {重复单元} 会被判定为缺少端基而无法验证"
+        )
+    return hints
+
+
+def _try_package_parse(text: str) -> tuple[bool, str, str, str, str]:
+    """调用 Olsen Lab 官方 BigSMILES 解析器。
+
+    返回 ``(是否通过, 规范化结构, 渲染器描述, 错误信息, 解析器状态)``；状态取
+    ``accepted``（通过）/ ``rejected``（入口存在但拒绝了该表达式）/ ``unavailable``
+    （未安装或没有可调用入口）。
+    """
     try:
         module = importlib.import_module("bigsmiles")
     except Exception as exc:
-        return False, text, "", f"未安装 Olsen Lab BigSMILES 解析库：{exc}"
+        return (
+            False,
+            text,
+            "BigSMILES 保守检查（未安装 Olsen Lab bigsmiles）",
+            f"未安装 Olsen Lab BigSMILES 解析库：{_summarize_library_error(exc)}",
+            "unavailable",
+        )
     version = getattr(module, "__version__", "未知版本")
+    rejected_renderer = f"BigSMILES 保守检查（Olsen Lab bigsmiles {version} 未通过）"
     parser_names = ("BigSMILES", "parse", "parse_bigsmiles", "from_string", "from_bigsmiles")
     last_error = ""
+    called = False
     for name in parser_names:
         parser = getattr(module, name, None)
         if not callable(parser):
             continue
+        called = True
         try:
             parsed = parser(text)
-            normalized = str(parsed).strip() or text
-            return True, normalized, f"Olsen Lab bigsmiles {version}", ""
         except Exception as exc:
-            last_error = str(exc)
-    message = "BigSMILES 库未找到可用的解析入口"
-    if last_error:
-        message += f"：{last_error}"
-    return False, text, f"Olsen Lab bigsmiles {version}", message
+            last_error = _summarize_library_error(exc)
+            continue
+        normalized = str(parsed).strip() or text
+        return True, normalized, f"Olsen Lab bigsmiles {version}", "", "accepted"
+    if called:
+        # 关键区分：入口存在、也真的执行了，是它「拒绝」了这条表达式；
+        # 不能写成「未找到可用入口」，那会把用户引到错误的方向。
+        message = "官方解析器拒绝该表达式"
+        if last_error:
+            message += f"：{last_error}"
+        return False, text, rejected_renderer, message, "rejected"
+    return (
+        False,
+        text,
+        f"BigSMILES 保守检查（Olsen Lab bigsmiles {version} 无可调用入口）",
+        "bigsmiles 库中没有找到可调用的解析入口",
+        "unavailable",
+    )
 
 
 def _parse_bigsmiles(text: str) -> _BigSMILESParse:
-    package_ok, normalized, package_renderer, package_error = _try_package_parse(text)
+    package_ok, normalized, package_renderer, package_error, parser_status = _try_package_parse(text)
     if package_ok:
         return _BigSMILESParse(
             valid=True,
             normalized=normalized,
             fragments=_candidate_fragments(text),
             renderer=package_renderer,
-            warning="",
+            parser_status=parser_status,
         )
+    hints = _diagnose_bigsmiles_syntax(text)
     if not _balanced_bigsmiles(text):
         return _BigSMILESParse(
             valid=False,
             normalized=text,
             fragments=[],
-            renderer=package_renderer or "BigSMILES 保守检查",
-            error="BigSMILES 括号、方括号或随机对象边界不匹配",
+            renderer=package_renderer,
+            parser_status=parser_status,
+            error="；".join(["BigSMILES 括号、方括号或随机对象边界不匹配", *hints]),
         )
     fragments = _candidate_fragments(text)
     if not fragments:
@@ -862,20 +1563,23 @@ def _parse_bigsmiles(text: str) -> _BigSMILESParse:
             valid=False,
             normalized=text,
             fragments=[],
-            renderer=package_renderer or "BigSMILES 保守检查",
-            error="未找到可识别的 BigSMILES 重复单元或连接片段",
+            renderer=package_renderer,
+            parser_status=parser_status,
+            error="；".join(["未找到可识别的 BigSMILES 重复单元或连接片段", *hints]),
         )
     warning = "；".join(
         value for value in [
-            "未能调用 Olsen Lab BigSMILES 解析入口，已使用保守语法检查",
+            "官方 BigSMILES 解析器未接受该表达式，已回退到本平台的保守语法检查，结果仅供结构核对",
             package_error,
+            *hints,
         ] if value
     )
     return _BigSMILESParse(
         valid=True,
         normalized=text,
         fragments=fragments,
-        renderer=package_renderer or "BigSMILES 保守检查",
+        renderer=package_renderer,
+        parser_status=parser_status,
         warning=warning,
     )
 
@@ -908,6 +1612,12 @@ class _BigSMILESFragmentSpec:
     connectors: list[str]
     parse_mode: str
     warning: str = ""
+    #: 组件归属标签（多组分输入时形如“组分 2/3”，单组分为空）。
+    component: str = ""
+    #: 需要在图中高亮的原子下标（用于“重复单元已展开”的完整骨架）。
+    highlight_atoms: tuple[int, ...] = ()
+    #: 展开时随机对象含多个候选，图中仅取了第一个候选。
+    has_alternatives: bool = False
 
 
 _CONNECTOR_TOKEN_RE = re.compile(r"\[\s*(?:(?:[$<>][^\]]*)|[?*])\s*\]")
@@ -1099,49 +1809,212 @@ def _build_rdkit_bigsmiles_specs(raw: str) -> list[_BigSMILESFragmentSpec]:
     return specs
 
 
-def _prepare_fragment_molecule_for_draw(molecule: object) -> object:
-    if Chem is None:
-        return molecule
-    drawable = Chem.Mol(molecule)
-    if rdDepictor is not None:
-        rdDepictor.Compute2DCoords(drawable, canonOrient=True)
-    return drawable
+_BIGSMILES_PANEL_STYLE: dict[str, dict[str, object]] = {
+    "expanded": {
+        "title": "完整骨架（重复单元已展开）",
+        "fill": (236, 248, 243),
+        "outline": (0, 121, 107),
+        "title_color": (0, 105, 92),
+    },
+    "context": {
+        "title": "完整外部骨架（随机对象占位）",
+        "fill": (246, 249, 253),
+        "outline": (83, 116, 150),
+        "title_color": (45, 82, 125),
+    },
+    "repeat": {
+        "title": "重复单元 / 随机对象",
+        "fill": (255, 250, 229),
+        "outline": (0, 121, 107),
+        "title_color": (0, 105, 92),
+    },
+    "segment": {
+        "title": "链外片段",
+        "fill": (248, 250, 252),
+        "outline": (150, 160, 170),
+        "title_color": (70, 80, 90),
+    },
+}
 
 
-def _render_rdkit_fragment_image(spec: _BigSMILESFragmentSpec, size: tuple[int, int]):
-    if spec.molecule is None or Draw is None:
-        return None
-    molecule = _prepare_fragment_molecule_for_draw(spec.molecule)
-    return Draw.MolToImage(
-        molecule,
-        size=(max(120, int(size[0])), max(100, int(size[1]))),
-        kekulize=False,
-        wedgeBonds=True,
-    ).convert("RGB")
-
-
-def _draw_arrow(draw, x1: float, y1: float, x2: float, y2: float) -> None:
-    draw.line((x1, y1, x2, y2), fill=(105, 125, 138), width=2)
-    angle = math.atan2(y2 - y1, x2 - x1)
-    size = 8.0
-    left = (x2 - size * math.cos(angle - math.pi / 6), y2 - size * math.sin(angle - math.pi / 6))
-    right = (x2 - size * math.cos(angle + math.pi / 6), y2 - size * math.sin(angle + math.pi / 6))
-    draw.polygon(((x2, y2), left, right), fill=(105, 125, 138))
-
-
-def _draw_connector_caption(draw, spec: _BigSMILESFragmentSpec, x: float, y: float, width: float, font) -> None:
+def _spec_note(spec: _BigSMILESFragmentSpec) -> str:
+    if spec.kind == "expanded":
+        suffix = "（随机对象含多个候选，图中取第一个候选）" if spec.has_alternatives else ""
+        if spec.highlight_atoms:
+            return "高亮部分为重复单元原子；已按连接端就地展开成连通骨架" + suffix
+        return "已把 {重复单元} 就地展开为连通的完整骨架" + suffix
     if spec.kind == "context":
         maps = re.findall(r"\[\*:(\d+)\]", spec.raw)
         labels = " ".join(f"{{R{int(value) - 899}}}" for value in maps)
-        text = "随机对象占位：" + (labels or "{R}")
-        color = (126, 82, 0)
-    elif not spec.connectors:
-        text = "连接端：无"
-        color = (110, 120, 128)
-    else:
-        text = "连接端：" + " ".join(spec.connectors)
-        color = (0, 105, 92)
-    draw.text((x, y), text, fill=color, font=font)
+        return "随机对象占位：" + (labels or "{R}")
+    if not spec.connectors:
+        return "连接端：无"
+    return "连接端：" + " ".join(spec.connectors)
+
+
+def _panel_for_spec(spec: _BigSMILESFragmentSpec) -> _Panel:
+    style = _BIGSMILES_PANEL_STYLE.get(spec.kind, _BIGSMILES_PANEL_STYLE["segment"])
+    title = str(style["title"])
+    if spec.component:
+        title = f"{spec.component} · {title}"
+    return _Panel(
+        title=title,
+        note=_spec_note(spec),
+        molecule=spec.molecule,
+        highlight_atoms=tuple(spec.highlight_atoms),
+        fill=style["fill"],
+        outline=style["outline"],
+        title_color=style["title_color"],
+    )
+
+
+def _strip_bigsmiles_connectors(text: str) -> str:
+    """删除 BigSMILES 连接端标记，保留原子、键与环信息的纯 SMILES 文本。"""
+    cleaned = _CONNECTOR_TOKEN_RE.sub("", text)
+    cleaned = cleaned.replace("{", "").replace("}", "")
+    return re.sub(r"\s+", "", cleaned)
+
+
+def _expand_repeat_units(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """把 ``{...}`` 就地展开成完整骨架文本。
+
+    返回 ``(展开后的 SMILES, [(插入片段起始字符下标, 长度)])``。BigSMILES 的连接端
+    ``[>] [<] [$…]`` 本身只是键端声明，去掉后剩下的原子序列就是真实的连线顺序。
+    随机对象含多个候选（``a,b``）时取第一个候选，以便仍然能给出一张连通骨架。
+    """
+    output: list[str] = []
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    index = 0
+    while index < len(text):
+        if text[index] != "{":
+            output.append(text[index])
+            cursor += 1
+            index += 1
+            continue
+        close = _find_matching_token(text, index, "{", "}")
+        if close is None:
+            output.append(text[index])
+            cursor += 1
+            index += 1
+            continue
+        content = text[index + 1 : close]
+        alternatives = _split_bigsmiles_alternatives(content)
+        inserted = _strip_bigsmiles_connectors(alternatives[0] if alternatives else content)
+        if inserted:
+            spans.append((cursor, len(inserted)))
+            output.append(inserted)
+            cursor += len(inserted)
+        index = close + 1
+    return "".join(output), spans
+
+
+def _atom_offsets(text: str) -> list[int]:
+    """每个原子 token 的起始字符下标（RDKit 按文本顺序分配原子下标）。"""
+    return [match.start() for match in _SMILES_ATOM_TOKEN_RE.finditer(text)]
+
+
+def _has_repeat_alternatives(text: str) -> bool:
+    """随机对象是否写成多候选形式（``a,b``）。"""
+    index = 0
+    while index < len(text):
+        if text[index] != "{":
+            index += 1
+            continue
+        close = _find_matching_token(text, index, "{", "}")
+        if close is None:
+            return False
+        if len(_split_bigsmiles_alternatives(text[index + 1 : close])) > 1:
+            return True
+        index = close + 1
+    return False
+
+
+def _quiet_smiles_parse(text: str, sanitize: bool):
+    """尝试性解析（不污染日志）：失败时返回 None。"""
+    if Chem is None:
+        return None
+    try:
+        from rdkit import rdBase
+
+        with rdBase.BlockLogs():
+            return Chem.MolFromSmiles(text, sanitize=sanitize)
+    except Exception:
+        pass
+    try:
+        return Chem.MolFromSmiles(text, sanitize=sanitize)
+    except Exception:
+        return None
+
+
+def _build_expanded_framework_spec(raw: str) -> _BigSMILESFragmentSpec | None:
+    """构造“重复单元已展开”的完整骨架片段（含高亮原子下标）。"""
+    if Chem is None or "{" not in raw:
+        return None
+    expanded, spans = _expand_repeat_units(raw)
+    if not expanded.strip():
+        return None
+    molecule = None
+    for sanitize in (True, False):
+        molecule = _quiet_smiles_parse(expanded, sanitize)
+        if molecule is not None:
+            break
+    if molecule is None:
+        return None
+
+    highlight: list[int] = []
+    offsets = _atom_offsets(expanded)
+    if spans and len(offsets) == molecule.GetNumAtoms():
+        for start, length in spans:
+            end = start + length
+            highlight.extend(
+                index for index, offset in enumerate(offsets) if start <= offset < end
+            )
+    return _BigSMILESFragmentSpec(
+        kind="expanded",
+        raw=expanded,
+        molecule=molecule,
+        connectors=_connector_tokens(raw),
+        parse_mode="expanded_framework",
+        highlight_atoms=tuple(sorted(set(highlight))),
+        has_alternatives=_has_repeat_alternatives(raw),
+    )
+
+
+def _bigsmiles_component_specs(raw: str, options: RenderOptions) -> list[_BigSMILESFragmentSpec]:
+    """按顶层 ``.`` 拆分组件，并为每个组件前插“完整骨架”面板。"""
+    components = [part for part in _split_top_level(raw, ".") if part.strip()] or [raw.strip()]
+    multi = len(components) > 1
+    collected: list[_BigSMILESFragmentSpec] = []
+    for index, component in enumerate(components):
+        label = f"组分 {index + 1}/{len(components)}" if multi else ""
+        group: list[_BigSMILESFragmentSpec] = []
+        if getattr(options, "expand_repeat_units", True):
+            expanded = _build_expanded_framework_spec(component)
+            if expanded is not None:
+                group.append(expanded)
+        group.extend(_build_rdkit_bigsmiles_specs(component))
+        for spec in group:
+            spec.component = label
+        collected.extend(group)
+    return collected
+
+
+def _chunk_rows(items: list, per_row: int) -> list[list]:
+    """把面板切成尽量均匀的若干行，避免最后一行只剩一个面板被拉得很大。"""
+    total = len(items)
+    if total == 0:
+        return []
+    per_row = max(1, int(per_row))
+    rows = math.ceil(total / per_row)
+    base, extra = divmod(total, rows)
+    out: list[list] = []
+    cursor = 0
+    for index in range(rows):
+        size = base + (1 if index < extra else 0)
+        out.append(items[cursor:cursor + size])
+        cursor += size
+    return out
 
 
 def _render_bigsmiles_rdkit(
@@ -1151,80 +2024,34 @@ def _render_bigsmiles_rdkit(
 ) -> tuple[list[_BigSMILESFragmentSpec], list[str]]:
     if Image is None or ImageDraw is None or Draw is None or Chem is None:
         raise RuntimeError("RDKit 或 Pillow 不可用")
-    specs = _build_rdkit_bigsmiles_specs(raw)
+    specs = _bigsmiles_component_specs(raw, options)
     drawable_specs = [spec for spec in specs if spec.molecule is not None]
     if not drawable_specs:
         raise ValueError("没有可由 RDKit 绘制的 BigSMILES 化学片段")
 
     warnings: list[str] = []
     for spec in specs:
-        if spec.warning:
+        if spec.warning and spec.warning not in warnings:
             warnings.append(spec.warning)
     if any(spec.parse_mode == "core_only" for spec in specs):
         warnings.append("部分连接端仅作为语义标记显示，未强行伪装成完整聚合物分子")
+    if any(spec.kind == "expanded" for spec in specs):
+        warnings.append("已额外输出“重复单元已展开”的完整骨架图（高亮原子即重复单元部分）")
 
-    width, height = int(options.image_width), int(options.image_height)
-    image = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(image)
-    title_font = _load_schematic_font(25, bold=True)
-    label_font = _load_schematic_font(16, bold=True)
-    caption_font = _load_schematic_font(13)
-    note_font = _load_schematic_font(12)
-    draw.text((32, 18), "BigSMILES 片段化学结构图", fill=(28, 45, 60), font=title_font)
-    draw.text((32, 54), "片段内部由 RDKit 二维布局；连接端和重复单元语义单独保留。", fill=(80, 90, 100), font=caption_font)
-
-    margin_x = 32
-    content_top = 92
-    footer_h = 54
-    gap_x, gap_y = 18, 18
-    columns = 1 if len(specs) == 1 else min(3, len(specs))
-    rows = math.ceil(len(specs) / columns)
-    cell_w = max(200, (width - margin_x * 2 - gap_x * (columns - 1)) / columns)
-    cell_h = max(190, (height - content_top - footer_h - gap_y * (rows - 1)) / rows)
-
-    for index, spec in enumerate(specs):
-        row, column = divmod(index, columns)
-        left = margin_x + column * (cell_w + gap_x)
-        top = content_top + row * (cell_h + gap_y)
-        right, bottom = left + cell_w, top + cell_h
-        is_repeat = spec.kind == "repeat"
-        is_context = spec.kind == "context"
-        fill = (255, 250, 229) if is_repeat else (246, 249, 253)
-        outline = (0, 121, 107) if is_repeat else (83, 116, 150) if is_context else (150, 160, 170)
-        draw.rounded_rectangle((left, top, right, bottom), radius=10, fill=fill, outline=outline, width=2)
-        if is_repeat:
-            label = "重复单元 / 随机对象"
-            label_color = (0, 105, 92)
-        elif is_context:
-            label = "完整外部骨架（随机对象占位）"
-            label_color = (45, 82, 125)
-        else:
-            label = "链外片段"
-            label_color = (70, 80, 90)
-        if len(specs) > 1:
-            label += f"  #{index + 1}"
-        draw.text((left + 12, top + 8), label, fill=label_color, font=label_font)
-        if spec.molecule is not None:
-            mol_image = _render_rdkit_fragment_image(
-                spec,
-                (int(cell_w - 28), max(120, int(cell_h - 78))),
-            )
-            if mol_image is not None:
-                mol_x = int(left + (cell_w - mol_image.width) / 2)
-                mol_y = int(top + 38 + (cell_h - 72 - mol_image.height) / 2)
-                image.paste(mol_image, (mol_x, mol_y))
-        else:
-            draw.text((left + 16, top + cell_h / 2), "该片段无法由 RDKit 解析", fill=(170, 60, 50), font=caption_font)
-        _draw_connector_caption(draw, spec, left + 12, bottom - 24, cell_w - 24, note_font)
-        if column < columns - 1 and index + 1 < len(specs):
-            _draw_arrow(draw, right + 3, top + cell_h / 2, right + gap_x - 3, top + cell_h / 2)
-
+    panels = [_panel_for_spec(spec) for spec in specs]
+    per_row = 3 if len(panels) >= 3 else max(1, len(panels))
     raw_note = raw.replace("\n", " ").strip()
     if len(raw_note) > 130:
         raw_note = raw_note[:127] + "..."
-    draw.text((32, height - 34), f"原始表达：{raw_note}", fill=(90, 90, 90), font=note_font)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path, format="PNG")
+    _compose_panel_figure(
+        _chunk_rows(panels, per_row),
+        output_path,
+        title="BigSMILES 片段化学结构图",
+        subtitle="片段内部由 RDKit 二维布局；连接端与重复单元语义单独保留。图高按内容自适应。",
+        footer=f"原始表达：{raw_note}",
+        width=int(options.image_width),
+        scale=_supersample_scale(options),
+    )
     return specs, warnings
 
 
@@ -1233,62 +2060,64 @@ def _render_bigsmiles_sample_rdkit(
     output_path: Path,
     options: RenderOptions,
 ) -> bool:
+    """代表性采样链段图：重复单元整体复制，并用省略号面板表示剩余重复数。"""
     repeat = next((spec for spec in specs if spec.kind == "repeat" and spec.molecule is not None), None)
     if repeat is None or Image is None or ImageDraw is None:
         return False
-    width, height = int(options.image_width), int(options.image_height)
-    image = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(image)
-    title_font = _load_schematic_font(24, bold=True)
-    label_font = _load_schematic_font(15, bold=True)
-    note_font = _load_schematic_font(12)
-    caption_font = _load_schematic_font(13)
     count = int(options.repeat_units)
     visible = count if count <= 4 else 3
     omitted = max(0, count - visible)
-    draw.text((32, 18), f"代表性采样链段示意图（重复单元数：{count}）", fill=(28, 45, 60), font=title_font)
-    draw.text((32, 54), "重复单元图像由 RDKit 生成后整体复制；不表示真实链长、分子量或唯一微观结构。", fill=(80, 90, 100), font=caption_font)
-
-    item_count = visible + (1 if omitted else 0)
-    gap = 14
-    item_w = max(170, (width - 64 - gap * (item_count - 1)) / item_count)
-    top, panel_h = 125, min(430, height - 180)
-    mol_image = _render_rdkit_fragment_image(repeat, (int(item_w - 20), int(panel_h - 65)))
-    if mol_image is None:
-        return False
-    x = 32.0
+    note = _spec_note(repeat)
+    panels: list[_Panel] = []
     for index in range(visible):
-        right = x + item_w
-        draw.rounded_rectangle((x, top, right, top + panel_h), radius=10, fill=(255, 250, 229), outline=(0, 121, 107), width=2)
-        draw.text((x + 10, top + 8), f"重复单元 {index + 1}", fill=(0, 105, 92), font=label_font)
-        mol_x = int(x + (item_w - mol_image.width) / 2)
-        mol_y = int(top + 36 + (panel_h - 60 - mol_image.height) / 2)
-        image.paste(mol_image, (mol_x, mol_y))
-        _draw_connector_caption(draw, repeat, x + 10, top + panel_h - 24, item_w - 20, note_font)
-        x = right
-        if index < visible - 1 or omitted:
-            _draw_arrow(draw, x + 3, top + panel_h / 2, x + gap - 3, top + panel_h / 2)
-            x += gap
+        panels.append(
+            _Panel(
+                title=f"重复单元 {index + 1}" if visible > 1 else "重复单元",
+                note=note,
+                molecule=repeat.molecule,
+                fill=(255, 250, 229),
+                outline=(0, 121, 107),
+                title_color=(0, 105, 92),
+            )
+        )
     if omitted:
-        right = x + item_w
-        draw.rounded_rectangle((x, top, right, top + panel_h), radius=10, fill=(248, 250, 252), outline=(150, 160, 170), width=2)
-        ellipsis_font = _load_schematic_font(25, bold=True)
-        label = f"... x {omitted} ..."
-        label_w, label_h = _text_size(draw, label, ellipsis_font)
-        draw.text((x + (item_w - label_w) / 2, top + (panel_h - label_h) / 2), label, fill=(80, 95, 110), font=ellipsis_font)
-    draw.text((32, height - 34), "BigSMILES 连接端保留为语义标记，采样图仅用于拓扑检查。", fill=(90, 90, 90), font=note_font)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path, format="PNG")
+        panels.append(
+            _Panel(
+                title="… 省略…",
+                note=f"共 {count} 个重复单元，此处省略 {omitted} 个",
+                molecule=None,
+                fill=(248, 250, 252),
+                outline=(150, 160, 170),
+                title_color=(70, 80, 90),
+                empty_text=f"… x {omitted} …",
+                empty_color=(80, 95, 110),
+            )
+        )
+    _compose_panel_figure(
+        _chunk_rows(panels, 4),
+        output_path,
+        title=f"代表性采样链段示意图（重复单元数：{count}）",
+        subtitle="重复单元图像由 RDKit 生成后整体复制；不表示真实链长、分子量或唯一微观结构。",
+        footer="BigSMILES 连接端保留为语义标记，采样图仅用于拓扑检查。",
+        width=int(options.image_width),
+        scale=_supersample_scale(options),
+        max_cell_h=420.0,
+    )
     return True
 
 def _render_bigsmiles(raw: str, output_dir: Path, options: RenderOptions) -> RenderResult:
     parsed = _parse_bigsmiles(raw.strip())
-    if not parsed.valid:
-        return _invalid_result(raw, "bigsmiles", parsed.error, parsed.renderer)
-    warnings = [
-        "BigSMILES 主图表示重复单元/连接模式视图，不代表唯一完整聚合物分子",
+    disclaimers = (
+        "主图表示重复单元/连接模式视图，不代表唯一完整聚合物分子",
         "二维位置用于结构检查和沟通，不代表真实聚合物构象",
-    ]
+    )
+    if not parsed.valid:
+        result = _invalid_result(raw, "bigsmiles", parsed.error, parsed.renderer)
+        result.disclaimers = disclaimers
+        result.parser_status = parsed.parser_status
+        return result
+    # 固定免责说明不再混进 warning_message，否则会把真正需要用户处理的问题淹没。
+    warnings: list[str] = []
     if parsed.warning:
         warnings.append(parsed.warning)
     image_name = _hash_name(raw.strip(), "main")
@@ -1317,6 +2146,8 @@ def _render_bigsmiles(raw: str, output_dir: Path, options: RenderOptions) -> Ren
                 error_message=f"BigSMILES 绘图失败：{fallback_exc}",
                 warning_message="；".join(warnings),
                 renderer=f"{parsed.renderer}；BigSMILES 绘图器",
+                disclaimers=disclaimers,
+                parser_status=parsed.parser_status,
             )
     sample_name = ""
     draw_status: DrawStatus = "rendered"
@@ -1347,7 +2178,10 @@ def _render_bigsmiles(raw: str, output_dir: Path, options: RenderOptions) -> Ren
         draw_status=draw_status,
         warning_message="；".join(warnings),
         renderer=(f"{parsed.renderer}；RDKit BigSMILES 片段布局" if use_rdkit_fragments else f"{parsed.renderer}；BigSMILES 保守示意绘图器"),
+        disclaimers=disclaimers,
+        parser_status=parsed.parser_status,
     )
+
 
 def render_structure(raw: str, output_dir: Path, options: RenderOptions | None = None) -> RenderResult:
     options = options or RenderOptions()

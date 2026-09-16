@@ -39,6 +39,23 @@ NETWORK_CONFIG_PATH = Path(
     )
 )
 
+# 这些主机是专供中国大陆直连的公共镜像/服务，走代理反而会被干扰（
+# 典型症状：FileMetadataError: Distant resource does not seem to be on huggingface.co）。
+# 始终加入 NO_PROXY 白名单强制直连，代理只服务于其它域名。
+DIRECT_BYPASS_HOSTS = ('hf-mirror.com', '.hf-mirror.com')
+
+
+def _ensure_direct_bypass_hosts() -> None:
+    """把需要直连的主机追加进 NO_PROXY/no_proxy，避免被代理劫持。"""
+    current = os.environ.get('NO_PROXY') or os.environ.get('no_proxy') or ''
+    parts = [p.strip() for p in current.split(',') if p.strip()]
+    missing = [h for h in DIRECT_BYPASS_HOSTS if h not in parts]
+    if missing:
+        parts.extend(missing)
+        merged = ','.join(parts)
+        os.environ['NO_PROXY'] = merged
+        os.environ['no_proxy'] = merged
+
 
 def _read_saved_settings() -> Dict[str, Any]:
     try:
@@ -153,6 +170,8 @@ def apply_network_settings(settings: Optional[Dict[str, Any]] = None) -> Optiona
     else:
         for name in names:
             os.environ.pop(name, None)
+    # 无论如何都保证镜像直连白名单生效（在设置/清除代理之后执行）
+    _ensure_direct_bypass_hosts()
     os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '120')
     os.environ.setdefault('HF_HUB_ETAG_TIMEOUT', '120')
     return proxy

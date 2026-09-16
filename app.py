@@ -8,6 +8,13 @@
   本文件        每 rerun 执行：UI 初始化 + 分组导航 + 任务锁 + 自动保存
 """
 
+import os
+
+# 必须在科学计算库加载前设置：conda 的 sklearn 会经 MKL 间接加载 Intel Fortran
+# 运行库 libifcoremd.dll，它默认注册自己的 Ctrl+C 控制台处理器，导致 Ctrl+C 只打印
+# forrtl: error (200) 并在 Python 退出/GC 阶段卡死，Streamlit 无法优雅停机。
+os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
+
 from app_lib import *
 
 st.set_page_config(

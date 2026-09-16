@@ -102,8 +102,111 @@ def test_bigsmiles_rdkit_layout_preserves_branch_and_ring_fragment(tmp_path: Pat
     assert "RDKit BigSMILES 片段布局" in result.renderer
     assert result.main_image_path
     with Image.open(tmp_path / result.main_image_path) as image:
+        # 面板图的可视宽度固定为 image_width；高度按内容自适应，
+        # 不再把分子硬塞进固定画布（否则宽分子会被压得很小）。
         assert image.width == 1000
-        assert image.height == 700
+        assert 200 < image.height < 1400
+
+
+def test_bigsmiles_main_figure_grows_instead_of_clipping_panels(tmp_path: Path):
+    """面板变多时画布要长高，而不是把右侧面板裁掉。"""
+    value = "CC{[>][<]CC(C)[>][<]}CC{[>][<]CC[>][<]}CC(C)=C.NCCN"
+    result = render_structure(value, tmp_path, RenderOptions(image_width=600))
+    assert result.draw_status == "rendered"
+    with Image.open(tmp_path / result.main_image_path) as image:
+        assert image.width == 600
+        assert image.height > 400
+
+
+def test_bigsmiles_expanded_framework_is_connected_and_highlighted(tmp_path: Path):
+    """{重复单元} 会展开成一张连通骨架，并高亮出重复单元原子。"""
+    value = "CC{[>][<]CC(C)[>][<]}CC(C)=C"
+    specs = renderer_module._bigsmiles_component_specs(value, RenderOptions())
+    expanded = [spec for spec in specs if spec.kind == "expanded"]
+    assert len(expanded) == 1
+    spec = expanded[0]
+    assert spec.molecule is not None
+    assert spec.raw.count("{") == 0
+    assert spec.highlight_atoms
+    assert all(0 <= index < spec.molecule.GetNumAtoms() for index in spec.highlight_atoms)
+    # 展开后的骨架应当比“占位视图”多出重复单元的原子。
+    context = next(item for item in specs if item.kind == "context")
+    assert spec.molecule.GetNumAtoms() > context.molecule.GetNumAtoms()
+
+
+def test_bigsmiles_accepted_by_official_parser_is_attributed_to_it(tmp_path: Path):
+    result = render_structure(
+        BIGSMILES_EXAMPLE, tmp_path, RenderOptions(requested_type="bigsmiles")
+    )
+    assert result.parser_status == "accepted"
+    assert result.renderer.startswith("Olsen Lab bigsmiles")
+    assert "拒绝" not in result.warning_message
+
+
+def test_rejected_library_error_is_short_single_line_and_not_misattributed(tmp_path: Path):
+    """官方解析器拒绝时，界面不能自称是 Olsen Lab 解析的，也不能把 token dump 透传。"""
+    value = "CC{C1CCC(O)CC1}CC"  # 合法化学，但 {…} 没写端基
+    result = render_structure(value, tmp_path, RenderOptions(requested_type="bigsmiles"))
+
+    assert result.parser_status == "rejected"
+    # 图是本平台保守检查画的，渲染器描述必须这么说。
+    assert result.renderer.startswith("BigSMILES 保守检查")
+    assert "未通过" in result.renderer
+
+    message = result.warning_message
+    assert "\n" not in message and "\t" not in message
+    assert len(message) < 600
+    # 不回显整段输入，也不搬出 token dump。
+    assert f"Parsing failed on '{value}'" not in message
+    assert "Issue with token" in message or "Stochastic object" in message
+
+
+def test_empty_brackets_and_missing_end_group_produce_actionable_hints(tmp_path: Path):
+    result = render_structure(
+        "CC{C1CCC([])(O)CC1}CC", tmp_path, RenderOptions(requested_type="bigsmiles")
+    )
+    assert "空方括号" in result.warning_message
+    assert "端基" in result.warning_message
+
+
+def test_valid_repeat_unit_without_end_group_still_gets_a_hint(tmp_path: Path):
+    result = render_structure(
+        "CC{C1CCC(O)CC1}CC", tmp_path, RenderOptions(requested_type="bigsmiles")
+    )
+    assert "端基" in result.warning_message
+    assert "空方括号" not in result.warning_message
+
+
+def test_static_disclaimers_do_not_drown_actionable_warnings(tmp_path: Path):
+    """固定免责说明要和真实问题分开，否则用户会先看到一堆声明而忽略该怎么改。"""
+    result = render_structure(BIGSMILES_EXAMPLE, tmp_path, RenderOptions())
+    assert result.disclaimers
+    assert any("不代表唯一完整聚合物分子" in item for item in result.disclaimers)
+    assert any("不代表真实聚合物构象" in item for item in result.disclaimers)
+    assert "不代表唯一完整聚合物分子" not in result.warning_message
+    assert "不代表真实聚合物构象" not in result.warning_message
+
+
+def test_summarize_library_error_strips_input_echo_and_collapses_lines():
+    raw = (
+        "Parsing failed on 'CC{C1}CC'.\n\tIssue with token 'X: {' (token: 3)\n\t\t"
+        "Stochastic object starts must be followed an explict or implicit end group."
+    )
+    summarized = renderer_module._summarize_library_error(raw)
+    assert "\n" not in summarized and "\t" not in summarized
+    assert "CC{C1}CC" not in summarized
+    assert summarized.startswith("Issue with token")
+
+
+def test_summarize_library_error_truncates_by_length():
+    summarized = renderer_module._summarize_library_error("x" * 5000)
+    assert len(summarized) == renderer_module._LIBRARY_ERROR_LIMIT
+    assert summarized.endswith("…")
+
+
+def test_summarize_library_error_handles_empty_and_none():
+    assert renderer_module._summarize_library_error(None) == ""
+    assert renderer_module._summarize_library_error("  \n ") == ""
 
 
 def test_bigsmiles_algorithmic_renderer_does_not_need_rdkit(tmp_path: Path, monkeypatch):

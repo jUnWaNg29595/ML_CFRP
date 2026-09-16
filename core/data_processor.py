@@ -705,6 +705,8 @@ class AdvancedDataCleaner:
         max_per_group_per_bin=None,
         max_samples_per_target_class=None,
         random_state=42,
+        protect_combo_cols=None,
+        min_samples_per_combo=1,
     ):
         """按配方分层的类别平衡：在源头控制训练数据集的配方分布与目标类别。
 
@@ -730,6 +732,10 @@ class AdvancedDataCleaner:
             max_per_group_per_bin: 每个目标分层中单一配方的样本上限（by_target_with_group_cap 模式使用）
             max_samples_per_target_class: 每个目标分层的样本总数上限
             random_state: 随机种子，保证抽样可复现
+            protect_combo_cols: 组合多样性保护列（str 或 list[str]，如仅按固化剂平衡时传树脂列）。
+                仅在 'within_group' 模式生效：削减高频配方时，为「仅存在于被削减配方中」的风险组合
+                （由这些列共同定义，如 树脂×助剂）预留最低配额，避免随机抽删把稀有组合整体清除（误伤）。
+            min_samples_per_combo: 每个风险组合在单个被削减配方中的最低保留样本数（默认 1）
 
         Returns:
             tuple[pd.DataFrame, dict]: 清洗后的 DataFrame 与详细统计信息字典
@@ -794,6 +800,38 @@ class AdvancedDataCleaner:
             else:
                 stratum_series = df[target_col].fillna("<missing_target>").astype(str)
 
+        # [组合多样性保护] 预计算：识别「仅存在于被削减配方中」的风险组合，
+        # 防止按单列（仅固化剂/仅树脂）平衡时随机抽删把稀有组合整体清除。
+        combo_protection_enabled = False
+        combo_series = None
+        combo_global_counts = {}
+        combo_group_map = {}
+        capped_group_ids = set()
+        protected_combo_set = set()
+        unprotected_combo_list = []
+        combo_reserved_total = 0
+        _protect_cols = []
+        if protect_combo_cols is not None:
+            _protect_cols = [protect_combo_cols] if isinstance(protect_combo_cols, str) else list(protect_combo_cols)
+            # 组合键不能与分组键重复，否则定义不出“组合差异”
+            _protect_cols = [c for c in _protect_cols if c in df.columns and c not in valid_group_cols]
+            combo_protection_enabled = (
+                len(_protect_cols) > 0
+                and stratify_mode == "within_group"
+                and max_samples_per_group is not None
+            )
+
+        if combo_protection_enabled:
+            if len(_protect_cols) == 1:
+                combo_series = df[_protect_cols[0]].fillna("<missing>").astype(str)
+            else:
+                combo_series = df[_protect_cols].fillna("<missing>").astype(str).agg(" || ".join, axis=1)
+            combo_global_counts = combo_series.value_counts().to_dict()
+            for _cid, _gval in zip(combo_series.to_numpy(), group_series.to_numpy()):
+                combo_group_map.setdefault(_cid, set()).add(_gval)
+            _grp_counts_tmp = group_series.value_counts()
+            capped_group_ids = {g for g, c in _grp_counts_tmp.items() if int(c) > int(max_samples_per_group)}
+
         indices_to_keep = []
 
         # 3. 分层模式执行
@@ -850,26 +888,82 @@ class AdvancedDataCleaner:
                     salt = abs(hash(str(grp_id))) % 1000000
                     rng_grp = np.random.RandomState((int(random_state) + salt) % (2**31 - 1))
 
-                    if stratum_series is None:
+                    # —— [组合多样性保护] 为「仅存在于被削减配方中」的风险组合预留最低配额 ——
+                    reserved_idx = []
+                    if combo_protection_enabled:
+                        grp_combo = combo_series.loc[grp_indices]
+                        at_risk_here = [
+                            cid
+                            for cid in grp_combo.unique()
+                            if combo_group_map.get(cid, set()) and combo_group_map[cid].issubset(capped_group_ids)
+                        ]
+                        # 全局最稀有的风险组合优先预留（最可能被彻底清除）
+                        at_risk_here.sort(key=lambda c: (combo_global_counts.get(c, 0), str(c)))
+                        budget_left = cap
+                        for cid in at_risk_here:
+                            c_candidates = grp_combo[grp_combo == cid].index.tolist()
+                            full_need = min(int(min_samples_per_combo), len(c_candidates))
+                            keep_n = min(full_need, budget_left)
+                            if keep_n <= 0:
+                                unprotected_combo_list.append({"combo": str(cid), "group": str(grp_id), "reason": "削减名额(cap)不足"})
+                                continue
+                            if stratum_series is not None:
+                                # 预留样本优先从最稀有的目标分层中挑选，顺带保护组合内的性能梯度
+                                c_strata = stratum_series.loc[c_candidates]
+                                strata_order = [
+                                    s for s, _ in sorted(c_strata.value_counts().items(), key=lambda kv: (kv[1], str(kv[0])))
+                                ]
+                                pools = {s: c_strata[c_strata == s].index.tolist() for s in strata_order}
+                                for lst in pools.values():
+                                    rng_grp.shuffle(lst)
+                                picked = []
+                                while len(picked) < keep_n and any(pools.values()):
+                                    for s in strata_order:
+                                        if pools[s]:
+                                            picked.append(pools[s].pop())
+                                            if len(picked) >= keep_n:
+                                                break
+                                reserved_idx.extend(picked)
+                            else:
+                                reserved_idx.extend(rng_grp.choice(c_candidates, size=keep_n, replace=False).tolist())
+                            budget_left -= keep_n
+                            combo_reserved_total += keep_n
+                            if keep_n >= full_need:
+                                protected_combo_set.add(cid)
+                            else:
+                                unprotected_combo_list.append(
+                                    {"combo": str(cid), "group": str(grp_id), "reason": f"名额不足，仅保留 {keep_n}/{full_need}"}
+                                )
+
+                    reserved_set = set(reserved_idx)
+                    remaining_indices = [i for i in grp_indices if i not in reserved_set]
+                    budget = cap - len(reserved_idx)
+
+                    if budget <= 0 or not remaining_indices:
+                        # 名额已被风险组合预留占满：仅保留预留样本
+                        indices_to_keep.extend(reserved_idx)
+                    elif stratum_series is None:
                         # 纯配方级下采样
-                        chosen = rng_grp.choice(grp_indices, size=cap, replace=False).tolist()
+                        chosen = rng_grp.choice(remaining_indices, size=budget, replace=False).tolist()
+                        indices_to_keep.extend(reserved_idx)
                         indices_to_keep.extend(chosen)
                     else:
-                        # 配方内目标属性分层抽样 (Largest Remainder Method)
-                        grp_strata = stratum_series.loc[grp_indices]
+                        # 配方内目标属性分层抽样 (Largest Remainder Method)，名额不含已预留样本
+                        m = len(remaining_indices)
+                        grp_strata = stratum_series.loc[remaining_indices]
                         strata_counts = grp_strata.value_counts()
 
                         quotas = {}
                         remainders = {}
                         allocated = 0
                         for s_val, count_s in strata_counts.items():
-                            exact = cap * count_s / m
+                            exact = budget * count_s / m
                             base_q = int(exact)
                             quotas[s_val] = min(base_q, count_s)
                             allocated += quotas[s_val]
                             remainders[s_val] = exact - base_q
 
-                        unallocated = cap - allocated
+                        unallocated = budget - allocated
                         # 按余额降序补齐
                         sorted_strata = sorted(remainders.keys(), key=lambda k: remainders[k], reverse=True)
                         for s_val in sorted_strata:
@@ -897,6 +991,7 @@ class AdvancedDataCleaner:
                                 chosen_s = rng_grp.choice(s_candidates, size=q, replace=False).tolist()
                                 grp_chosen.extend(chosen_s)
 
+                        indices_to_keep.extend(reserved_idx)
                         indices_to_keep.extend(grp_chosen)
 
         # 4. 排序并构建结果
@@ -934,6 +1029,28 @@ class AdvancedDataCleaner:
             "target_distribution_after": stratum_series.loc[indices_to_keep].value_counts().to_dict() if (stratum_series is not None and indices_to_keep) else {},
             "bin_edges": [float(b) for b in target_bin_edges] if target_bin_edges is not None else None,
         }
+
+        if combo_protection_enabled:
+            at_risk_all = [
+                cid for cid, gset in combo_group_map.items() if gset and gset.issubset(capped_group_ids)
+            ]
+            stats["combo_protection"] = {
+                "enabled": True,
+                "combo_cols": list(_protect_cols),
+                "min_samples_per_combo": int(min_samples_per_combo),
+                "n_at_risk_combos": len(at_risk_all),
+                "protected_combos": sorted(str(c) for c in protected_combo_set),
+                "reserved_samples": int(combo_reserved_total),
+                "unprotected_combos": unprotected_combo_list,
+            }
+        elif protect_combo_cols is not None:
+            stats["combo_protection"] = {
+                "enabled": False,
+                "note": (
+                    "组合多样性保护仅在 within_group 模式且设置 max_samples_per_group 时生效；"
+                    "或保护列均与分组列重复/不在数据集中，已自动忽略。"
+                ),
+            }
 
         return self.cleaned_data, stats
     def aggregate_by_keys(self, keys, target_col, agg: str = 'median', dropna_target: bool = True):

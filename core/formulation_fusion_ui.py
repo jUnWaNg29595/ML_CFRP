@@ -12,7 +12,6 @@ import streamlit as st
 from typing import Optional, Tuple, List, Dict, Any
 
 from core.formulation_fusion import FormulationFusionEngine
-from core.epoxy_mechanism_features import EpoxyMechanismEngine
 
 
 @st.fragment
@@ -235,11 +234,6 @@ def render_formulation_fusion_ui(
             )
 
         with col_opt2:
-            enrich_mechanism = st.checkbox(
-                "⚡ 同步计算 18 项高分子物理交联机理特征 (Mc, 凝胶点, 轨道能差等)",
-                value=True,
-                help="基于各单体分子结构与精确当量比，实时计算交联密度、自由体积缺陷代理指标及轨道动力学能差。"
-            )
             auto_load_workspace = st.checkbox(
                 "📥 融合清洗完成后自动载入系统工作区 (直接供后续特征提取/训练使用)",
                 value=True,
@@ -267,7 +261,6 @@ def render_formulation_fusion_ui(
                         curing_type_filter=curing_type_val,
                         mode=mode_val,
                         drop_metadata=drop_useless_metadata,
-                        enrich_mechanism=enrich_mechanism,
                         base_df=df_narrow
                     )
 
@@ -283,12 +276,11 @@ def render_formulation_fusion_ui(
 
                     curing_info = f"固化体系筛选: `{curing_type_val}` ({clean_stats.get('filtered_rows', len(fused_clean_df))} 样本)" if curing_type_val else "保留全部固化体系"
                     r3_info = "已规范保留 resin_3 物理特征" if clean_stats.get("resin_3_included") else ""
-                    mech_info = f"注入 {clean_stats.get('mechanism_features_count', 0)} 项机理特征"
 
                     st.success(
                         f"🎉 **跨表融合与特征纯化完成！**\n\n"
                         f"* 📊 **最终训练维度**: **{fused_clean_df.shape[0]} 行 × {fused_clean_df.shape[1]} 列**\n"
-                        f"* 🔬 **筛选与组织**: {curing_info} | {r3_info} | {mech_info}\n"
+                        f"* 🔬 **筛选与组织**: {curing_info} | {r3_info}\n"
                         f"* 🧹 **纯化保障**: 已彻底剥离 `curing_type_standard`、`curing_mechanism`、全部 `*_format` 格式列及原始单位元数据，特征集干净纯粹。"
                     )
                 except Exception as e_fuse:
