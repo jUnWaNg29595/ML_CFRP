@@ -308,6 +308,15 @@ class ExternalFeatureAugmenter:
             name = name or artifact.get("model_name") or target
 
             feature_cols = [str(c) for c in (artifact.get("feature_cols") or [])]
+            # 关键：模型 pipeline 的真实输入列数可能大于 artifact.feature_cols。
+            # 例：Pipeline(imputer -> feature_mask -> scaler -> model)，
+            #     imputer 吃 2070 列（canonical），mask 后 1408 列进 model，
+            #     而 artifact.feature_cols 只记录了 mask 后的 1408 列。
+            # 这时必须按 imputer 的期望列数（2070）喂数据，否则报
+            # "X has 1408 features, but SimpleImputer is expecting 2070"。
+            input_feature_cols = self._resolve_input_feature_cols(
+                artifact, predictor, feature_cols
+            )
             self.entries.append(
                 {
                     "index": idx,
@@ -316,10 +325,142 @@ class ExternalFeatureAugmenter:
                     "predictor": predictor,
                     "target_col": target,
                     "feature_cols": feature_cols,
+                    "input_feature_cols": input_feature_cols,
                     "metrics": dict(artifact.get("metrics") or {}),
                     "extra": dict(artifact.get("extra") or {}),
                 }
             )
+
+    @staticmethod
+    def _pipeline_expected_n_features(predictor: Any) -> Optional[int]:
+        """取 pipeline 首步声明的输入列数（sklearn 在 fit 时记录）。"""
+        try:
+            for _name, step in (getattr(predictor, "steps", None) or []):
+                n = getattr(step, "n_features_in_", None)
+                if n:
+                    return int(n)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _repair_columns_to_length(
+        candidate: List[str],
+        expected: int,
+        audit: Dict[str, Any],
+        mask: Optional[Sequence[Any]] = None,
+    ) -> Optional[List[str]]:
+        """当记录的特征列数与 pipeline 期望不符时，用 feature_mask 反推真正的输入列。
+
+        背景：某些 artifact 的 canonical_feature_cols 会多记录 1 列（重复列/常量列
+        处理差异），而 pipeline 的 imputer 是按实际列数 fit 的。此时用 mask 对齐：
+
+            canonical - removed == effective（顺序一致）
+            mask 的 True 位置依次对应 effective，False 位置对应 removed
+
+        逐个尝试删掉一个 removed 列，使重建的 mask 与真实 mask 完全一致，
+        那一个就是多记录的列。
+        """
+        removed = [str(c) for c in (audit.get("removed_feature_cols") or [])]
+        effective = [str(c) for c in (audit.get("effective_feature_cols") or [])]
+        if not removed or not effective or mask is None:
+            return None
+        mask_list = [bool(m) for m in mask]
+        if len(candidate) - 1 != len(mask_list):
+            return None
+
+        effective_set = set(effective)
+        removed_set = set(removed)
+        for drop in removed:
+            if drop not in removed_set:
+                continue
+            built = [c for c in candidate if c != drop]
+            if len(built) != len(mask_list):
+                continue
+            # 重建 mask：True 当且仅当该列在 effective 里
+            rebuilt_mask = [c in effective_set and c not in removed_set for c in built]
+            if rebuilt_mask == mask_list:
+                # 再校验：mask 保留的列依次等于 effective
+                kept = [c for c, m in zip(built, mask_list) if m]
+                if kept == effective:
+                    return built
+        return None
+
+    @staticmethod
+    def _resolve_input_feature_cols(
+        artifact: Dict[str, Any],
+        predictor: Any,
+        declared_feature_cols: List[str],
+    ) -> List[str]:
+        """确定模型的真实输入列（可能多于 artifact.feature_cols）。
+
+        背景：Pipeline(imputer → feature_mask → scaler → model) 中，
+        imputer 吃全部列（如 2070），mask 后才是模型真正用的列（如 1408），
+        而 artifact.feature_cols 常常只记录了 mask 后的 1408 列。
+        必须按 imputer 的期望列数喂数据，否则报
+        "X has 1408 features, but SimpleImputer is expecting 2070"。
+
+        优先级：
+            1. pipeline 各步的 feature_names_in_（最权威，带列名）
+            2. feature_audit.canonical_feature_cols（最完整，必要时用 mask 修复长度）
+            3. extra.final_feature_names / screening_reference_X 列
+            4. artifact.feature_cols（兜底）
+        """
+        declared = [str(c) for c in (declared_feature_cols or [])]
+        extra = artifact.get("extra") or {}
+        audit = extra.get("feature_audit") or {}
+        expected = ExternalFeatureAugmenter._pipeline_expected_n_features(predictor)
+
+        candidates: List[List[str]] = []
+
+        # 1) pipeline 步的 feature_names_in_（带列名且是 fit 时真实列）
+        try:
+            for _name, step in (getattr(predictor, "steps", None) or []):
+                names = getattr(step, "feature_names_in_", None)
+                if names is not None and len(names):
+                    candidates.append([str(c) for c in names])
+                    break
+        except Exception:
+            pass
+
+        # 2) canonical_feature_cols
+        canonical = audit.get("canonical_feature_cols")
+        if isinstance(canonical, (list, tuple)) and canonical:
+            candidates.append([str(c) for c in canonical])
+
+        # 3) final_feature_names / screening_reference_X
+        finals = extra.get("final_feature_names")
+        if isinstance(finals, (list, tuple)) and finals:
+            candidates.append([str(c) for c in finals])
+        ref = extra.get("screening_reference_X")
+        if ref is not None and hasattr(ref, "columns"):
+            candidates.append([str(c) for c in ref.columns])
+
+        # 4) 声明的 feature_cols
+        if declared:
+            candidates.append(declared)
+
+        mask = None
+        try:
+            for _name, step in (getattr(predictor, "steps", None) or []):
+                if hasattr(step, "feature_mask"):
+                    mask = list(step.feature_mask)
+                    break
+        except Exception:
+            pass
+
+        for cand in candidates:
+            if expected is None or len(cand) == expected:
+                if len(cand) > len(declared) or not declared:
+                    return cand
+                return declared
+            if expected is not None and len(cand) > expected:
+                repaired = ExternalFeatureAugmenter._repair_columns_to_length(
+                    cand, expected, audit, mask
+                )
+                if repaired:
+                    return repaired
+        return declared
 
     # -- 内省 ---------------------------------------------------------------
     def get_info(self) -> List[Dict[str, Any]]:
@@ -332,15 +473,232 @@ class ExternalFeatureAugmenter:
                 "metrics": dict(e["metrics"]),
                 "output_col": f"{e['target_col']}_pred",
                 "model_type": type(e["predictor"]).__name__,
+                "has_molecular_workflow": self.has_molecular_workflow(e),
+                "molecular_workflow_steps": self.molecular_workflow_step_count(e),
             }
             for e in self.entries
         ]
 
+    # -- 模型自带分子特征 workflow（关键：必须优先复用）----------------------
+    @staticmethod
+    def get_molecular_workflow(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """取出模型内部保存的分子特征提取配方（训练时的原始流程）。"""
+        extra = entry.get("extra") or {}
+        wf = extra.get("molecular_feature_workflow")
+        if isinstance(wf, dict) and wf.get("steps"):
+            return wf
+        return None
+
+    @classmethod
+    def has_molecular_workflow(cls, entry: Dict[str, Any]) -> bool:
+        return cls.get_molecular_workflow(entry) is not None
+
+    @classmethod
+    def molecular_workflow_step_count(cls, entry: Dict[str, Any]) -> int:
+        wf = cls.get_molecular_workflow(entry)
+        return len(wf.get("steps") or []) if wf else 0
+
+    @classmethod
+    def workflow_required_source_columns(cls, entry: Dict[str, Any]) -> List[str]:
+        """workflow 需要的全部源列（SMILES / BigSMILES 列）。"""
+        wf = cls.get_molecular_workflow(entry)
+        if not wf:
+            return []
+        contract = wf.get("input_contract") or {}
+        cols = list(contract.get("selected_source_columns") or [])
+        if not cols:
+            for step in wf.get("steps") or []:
+                for col in step.get("source_columns") or []:
+                    if col not in cols:
+                        cols.append(col)
+        return [str(c) for c in cols]
+
+    @classmethod
+    def workflow_output_columns(cls, entry: Dict[str, Any]) -> List[str]:
+        """workflow 能产出的全部特征列名。"""
+        wf = cls.get_molecular_workflow(entry)
+        if not wf:
+            return []
+        names = [str(c) for c in (wf.get("final_feature_names") or [])]
+        if not names:
+            for step in wf.get("steps") or []:
+                names.extend(str(c) for c in (step.get("feature_names") or []))
+        return names
+
+    def replay_molecular_workflow(
+        self,
+        df: pd.DataFrame,
+        *,
+        device: Any = None,
+        progress_callback: Optional[Callable[[dict], None]] = None,
+        fill_missing_source_columns: bool = True,
+        skip_unavailable_steps: bool = True,
+        only_needed_steps: bool = True,
+    ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+        """回放各模型自带的分子特征 workflow，产出训练时用的那套特征列。
+
+        这是**首选路径**：模型训练时用什么配方提取特征，预测时就用同一配方，
+        而不是自己猜 RDKit/Mordred 特征（那会得到不相干的列，且对上千个特征
+        逐个试探会卡死）。
+
+        参数:
+            fill_missing_source_columns: 缺失的源列（如工作区没有 resin_2_structure）
+                                        自动补空列，让 workflow 能跑（那些步骤产出 NaN，
+                                        与训练时的行为一致）
+            skip_unavailable_steps:     后端不可用（如未安装 xtb）的步骤跳过而非中断
+            only_needed_steps:          True（默认）—— 只执行产物被模型 pipeline 真正
+                                        需要的步骤。训练时可能试了很多方法（力场、
+                                        反应模拟），但最终被 feature_mask 剔除的特征
+                                        对预测毫无影响，重算它们纯属浪费（实测环氧反应
+                                        模拟 39.8s、力场 26s，占整个回放的 96%）。
+
+        返回:
+            (增强后的 df, 每个模型的回放报告)
+        """
+        try:
+            from .molecular_feature_workflow import execute_molecular_feature_workflow
+        except ImportError:  # pragma: no cover
+            from molecular_feature_workflow import execute_molecular_feature_workflow
+
+        out = df.copy()
+        reports: List[Dict[str, Any]] = []
+
+        for entry in self.entries:
+            wf = self.get_molecular_workflow(entry)
+            report: Dict[str, Any] = {
+                "model_name": entry["name"],
+                "status": "skipped",
+                "reason": None,
+                "n_source_columns": 0,
+                "filled_source_columns": [],
+                "n_output_columns": 0,
+                "n_new_columns": 0,
+                "skipped_steps": [],
+                "warnings": [],
+            }
+            if wf is None:
+                report["reason"] = "模型未保存 molecular_feature_workflow"
+                reports.append(report)
+                continue
+
+            source_cols = self.workflow_required_source_columns(entry)
+            report["n_source_columns"] = len(source_cols)
+            work = out
+            if fill_missing_source_columns:
+                missing = [c for c in source_cols if c not in work.columns]
+                if missing:
+                    work = work.copy()
+                    for col in missing:
+                        work[col] = np.nan
+                    report["filled_source_columns"] = missing
+
+            still_missing = [c for c in source_cols if c not in work.columns]
+            if still_missing:
+                report["status"] = "failed"
+                report["reason"] = "缺少源列: " + ", ".join(still_missing)
+                reports.append(report)
+                continue
+
+            # 裁剪 workflow：只保留产物被模型需要的步骤
+            run_wf = wf
+            if only_needed_steps:
+                run_wf, skipped = self._prune_workflow_to_needed_steps(entry, wf)
+                report["skipped_steps"] = skipped
+
+            try:
+                execution = execute_molecular_feature_workflow(
+                    work.reset_index(drop=True),
+                    run_wf,
+                    device=device,
+                    mode="training_import",
+                    progress_callback=progress_callback,
+                )
+            except Exception as exc:
+                if not skip_unavailable_steps:
+                    report["status"] = "failed"
+                    report["reason"] = f"回放异常: {exc}"
+                    reports.append(report)
+                    continue
+                report["status"] = "failed"
+                report["reason"] = f"回放异常: {exc}"
+                reports.append(report)
+                continue
+
+            features = execution.features.reset_index(drop=True)
+            features.index = out.index
+            # 已存在的同名列先删掉，用 workflow 新算的值覆盖（训练时就是这么算的）
+            replace_cols = [c for c in features.columns if c in out.columns]
+            if replace_cols:
+                out = out.drop(columns=replace_cols)
+            out = pd.concat([out, features], axis=1)
+
+            report["status"] = "ok"
+            report["n_output_columns"] = int(features.shape[1])
+            report["n_new_columns"] = int(len([c for c in features.columns if c not in df.columns]))
+            report["warnings"] = [str(w) for w in (execution.warnings or [])][:20]
+            report["workflow_hash"] = execution.workflow_hash
+            reports.append(report)
+
+        return out, reports
+
+    @classmethod
+    def _prune_workflow_to_needed_steps(
+        cls, entry: Dict[str, Any], wf: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """裁掉产物完全不被模型需要的步骤。
+
+        判定依据：步骤声明的 feature_names（带/不带 prefix）与模型 pipeline 的
+        真实输入列（input_feature_cols）有无交集。无交集则该步骤对预测零贡献。
+
+        安全策略：
+            - 模型需要列未知时不做任何裁剪（宁慢不错）
+            - 所有步骤都被裁掉时退回原 workflow
+            - 只裁“产物零命中”的步骤，部分命中的照跑
+        """
+        needed = set(str(c) for c in (entry.get("input_feature_cols") or []))
+        if not needed:
+            return wf, []
+
+        steps = list(wf.get("steps") or [])
+        keep_steps: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        for step in steps:
+            names = [str(n) for n in (step.get("feature_names") or [])]
+            prefix = str(step.get("prefix") or "")
+            prefixed = [
+                (f"{prefix}_{n}" if prefix and not n.startswith(prefix) else n)
+                for n in names
+            ]
+            hits = sum(1 for n in (names + prefixed) if n in needed)
+            if hits > 0 or not names:
+                keep_steps.append(step)
+            else:
+                skipped.append({
+                    "step_id": step.get("step_id"),
+                    "method": step.get("method"),
+                    "n_features": len(names),
+                })
+
+        if not keep_steps:
+            return wf, []
+        if len(keep_steps) == len(steps):
+            return wf, []
+
+        pruned = dict(wf)
+        pruned["steps"] = keep_steps
+        keep_ids = [str(s.get("step_id")) for s in keep_steps]
+        merge_order = [sid for sid in (wf.get("merge_order") or []) if sid in keep_ids]
+        pruned["merge_order"] = merge_order or keep_ids
+        return pruned, skipped
+
     def required_features(self) -> List[str]:
-        """所有模型需要的特征名并集（保持首次出现顺序）。"""
+        """所有模型需要的特征名并集（保持首次出现顺序）。
+
+        用 input_feature_cols（模型 pipeline 的真实输入，可能多于 artifact.feature_cols）。
+        """
         seen: List[str] = []
         for entry in self.entries:
-            for col in entry["feature_cols"]:
+            for col in entry.get("input_feature_cols") or entry["feature_cols"]:
                 if col not in seen:
                     seen.append(col)
         return seen
@@ -522,6 +880,8 @@ class ExternalFeatureAugmenter:
         allow_fuzzy: bool = True,
         allow_partial: bool = True,
         min_feature_coverage: float = 0.5,
+        replay_workflow: bool = True,
+        device: Any = None,
     ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
         """预测并写回。
 
@@ -538,9 +898,13 @@ class ExternalFeatureAugmenter:
             allow_partial:     True（默认）—— 部分特征缺失时仍预测，缺失列传 NaN，
                                交由模型自带的 imputer 处理（sklearn Pipeline 常见）
             min_feature_coverage: allow_partial 时的最低特征覆盖率（低于此值仍跳过）
+            replay_workflow:   True（默认）—— **优先回放模型自带的分子特征 workflow**，
+                               产出训练时用的那套特征列。这是关键：模型训练时用什么
+                               配方，预测时就用同一配方，而不是自己猜方法。
+            device:            提取后端设备（如 torch device）
 
         返回:
-            (augmented_df, reports)
+            (augmented_df, reports)。reports 首元素为 workflow 回放汇总（若有）。
         """
         if output_mode not in ("new_column", "fill_missing", "overwrite"):
             raise ValueError("output_mode 必须是 new_column / fill_missing / overwrite 之一")
@@ -548,28 +912,53 @@ class ExternalFeatureAugmenter:
         result = df.copy()
         reports: List[Dict[str, Any]] = []
 
+        # ---- 第 0 步（关键）：优先回放模型自带的分子特征 workflow ----
+        workflow_reports: List[Dict[str, Any]] = []
+        if replay_workflow and any(self.has_molecular_workflow(e) for e in self.entries):
+            result, workflow_reports = self.replay_molecular_workflow(
+                result, device=device,
+            )
+            ok = [r for r in workflow_reports if r["status"] == "ok"]
+            failed = [r for r in workflow_reports if r["status"] == "failed"]
+            total_new = sum(r["n_new_columns"] for r in ok)
+            note = (
+                f"已回放 {len(ok)}/{len(workflow_reports)} 个模型自带 workflow，"
+                f"新增 {total_new} 个特征列"
+            )
+            if failed:
+                note += f"；{len(failed)} 个失败（{'；'.join(str(r.get('reason')) for r in failed[:2])}）"
+            reports.append({
+                "kind": "molecular_workflow_replay",
+                "status": "ok" if ok else "failed",
+                "note": note,
+                "details": workflow_reports,
+            })
+
         for entry in self.entries:
             target = entry["target_col"]
             feature_cols = entry["feature_cols"]
+            # 模型 pipeline 的真实输入列（可能多于 feature_cols，如 imputer 吃 2070 列）
+            input_cols = list(entry.get("input_feature_cols") or feature_cols)
             out_col = target if output_mode != "new_column" else f"{target}{suffix}"
 
             # 按模型分别解析，避免"一个模型缺特征连坐其他模型"
             resolution = self.resolve_features(
-                result, manual_overrides=manual_overrides, allow_fuzzy=allow_fuzzy, features=feature_cols,
+                result, manual_overrides=manual_overrides, allow_fuzzy=allow_fuzzy, features=input_cols,
             )
             n_resolved = sum(
-                1 for f in feature_cols
+                1 for f in input_cols
                 if f in resolution.resolved or f in (resolution.get("pattern") or {})
             )
-            coverage_ratio = n_resolved / max(1, len(feature_cols))
+            coverage_ratio = n_resolved / max(1, len(input_cols))
             report: Dict[str, Any] = {
                 "name": entry["name"],
                 "target_col": target,
                 "output_col": out_col,
                 "output_mode": output_mode,
                 "status": "ok",
-                "n_features_required": len(feature_cols),
+                "n_features_required": len(input_cols),
                 "n_features_resolved": n_resolved,
+                "n_features_model": len(feature_cols),
                 "feature_coverage": float(coverage_ratio),
                 "unresolved": list(resolution.unresolved),
                 "needs_review": dict(resolution.needs_review),
@@ -597,15 +986,15 @@ class ExternalFeatureAugmenter:
                 continue
 
             try:
-                features = self.build_feature_frame(result, resolution, entry, feature_cols=feature_cols)
+                features = self.build_feature_frame(result, resolution, entry, feature_cols=input_cols)
             except Exception as exc:
                 report["status"] = "error"
                 report["note"] = f"构造特征失败: {exc}"
                 reports.append(report)
                 continue
 
-            # 缺失特征填 NaN：模型自带的 imputer 会处理；若模型无 imputer 会在此抛错
-            features = features.reindex(columns=feature_cols)
+            # 严格按模型 pipeline 的输入契约排序列（含 imputer 需要的全部列）
+            features = features.reindex(columns=input_cols)
             if resolution.unresolved:
                 report["note"] = (
                     f"{len(resolution.unresolved)} 个特征缺失已置 NaN，交由模型内置填充处理"

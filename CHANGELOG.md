@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+### 新增
+- 【总表特征自动解析】`core/auto_feature_resolver.py` 大幅增强，解决「预测时从总表按结构查不到特征」的问题：
+  - 结构指纹匹配：新增 `_row_fingerprint` / `_build_fingerprint_index` / `lookup_by_fingerprint`，用工作区行的结构列组合做指纹索引，命中总表同结构行后取特征，替代原先只能靠单一列名精确匹配的做法
+  - 派生列索引：新增 `_build_derived_index` / `_lookup_derived` / `_match_derived_column`，支持从关联表 join 出来的派生特征回填
+  - 关联表 join：新增 `_join_related_tables` / `_safe_left_merge` / `_lookup_from_hits`，按结构列安全左连接（自动处理重复列名与键缺失）
+  - 多行聚合策略：新增 `_is_blank` / `_collapse_values`，同一结构在总表中有多行观测时，旧实现是 first-wins（等于随机取一行），现改为数值型取**中位数**（对连续量稳健）、分类型取**众数**（并列取首个），空值占位符（`未测`/`无`/`N/A` 等）统一识别
+  - 单分子特征直算：新增 `looks_molecular` / `_parse_molecule_cached` / `_compute_feature_from_mol` / `compute_single_molecule_feature`，总表查不到时直接用 RDKit 从结构 SMILES 现算（带解析缓存）
+  - 特征归属判定：新增 `_feature_belongs_to_column` / `_same_role_structure_cols`，避免把 A 结构的特征填到 B 结构的行
+- 【模型输入契约】`core/external_feature_augmenter.py` 新增 pipeline 真实输入列数解析，修复预测时 `SimpleImputer is expecting N features` 报错：
+  - 根因：`Pipeline(imputer -> feature_mask -> scaler -> model)` 中 `artifact.feature_cols` 只记录了 mask **之后**的列（如 1408），而 imputer 期望的是 mask **之前**的全量列（如 2070），按 artifact 喂数据必然维度不匹配
+  - 新增 `_pipeline_expected_n_features`（读取 sklearn pipeline 首步 fit 时记录的 `n_features_in_`）与 `_repair_columns_to_length`（用 `feature_mask` 反推真正输入列），`_resolve_input_feature_cols` 汇总解析结果；条目新增 `input_feature_cols` 字段，喂数据时优先使用
+  - 分子特征 workflow 回放：新增 `get_molecular_workflow` / `has_molecular_workflow` / `molecular_workflow_step_count` / `workflow_required_source_columns` / `workflow_output_columns` / `replay_molecular_workflow` / `_prune_workflow_to_needed_steps`，模型自带训练时提取配方时直接回放该配方，不再靠猜测 RDKit/Mordred 特征
+  - `app_lib.py` 预测页新增「📋 模型输入契约」面板：展示各模型是否自带 workflow、模型输入列数 vs 声明特征数差异，并提示 workflow 源列缺失情况
+
 ### 性能
 - 【SHAP 分析】TabPFN 高维场景批量置换 SHAP 提速约 8-10×（实测 532 特征/500 样本从 ~25 分钟降至 ~2.5 分钟，RTX 级 GPU），无显存增量：
   - 根因一：TabPFN 9.0 `n_estimators="auto"` 在特征数 > `max_features_per_estimator(500)` 时仍至少跑 8 个 ensemble 成员，每次 predict 行成本 ≈ 8 × 单成员前向（实测 532 特征 ~4ms/行 vs est=2 ~1.1ms/行）

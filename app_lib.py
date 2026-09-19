@@ -21613,83 +21613,226 @@ def _render_external_feature_augmentation():
 
     st.success(f"✅ 已加载 {len(augmenter.entries)} 个模型")
 
+    # ---- 模型契约总览（含是否自带分子特征 workflow）----
+    _info = augmenter.get_info()
+    _wf_models = [m for m in _info if m.get('has_molecular_workflow')]
+    if _wf_models:
+        st.info(
+            f"🔍 检测到 **{len(_wf_models)}** 个模型自带分子特征 workflow（训练时的提取配方）。"
+            "预测时将**直接回放该配方**，而不是自己猜 RDKit/Mordred 特征。"
+        )
+    with st.expander("📋 模型输入契约", expanded=bool(_wf_models)):
+        # 预建 name → 真实输入列数 映射（避免在列表推导里做查找）
+        _input_len = {
+            e["name"]: len(e.get("input_feature_cols") or e.get("feature_cols") or [])
+            for e in augmenter.entries
+        }
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        '模型': m['name'],
+                        '目标列': m['target_col'],
+                        '自带 workflow': ('✅ ' + str(m['molecular_workflow_steps']) + ' 步')
+                                         if m.get('has_molecular_workflow') else '—',
+                        '模型输入列数': _input_len.get(m['name'], m['n_features']),
+                        '声明特征数': m['n_features'],
+                    }
+                    for m in _info
+                ]
+            ),
+            use_container_width=True,
+        )
+        for e in augmenter.entries:
+            if not augmenter.has_molecular_workflow(e):
+                continue
+            inp = e.get('input_feature_cols') or []
+            if len(inp) > len(e['feature_cols']):
+                st.caption(
+                    f"ℹ️ `{e['name']}`：pipeline 真实输入 **{len(inp)}** 列，"
+                    f"而 artifact 只声明了 **{len(e['feature_cols'])}** 列"
+                    "（中间有 feature_mask 剔列）——已自动按真实契约喂数据。"
+                )
+            src = augmenter.workflow_required_source_columns(e)
+            st.caption(f"   ↳ workflow 源列：{'、'.join('`' + c + '`' for c in src)}")
+            missing_src = [c for c in src if c not in df.columns]
+            if missing_src:
+                st.caption(
+                    "   ↳ 工作区缺少：" + "、".join('`' + c + '`' for c in missing_src)
+                    + "（回放时自动补空，对应特征为 NaN）"
+                )
+
     # ---- 总表配置（用于自动查询算不出的特征）----
     st.markdown("#### 1️⃣ 自动特征提取配置")
-    with st.expander("📚 总表设置（自动提取算不出的特征时，按结构查总表）", expanded=False):
-        master_default = st.session_state.get('ext_aug_master_tables', [])
+    with st.expander("📚 总表设置（自动提取算不出的特征时，按结构查总表）", expanded=True):
         master_uploaded = st.file_uploader(
-            "上传总表（含结构列 + 已算好的分子特征，可多选；按上传顺序优先命中）",
+            "上传总表（含结构列 + 已算好的特征，可多选；按上传顺序优先命中）",
             type=['csv', 'xlsx', 'xls'],
             accept_multiple_files=True,
             key="ext_aug_master",
         )
+        use_ml_dataset = st.checkbox(
+            "使用 ml_dataset 全表（推荐）", value=True, key="ext_aug_use_mlds",
+            help="加载 ml_dataset/ml_wide_samples.csv；同目录的 ml_performance_*.csv "
+                 "会自动用于关系表 join（test_standard_* 这类需跨表取的特征）",
+        )
+        mlds_dir = st.text_input(
+            "ml_dataset 目录",
+            value=st.session_state.get('ext_aug_mlds_dir', r"C:/Users/wangj/Desktop/ml_dataset"),
+            key="ext_aug_mlds_dir_input",
+            disabled=not use_ml_dataset,
+        )
+        st.session_state['ext_aug_mlds_dir'] = mlds_dir
         use_workspace_master = st.checkbox(
-            "同时使用平台内置参考数据", value=True, key="ext_aug_use_builtin",
-            help="平台自带的 data_fixed / results 目录中的全量表",
+            "同时使用平台内置参考数据", value=False, key="ext_aug_use_builtin",
+            help="平台自带的 data_fixed / results 目录中的旧表（列名与 ml_dataset 不同，一般不勾）",
         )
 
-    master_frames: List[Any] = []
+    # 注意：必须把**路径**传给 resolver（而不是 DataFrame），
+    # 否则 _master_paths 为空，关系表 join 无法发现同目录的 ml_performance_*.csv。
+    master_sources: List[Any] = []          # 路径或 DataFrame
+    master_labels: List[str] = []
     if master_uploaded:
         for f in master_uploaded:
+            name = getattr(f, 'name', '总表')
             try:
-                if str(getattr(f, 'name', '')).lower().endswith(('.xlsx', '.xls')):
-                    master_frames.append((getattr(f, 'name', '总表'), pd.read_excel(f)))
+                if str(name).lower().endswith(('.xlsx', '.xls')):
+                    master_sources.append(pd.read_excel(f))
                 else:
-                    master_frames.append((getattr(f, 'name', '总表'), pd.read_csv(f, low_memory=False)))
+                    master_sources.append(pd.read_csv(f, low_memory=False))
+                master_labels.append(str(name))
             except Exception as exc:
-                st.warning(f"总表 {getattr(f, 'name', '')} 读取失败: {exc}")
+                st.warning(f"总表 {name} 读取失败: {exc}")
+
+    if use_ml_dataset and mlds_dir:
+        wide = os.path.join(mlds_dir, 'ml_wide_samples.csv')
+        if os.path.exists(wide):
+            master_sources.append(wide)     # 传路径 → 启用关系表 join
+            master_labels.append('ml_wide_samples.csv（+关系表 join）')
+        else:
+            st.warning(f"⚠️ 未找到 {wide}，请检查 ml_dataset 目录")
+
     if use_workspace_master:
         for path in (
             'data_fixed/latest_data_fixed.csv',
             'results/manual_process_fully_cleaned.csv',
         ):
-            try:
-                if os.path.exists(path):
-                    master_frames.append((os.path.basename(path), pd.read_csv(path, low_memory=False)))
-            except Exception:
-                pass
+            if os.path.exists(path):
+                master_sources.append(path)
+                master_labels.append(os.path.basename(path))
 
     try:
         from core.auto_feature_resolver import AutoFeatureResolver
-        resolver = AutoFeatureResolver(
-            master_tables=[frame for _name, frame in master_frames],
-            verbose=False,
-        )
+        resolver = AutoFeatureResolver(master_tables=master_sources, verbose=False)
         resolver_ready = True
-        if master_frames:
-            st.caption(f"已载入 {len(master_frames)} 张总表：" + "、".join(name for name, _ in master_frames))
+        if master_sources:
+            st.caption(f"已载入 {len(master_sources)} 张总表：" + "、".join(master_labels))
+        else:
+            st.warning("⚠️ 未配置任何总表；算不出的特征将无法从总表查询")
     except Exception as exc:
         st.warning(f"⚠️ 自动提取模块加载失败（将只能手工映射）: {exc}")
         resolver = None
         resolver_ready = False
 
-    # ---- 逐模型诊断：自动提取 + 总表查询 ----
+    # ---- 逐模型诊断：先回放自带 workflow，再自动提取 + 总表查询 ----
     st.markdown("#### 2️⃣ 特征自动提取与对接诊断")
-    all_columns = list(df.columns)
-    required_all = augmenter.required_features()
-    already_map: Dict[str, str] = {}
-    for feat in required_all:
-        if feat in df.columns:
-            already_map[feat] = feat
 
-    # 自动补齐：现场计算 → 总表查询
+    # 第 0 步（关键）：回放模型自带的分子特征 workflow
+    # 训练时用什么配方提取特征，这里就用同一配方，而不是自己猜方法。
+    # 必须在自动提取之前做，否则会把 workflow 该产出的上千个特征
+    # 当成“缺失特征”逐个试探（既慢又不准）。
+    #
+    # 缓存：Streamlit 每次交互都会重跑整段脚本。若不缓存，导入模型、改任何
+    # 选项、点按钮都会重算一次（实测每次 20s），用户会看到“提取两遍”。
     df_enriched = df
+    wf_replay_reports: List[Dict[str, Any]] = []
     auto_report: Dict[str, Any] = {'computed': {}, 'from_master': {}, 'unresolved': [], 'columns_added': []}
-    if resolver_ready and resolver is not None:
-        todo = [f for f in required_all if f not in already_map]
-        if todo:
-            with st.spinner(f"正在自动提取 {len(todo)} 个特征（RDKit 计算 + 总表查询）..."):
+
+    _cache_key = (
+        tuple(sorted(names)),
+        tuple(sorted(master_labels)),
+        _df_cache_key(df),
+        int(df.shape[0]),
+        int(df.shape[1]),
+    )
+    _cached = st.session_state.get('ext_aug_enriched_cache')
+    _cache_hit = bool(_cached and _cached.get('key') == _cache_key)
+
+    if _cache_hit:
+        df_enriched = _cached['df_enriched']
+        wf_replay_reports = _cached.get('wf_replay_reports') or []
+        auto_report = _cached.get('auto_report') or auto_report
+        st.caption("♻️ 复用上次的特征提取结果（未重新计算）")
+    else:
+        if any(augmenter.has_molecular_workflow(e) for e in augmenter.entries):
+            with st.spinner("正在回放模型自带的分子特征 workflow（训练时的提取配方）..."):
                 try:
-                    df_enriched, auto_report = resolver.resolve(df, todo, already_resolved=already_map)
+                    df_enriched, wf_replay_reports = augmenter.replay_molecular_workflow(df)
                 except Exception as exc:
-                    st.warning(f"自动提取部分失败: {exc}")
+                    st.warning(f"⚠️ workflow 回放失败，将退回逐特征提取: {exc}")
                     df_enriched = df
-        if auto_report.get('columns_added'):
-            st.success(f"✅ 自动补齐了 {len(auto_report['columns_added'])} 个特征列")
-        if auto_report.get('computed'):
-            st.caption("🖩 现场计算: " + "、".join(f"`{k}`" for k in list(auto_report['computed'])[:8]))
-        if auto_report.get('from_master'):
-            st.caption("📚 总表查询: " + "、".join(f"`{k}`" for k in list(auto_report['from_master'])[:8]))
+                    wf_replay_reports = []
+
+        all_columns = list(df_enriched.columns)
+        required_all = augmenter.required_features()
+        already_map: Dict[str, str] = {}
+        for feat in required_all:
+            if feat in df_enriched.columns:
+                already_map[feat] = feat
+
+        # 自动补齐：现场计算 → 总表查询 → 提取引擎（仅对 workflow 未覆盖的少量特征）
+        if resolver_ready and resolver is not None:
+            todo = [f for f in required_all if f not in already_map]
+            if todo:
+                with st.spinner(f"正在补齐剩余 {len(todo)} 个特征（现场计算 + 总表查询）..."):
+                    try:
+                        df_enriched, auto_report = resolver.resolve(
+                            df_enriched, todo, already_resolved=already_map
+                        )
+                    except Exception as exc:
+                        st.warning(f"自动提取部分失败: {exc}")
+
+        st.session_state['ext_aug_enriched_cache'] = {
+            'key': _cache_key,
+            'df_enriched': df_enriched,
+            'wf_replay_reports': wf_replay_reports,
+            'auto_report': auto_report,
+        }
+
+    # ---- 展示提取结果（缓存命中/未命中都要显示）----
+    for _r in wf_replay_reports:
+        if _r.get('status') == 'ok':
+            st.success(
+                f"✅ 已回放 `{_r['model_name']}` 的 workflow："
+                f"新增 {_r['n_new_columns']} 个特征列"
+                + (f"，跳过 {len(_r.get('skipped_steps') or [])} 个模型用不到的步骤"
+                   if _r.get('skipped_steps') else "")
+            )
+            if _r.get('filled_source_columns'):
+                st.caption(
+                    "   ↳ 工作区缺少的源列已自动补空："
+                    + "、".join(f"`{c}`" for c in _r['filled_source_columns'])
+                )
+        else:
+            st.warning(f"⚠️ `{_r['model_name']}` workflow 回放未完成：{_r.get('reason')}")
+
+    if auto_report.get('columns_added'):
+        st.success(f"✅ 自动补齐了 {len(auto_report['columns_added'])} 个特征列")
+    if auto_report.get('computed'):
+        st.caption("🖩 现场计算: " + "、".join(f"`{k}`" for k in list(auto_report['computed'])[:8]))
+    if auto_report.get('from_master'):
+        st.caption("📚 总表查询: " + "、".join(f"`{k}`" for k in list(auto_report['from_master'])[:8]))
+        _hi = [k for k, v in auto_report['from_master'].items() if '复合键' in str(v)]
+        _lo = auto_report.get('low_confidence') or {}
+        if _hi:
+            st.caption(f"   ↳ 其中 {len(_hi)} 个用**复合键**（树脂+固化剂组合）命中，置信高")
+        if _lo:
+            st.warning(
+                f"⚠️ 有 {len(_lo)} 个特征（如 "
+                + "、".join(f"`{k}`" for k in list(_lo)[:4])
+                + "）在同结构下存在多个候选，已取中位数/众数。"
+                "这些是工艺/配方量，**建议用工作区真实值覆盖**。"
+            )
 
     # 手工映射（仅针对自动提取仍失败的）
     manual_overrides: Dict[str, str] = {}
@@ -21754,6 +21897,12 @@ def _render_external_feature_augmentation():
         preview_cols = ", ".join(str(e["target_col"]) + suffix for e in augmenter.entries)
         st.caption(f"将新增列：{preview_cols}")
 
+    keep_intermediate = st.checkbox(
+        "同时保留中间特征列（默认不保留）", value=False, key="ext_aug_keep_intermediate",
+        help="模型预测需要上千个中间特征（指纹/量子化学等）。默认只把预测值写回，"
+             "不把中间特征灌进工作区（否则列数从几十变成上千）。",
+    )
+
     # ---- 执行 ----
     st.markdown("#### 4️⃣ 执行补齐")
     if st.button("🚀 开始预测并补齐", type="primary", key="ext_aug_run"):
@@ -21765,23 +21914,104 @@ def _render_external_feature_augmentation():
                     output_mode=mode,
                     suffix=suffix,
                     add_source_flag=add_flag,
+                    # workflow 已在第 2 步回放过，避免重复计算上千个特征
+                    replay_workflow=False,
                 )
             except Exception as exc:
                 st.error(f"❌ 补齐失败: {exc}")
                 st.code(traceback.format_exc())
                 return
 
-        st.session_state['processed_data'] = out
-        st.session_state['ext_aug_reports'] = reports
+        # 关键：默认只保留“原始工作区列 + 本次预测列”，丢掉中间特征。
+        # augment() 会输出工作区列 + 上千个中间特征 + 预测列；中间特征只是
+        # 模型预测的输入，对用户后续训练无用，写回工作区只会把列数从几十变成上千。
+        if not keep_intermediate:
+            # 只保留本次模型产生的预测列（避免把别的模型遗留的 _pred/_source 也带上）
+            _this_pred: List[str] = []
+            for _e in augmenter.entries:
+                _this_pred.append(str(_e['target_col']) + suffix)
+                if add_flag:
+                    _this_pred.append(str(_e['target_col']) + suffix + '_source')
+            _orig_cols = [c for c in df.columns if c in out.columns]
+            _pred_cols = [c for c in _this_pred if c in out.columns]
+            _keep = list(dict.fromkeys(_orig_cols + _pred_cols))
+            out = out[_keep].copy()
+
+        # 把第 2 步的 workflow 回放报告合并进结果，供下方展示（否则结果区看不到回放详情）
+        _merged_reports = list(reports)
+        if wf_replay_reports:
+            _ok = [x for x in wf_replay_reports if x.get('status') == 'ok']
+            _failed = [x for x in wf_replay_reports if x.get('status') != 'ok']
+            _note = f"已回放 {len(_ok)}/{len(wf_replay_reports)} 个模型自带 workflow，" \
+                    f"新增 {sum(x.get('n_new_columns', 0) for x in _ok)} 个特征列"
+            if _failed:
+                _note += f"；{len(_failed)} 个未完成"
+            _merged_reports.insert(0, {
+                'kind': 'molecular_workflow_replay',
+                'status': 'ok' if _ok else 'failed',
+                'note': _note,
+                'details': wf_replay_reports,
+            })
+        # 暂存结果：不直接改工作区，等用户确认后点「应用到工作区」再写
+        st.session_state['ext_aug_pending'] = out
+        st.session_state['ext_aug_reports'] = _merged_reports
         st.session_state['ext_aug_shape'] = (df.shape, out.shape)
+        st.session_state['ext_aug_kept_intermediate'] = bool(keep_intermediate)
 
     # ---- 结果展示 ----
     reports = st.session_state.get('ext_aug_reports')
     shapes = st.session_state.get('ext_aug_shape')
-    if reports and shapes:
+    _pending = st.session_state.get('ext_aug_pending')
+    if reports and shapes and _pending is not None:
         before, after = shapes
+        _kept_inter = st.session_state.get('ext_aug_kept_intermediate', False)
         st.markdown("#### 5️⃣ 补齐结果")
         st.success(f"✅ 数据形状 {before} → {after}（新增 {after[1] - before[1]} 列）")
+        if not _kept_inter:
+            _n_pred = len([c for c in _pending.columns if c.endswith('_pred')])
+            st.caption(
+                f"ℹ️ 已自动丢弃 {after[1] - before[1] - _n_pred:,} 个中间特征列"
+                "（模型预测的输入，对后续训练无用）；只保留原始列 + 预测值。"
+                "如需保留，请勾选上方的「同时保留中间特征列」。"
+            )
+
+        # 模型自带分子特征 workflow 回放报告（关键：证明用的是训练时的配方）
+        for r in reports:
+            if r.get('kind') != 'molecular_workflow_replay':
+                continue
+            icon = "✅" if r.get('status') == 'ok' else "❌"
+            st.info(f"{icon} **分子特征 workflow 回放**：{r.get('note', '')}")
+            details = r.get('details') or []
+            if details:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                '模型': d['model_name'],
+                                '状态': {'ok': '✅ 已回放', 'skipped': '⏭️ 无配方', 'failed': '❌ 失败'}.get(d['status'], d['status']),
+                                '源列数': d['n_source_columns'],
+                                '自动补空源列': len(d.get('filled_source_columns') or []),
+                                '产出特征列': d['n_output_columns'],
+                                '跳过步骤': len(d.get('skipped_steps') or []),
+                                '原因/警告': d.get('reason') or ('；'.join((d.get('warnings') or [])[:1]) or ''),
+                            }
+                            for d in details
+                        ]
+                    ),
+                    use_container_width=True,
+                )
+                skipped_all = [s for d in details for s in (d.get('skipped_steps') or [])]
+                if skipped_all:
+                    with st.expander(f"⏭️ 已跳过的 {len(skipped_all)} 个步骤（产物不被模型使用，重算无意义）"):
+                        st.dataframe(pd.DataFrame(skipped_all), use_container_width=True)
+                filled = [c for d in details for c in (d.get('filled_source_columns') or [])]
+                if filled:
+                    st.caption(
+                        "以下源列工作区没有，已自动补空（对应特征为 NaN，与训练时缺该组分的处理一致）："
+                        + "、".join(filled)
+                    )
+
+        model_reports = [r for r in reports if r.get('kind') != 'molecular_workflow_replay']
         st.dataframe(
             pd.DataFrame(
                 [
@@ -21795,7 +22025,7 @@ def _render_external_feature_augmentation():
                         '预测均值': round(r['pred_mean'], 3) if r['pred_mean'] is not None else None,
                         '说明': r['note'],
                     }
-                    for r in reports
+                    for r in model_reports
                 ]
             ),
             use_container_width=True,
@@ -21807,18 +22037,81 @@ def _render_external_feature_augmentation():
             elif r['status'] == 'skipped':
                 st.warning(f"【{r['name']}】{r['note']}")
 
-        new_cols = [c for c in st.session_state['processed_data'].columns if c not in df.columns]
+        new_cols = [c for c in _pending.columns if c not in df.columns]
         if new_cols:
             st.markdown("**新增列预览**")
-            st.dataframe(st.session_state['processed_data'][new_cols].head(20), use_container_width=True)
-            csv = st.session_state['processed_data'].to_csv(index=False, encoding='utf-8-sig')
-            st.download_button(
-                "📥 下载补齐后的数据",
-                csv,
-                "augmented_features.csv",
-                "text/csv",
-                key="ext_aug_download",
+            st.dataframe(_pending[new_cols].head(20), use_container_width=True)
+
+        # ---- 写回工作区 ----
+        st.markdown("#### 6️⃣ 写回工作区")
+        _applied_sig = st.session_state.get('ext_aug_applied_signature')
+        _cur_sig = (
+            int(_pending.shape[0]) if _pending is not None else 0,
+            int(_pending.shape[1]) if _pending is not None else 0,
+            tuple(sorted(str(c) for c in _pending.columns)) if _pending is not None else (),
+        )
+        _already_applied = bool(_applied_sig and _applied_sig == _cur_sig)
+
+        col_a, col_b = st.columns([2, 3])
+        with col_a:
+            if st.button(
+                "✅ 应用到工作区" if not _already_applied else "✅ 已应用到工作区",
+                type="primary",
+                key="ext_aug_apply_workspace",
+                disabled=_already_applied or _pending is None,
+                help="把补齐后的数据写回工作区，供后续训练/筛选使用",
+            ):
+                st.session_state['processed_data'] = _pending
+                st.session_state['ext_aug_applied_signature'] = _cur_sig
+                # 数据变了 → 失效依赖列集合/内容的缓存，避免后续页面用旧结果
+                _clear_feature_classification_cache()
+                for _k in ('ext_aug_enriched_cache', 'ext_aug_reports', 'ext_aug_shape'):
+                    st.session_state.pop(_k, None)
+                try:
+                    _register_source_feature_names(_pending, overwrite=True)
+                except Exception:
+                    pass
+                st.success(
+                    f"✅ 已写入工作区：{_pending.shape[0]} 行 × {_pending.shape[1]} 列"
+                    + (f"（新增 {len(new_cols)} 列）" if new_cols else "")
+                )
+                st.info("💡 现在可以到「特征选择」/「模型训练」等页面使用这些新列")
+                st.rerun()
+        with col_b:
+            if _already_applied:
+                st.caption("✓ 当前工作区已包含这批补齐列（无需重复应用）")
+            elif _pending is not None:
+                st.caption(
+                    f"待写入：{_pending.shape[0]} 行 × {_pending.shape[1]} 列"
+                    + (f"（新增 {len(new_cols)} 列）" if new_cols else "")
+                )
+
+        # ---- 导出 ----
+        _exp_col, _exp_btn = st.columns([2, 3])
+        with _exp_col:
+            _fmt = st.radio(
+                "导出格式", ["CSV", "Excel"], horizontal=True,
+                key="ext_aug_export_fmt", label_visibility="collapsed",
             )
+        with _exp_btn:
+            try:
+                if _fmt == "Excel":
+                    _payload = dataframe_to_excel_bytes(_pending)
+                    st.download_button(
+                        "📥 下载补齐后的数据（.xlsx）", _payload,
+                        "augmented_features.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="ext_aug_download_xlsx",
+                    )
+                else:
+                    _csv = _pending.to_csv(index=False, encoding='utf-8-sig')
+                    st.download_button(
+                        "📥 下载补齐后的数据（.csv）", _csv,
+                        "augmented_features.csv", "text/csv",
+                        key="ext_aug_download_csv",
+                    )
+            except Exception as _exc:
+                st.caption(f"导出准备失败：{_exc}")
 
 
 def page_model_imputation():
