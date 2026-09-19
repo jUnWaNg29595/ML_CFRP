@@ -14,6 +14,32 @@ from typing import Optional, Tuple, List, Dict, Any
 from core.formulation_fusion import FormulationFusionEngine
 
 
+def _file_signature(path: str) -> tuple:
+    """文件指纹（路径 + mtime + 大小）。文件被改写后指纹变化，缓存自动失效。"""
+    try:
+        stat = os.stat(path)
+        return (os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (os.path.abspath(path), None, None)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cached_read_csv_table(path: str, mtime_ns, size: int) -> pd.DataFrame:
+    """按文件指纹缓存 CSV 读取结果。
+
+    母宽表 ml_wide_samples.csv 约 20MB / 1200+ 列，直接读盘需 0.7~1.1s。
+    本面板每次 rerun 都会重建，缓存后可把重复读盘降到 0。
+    调用方只读该 DataFrame（引擎内部均先 .copy() 再改），不会污染缓存对象。
+    """
+    return pd.read_csv(path, low_memory=False)
+
+
+def read_csv_cached(path: str) -> pd.DataFrame:
+    """读取 CSV（带指纹缓存）。文件不存在时由 pandas 正常抛错。"""
+    _abs, mtime_ns, size = _file_signature(path)
+    return _cached_read_csv_table(path, mtime_ns, size)
+
+
 @st.fragment
 def render_formulation_fusion_ui(
     standalone: bool = True,
@@ -30,11 +56,11 @@ def render_formulation_fusion_ui(
         st.title("🔗 跨表配方数据融合引擎 (Formulation Fusion Engine)")
         st.markdown(
             "将各个目标性能窄表（如 `ml_qspr_model_tg_c.csv`）与全组分配方母宽表（`ml_wide_samples.csv`）"
-            "进行智能化学语义对齐，**一键补全各单体用量 (PHR)、当量 (EEW/AHEW) 及 18 项交联机理特征**。"
+            "进行智能化学语义对齐，**一键补全各单体用量 (PHR)、当量 (EEW/AHEW)、固化工艺温度/时间参数及 18 项交联机理特征**。"
         )
     else:
         st.markdown("### 🔗 跨表配方数据融合 (One-Click Fusion)")
-        st.caption("自动关联母配方宽表 `ml_wide_samples.csv`，补充各组分精确配比与物理机理参数。")
+        st.caption("自动关联母配方宽表 `ml_wide_samples.csv`，补充各组分精确配比、物理机理参数及固化工艺温度。")
 
     engine = FormulationFusionEngine()
 
@@ -105,7 +131,7 @@ def render_formulation_fusion_ui(
                 )
                 if selected_narrow_path and os.path.exists(selected_narrow_path):
                     try:
-                        df_narrow = pd.read_csv(selected_narrow_path)
+                        df_narrow = read_csv_cached(selected_narrow_path)
                         narrow_label = os.path.basename(selected_narrow_path)
                         st.caption(f"已加载: `{narrow_label}` ({df_narrow.shape[0]} 行 × {df_narrow.shape[1]} 列)")
                     except Exception as e:
@@ -160,7 +186,7 @@ def render_formulation_fusion_ui(
                 )
                 if selected_wide_path and os.path.exists(selected_wide_path):
                     try:
-                        df_wide = pd.read_csv(selected_wide_path, low_memory=False)
+                        df_wide = read_csv_cached(selected_wide_path)
                         wide_label = os.path.basename(selected_wide_path)
                         st.caption(f"已加载: `{wide_label}` ({df_wide.shape[0]} 行 × {df_wide.shape[1]} 列)")
                     except Exception as e:
@@ -222,6 +248,15 @@ def render_formulation_fusion_ui(
 
         col_opt1, col_opt2 = st.columns(2)
         with col_opt1:
+            single_component_only = st.checkbox(
+                "🧬 仅保留单组分配方 (树脂/固化剂各 1 组分，不含小分子添加剂)",
+                value=False,
+                help="**单组分配方模式**：\n\n"
+                     "1. **样本筛选**：剔除树脂 2/3 组分、固化剂 2/3 组分任一非空的样本；\n"
+                     "2. **小分子添加剂**：small_additive_1/2 均丢弃（含添加剂样本一并剔除，列不进入工作表）；\n"
+                     "3. **组分数量特征**：筛选后 `*_component_count` 恒为 1/0，全部不放入工作表；\n"
+                     "4. 输出仅保留 resin_1 + curing_agent_1 的纯净双组分体系。"
+            )
             drop_useless_metadata = st.checkbox(
                 "🧹 彻底剔除无意义元数据列 (curing_type_standard, curing_mechanism, *_format, raw_unit 等)",
                 value=True,
@@ -230,10 +265,19 @@ def render_formulation_fusion_ui(
             include_resin_3 = st.checkbox(
                 "🧪 规范化纳入三组分配方特征 (保留 resin_3_structure, phr, MW, 官能度)",
                 value=True,
+                disabled=single_component_only,
                 help="保留三元树脂共混配方的结构、用量和物理量，同时剥离冗余的 format、unit 等元数据标签。"
+                + ("　⚠️ 已被「单组分配方模式」覆盖：多组分列不会进入工作表。" if single_component_only else "")
             )
 
         with col_opt2:
+            augment_standards = st.checkbox(
+                "📜 关联测试标准 (ASTM / ISO / GB / DIN / JIS)",
+                value=True,
+                help="从 `ml_performance_standards.csv` 自动关联样本使用的测试标准，"
+                     "输出 `test_standard_organization`、`test_standard_canonical` (如 ASTM D3418-1982) 与引用数量。"
+                     "窄表无 ID 时通过 record_id 桥接，未覆盖样本留空。"
+            )
             auto_load_workspace = st.checkbox(
                 "📥 融合清洗完成后自动载入系统工作区 (直接供后续特征提取/训练使用)",
                 value=True,
@@ -254,6 +298,11 @@ def render_formulation_fusion_ui(
                         fill_missing_r=True
                     )
 
+                    # 可选：关联测试标准 (ASTM / ISO / GB / DIN / JIS)
+                    if augment_standards:
+                        fused_df, std_meta = engine.augment_with_test_standards(fused_df)
+                        meta.update(std_meta)
+
                     # 执行特征纯化清洗
                     fused_clean_df, clean_stats = engine.clean_features_for_ml(
                         fused_df,
@@ -261,7 +310,8 @@ def render_formulation_fusion_ui(
                         curing_type_filter=curing_type_val,
                         mode=mode_val,
                         drop_metadata=drop_useless_metadata,
-                        base_df=df_narrow
+                        base_df=df_narrow,
+                        single_component_only=single_component_only
                     )
 
                     meta.update(clean_stats)
@@ -277,12 +327,47 @@ def render_formulation_fusion_ui(
                     curing_info = f"固化体系筛选: `{curing_type_val}` ({clean_stats.get('filtered_rows', len(fused_clean_df))} 样本)" if curing_type_val else "保留全部固化体系"
                     r3_info = "已规范保留 resin_3 物理特征" if clean_stats.get("resin_3_included") else ""
 
-                    st.success(
-                        f"🎉 **跨表融合与特征纯化完成！**\n\n"
-                        f"* 📊 **最终训练维度**: **{fused_clean_df.shape[0]} 行 × {fused_clean_df.shape[1]} 列**\n"
-                        f"* 🔬 **筛选与组织**: {curing_info} | {r3_info}\n"
-                        f"* 🧹 **纯化保障**: 已彻底剥离 `curing_type_standard`、`curing_mechanism`、全部 `*_format` 格式列及原始单位元数据，特征集干净纯粹。"
-                    )
+                    if single_component_only:
+                        single_info = (
+                            f"🧬 **单组分配方**: 仅树脂/固化剂各 1 组分且无小分子添加剂 "
+                            f"({clean_stats.get('single_filtered_rows', len(fused_clean_df))} 样本保留，"
+                            f"已剔除多组分列与 {clean_stats.get('single_dropped_cols_count', 0)} 个组分数量特征)"
+                        )
+                    else:
+                        single_info = "含全部组分配方样本"
+
+                    proc_backfilled = meta.get("process_backfilled") or []
+                    temp_cols = [c for c in fused_clean_df.columns if "temperature" in str(c).lower()]
+                    if proc_backfilled:
+                        proc_info = f"🔥 工艺温度补齐: 从母宽表指纹回填 {len(proc_backfilled)} 列（含 {', '.join(temp_cols[:2])}）"
+                    elif temp_cols:
+                        proc_info = f"🔥 工艺温度: 已包含 {len(temp_cols)} 个工艺温度列（如 {temp_cols[0]}）"
+                    else:
+                        proc_info = "⚠️ 未见工艺温度列（母宽表可能缺失）"
+
+                    if augment_standards and meta.get("standards_matched", 0) > 0:
+                        std_info = (
+                            f"📜 测试标准: {meta.get('standards_matched')} 样本已关联 "
+                            f"({meta.get('standards_coverage', 0) * 100:.1f}% 覆盖，策略: {meta.get('standards_strategy')})"
+                        )
+                    elif augment_standards:
+                        std_info = "📜 测试标准: 未找到可关联的标准记录（可检查 ml_performance_standards.csv）"
+                    else:
+                        std_info = None
+
+                    success_lines = [
+                        f"🎉 **跨表融合与特征纯化完成！**\n\n",
+                        f"* 📊 **最终训练维度**: **{fused_clean_df.shape[0]} 行 × {fused_clean_df.shape[1]} 列**\n",
+                        f"* 🔬 **筛选与组织**: {curing_info} | {r3_info}\n",
+                        f"* {proc_info}\n",
+                    ]
+                    if std_info:
+                        success_lines.append(f"* {std_info}\n")
+                    success_lines.extend([
+                        f"* {single_info}\n",
+                        f"* 🧹 **纯化保障**: 已彻底剥离 `curing_type_standard`、`curing_mechanism`、全部 `*_format` 格式列及原始单位元数据，特征集干净纯粹。",
+                    ])
+                    st.success("".join(success_lines))
                 except Exception as e_fuse:
                     st.error(f"❌ 融合失败: {e_fuse}")
 
@@ -296,7 +381,16 @@ def render_formulation_fusion_ui(
 
         st.markdown("---")
         st.markdown("#### 📊 3. 融合后数据预览与操作")
-        st.dataframe(res_df.head(20), width="stretch")
+        # [性能] 融合结果是宽表（紧凑模式 ~70-80 列，全息模式 300-450 列，原始模式可达 1248 列）。
+        # 直接渲染会在每次交互 rerun 时重发整份数据（实测 1248 列 × 20 行 = 439KB），
+        # 因此复用 app_lib.render_capped_preview 默认只展示前 40 列。
+        try:
+            from core.preview_ui import render_capped_preview
+            render_capped_preview(
+                res_df, key="fusion_result_preview", caption_prefix="融合结果", height=320
+            )
+        except Exception:
+            st.dataframe(res_df.head(20), width="stretch")
 
         # 净化文件名：去除重复的 fused_ 前缀与 .csv.csv
         clean_base_label = re.sub(r'^(fused_)+', '', narrow_label or 'dataset')
@@ -329,3 +423,113 @@ def render_formulation_fusion_ui(
                     st.success(f"✅ 已保存至: `{save_path_default}`")
                 except Exception as e_save:
                     st.error(f"保存失败: {e_save}")
+
+    # ν 嵌入模型训练区（两阶段 PINN · 阶段1）
+    try:
+        render_nu_encoder_ui(default_dir=default_dir)
+    except Exception as e_nu:
+        st.warning(f"ν 编码器组件加载失败: {e_nu}")
+
+
+@st.fragment
+def render_nu_encoder_ui(default_dir: str = r"C:\Users\wangj\Desktop\ml_dataset"):
+    """
+    渲染交联密度 (ν) 嵌入模型训练 UI（两阶段 PINN · 阶段1）
+    - 用实测 ν 数据一键训练专用编码器（含脏数据清理、留出评估）
+    - 冻结产物自动被 EpoxyPINN / Transformer+PINN 发现并嵌入
+    - 训练与预测均无需手工输入 ν
+    """
+    st.markdown("---")
+    st.markdown("#### 🧬 交联密度 (ν) 嵌入模型（两阶段 PINN · 阶段1）")
+    st.caption(
+        "用实测交联密度训练专用编码器（自动清理脏数据），冻结后自动嵌入 PINN 作为物理基线——"
+        "**训练与预测均无需手工输入 ν**。编码器激活后建议将 PINN 的 Physics Weight 调至 0.2~0.3。"
+    )
+
+    from core.crosslink_nu_model import CrosslinkNuEncoder, default_encoder_path
+
+    enc_path = default_encoder_path()
+    if os.path.exists(enc_path):
+        try:
+            enc = CrosslinkNuEncoder.load(enc_path)
+            prov = getattr(enc, "provenance_", {}) or {}
+            st.success(
+                f"✅ ν 编码器已就绪并会被 PINN 自动嵌入 ｜ 训练样本: {prov.get('n_train', '?')} ｜ "
+                f"特征数: {prov.get('n_features', '?')} ｜ 清理剔除: {prov.get('n_dropped_dirty', '?')} 条脏数据"
+            )
+        except Exception as e_enc:
+            st.warning(f"⚠️ 编码器文件存在但加载失败（将回退理论基线）: {e_enc}")
+    else:
+        st.info("ℹ️ 尚未训练 ν 编码器 —— PINN 将回退为较弱的理论基线，建议先训练。")
+
+    # 数据源扫描（与融合引擎同目录逻辑）
+    nu_files: list = []
+    for s_dir in dict.fromkeys([default_dir, os.getcwd()]):
+        if os.path.exists(s_dir):
+            try:
+                for fname in os.listdir(s_dir):
+                    if fname.lower().endswith(".csv") and "crosslink_density" in fname.lower():
+                        nu_files.append(os.path.join(s_dir, fname))
+            except Exception:
+                pass
+    if not nu_files:
+        st.warning("未找到含 crosslink_density 的数据文件（可将实测 ν 表放入 ml_dataset 目录）")
+        return
+
+    src = st.selectbox("ν 数据源", nu_files,
+                       format_func=lambda p: os.path.basename(p))
+
+    c1, c2, c3 = st.columns(3)
+    lo = c1.number_input("ν 合理下界 (mol/m³)", min_value=10.0, max_value=1000.0, value=100.0, step=10.0,
+                         help="低于下界的记录视为单位错误/异常，训练时剔除")
+    hi = c2.number_input("ν 合理上界 (mol/m³)", min_value=1000.0, max_value=1000000.0, value=10000.0, step=500.0,
+                         help="实测数据显示 >1e4 的记录多为模量回算单位错误")
+    holdout = c3.slider("留出评估比例", 0.1, 0.4, 0.2, 0.05,
+                        help="先在留出集上评估编码器质量（Spearman），再用全量数据重训正式产物")
+
+    if st.button("🚀 训练 / 更新 ν 编码器", type="primary", use_container_width=True):
+        try:
+            with st.spinner("清理数据 → 留出评估 → 全量重训 → 保存 ..."):
+                df = pd.read_csv(src, encoding="utf-8", encoding_errors="replace")
+                nu_col = "crosslink_density_mol_m3" if "crosslink_density_mol_m3" in df.columns else \
+                    next((c for c in df.columns if "crosslink_density" in c.lower()
+                          and pd.api.types.is_numeric_dtype(df[c])), None)
+                if nu_col is None:
+                    st.error("❌ 数据源中未找到数值型交联密度列")
+                    return
+                # 剔除 ν 自身的测量条件列（防止编码器学到测量方法偏差）
+                drop_cols = [c for c in df.columns if c != nu_col and c.startswith(nu_col + "_")]
+                X_df = df.drop(columns=[nu_col] + drop_cols)
+                nu = pd.to_numeric(df[nu_col], errors="coerce").to_numpy(dtype=float)
+
+                valid = np.isfinite(nu) & (nu >= lo) & (nu <= hi)
+                st.caption(f"数据体检: 共 {len(nu)} 条 ｜ 有效 {int(valid.sum())} 条 ｜ "
+                           f"剔除脏数据 {int((~valid).sum())} 条（区间 [{lo:.0f}, {hi:.0f}] 之外）")
+
+                rng = np.random.RandomState(42)
+                v_idx = np.where(valid)[0]
+                perm = rng.permutation(v_idx)
+                n_te = max(1, int(len(perm) * holdout))
+                te_idx, tr_idx = perm[:n_te], perm[n_te:]
+
+                enc_eval = CrosslinkNuEncoder(nu_bounds=(float(lo), float(hi)))
+                enc_eval.fit(X_df.iloc[tr_idx].reset_index(drop=True), nu[tr_idx])
+                lp = enc_eval.predict_log_nu(X_df.iloc[te_idx].reset_index(drop=True))
+                from scipy.stats import spearmanr as _spr
+                from sklearn.metrics import r2_score as _r2
+                rho = float(_spr(np.exp(lp), nu[te_idx])[0])
+                r2l = float(_r2(np.log(nu[te_idx]), lp))
+
+                m1, m2 = st.columns(2)
+                m1.metric("留出集 Spearman (ν)", f"{rho:.3f}", help="ν 编码器预测与实测的秩相关；理论基线约 0.24")
+                m2.metric("留出集 R² (log ν)", f"{r2l:.3f}")
+
+                final = CrosslinkNuEncoder(nu_bounds=(float(lo), float(hi)))
+                final.fit(X_df, nu)
+                final.save(enc_path)
+                st.success(f"✅ 编码器已保存: `{enc_path}` —— PINN 下次训练自动嵌入，无需任何额外操作")
+                st.caption("💡 提示：编码器激活后（ν 100% 覆盖），建议将 PINN 的 Physics Weight 调至 0.2~0.3")
+        except ImportError as e_imp:
+            st.error(f"❌ 缺少依赖: {e_imp}")
+        except Exception as e_train:
+            st.error(f"❌ 训练失败: {e_train}")

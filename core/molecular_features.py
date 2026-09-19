@@ -100,20 +100,33 @@ def resolve_transformer_trust_remote_code(model_name, resolved_model_path=None, 
 
     return is_molformer_name
 
-# PyTorch 是可选依赖 (用于 ANI2x 力场计算)
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-    torch = None
+# PyTorch 是可选依赖 (用于 ANI2x 力场 / LM 特征)
+# [懒加载改造] 原模块级 import torch 会使每个 spawn worker（3D 构象生成只用 RDKit）
+# 都被迫加载 torch（~4.6s CPU + 大量文件 I/O），是大规模并行的启动瓶颈。
+# 改为按需加载：需要 torch 的类（MLForceFieldExtractor / LM 特征）实例化时各自局部 import。
+_torch_cache: dict = {}
+
+def _ensure_torch():
+    """按需加载 torch，返回模块或 None（不可用）。结果缓存，线程安全性足够
+    （最坏情况重复 import，Python import 锁保证幂等）。"""
+    if "torch" not in _torch_cache:
+        try:
+            import torch as _t
+            _torch_cache["torch"] = _t
+        except Exception as e:
+            print(f"Warning: Failed to import torch: {e}")
+            _torch_cache["torch"] = None
+    return _torch_cache["torch"]
+
+TORCH_AVAILABLE = None  # 已废弃占位：可用性以 MLForceFieldExtractor.AVAILABLE 为准
 
 # [新增] 后台任务管理器 - 支持任务取消
 from .task_manager import (
     get_task_manager, 
     is_cancelled, 
     CancellableProcessPoolExecutor,
-    safe_worker_count
+    safe_worker_count,
+    prevent_spawn_main_reimport
 )
 
 # [新增] 支持 SMILES / SELFIES / BigSMILES 输入
@@ -256,6 +269,20 @@ try:
             params.useRandomCoords = True
         except Exception:
             pass
+        # [修复3] 立体化学确定性：固定随机种子。
+        # 反应产物含 12-27 个未指定立体中心，ETKDG 每次随机选构型会导致
+        # 同一分子两次嵌入得到不同异构体 → 3D 特征（NPR/力场能量/回转半径）
+        # 带不可复现噪声。固定种子使同一输入恒得同一构象。
+        try:
+            params.randomSeed = 0xC0FFEE
+        except Exception:
+            pass
+        # [提速] RDKit 默认迭代数=10×原子数（大分子放大到数千次尝试），
+        # 300 次上限覆盖常规成功率并约束最坏耗时
+        try:
+            params.maxIterations = 300
+        except Exception:
+            pass
         try:
             params.maxAttempts = 50
         except Exception:
@@ -273,6 +300,10 @@ except ImportError:
     RDKIT_AVAILABLE = False
 
 try:
+    # [兼容性修复] mordred 1.2.0 使用 numpy.product，numpy 2.x 已移除该 API
+    # （别名到 np.prod），否则 MORDRED_AVAILABLE 恒为 False、Mordred 特征不可用。
+    if not hasattr(np, "product"):
+        np.product = np.prod
     from mordred import Calculator, descriptors
 
     MORDRED_AVAILABLE = True
@@ -1318,28 +1349,22 @@ def _generate_3d_data_worker(smiles):
                 fail_reasons.append(f'unsupported_elements:{unsupported}')
                 continue
 
-            mol = Chem.AddHs(mol)  # 力场/ANI 计算建议加氢
-
-            # ✅ 再次检查（AddHs后）
-            if mol.GetNumAtoms() == 0:
-                fail_reasons.append('no_atoms_after_addh')
-                continue
-
-            # 2) 生成 3D 构象（ETKDGv3）
+            # [提速] 先嵌重原子骨架，再 AddHs(addCoords=True) 补氢：
+            # 加氢后原子数翻倍以上，ETKDG 距离几何耗时膨胀 4-8 倍（实测 1024 原子嵌入 142s）；
+            # 重原子骨架嵌入 ~10s，补氢近零成本，随后 MMFF 松弛自动弛豫氢位置
             params = _get_etkdg_params()
             # RDKit 版本差异：部分属性可能不存在/只读，使用 best-effort 设置
-            for _attr, _val in [("useRandomCoords", True), ("numThreads", 1), ("maxAttempts", 50)]:
+            for _attr, _val in [("useRandomCoords", True), ("numThreads", 1)]:
                 try:
                     setattr(params, _attr, _val)
                 except Exception:
                     pass
-
             res, _err = _embed_molecule_compat(mol, params)
             res = int(res) if res is not None else -1
             if res != 0:
-                # 兜底：再试一次
+                # 兜底：随机坐标重试
                 try:
-                    res = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=100)
+                    res = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=25)
                 except TypeError:
                     # 某些 RDKit 版本不支持这些关键字
                     try:
@@ -1352,6 +1377,13 @@ def _generate_3d_data_worker(smiles):
                     # 该片段 3D 生成失败：跳过该片段
                     fail_reasons.append('embed_failed')
                     continue
+
+            mol = Chem.AddHs(mol, addCoords=True)  # 在既有构象上补氢（力场/ANI 需要显式氢）
+
+            # ✅ 再次检查（AddHs后）
+            if mol.GetNumAtoms() == 0:
+                fail_reasons.append('no_atoms_after_addh')
+                continue
 
             # 3) 快速几何优化：优先 MMFF，否则 UFF（减少迭代次数避免卡住）
             try:
@@ -1383,6 +1415,11 @@ def _generate_3d_data_worker(smiles):
 # =============================================================================
 # 3D 描述符：RDKit3D + Coulomb Matrix (可选更前沿的构象表征)
 # =============================================================================
+# [防卡死] 3D 嵌入/优化/库仑矩阵代价随原子数急剧增长(O(n^3)级别)。
+# BigSMILES 采样代理可能拼接出数百~数千原子的超大分子，单条即可长时间占用
+# worker 进程(表现为批量提取到一半卡死)。超过上限直接跳过该片段。
+_RDKIT3D_MAX_HEAVY_ATOMS = 150
+
 def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
     """
     计算单个样本的 3D 构象描述符（修复版）
@@ -1425,6 +1462,10 @@ def _rdkit3d_feature_worker(smiles, coulomb_top_k: int = 10):
 
             # 过滤掉单原子或太小的碎片（通常是离子或杂质），它们很难生成有意义的 3D
             if mol.GetNumAtoms() < 2:
+                continue
+
+            # [防卡死] 超大分子跳过，避免 EmbedMolecule/MMFF/库仑矩阵特征分解卡住 worker
+            if mol.GetNumAtoms() > _RDKIT3D_MAX_HEAVY_ATOMS:
                 continue
 
             mol = Chem.AddHs(mol)
@@ -1562,6 +1603,7 @@ class RDKit3DDescriptorExtractor:
 
         feats = []
         valid_indices = []
+        drop_reasons = {}  # {原始索引: 失败原因}，用于零结果时的诊断
 
         print(f"\n🧊 3D 构象描述符提取 (n_jobs={n_jobs}, coulomb_top_k={self.coulomb_top_k})")
 
@@ -1578,68 +1620,163 @@ class RDKit3DDescriptorExtractor:
                     feats.append(out)
                     valid_indices.append(idx)
         else:
+            pbar = None
             try:
-                # ✅ 修复：使用 submit + wait 替代 map，添加超时机制避免卡死
+                # ✅ 修复(v2)：按"真实 worker 数"分波提交 + 僵尸进程池强制重建，
+                # 彻底杜绝大批次超时级联与 shutdown 永久挂起导致的卡死。
                 from concurrent.futures import wait, TimeoutError as FuturesTimeoutError
-                
+                from concurrent.futures.process import BrokenProcessPool
+
                 per_molecule_timeout = 30  # 单分子超时时间（秒）
                 results_dict = {}  # {index: result}
                 total = len(smiles_list)
-                timeout_count = 0
-                
-                # 分批处理
-                batch_submit_size = n_jobs * 2
+
+                # 关键修复 1：Windows 句柄限制会把 max_workers 钳到 31，
+                # 必须用"真实"worker 数计算波次大小与超时，否则超时形同虚设
+                # （此前按请求值 128 算出的 70s 超时，对 31 个真实 worker 过短，
+                #   导致每批必超时 → 级联丢弃 → 进度条冻结在整批边界）
+                effective_jobs = safe_worker_count(n_jobs, cap_nt=60)
+                if effective_jobs != n_jobs:
+                    print(f"⚠️ Windows 多进程句柄限制：worker 已从 {n_jobs} 钳制为 {effective_jobs}")
+                    n_jobs = effective_jobs
+
+                wave_size = max(1, n_jobs)  # 每波刚好一个"满波"任务，进度按波推进
+                wave_timeout = per_molecule_timeout * (wave_size / max(1, n_jobs) + 1) + 15.0
+
                 pbar = tqdm(total=total, desc=f"3D Descriptors ({n_jobs} workers)")
-                
-                with CancellableProcessPoolExecutor(max_workers=n_jobs, task_name="3D描述符提取") as executor:
-                    for batch_start in range(0, total, batch_submit_size):
-                        # 检查是否请求取消
-                        if is_cancelled():
-                            print("⏹️ 任务已取消")
-                            pbar.close()
-                            break
-                            
-                        batch_end = min(batch_start + batch_submit_size, total)
-                        batch_smiles = smiles_list[batch_start:batch_end]
-                        
-                        # 提交这一批任务
-                        futures = {
-                            executor.submit(worker, s): batch_start + j 
-                            for j, s in enumerate(batch_smiles)
-                        }
-                        
-                        # 等待这批任务完成，设置超时
-                        batch_timeout = per_molecule_timeout * len(batch_smiles) / max(1, n_jobs) + 10
-                        done, not_done = wait(futures.keys(), timeout=batch_timeout)
-                        
-                        # 处理完成的任务
-                        for future in done:
-                            idx = futures[future]
+
+                def _spawn_pool():
+                    return CancellableProcessPoolExecutor(
+                        max_workers=n_jobs, task_name="3D描述符提取"
+                    )
+
+                def _kill_pool(executor_):
+                    """强制终止所有 worker（含卡死僵尸），防止其长期占用 CPU。
+
+                    注意：不能用 shutdown(wait=True)——一个永不返回的病态分子
+                    （如超配位硼的构象搜索）会让整个提取永久挂起。
+                    """
+                    try:
+                        procs = list(getattr(executor_, "_processes", {}).values())
+                    except Exception:
+                        procs = []
+                    try:
+                        executor_.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
+                    for p_ in procs:
+                        try:
+                            if p_.is_alive():
+                                p_.terminate()
+                        except Exception:
+                            pass
+                    try:
+                        get_task_manager().complete_task(executor_.task_id)
+                    except Exception:
+                        pass
+
+                def _run_pass(items, pass_label, update_pbar=True):
+                    """按波次跑一轮提取，返回 (results_dict, dropped_idx_list, failure_reasons)。"""
+                    res, dropped, reasons = {}, [], {}
+                    executor = None
+                    broken_streak = 0
+                    try:
+                        executor = _spawn_pool()
+                        pos = 0
+                        first_wave = True
+                        while pos < len(items):
+                            if is_cancelled():
+                                print("⏹️ 任务已取消")
+                                for idx_, _ in items[pos:]:
+                                    dropped.append(idx_)
+                                    reasons[idx_] = "任务取消"
+                                break
+                            wave = items[pos:pos + wave_size]
+                            pos += len(wave)
                             try:
-                                out = future.result(timeout=1)
-                                if out is not None:
-                                    results_dict[idx] = out
-                            except Exception:
-                                pass
-                        
-                        # 取消超时的任务
-                        for future in not_done:
-                            future.cancel()
-                            timeout_count += 1
-                        
-                        pbar.update(len(batch_smiles))
-                
+                                futures = {
+                                    executor.submit(worker, s): idx
+                                    for idx, s in wave
+                                }
+                            except BrokenProcessPool:
+                                broken_streak += 1
+                                for idx_, _ in wave:
+                                    dropped.append(idx_)
+                                    reasons[idx_] = "进程池崩溃(BrokenProcessPool)"
+                                _kill_pool(executor)
+                                if broken_streak >= 3:
+                                    raise  # 池反复崩溃，交给外层回退单进程
+                                executor = _spawn_pool()
+                                continue
+
+                            # 首波需要等待子进程冷启动（import torch/rdkit 可能 10~30s+），
+                            # 额外给 60s 宽限，避免小列首波被误判超时整批取消
+                            wave_timeout_eff = wave_timeout + 60.0 if first_wave else wave_timeout
+                            first_wave = False
+                            done, not_done = wait(futures.keys(), timeout=wave_timeout_eff)
+                            for f in done:
+                                try:
+                                    out = f.result(timeout=1)
+                                    if out is not None:
+                                        res[futures[f]] = out
+                                    else:
+                                        # worker 正常返回但结果为空：SMILES 解析/过滤失败
+                                        reasons[futures[f]] = "worker返回空（SMILES 解析/过滤失败）"
+                                except Exception as ex:
+                                    # [诊断] 不再静默吞掉：子进程导入/反序列化等错误在此暴露
+                                    reasons[futures[f]] = f"worker异常: {type(ex).__name__}: {ex}"[:200]
+                            zombies = 0
+                            for f in not_done:
+                                if f.cancel():
+                                    # 尚在排队就被取消：也要记录并重试，否则静默丢失
+                                    dropped.append(futures[f])
+                                    reasons[futures[f]] = f"排队超时未运行（>{wave_timeout_eff:.0f}s）"
+                                    continue
+                                zombies += 1
+                                dropped.append(futures[f])
+                                reasons[futures[f]] = f"运行超时(>{wave_timeout_eff:.0f}s)，已强制终止"
+                            if zombies:
+                                # 关键修复 2：运行中的僵尸任务无法取消且占满 worker，
+                                # 必须杀掉整个池重建，否则后续波次全部饿死
+                                print(f"⏳ {pass_label}：{zombies} 个分子超时（>{wave_timeout_eff:.0f}s），"
+                                      f"已强制清理并重建进程池")
+                                _kill_pool(executor)
+                                executor = _spawn_pool()
+                            if update_pbar:
+                                pbar.update(len(wave))
+                        return res, dropped, reasons
+                    finally:
+                        if executor is not None:
+                            _kill_pool(executor)
+
+                items = list(enumerate(smiles_list))
+                results_dict, dropped_idx, drop_reasons = _run_pass(items, "3D 提取")
+
+                # 关键修复 3：超时分子换全新进程池重试一轮，避免偶发超时造成静默丢行
+                if dropped_idx and not is_cancelled():
+                    print(f"🔁 对 {len(dropped_idx)} 个超时/异常分子重试（全新进程池）...")
+                    retry_items = [(i, smiles_list[i]) for i in dropped_idx]
+                    retry_res, still_dropped, retry_reasons = _run_pass(retry_items, "3D 重试", update_pbar=False)
+                    results_dict.update(retry_res)
+                    drop_reasons.update(retry_reasons)
+                    dropped_idx = still_dropped
+                    if still_dropped:
+                        print(f"⚠️ {len(still_dropped)} 个分子两次提取均失败，已跳过：")
+                        for i in still_dropped[:10]:
+                            print(f"   - 第 {i + 1} 行：{str(smiles_list[i])[:60]} ({drop_reasons.get(i, '未知')})")
+                        if len(still_dropped) > 10:
+                            print(f"   - ...等共 {len(still_dropped)} 个（这些行特征将为空）")
+
                 pbar.close()
-                
-                if timeout_count > 0:
-                    print(f"⚠️ {timeout_count} 个分子处理超时，已跳过")
-                
+
                 # 按索引顺序排列结果
                 for idx in sorted(results_dict.keys()):
                     feats.append(results_dict[idx])
                     valid_indices.append(idx)
                     
             except Exception as e:
+                if pbar is not None:
+                    pbar.close()
                 if "取消" in str(e) or is_cancelled():
                     print("⏹️ 任务已取消")
                 else:
@@ -1653,8 +1790,32 @@ class RDKit3DDescriptorExtractor:
                             feats.append(out)
                             valid_indices.append(idx)
 
-        if not feats:
+        if not smiles_list:
             return pd.DataFrame(), []
+
+        if not feats:
+            # [诊断] 零结果不再静默返回：汇总所有失败原因并抛出，
+            # 由上层 st.error 展示，彻底避免只看到 "no features extracted" 却无从排查
+            if is_cancelled():
+                raise RuntimeError(
+                    "3D 构象描述符提取被取消（检测到取消标志），未得到任何特征。"
+                    "若未手动取消，请检查是否有其它页面的取消/紧急停止被触发。"
+                )
+            from collections import Counter as _Counter
+            reason_counts = _Counter(drop_reasons.values()) if drop_reasons else {}
+            lines = [
+                f"3D 构象描述符提取失败：{len(smiles_list)} 个输入未得到任何特征，失败原因统计："
+            ]
+            if reason_counts:
+                for _r, _c in reason_counts.most_common():
+                    lines.append(f"  · {_r}：{_c} 个")
+            else:
+                lines.append("  · 所有 SMILES 均解析/过滤失败（worker 返回空）")
+            if drop_reasons:
+                lines.append("示例（行号为原始数据行号）：")
+                for _i, _r in list(drop_reasons.items())[:5]:
+                    lines.append(f"  · 第 {_i + 1} 行 {str(smiles_list[_i])[:60]!r}：{_r}")
+            raise RuntimeError("\n".join(lines))
 
         df = pd.DataFrame(feats)
         df = df.apply(pd.to_numeric, errors='coerce')
@@ -2183,7 +2344,7 @@ class OptimizedRDKitFeatureExtractor:
 
         # [Windows 安全修复] WaitForMultipleObjects 最多 63 句柄，
         # worker > ~62 时 loky/multiprocessing 会崩（need at most 63 handles）
-        cpu_count = safe_worker_count(cpu_count)
+        cpu_count = safe_worker_count(cpu_count, cap_nt=60)
 
         # [性能修复] 解除线程限制，使用全部CPU核心
         if n_jobs == -1:
@@ -2634,9 +2795,10 @@ class AdvancedMolecularFeatureExtractor:
         else:
             n_proc = max(1, min(n_jobs_int, cpu_count))
             # Windows: 限制合理上限，61 进程 IPC 开销太大
-            if is_windows and n_proc > 16:
-                print(f"⚠️ Windows 下 {n_proc} 进程 IPC 开销过大，自动降至 16")
-                n_proc = 16
+            if is_windows and n_proc > 60:
+                # Windows 单池 63 句柄限制，60 留余量
+                print(f"⚠️ Windows 单池上限 60 workers，已从 {n_proc} 调整")
+                n_proc = 60
 
         # 分子太少时不值得并行
         if len(unique_mols) < n_proc * 10:
@@ -2664,6 +2826,12 @@ class AdvancedMolecularFeatureExtractor:
         progress_base = 0.10
         progress_range = 0.80
 
+        # [关键修复] mordred 的 calc.pandas(nproc>1) 内部用 multiprocessing.Pool，
+        # Windows 下为 spawn —— 子进程默认会重导入 Streamlit 页面脚本（__main__），
+        # 导致 worker 崩溃/极慢（与 ANI/快速力场同源问题），创建池前必须阻断。
+        if n_proc > 1 and os.name == "nt":
+            prevent_spawn_main_reimport()
+
         for batch_idx, i in enumerate(range(0, total_mols, effective_batch), 1):
             batch_mols = unique_mols[i: i + effective_batch]
 
@@ -2682,14 +2850,18 @@ class AdvancedMolecularFeatureExtractor:
                             if i == 0:
                                 print("  ⚠️ Mordred 版本不支持并行参数，切换至默认模式...")
                             n_proc = 1
-                            df_batch = calc.pandas(batch_mols, quiet=True)
+                            df_batch = calc.pandas(batch_mols, nproc=1, quiet=True)
                     except Exception as e:
                         if i == 0:
                             print(f"  ⚠️ 并行计算出错 ({str(e)})，自动切换回单进程模式...")
                         n_proc = 1
-                        df_batch = calc.pandas(batch_mols, quiet=True)
+                        df_batch = calc.pandas(batch_mols, nproc=1, quiet=True)
                 else:
-                    df_batch = calc.pandas(batch_mols, quiet=True)
+                    # [关键修复] n_proc==1 时必须显式传 nproc=1。
+                    # Mordred 的 Calculator.map() 在 nproc=None 时用 cpu_count()，
+                    # 本机 512 核 → 514 个句柄 → Windows 的 WaitForMultipleObjects
+                    # 上限 63 直接抛 "need at most 63 handles"，计算全部丢失。
+                    df_batch = calc.pandas(batch_mols, nproc=1, quiet=True)
 
                 if type(df_batch).__name__ == 'MordredDataFrame':
                     df_batch = pd.DataFrame(df_batch)
@@ -2766,6 +2938,23 @@ class AdvancedMolecularFeatureExtractor:
                 continue
 
         return self._process_result(all_features, valid_indices)
+
+
+def _spawn_worker_budget(hard_cap: int = 240, per_worker_mb: float = 700.0,
+                         ram_frac: float = 0.7, default_cap: int = 60) -> int:
+    """按可用内存估算 spawn worker 数上限。
+
+    每个 spawn worker 需 import molecular_features 全链（torch+rdkit+bigsmiles），
+    实测 RSS ≈ 500MB；按 per_worker_mb 保守计。预算 = 可用内存 × ram_frac。
+    psutil 不可用或异常时返回 default_cap。
+    """
+    try:
+        import psutil
+        avail_mb = psutil.virtual_memory().available / 2**20
+        cap = int(avail_mb * ram_frac / per_worker_mb)
+        return max(1, min(hard_cap, cap))
+    except Exception:
+        return default_cap
 
 
 class MLForceFieldExtractor:
@@ -2912,13 +3101,16 @@ class MLForceFieldExtractor:
         try:
             if self.device is not None and getattr(self.device, 'type', '') == 'cuda' and n_jobs > 1:
                 use_spawn = True
-                # ✅ 关键修复：限制 spawn 模式下的最大 worker 数量
-                # 每个 spawn 子进程大约消耗 500MB-1GB 内存（RDKit + NumPy + 基础库）
-                MAX_SPAWN_WORKERS = 8  # 最多 8 个 worker，避免 OOM
+                # [512核扩展] 原 MAX_SPAWN_WORKERS=8 硬顶改为内存感知预算：
+                # 每 worker import 全链(torch+rdkit+bigsmiles) ≈ 500MB，
+                # 预算 = 可用内存×70% / 700MB，硬顶 240（3D 计算 ~0.1s/分子，
+                # worker 启动才是大头，超过 240 后收益递减且 spawn 风暴伤磁盘 I/O）
+                ram_cap = _spawn_worker_budget(hard_cap=240)
                 original_n_jobs = n_jobs
-                n_jobs = min(n_jobs, MAX_SPAWN_WORKERS)
+                n_jobs = min(n_jobs, ram_cap)
                 if original_n_jobs != n_jobs:
-                    print(f'⚠️ CUDA + spawn 模式：为避免内存溢出，worker 数从 {original_n_jobs} 降至 {n_jobs}')
+                    print(f'⚠️ 内存预算：worker 数从 {original_n_jobs} 调整为 {n_jobs}'
+                          f'（每 worker ≈0.5GB，受可用内存或 240 硬顶约束）')
                 print(f'✅ 检测到 CUDA 环境，使用 spawn 模式进行 3D 生成（{n_jobs} workers）')
         except Exception:
             pass
@@ -2926,8 +3118,8 @@ class MLForceFieldExtractor:
         valid_indices = []
         sample_frags = []  # list[list[(atoms, coords)]]
         
-        # 单分子超时时间（秒）
-        per_molecule_timeout = 30
+        # 单分子超时时间（秒）——交联产物可达 400+ 重原子，60s 给嵌入+MMFF 留足窗口
+        per_molecule_timeout = 60
 
         try:
             if n_jobs == 1:
@@ -2956,73 +3148,89 @@ class MLForceFieldExtractor:
                 fail_stats = {}  # 统计失败原因
 
                 ctx = mp.get_context('spawn')
-                # [Windows 安全修复] 钳制进程数避免 63 句柄上限崩溃
-                n_jobs = safe_worker_count(n_jobs)
-                pbar = tqdm(total=total, desc=f"3D Generation (spawn, {n_jobs} workers)")
+                # [关键修复] Windows spawn 子进程默认会重导入 Streamlit 页面脚本（__main__），
+                # 导致 worker 启动数十秒/崩溃 → 每个结果都等满 30s 超时（30s/it）。
+                # 必须在创建 Pool 前阻断重导入，否则 CUDA+多 worker 路径完全不可用。
+                prevent_spawn_main_reimport()
+                # [512核扩展] Windows 下 WaitForMultipleObjects 最多 63 句柄：
+                # 单池 worker 上限 60（含 2 个 queue reader 余量）。需要更多 worker 时
+                # 自动拆分为多个进程池并行（每池内部句柄数各自独立，互不越限）。
+                _PER_POOL_MAX = 60
+                n_jobs = safe_worker_count(n_jobs, cap_nt=240)  # 总量钳制（内存预算已在前限过）
+                n_pools = max(1, -(-n_jobs // _PER_POOL_MAX))
+                workers_per_pool = max(1, -(-n_jobs // n_pools))
+                pbar = tqdm(total=total,
+                            desc=f"3D Generation (spawn, {n_jobs} workers/{n_pools} pools)")
 
-                # 每批提交的任务数（控制内存峰值）
-                batch_chunk = n_jobs * 4
+                # 大量 worker 同时冷启动（import torch/rdkit）会互相争抢磁盘 I/O，
+                # 前 n_jobs 个结果允许更长的等待窗口，避免首批被 30s 超时误杀
+                cold_start_budget = min(120.0, per_molecule_timeout + n_jobs * 0.5)
 
+                pools = []
                 try:
-                    with ctx.Pool(processes=n_jobs, maxtasksperchild=50) as pool:
-                        for batch_start in range(0, total, batch_chunk):
+                    pools = [ctx.Pool(processes=workers_per_pool, maxtasksperchild=200)
+                             for _ in range(n_pools)]
+
+                    # 全量 round-robin 提交（SMILES 字符串极小，pickling 开销可忽略）
+                    per_pool_ars = [[] for _ in pools]
+                    for idx, smi in enumerate(smiles_list):
+                        pi = idx % n_pools
+                        per_pool_ars[pi].append(
+                            (idx, pools[pi].apply_async(_generate_3d_data_worker, (smi,)))
+                        )
+
+                    # 逐池收集（各池已在并行计算，收集顺序不影响总吞吐）
+                    fetched = 0
+                    for pi, ars in enumerate(per_pool_ars):
+                        for idx, ar in ars:
                             if is_cancelled():
                                 print("⏹️ 任务已取消")
                                 break
-
-                            batch_end = min(batch_start + batch_chunk, total)
-
-                            # 提交这一批任务
-                            async_results = []
-                            for idx in range(batch_start, batch_end):
-                                smi = smiles_list[idx]
-                                ar = pool.apply_async(_generate_3d_data_worker, (smi,))
-                                async_results.append((idx, ar))
-
-                            # 获取这一批的结果
-                            for idx, ar in async_results:
-                                if is_cancelled():
-                                    break
-                                try:
-                                    res = ar.get(timeout=per_molecule_timeout)
-                                    # 检查结果类型
-                                    if isinstance(res, dict) and 'error' in res:
-                                        # 失败，统计原因
-                                        error_type = res.get('error', 'unknown')
-                                        fail_stats[error_type] = fail_stats.get(error_type, 0) + 1
-                                        if len(error_samples) < 5:
-                                            error_samples.append({
-                                                'idx': idx,
-                                                'smiles': smiles_list[idx][:100] if idx < len(smiles_list) else 'N/A',
-                                                'error': error_type,
-                                                'details': res.get('reasons') or res.get('message', '')
-                                            })
-                                    elif res is not None and isinstance(res, list):
-                                        # 成功
-                                        results_dict[idx] = res
-                                except mp.TimeoutError:
-                                    timeout_count += 1
-                                    fail_stats['timeout'] = fail_stats.get('timeout', 0) + 1
-                                except Exception as e:
-                                    error_count += 1
-                                    fail_stats['exception'] = fail_stats.get('exception', 0) + 1
-                                    # 记录前5个错误样本用于调试
+                            timeout = cold_start_budget if fetched < n_jobs else per_molecule_timeout
+                            try:
+                                res = ar.get(timeout=timeout)
+                                # 检查结果类型
+                                if isinstance(res, dict) and 'error' in res:
+                                    # 失败，统计原因
+                                    error_type = res.get('error', 'unknown')
+                                    fail_stats[error_type] = fail_stats.get(error_type, 0) + 1
                                     if len(error_samples) < 5:
                                         error_samples.append({
                                             'idx': idx,
                                             'smiles': smiles_list[idx][:100] if idx < len(smiles_list) else 'N/A',
-                                            'error': 'exception',
-                                            'details': str(e)[:200]
+                                            'error': error_type,
+                                            'details': res.get('reasons') or res.get('message', '')
                                         })
-                                pbar.update(1)
-
-                        # 优雅关闭进程池
-                        pool.close()
-                        pool.join()
+                                elif res is not None and isinstance(res, list):
+                                    # 成功
+                                    results_dict[idx] = res
+                            except mp.TimeoutError:
+                                timeout_count += 1
+                                fail_stats['timeout'] = fail_stats.get('timeout', 0) + 1
+                            except Exception as e:
+                                error_count += 1
+                                fail_stats['exception'] = fail_stats.get('exception', 0) + 1
+                                # 记录前5个错误样本用于调试
+                                if len(error_samples) < 5:
+                                    error_samples.append({
+                                        'idx': idx,
+                                        'smiles': smiles_list[idx][:100] if idx < len(smiles_list) else 'N/A',
+                                        'error': 'exception',
+                                        'details': str(e)[:200]
+                                    })
+                            fetched += 1
+                            pbar.update(1)
 
                 except Exception as e:
                     print(f"⚠️ spawn 模式进程池错误: {e}")
                 finally:
+                    # 所有结果均已取出（或已取消/异常），统一终止回收全部进程池
+                    for _p in pools:
+                        try:
+                            _p.terminate()
+                            _p.join()
+                        except Exception:
+                            pass
                     pbar.close()
 
                 # 打印详细统计
@@ -3259,9 +3467,9 @@ class MLForceFieldExtractor:
 
 
 def _quick_ff_embed_mol(mol):
-    mol = Chem.AddHs(mol)
+    # [提速] 先嵌重原子骨架，再 AddHs(addCoords=True) 补氢（同 ANI worker：加氢后嵌入成本膨胀 4-8 倍）
     params = _get_etkdg_params()
-    for _attr, _val in [("useRandomCoords", True), ("numThreads", 1), ("maxAttempts", 50)]:
+    for _attr, _val in [("useRandomCoords", True), ("numThreads", 1)]:
         try:
             setattr(params, _attr, _val)
         except Exception:
@@ -3270,10 +3478,12 @@ def _quick_ff_embed_mol(mol):
     res = int(res) if res is not None else -1
     if res != 0:
         try:
-            res = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=100)
+            res = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=25)
         except Exception:
             res = -1
-    return mol if res == 0 else None
+    if res != 0:
+        return None
+    return Chem.AddHs(mol, addCoords=True)
 
 
 def _quick_ff_mmff_energy(mol, max_iters: int, do_minimize: bool):
@@ -3497,58 +3707,79 @@ class QuickForceFieldFeatureExtractor:
             total = len(smiles_list)
             timeout_count = 0
             error_count = 0
+            error_samples: list[str] = []  # 记录前几个异常，避免静默吞错无法诊断
             batch_size = max(1, n_jobs * 8)
             ctx = mp.get_context("spawn") if os.name == "nt" else mp.get_context("fork")
-            # [Windows 安全修复] 钳制进程数避免 63 句柄上限崩溃
-            n_jobs = safe_worker_count(n_jobs)
+            if os.name == "nt":
+                # 同上：阻断 spawn 子进程对 Streamlit 页面的重导入
+                prevent_spawn_main_reimport()
+            # [Windows 安全修复] 钳制进程数避免 63 句柄上限崩溃（单池上限 60）
+            n_jobs = safe_worker_count(n_jobs, cap_nt=60)
             pbar = tqdm(total=total, desc=f"Quick FF ({n_jobs} workers)")
-            for batch_start in range(0, total, batch_size):
-                if is_cancelled():
-                    break
-                batch_end = min(batch_start + batch_size, total)
-                batch_smiles = smiles_list[batch_start:batch_end]
-                pool = ctx.Pool(processes=n_jobs, maxtasksperchild=50)
-                async_results = []
-                for j, smi in enumerate(batch_smiles):
-                    ar = pool.apply_async(
-                        _quick_ff_worker,
-                        (
-                            smi,
-                            self.ff_mode,
-                            int(self.max_iters),
-                            bool(self.minimize),
-                            self.max_heavy_atoms,
-                            self.max_fragments,
-                            bool(self.keep_largest_fragment),
-                            self.skip_optimize_above_atoms,
-                        ),
-                    )
-                    async_results.append((batch_start + j, ar))
-                timed_out = False
-                for idx, ar in async_results:
-                    if is_cancelled():
-                        break
-                    try:
-                        feats = ar.get(timeout=per_timeout)
-                        if feats is not None:
-                            features_list.append(feats)
-                            valid_indices.append(idx)
-                    except mp.TimeoutError:
-                        timeout_count += 1
-                        timed_out = True
-                    except Exception:
-                        error_count += 1
-                    pbar.update(1)
-                if timed_out:
+            # [性能修复] 池跨批复用：原来每批(n_jobs*8 个分子)都新建+销毁进程池，
+            # Windows spawn 下每个 worker 冷启动 ~6s（import torch/rdkit 链），
+            # 405 分子 ≈ 7 批 × 8 worker = 56 次启动 ≈ 45s 纯开销。
+            # 现在整个提取只建一次池；仅当批内出现超时(worker 可能卡死)时
+            # terminate 并在下一批重建。maxtasksperchild 调大至 200 降低回收频率。
+            pool = None
+            try:
+                for batch_start in range(0, total, batch_size):
+                  if is_cancelled():
+                      break
+                  batch_end = min(batch_start + batch_size, total)
+                  batch_smiles = smiles_list[batch_start:batch_end]
+                  if pool is None:
+                      pool = ctx.Pool(processes=n_jobs, maxtasksperchild=200)
+                  async_results = []
+                  for j, smi in enumerate(batch_smiles):
+                      ar = pool.apply_async(
+                          _quick_ff_worker,
+                          (
+                              smi,
+                              self.ff_mode,
+                              int(self.max_iters),
+                              bool(self.minimize),
+                              self.max_heavy_atoms,
+                              self.max_fragments,
+                              bool(self.keep_largest_fragment),
+                              self.skip_optimize_above_atoms,
+                          ),
+                      )
+                      async_results.append((batch_start + j, ar))
+                  timed_out = False
+                  for idx, ar in async_results:
+                      if is_cancelled():
+                          break
+                      try:
+                          feats = ar.get(timeout=per_timeout)
+                          if feats is not None:
+                              features_list.append(feats)
+                              valid_indices.append(idx)
+                      except mp.TimeoutError:
+                          timeout_count += 1
+                          timed_out = True
+                      except Exception as _e:  # noqa: BLE001
+                          error_count += 1
+                          if len(error_samples) < 3:
+                              error_samples.append(f"#{idx} {type(_e).__module__}.{type(_e).__name__}: {_e}")
+                      pbar.update(1)
+                  if timed_out:
+                      # worker 可能已卡死：销毁整池，下一批重建干净池
+                      pool.terminate()
+                      pool.join()
+                      pool = None
+            finally:
+                # 所有结果均已取出（或已取消/异常），统一终止回收进程池
+                if pool is not None:
                     pool.terminate()
-                else:
-                    pool.close()
-                pool.join()
+                    pool.join()
             pbar.close()
             if timeout_count > 0:
                 print(f"⚠️ Quick FF: {timeout_count} 个分子超时，已跳过")
             if error_count > 0:
                 print(f"⚠️ Quick FF: {error_count} 个分子出错，已跳过")
+                for _s in error_samples:
+                    print(f"   ↳ {_s}")
         else:
             for idx, smi in enumerate(tqdm(smiles_list, desc="Quick FF")):
                 feats = self._calc_features(smi)
@@ -4791,7 +5022,10 @@ def extract_fingerprints(smiles_list, fp_type='MACCS', n_bits=2048, radius=2,
         prefix: 特征名前缀
     
     Returns:
-        DataFrame: 指纹特征
+        (DataFrame, valid_indices): 指纹特征 + 相对输入列表的有效行下标。
+        解析失败的 SMILES 行会被跳过，因此 DataFrame 行数可能小于输入行数，
+        调用方必须用 valid_indices 对齐回源数据行，否则会触发
+        feature contract violation（行数不一致）。
     """
     extractor = FingerprintExtractor()
     df, valid_indices = extractor.smiles_to_fingerprints(
@@ -4804,7 +5038,7 @@ def extract_fingerprints(smiles_list, fp_type='MACCS', n_bits=2048, radius=2,
     )
     if prefix:
         df = _add_prefix_to_columns(df, prefix)
-    return df
+    return df, valid_indices
 
 
 def extract_rdkit_descriptors(smiles_list, prefix=None):
@@ -4816,13 +5050,14 @@ def extract_rdkit_descriptors(smiles_list, prefix=None):
         prefix: 特征名前缀
     
     Returns:
-        DataFrame: RDKit 描述符特征
+        (DataFrame, valid_indices): RDKit 描述符特征 + 相对输入列表的有效行下标。
+        解析失败的 SMILES 行会被跳过，调用方必须用 valid_indices 对齐回源数据行。
     """
     extractor = RDKitFeatureExtractor()
     df, valid_indices = extractor.smiles_to_rdkit_features(smiles_list)
     if prefix:
         df = _add_prefix_to_columns(df, prefix)
-    return df
+    return df, valid_indices
 
 
 def extract_rdkit_descriptors_parallel(smiles_list, n_jobs=-1, batch_size=500, 
@@ -4848,7 +5083,7 @@ def extract_rdkit_descriptors_parallel(smiles_list, n_jobs=-1, batch_size=500,
     df, valid_indices = extractor.smiles_to_rdkit_features(smiles_list)
     if prefix:
         df = _add_prefix_to_columns(df, prefix)
-    return df
+    return df, valid_indices
 
 
 def extract_rdkit_descriptors_lowmem(smiles_list, batch_size=100, prefix=None):
@@ -4867,7 +5102,7 @@ def extract_rdkit_descriptors_lowmem(smiles_list, batch_size=100, prefix=None):
     df, valid_indices = extractor.smiles_to_rdkit_features(smiles_list)
     if prefix:
         df = _add_prefix_to_columns(df, prefix)
-    return df
+    return df, valid_indices
 
 
 def extract_mordred_descriptors(smiles_list, ignore_3D=True, batch_size=1000, n_jobs=None, prefix=None,
@@ -4899,7 +5134,7 @@ def extract_mordred_descriptors(smiles_list, ignore_3D=True, batch_size=1000, n_
     )
     if prefix:
         df = _add_prefix_to_columns(df, prefix)
-    return df
+    return df, valid_indices
 
 
 class FGDFeatureExtractor:

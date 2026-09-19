@@ -64,7 +64,10 @@ from .smiles_utils import convert_to_smiles, normalize_chemical_string, split_sm
 class TDAConfig:
     """TDA 特征配置"""
     maxdim: int = 2
-    thresh: Optional[float] = None
+    # [修复] ripser>=0.6 的 thresh 不接受 None（会抛 TypeError: must be real number, not NoneType），
+    # 而旧代码把异常静默吞掉 → 所有分子都返回退化的常数列（count=1，其余全 0）。
+    # 现固定为 np.inf（无阈值上界，由算法自行裁剪），非有限值会在计算前归一化。
+    thresh: Optional[float] = np.inf
     metric: str = "euclidean"
     max_points: Optional[int] = 200  # 限制最大原子数，加速 Ripser
     downsample_seed: int = 42
@@ -190,11 +193,21 @@ class PersistentHomologyFeatureExtractor:
             points = points[idx]
 
         # 运行 Ripser
+        # [修复] thresh 必须为实数；None/NaN 会导致 ripser 抛异常（旧代码静默吞掉后返回全零特征）
+        thresh_val = self.config.thresh
+        if thresh_val is None or not np.isfinite(np.asarray(thresh_val, dtype=float)):
+            thresh_val = np.inf
+        else:
+            thresh_val = float(thresh_val)
         try:
-            out = ripser(points, maxdim=self.config.maxdim, thresh=self.config.thresh, metric=self.config.metric)
+            out = ripser(points, maxdim=self.config.maxdim, thresh=thresh_val,
+                         metric=self.config.metric)
             dgms = out.get("dgms", [])
+            self._n_ripser_ok = getattr(self, "_n_ripser_ok", 0) + 1
         except Exception:
             # 极少数情况 (如共线点) ripser 可能失败，返回零特征
+            # [修复] 不再无限静默：累计失败计数，供调用方告警
+            self._n_ripser_fail = getattr(self, "_n_ripser_fail", 0) + 1
             dgms = []
 
         feat = {}
@@ -369,4 +382,16 @@ class PersistentHomologyFeatureExtractor:
         # 填充 NaN
         df = df.fillna(0.0)
         self.feature_names = df.columns.tolist()
+        # [修复] 失败率告警：旧 bug 下 100% 分子静默退化，调用方无从察觉
+        n_fail = getattr(self, "_n_ripser_fail", 0)
+        n_ok = getattr(self, "_n_ripser_ok", 0)
+        if n_fail > 0:
+            print(f"⚠️ TDA: {n_fail} 个分子 ripser 计算失败（成功 {n_ok} 个）")
+        # 退化检测：若所有行的拓扑寿命统计恒为 0，说明特征无信息
+        try:
+            _lif_cols = [c for c in df.columns if c.endswith("max") or c.endswith("sum")]
+            if _lif_cols and float(df[_lif_cols].abs().to_numpy().sum()) == 0.0:
+                print("⚠️ TDA: 所有分子的拓扑寿命均为 0（特征退化，请检查 thresh/点云生成）")
+        except Exception:
+            pass
         return df, valid_indices

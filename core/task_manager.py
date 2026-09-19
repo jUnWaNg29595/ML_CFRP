@@ -9,6 +9,7 @@
 """
 
 import os
+import sys
 import signal
 import atexit
 import threading
@@ -258,6 +259,12 @@ def ensure_emergency_stop_server() -> Dict[str, Any]:
         }
 
 
+#: 孤儿进程扫描的最小间隔（秒）。psutil 递归遍历子进程在 Windows 上约需 90ms，
+#: 而 render_task_manager_ui 每次 rerun 都会调用它。孤儿检测本身是辅助告警，
+#: 没有必要每次重绘都重算，节流后侧边栏开销从 ~88ms 降到 0（命中缓存时）。
+_ORPHAN_SCAN_MIN_INTERVAL_SEC = 10.0
+
+
 def _list_child_processes() -> List[Dict[str, Any]]:
     """Best-effort listing of child processes for orphan detection."""
     processes: List[Dict[str, Any]] = []
@@ -345,6 +352,8 @@ class BackgroundTaskManager:
         self._futures: Dict[str, List[Future]] = {}  # task_id -> futures
         self._task_counter = 0
         self._manager_lock = threading.RLock()
+        # 孤儿进程扫描节流缓存: (扫描时间, 结果)
+        self._orphan_cache: Optional[tuple] = None
         self._initialized = True
         
         # 清除之前的取消状态
@@ -570,7 +579,16 @@ class BackgroundTaskManager:
             ]
 
     def get_orphan_processes(self) -> List[Dict[str, Any]]:
-        """检测未注册的子进程（可能是后台遗留任务）"""
+        """检测未注册的子进程（可能是后台遗留任务）。
+
+        结果在 _ORPHAN_SCAN_MIN_INTERVAL_SEC 内复用（节流），避免每次 UI rerun
+        都做一次昂贵的 psutil 进程树遍历。孤儿进程是长期状态，节流不影响判断。
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_orphan_cache", None)
+        if cached is not None and (now - cached[0]) < _ORPHAN_SCAN_MIN_INTERVAL_SEC:
+            return list(cached[1])
+
         with self._manager_lock:
             registered_pids = set()
             for p in self._processes:
@@ -590,7 +608,12 @@ class BackgroundTaskManager:
             if pid in registered_pids:
                 continue
             orphans.append(info)
-        return orphans
+        self._orphan_cache = (now, orphans)
+        return list(orphans)
+
+    def invalidate_orphan_cache(self) -> None:
+        """强制下次重新扫描孤儿进程（终止/重置后调用）。"""
+        self._orphan_cache = None
 
     def terminate_orphan_processes(self, force: bool = False) -> Dict[str, Any]:
         """终止未注册子进程"""
@@ -605,6 +628,7 @@ class BackgroundTaskManager:
                 result["terminated"] += 1
             else:
                 result["errors"].append(f"terminate pid {pid} failed")
+        self.invalidate_orphan_cache()
         return result
     
     def get_all_tasks(self) -> List[TaskInfo]:
@@ -736,6 +760,7 @@ class BackgroundTaskManager:
             self._futures.clear()
             self._executors.clear()
             self._processes.clear()
+        self.invalidate_orphan_cache()
         clear_cancel()
 
 
@@ -991,17 +1016,53 @@ def safe_worker_count(n, cap_nt: int = 31) -> int:
     return n
 
 
+def prevent_spawn_main_reimport():
+    """
+    阻止 Windows spawn 子进程重导入 Streamlit 页面脚本（__main__）。
+
+    背景：Streamlit 运行页面时会把页面脚本装进 sys.modules['__main__']（带真实 __file__），
+    且每次 rerun 都会新建 module 对象。Windows 下 multiprocessing / ProcessPoolExecutor
+    默认用 spawn 方式，其 bootstrap 会根据 __main__.__file__ 把整个页面脚本作为
+    __mp_main__ 在每个子进程里重新执行一遍：页面顶层的 st.* 调用 / session_state /
+    重型 import 会导致子进程崩溃或耗时几十秒，表现为池内任务永远完不成、
+    所有结果等满超时（例如 ANI 3D 生成恒定 30s/it、ETA 数小时）。
+
+    原理：给 __main__ 设置一个 name 为 '__main__' 的 ModuleSpec，spawn 的
+    get_preparation_data 会转而记录 init_main_from_name='__main__'，而
+    _fixup_main_from_name 对 '__main__' 直接 return —— 子进程完全跳过页面重导入，
+    仅按需 unpickle 导入 core.* 模块级 worker 函数。
+
+    约束：传给进程池的可调用对象必须位于可导入模块（core.* 均满足），
+    不能是页面/交互环境里定义的闭包或局部函数。
+    本函数幂等、开销为零，必须在创建 spawn 池之前调用。
+    """
+    main_mod = sys.modules.get("__main__")
+    if main_mod is None:
+        return
+    if getattr(main_mod, "__spec__", None) is not None:
+        # 已有 spec（包入口/交互环境等），bootstrap 不会按 path 重导入，无需处理
+        return
+    try:
+        import importlib.machinery as _machinery
+        main_mod.__spec__ = _machinery.ModuleSpec("__main__", None)
+    except Exception:
+        pass  # 防御性：修复失败不应阻断主流程
+
+
 class CancellableProcessPoolExecutor(ProcessPoolExecutor):
     """支持取消功能的 ProcessPoolExecutor 包装器"""
 
-    # Windows WaitForMultipleObjects 硬限制 63 个句柄；每个 worker 至少占用
-    # 1 个句柄，64+ worker 会在 connection._exhaustive_wait 处抛
-    # "need at most 63 handles" 并崩溃。钳制到 31 保底安全。
-    _MAX_WORKERS_NT = 31
+    # Windows WaitForMultipleObjects 硬限制 63 个句柄；ProcessPoolExecutor 内部
+    # 等待 worker sentinels + queue reader，60 worker + ~2 reader < 63 安全
+    # （原钳制 31 过于保守，512 核服务器利用率太低）。
+    _MAX_WORKERS_NT = 60
 
     def __init__(self, *args, task_name: str = "并行任务", **kwargs):
         if os.name == "nt" and "max_workers" in kwargs and kwargs["max_workers"] is not None:
             kwargs["max_workers"] = max(1, min(int(kwargs["max_workers"]), self._MAX_WORKERS_NT))
+        # Windows spawn 子进程默认会重导入 Streamlit 页面脚本（__main__），
+        # 导致 worker 启动数十秒/崩溃 → 任务全部超时。见函数 docstring。
+        prevent_spawn_main_reimport()
         super().__init__(*args, **kwargs)
         self._task_manager = get_task_manager()
         self._task_id = self._task_manager.register_task(

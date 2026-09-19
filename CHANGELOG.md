@@ -7,13 +7,56 @@
 
 ## [Unreleased]
 
+### 性能
+- 【SHAP 分析】TabPFN 高维场景批量置换 SHAP 提速约 8-10×（实测 532 特征/500 样本从 ~25 分钟降至 ~2.5 分钟，RTX 级 GPU），无显存增量：
+  - 根因一：TabPFN 9.0 `n_estimators="auto"` 在特征数 > `max_features_per_estimator(500)` 时仍至少跑 8 个 ensemble 成员，每次 predict 行成本 ≈ 8 × 单成员前向（实测 532 特征 ~4ms/行 vs est=2 ~1.1ms/行）
+  - 根因二：置换 SHAP 的 coalition 行数 = 2M+1，M=532 时每样本 1065 行、500 样本共 53 万行
+  - `core/model_interpreter.py` 新增 `_create_fast_shap_predictor`：SHAP 期间每次 predict 前临时截断 executor 的 per-config 对齐列表（configs/pipelines/subsample_feature_indices/subsample_row_indices/pipeline_seeds/ensemble_members，兼容 OnDemand/CachePreprocessing/ExplicitKVCache 三种引擎）至前 2 个成员，用完 finally 恢复原值 —— 零额外显存（不克隆模型，避免双份权重/KV cache 驻留 GPU OOM），异常安全还原，实测 SHAP 后模型预测 bit 级一致；引擎结构不认识时回退原模型
+  - 新增 `_select_top_k_features`：先用 LightGBM（回退 ExtraTrees）在训练集上选出 top-120 特征，仅对它们做精确置换，其余列固定为背景值（coalition 行数 1065→241，约 4.4×）；未被选中列 SHAP 记 0，对 beeswarm/bar 的 top-N 展示无影响
+  - `_compute_batched_permutation_shap` 支持 `predict_fn` / `top_feature_idx` 参数：top-K 模式在 chunk 级别把 K 列工作子矩阵散射回 M 列全特征矩阵后再送预测器；置换轮数预算按实际状态数折算；一致性检查改为打印 f(全集coalition)−(Σφ+base)（top-K 模式下该残差含未解释列在背景值处的联合贡献，属预期）
+  - 保真度实测：est=2 vs est=8 的置换 SHAP 特征重要性排序 Spearman≈0.89、top-10 重叠 9/10、top-8 排名完全一致；端到端合成数据（532 特征，前 6 信号列）全部进入 top-6
+  - 回归测试 `tests/test_batched_permutation_shap.py` 新增 5 例（top-K 解析解/守恒残差/分块不变性/非 TabPFN 直通/低维不启用）
+
 ### 修复
+- 侧边栏「📥 数据导出」第一次能导出，折叠面板后重新打开（或切换格式/勾选“包含索引”后再点下载）时点下载无反应/无法导出表格：
+  - 根因：`st.download_button` 的媒体文件 id 由 `内容 + mimetype + 文件名` 三者哈希得到（`MemoryMediaFileStorage._calculate_file_id`），且文件名里的时间戳也参与 download_button 元素 id。导出载荷缓存原本是**进程级单条目**，任何一次驱逐都会让下次重跑重新生成时间戳 → 文件名变化 → 产生新的媒体文件；旧媒体文件成为孤儿后被 Streamlit 按 DOWNLOADABLE 两阶段回收（第一次 sweep 标记、第二次 sweep 删除），浏览器已持有的下载链接随即 404
+  - 触发驱逐的两个必然场景：① 缓存是进程全局的，**另一会话/用户**导出一次即把本会话条目挤掉；② 「状态条记录」页 tab2 仍以 `key_prefix=""` 调用同一面板，与侧边栏面板（`key_prefix="sb_"`）**同时渲染时互相挤占条目**，导致每次重跑双双 miss
+  - 实测复现（真实 app + WebSocket 协议驱动）：反复切换“包含索引”后，同样设置（CSV/索引关）得到的 URL 从 `802e981e…` 变为 `0efc406c…`，且旧 URL `HTTP=404`
+  - `core/fe_tracker.py`：`_build_export_payload` 缓存改为**会话级多条目**（存 `st.session_state`，随会话生灭，上限 8 条 FIFO），不再跨会话/跨面板互相驱逐；缓存键把原来只看末列名的探针升级为 `形状+全部列名+全部 dtype+索引端点` 的进程内哈希（实测 607/1248 列 ~0.1-0.2ms，不影响侧边栏重跑预算），可捕捉列增删/改名/类型变化；`ts` 与 payload 绑定存储，只有 payload 真正重建时时间戳才更新，同一份数据同一格式在多次重跑之间文件名保持不变
+  - `st.download_button` 三个分支补上显式稳定 `key`（`{prefix}export_dl_csv/xlsx/json`）：带 key 时 Streamlit 的 `key_as_main_identity` 会把 file_name 从元素 id 中剔除，数据变化时只更新 url、不再销毁重建控件
+  - 回归测试 `tests/test_data_export_panel_stability.py`（9 项）：同数据同格式文件名跨重跑稳定、插入其它格式/其它数据/双面板交替后文件名不变、缓存会话级且有界、数据替换后载荷与时间戳刷新、AppTest 驱动真实面板验证 download_button 元素 id 不随数据变化而 URL 更新；修复前的单条目全局实现在跨秒重跑场景下前 4 项全部失败（已用可控时钟 A/B 验证）
+- 批量特征提取报 `feature contract violation: feature row count does not match valid-row indices (953 != 954)`（如 resin_1_structure 列，分子指纹/RDKit 描述符/Mordred 方法）：
+  - 根因：`extract_fingerprints` 等便捷函数内部会跳过解析失败的 SMILES 行（如七元芳环 BigSMILES，repair 链也修不了），返回的特征 DataFrame 行数（953）小于输入有效行数（954），但便捷函数丢弃了内部 valid_indices，批量循环误以为返回行数与全部有效行一一对应，contract 校验行数不一致后中断整列提取
+  - `core/molecular_features.py`：`extract_fingerprints` / `extract_rdkit_descriptors` / `extract_rdkit_descriptors_parallel` / `extract_rdkit_descriptors_lowmem` / `extract_mordred_descriptors` 五个便捷函数改为返回 `(df, valid_indices)`（与底层 extractor 一致，不再丢弃有效行下标）
+  - `app_lib.py` 批量循环：上述五个分支接收 `sub_valid_idx` 并映射回源行 `extracted_valid_indices = [valid_indices[i] for i in sub_valid_idx]`，与 3D构象/TDA/xTB/GNN 等分支处理模式对齐；解析失败行回填 NaN，不再中断整个批处理
+  - 回归验证脚本 `scripts/verify_fingerprint_fix.py`：954 行含 1 条七元芳环无效 SMILES，contract 校验通过、失败行回填 NaN、批处理不中断
+- TabPFN 不可用（`ModuleNotFoundError` / 首次训练时 HuggingFace 下载失败）：
+  - `CFRP_env` 安装 `tabpfn==9.0.0`（满足 requirements 的 `tabpfn>=0.1.9`，API 兼容 `TabPFNRegressor` + `model_path`/`ignore_pretraining_limits` 等参数集）
+  - tabpfn 9.x 默认模型 v3.5（`Prior-Labs/tabpfn_3_5`）为 gated 仓库，且其许可检查硬编码 `huggingface.co` API（不遵循 `HF_ENDPOINT`），国内网络下必然抛 `TabPFNHuggingFaceGatedRepoError`；项目代码本就优先探测本地 v3 权重（`core/model_trainer.py` 的 local_candidates），故手动从 hf-mirror.com 镜像下载非 gated 的 v3 回归权重（233MB）至 `%APPDATA%\Roaming\tabpfn\tabpfn-v3-regressor-v3_default.ckpt`（与 tabpfn 默认缓存目录及项目探测路径一致），此后 fit/predict 完全离线、不再触发任何在线许可检查
+  - 端到端验证通过（CPU fit+predict）；若日后缓存被清，可重新执行：`curl -L -o "%APPDATA%\\Roaming\\tabpfn\\tabpfn-v3-regressor-v3_default.ckpt" https://hf-mirror.com/Prior-Labs/tabpfn_3/resolve/main/tabpfn-v3-regressor-v3_default.ckpt`
 - 模型训练页：点击下载按钮（训练结果 PNG/CSV、导出模型等）或任意控件后整页重跑，导致训练结果区（指标卡/图表/表格/各类下载按钮）整体消失，"点一下下载其他按钮都不见了"：
   - 将手动训练结果渲染逻辑提取为 `_render_manual_training_results(res, cv_res, persist_run)`；训练完成时以 `persist_run=True` 调用（含保存训练记录、自动导出模型、内存清理等副作用），任何交互触发整页重跑后自动以 `persist_run=False` 恢复渲染（零副作用，不重复保存训练记录/不重复导出模型）
   - 分类模型结果区同理：`_render_binary_classification_results` 新增 `persist_run` 参数，重跑恢复时跳过训练记录落盘
   - 顺带修复：结果渲染代码引用了页面作用域从未定义的 `feature_cols`，NameError 被外层 `except` 静默吞掉，导致 parity/residual 图从未写入训练记录 extra_figs；现在显式从 session_state 取值
 
 ### 性能
+- 【分子特征】页首屏从 1.01s 降至 0.016s（中位数，约 63×），根因是 Streamlit `st.expander` **无论是否展开都会执行内部代码**：
+  - 两个「折叠态」重面板每次 rerun 都要完整构建，其中 `core/formulation_fusion_ui` 会重读 20MB 母宽表 `ml_wide_samples.csv`（10749×1248），实测单次 0.7~1.1s，占首屏 ~98% 耗时
+  - `app_lib.py` 新增 `render_lazy_panel(label, key, builder, hint)`：`st.toggle` + 仅在展开时调用 builder，未展开时面板代码完全不执行；分子特征页的「跨表配方数据融合工具」与「高分子物理指数」改为按需构建，并补充未展开时的功能提示
+  - `core/formulation_fusion_ui.py` 新增 `read_csv_cached()`（`st.cache_data` + 文件指纹 `mtime_ns`/`size`）：展开面板后首次读盘 0.78s，命中缓存 0.18s，文件被改写自动失效；窄表/母宽表读盘统一走该函数
+  - `app_lib._detect_smiles_cols_smart`：宽表下预筛 object 列 + 预编译正则替代「每样本 9 次 `in` 检查 + 多次 `replace`」，7000×1205 数据下页面主体从 0.35s 降至 0.06s
+  - 修复 `page_molecular_features` 内三处 `import re`：函数内 import 会让 `re` 在整个函数作用域变成局部变量，导致上方 `re.compile` 抛 `UnboundLocalError`（模块级已有 `import re`）
+- 侧边栏每次 rerun 固定 ~88ms 开销：`BackgroundTaskManager.get_orphan_processes` 用 psutil 递归遍历子进程树（Windows 约 88~95ms），而 `render_task_manager_ui` 每次 rerun 都调用；加 10s 节流缓存 + `invalidate_orphan_cache()`（终止/重置后失效），侧边栏降至 ~0.08s
+- 新增回归测试 `tests/test_molecular_features_page_perf.py`（首屏不读母宽表、首屏耗时预算、展开后才构建、折叠回去零成本、缓存命中与文件改写失效、`render_lazy_panel` 返回值语义）
+- 新增基准脚本 `tools/bench_molecular_features_page.py`（脚本内计时 + read_csv 追踪；注意 cProfile 包 `AppTest.run()` 只会抓到测试框架的 sleep 轮询，无法定位真实瓶颈）
+- 【分子特征】页交互卡顿（点击选择框/复选框后卡）已修复：提取完成后工作区常有上千列指纹特征，`_render_extracted_features_panel` 的 `st.dataframe(features_df.head(20))` 会把**全部列**转成 Arrow 并在**每次交互 rerun** 重发给浏览器：
+  - 实测交互 rerun：2000 列 → 脚本 0.87s / 负载 801KB；6474×3000 → 0.94s / 1.2MB
+  - 新增 `core/preview_ui.py` 的 `render_capped_preview()`：默认只渲染前 40 列（约 31KB / <2ms），其余列通过**按需展开**的列选择器查看（选择器本身也延迟构建，否则上千个列名同样拖慢页面）；列数不超过上限时行为与直接 `st.dataframe` 一致
+  - 分子特征页两处预览（已提取特征面板、批量提取预览）与 `core/formulation_fusion_ui` 的融合结果预览（紧凑 70-80 列 / 全息 300-450 列 / 原始 1248 列）全部改用它
+  - 修复后交互 rerun：负载 0.031MB（-96%）、脚本 0.029s（-97%），且与表宽解耦（6474×3000 同样是 31KB）
+  - 预览列数**未被牺牲**：展开“自定义要预览的列”可访问全部列并支持搜索
+- 新增回归测试（`tests/test_molecular_features_page_perf.py`，共 12 项）：宽表交互负载预算、交互脚本耗时预算、预览默认截断列、自定义列选择仍生效；已确认这 4 项在修复前的代码上全部失败、修复后全部通过
+- 新增交互基准脚本 `tools/bench_molecular_features_interaction.py`：在脚本线程内同时采集「脚本耗时」与「发给浏览器的 delta 负载」
 - TabPFN 等黑盒模型 SHAP 提速约两个数量级（实测 200 样本默认参数从外推 ~53 分钟降至 ~22 秒，RTX 2080 Ti）：
   - 新增「跨样本批量置换 SHAP」快速路径（`core/model_interpreter.py`）：每个样本每轮置换仅需 2M+1 次评估，并把一批样本的 coalition 行合并成少量大 batch 一次性调用 `model.predict`，避免 KernelExplainer 逐样本、每次都重跑 TabPFN 完整训练上下文前向（含 8 个 ensemble 成员）的开销
   - 适用于 TabPFN、TabNet、FT-Transformer、人工神经网络、BNN/Transformer 系列等无专用 Explainer 的黑盒模型；失败时自动回退到原 KernelExplainer 路径

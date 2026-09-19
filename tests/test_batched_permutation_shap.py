@@ -105,3 +105,76 @@ def test_non_blackbox_models_do_not_take_fast_path():
 
 def test_blackbox_model_registry_contains_tabpfn():
     assert "TabPFN" in BATCHED_PERMUTATION_MODELS
+
+
+# ---------------------------------------------------------------------------
+# [性能优化 2026-09] top-K 特征筛选 + TabPFN 降级预测器的回归测试
+# ---------------------------------------------------------------------------
+
+def test_batched_shap_topk_mode_matches_analytic_solution_on_selected_cols():
+    """top-K 模式：被选中的列保持解析解 φ_i = w_i (x_i − bg_i)，未选中列记 0。"""
+    rng = np.random.default_rng(6)
+    M, K = 40, 12
+    w = rng.normal(size=M)
+    interp = _build_interpreter(w, n_test=15, M=M)
+    top_idx = np.arange(K)  # 任意选前 K 列
+    shap_values, _ = interp._compute_batched_permutation_shap(
+        interp.X_test, n_permutations=8, top_feature_idx=top_idx
+    )
+    bg_row = interp._resolve_background_row(np.random.default_rng(42))
+    X = interp.X_test.to_numpy()
+
+    assert shap_values.shape == (len(X), M)
+    # 未选中列 SHAP 必须严格为 0（在 coalition 中恒为背景）
+    assert np.all(shap_values[:, K:] == 0.0)
+    # 选中列与解析解一致（独立特征 + 线性模型 ⇒ 无交互项）
+    expected = (X[:, :K] - bg_row[None, :K]) * w[None, :K]
+    rel_err = np.max(np.abs(shap_values[:, :K] - expected)) / np.max(np.abs(expected))
+    assert rel_err < 0.02
+
+
+def test_batched_shap_topk_consistency_gap_equals_unexplained_contribution():
+    """top-K 模式的一致性残差 = 未解释列脱离背景的联合贡献（可精确验证）。"""
+    w = np.random.default_rng(7).normal(size=30)
+    interp = _build_interpreter(w, n_test=10, M=30)
+    bg_row = interp._resolve_background_row(np.random.default_rng(42))
+    top_idx = np.arange(10)
+    shap_values, base_values = interp._compute_batched_permutation_shap(
+        interp.X_test, n_permutations=4, top_feature_idx=top_idx
+    )
+    X = interp.X_test.to_numpy()
+    full_pred = interp.model.predict(X)
+    resid = full_pred - (shap_values.sum(axis=1) + base_values)
+    # 未选列固定在背景 → 残差 = Σ_{i∉top} w_i (x_i − bg_i)
+    expected_gap = (X[:, 10:] - bg_row[None, 10:]) @ w[10:]
+    assert np.max(np.abs(resid - expected_gap)) < 1e-8
+
+
+def test_batched_shap_topk_invariant_to_chunking():
+    """top-K 模式同样对 chunk/batch 参数不变。"""
+    w = np.random.default_rng(8).normal(size=18)
+    interp = _build_interpreter(w, n_test=12, M=18)
+    top_idx = np.arange(10)
+    tiny, _ = interp._compute_batched_permutation_shap(
+        interp.X_test, n_permutations=3, chunk_rows=17, batch_rows_cap=40,
+        random_state=42, top_feature_idx=top_idx,
+    )
+    huge, _ = interp._compute_batched_permutation_shap(
+        interp.X_test, n_permutations=3, chunk_rows=10**6, batch_rows_cap=10**9,
+        random_state=42, top_feature_idx=top_idx,
+    )
+    assert np.max(np.abs(tiny - huge)) < 1e-9
+
+
+def test_create_fast_shap_predictor_passthrough_non_tabpfn():
+    """非 TabPFN 黑盒不做降级，原样返回模型自身的 predict。"""
+    w = np.random.default_rng(9).normal(size=8)
+    interp = _build_interpreter(w, M=8)
+    assert interp._create_fast_shap_predictor() == interp.model.predict
+
+
+def test_select_top_k_features_disabled_for_low_dim():
+    """特征数低于阈值时不启用 top-K（返回 None）。"""
+    w = np.random.default_rng(10).normal(size=20)
+    interp = _build_interpreter(w, M=20)
+    assert interp._select_top_k_features(20) is None

@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import hashlib
 import inspect
 import math
 import os
 import platform
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -30,6 +32,7 @@ import pandas as pd
 from sklearn.base import BaseEstimator, RegressorMixin
 
 from .missing_value_handler import MissingValueHandler, build_missing_mask
+from . import crosslink_physics as xphy
 
 try:
     import torch
@@ -137,6 +140,10 @@ def _infer_mode(mode: str, target_name: Optional[str]) -> str:
     t = (target_name or "").strip().lower()
     if "tg" in t:
         return "tg"
+    # 热稳定类目标（td5/td10/td50/tmax/char yield）：不走 DiBenedetto tg 分支，
+    # 交联密度读出头将在后续版本接入 thermal 模式
+    if any(k in t for k in ("td5", "td10", "td50", "tmax", "decomposition", "thermal_stability", "char_yield")):
+        return "thermal"
     if "modulus" in t or "young" in t or "elastic" in t:
         return "mechanics"
     return "generic"
@@ -185,6 +192,11 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         missing_value_strategy: str = "bayesian",
         missing_imputer_max_iter: int = 15,
         missing_n_imputations: int = 5,
+        crosslink_physics_weight: float = 0.1,
+        nu_column: str = "",
+        nu_encoder_path: str = "",
+        use_polymer_physics: bool = True,
+        polymer_physics_features: str = "",
     ):
         self.mode = mode
         self.target_name = target_name
@@ -206,6 +218,14 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         self.missing_value_strategy = missing_value_strategy
         self.missing_imputer_max_iter = missing_imputer_max_iter
         self.missing_n_imputations = missing_n_imputations
+        # ν（交联密度）中间层：辅助监督权重与实测 ν 列名（空=自动探测 crosslink_density_mol_m3）
+        # nu_encoder_path：阶段1冻结的 ν 嵌入模型路径（空=自动发现 models/crosslink_nu_encoder.joblib）
+        self.crosslink_physics_weight = crosslink_physics_weight
+        self.nu_column = nu_column
+        self.nu_encoder_path = nu_encoder_path
+        # 高分子物理指数（芳香度/sp3/柔性/BDE/内聚能）——从结构 SMILES 零标签计算
+        self.use_polymer_physics = bool(use_polymer_physics)
+        self.polymer_physics_features = polymer_physics_features
 
         # fitted attrs
         self._mode_: Optional[str] = None
@@ -213,6 +233,13 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         self._model_: Optional[nn.Module] = None
         self._device_: str = "cpu"
         self._missing_handler_: Optional[MissingValueHandler] = None
+        # ν 中间层状态
+        self._nu_active_: bool = False
+        self._nu_ch_: int = -1          # ν 残差 logit 通道索引
+        self._nu_param_ch_: int = -1    # 斜率/K 通道索引（tg: Fox–Loshaek K；thermal/generic: ν 斜率）
+        self._log_nu_ref_: float = float(np.log(2000.0))
+        self._log_mc_ref_: float = float(np.log(2000.0))
+        self._nu_encoder_ = None        # 阶段1冻结编码器（CrosslinkNuEncoder 或 None）
 
         # special column names
         self._col_r_: Optional[str] = None
@@ -235,12 +262,22 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         return "cuda" if torch.cuda.is_available() else "cpu"
 
     def _identify_special_columns(self, df: pd.DataFrame):
-        cols = set(df.columns)
+        cols = list(df.columns)
 
-        for c in ["r_value", "stoich_ratio", "stoichiometric_ratio", "Stoich_Ratio", "StoichRatio"]:
-            if c in cols:
-                self._col_r_ = c
-                break
+        # 化学计量比列识别：正则候选覆盖 formulation_r_value / *_equivalent_ratio 等实际命名。
+        # alpha_max_from_r 对 r 与 1/r 对称，因此 equivalent_ratio 类列物理上等价可用。
+        r_candidates: List[Tuple[int, str]] = []
+        for c in cols:
+            cl = str(c).strip().lower()
+            if cl == "r_value" or cl.endswith("_r_value"):
+                r_candidates.append((0, c))  # 显式 r_value 优先
+            elif "equivalent_ratio" in cl:
+                r_candidates.append((1, c))
+            elif "stoich" in cl:
+                r_candidates.append((2, c))
+        if r_candidates:
+            r_candidates.sort(key=lambda t: (t[0], len(t[1])))
+            self._col_r_ = r_candidates[0][1]
 
         for c in ["r_confidence", "R_confidence", "stoich_confidence"]:
             if c in cols:
@@ -260,7 +297,17 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                 self._col_is_nf_ = c
                 break
 
-    def _build_numeric_features(self, df_raw: pd.DataFrame) -> pd.DataFrame:
+    # 非数值文本列黑名单：结构/标识/测试条件等语义列，绝不允许被 parse_first_number 污染成假数值。
+    # _ALWAYS_DROP：分子结构标识列 → 永远直接剔除（结构信息由外部分子特征管线负责）。
+    # 其余黑名单列：低基数(≤12)→ one-hot；高基数 → 直接剔除。
+    _TEXT_COLS_ALWAYS_DROP = ("structure", "smiles", "inchi", "bigsmiles")
+    _TEXT_COL_BLACKLIST = (
+        "_method", "_atmosphere", "_standard", "mechanism", "_formula",
+        "_source", "_basis", "_unit", "layup", "铺层", "工艺路线", "结构",
+        "test_method", "specimen",
+    )
+
+    def _build_numeric_features(self, df_raw: pd.DataFrame, fit_categoricals: bool = False) -> pd.DataFrame:
         df = df_raw.copy()
 
         drop_text_cols = set()
@@ -269,16 +316,55 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         if self._col_r_conf_ is not None:
             drop_text_cols.add(self._col_r_conf_)
 
-        # [修复开始] ------------------------------------------------
-        for c in df.columns:
-            # 只有当列名为字符串，包含 smiles/inchi，且数据类型 **不是** 数值型时，才认为是原始文本列进行剔除
-            if isinstance(c, str) and ("smiles" in c.lower() or "inchi" in c.lower()):
-                if not pd.api.types.is_numeric_dtype(df[c]):
-                    drop_text_cols.add(c)
-        # [修复结束] ------------------------------------------------
+        onehot_frames: List[pd.DataFrame] = []
+        if fit_categoricals:
+            cat_levels: Dict[str, List[str]] = {}
+        else:
+            cat_levels = dict(getattr(self, "_cat_levels_", {}) or {})
+
+        for c in list(df.columns):
+            if not isinstance(c, str) or pd.api.types.is_numeric_dtype(df[c]):
+                continue
+            cl = c.lower()
+            # 分子结构标识列：无论基数大小永远剔除，禁止 one-hot / parse_first_number
+            if any(p in cl for p in self._TEXT_COLS_ALWAYS_DROP):
+                drop_text_cols.add(c)
+                continue
+            # 历史逻辑保留：明确含 smiles/inchi 的非数值列直接剔除
+            if "smiles" in cl or "inchi" in cl:
+                drop_text_cols.add(c)
+                continue
+            # 黑名单语义列：禁止落入 parse_first_number
+            if any(p in cl for p in self._TEXT_COL_BLACKLIST):
+                drop_text_cols.add(c)
+                s = df[c].astype(str)
+                nuniq = int(s.nunique(dropna=True))
+                if 2 <= nuniq <= 12:
+                    if fit_categoricals:
+                        levels = sorted(s.dropna().unique().tolist())[:12]
+                        cat_levels[c] = levels
+                    else:
+                        levels = cat_levels.get(c)
+                        if not levels:
+                            continue
+                    cat_idx = pd.Categorical(
+                        s.where(s.isin(levels), other="__other__"),
+                        categories=list(levels) + ["__other__"],
+                    )
+                    dummies = pd.get_dummies(cat_idx, prefix=c, dtype=float)
+                    # 关键：pd.get_dummies(Categorical) 返回 RangeIndex，必须回填原索引，
+                    # 否则 concat(axis=1) 按索引对齐会导致行膨胀/错位（非连续索引输入时）
+                    dummies.index = df.index
+                    onehot_frames.append(dummies)
+                # 高基数（如 SMILES 结构列）或常数列：直接剔除
+                continue
 
         if drop_text_cols:
             df = df.drop(columns=[c for c in drop_text_cols if c in df.columns], errors="ignore")
+        if onehot_frames:
+            df = pd.concat([df] + onehot_frames, axis=1)
+        if fit_categoricals:
+            self._cat_levels_ = cat_levels
 
         # 尝试将剩余的 object 列转为数值（处理混杂的字符串）
         for c in df.columns:
@@ -321,6 +407,9 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             )
 
         X_raw = df_num.to_numpy(dtype=float)
+        # 记录插补器拟合时的完整列集合：后续 _transform 需要先展开到同一列集再插补
+        # （下方会剔除常数列，但插补器是按全列拟合的，直接喂子集会列数不匹配）
+        self._imputer_feature_names_ = list(df_num.columns)
         self._missing_handler_ = MissingValueHandler(
             strategy=self.missing_value_strategy,
             random_state=self.seed,
@@ -357,6 +446,14 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         std = np.where(std < 1e-8, 1.0, std)
         return _PreprocessPack(feature_names=feature_names, median=median, mean=mean, std=std)
 
+    def _df_cache_key(self, df_raw: pd.DataFrame) -> Optional[str]:
+        """数据内容指纹，用于 _transform 结果缓存（相同 DataFrame 直接复用插补/标准化结果）。"""
+        try:
+            h = pd.util.hash_pandas_object(df_raw, index=True).to_numpy(dtype=np.int64)
+            return hashlib.md5(h.tobytes()).hexdigest()
+        except Exception:
+            return None
+
     def _transform(
         self,
         df_raw: pd.DataFrame,
@@ -366,6 +463,15 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             raise RuntimeError("Model is not fitted yet.")
         if self._missing_handler_ is None:
             raise RuntimeError("Missing-value handler is not fitted yet.")
+
+        # ---- 结果缓存：fit 内部 + predict(train)/predict(test) 的重复变换直接命中 ----
+        cache: "OrderedDict[str, Tuple[np.ndarray, Dict[str, np.ndarray], np.ndarray]]" = getattr(
+            self, "_transform_cache_", None
+        )
+        key = self._df_cache_key(df_raw)
+        if cache is not None and key is not None and key in cache:
+            x_out, aux_c, mask_c = cache[key]
+            return (x_out, aux_c, mask_c) if return_missing_mask else (x_out, aux_c)
 
         n = len(df_raw)
         aux: Dict[str, np.ndarray] = {}
@@ -406,21 +512,56 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         aux["Ef"] = Ef.astype(np.float32)
         aux["rho_f"] = rho_f.astype(np.float32)
 
+        # ν（交联密度）物理基线量：理论 ν 与 Mc（log 空间，供潜变量残差与 Fox–Loshaek 使用）
+        xl = xphy.compute_crosslink_features(df_raw)
+        if len(xl.columns) > 0:
+            nu_th = xl["xl_nu_theory_mol_m3"].to_numpy(dtype=float)
+            mc = xl["xl_Mc_g_mol"].to_numpy(dtype=float)
+        else:
+            nu_th = np.full(n, np.nan)
+            mc = np.full(n, np.nan)
+        aux["log_nu_theory"] = np.where(
+            np.isfinite(nu_th) & (nu_th > 0), np.log(nu_th), np.nan
+        ).astype(np.float32)
+        aux["log_Mc"] = np.where(
+            np.isfinite(mc) & (mc > 0), np.log(mc), np.nan
+        ).astype(np.float32)
+        aux["alpha_gel"] = xl["xl_alpha_gel"].to_numpy(dtype=np.float32) if "xl_alpha_gel" in xl.columns else np.full(n, np.nan, dtype=np.float32)
+        aux["alpha_max"] = xl["xl_alpha_max"].to_numpy(dtype=np.float32) if "xl_alpha_max" in xl.columns else np.full(n, np.nan, dtype=np.float32)
+
         df_num = self._build_numeric_features(df_raw)
 
-        for c in self._prep_.feature_names:
+        # 展开到插补器拟合时的完整列集合（缺失列补 NaN，多余列丢弃）
+        full_cols = list(getattr(self, "_imputer_feature_names_", None) or self._prep_.feature_names)
+        for c in full_cols:
             if c not in df_num.columns:
                 df_num[c] = np.nan
-        df_num = df_num[self._prep_.feature_names].copy()
+        df_num = df_num[full_cols].copy()
 
         X = df_num.to_numpy(dtype=float)
         missing_mask = build_missing_mask(X)
         X = np.where(np.isfinite(X), X, np.nan)
         X = self._missing_handler_.transform(X)
 
+        # 仅保留非常数特征子集（与 _prep_.feature_names 对齐）再做标准化
+        prep_names = list(self._prep_.feature_names)
+        if prep_names != full_cols:
+            keep_idx = [full_cols.index(c) for c in prep_names]
+            X = X[:, keep_idx]
+            missing_mask = missing_mask[:, keep_idx]
+
         X = (X - self._prep_.mean) / self._prep_.std
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         X_out = X.astype(np.float32)
+
+        if cache is not None and key is not None:
+            try:
+                cache[key] = (X_out, aux, missing_mask.astype(np.float32))
+                while len(cache) > 2:
+                    cache.popitem(last=False)
+            except Exception:
+                pass
+
         if return_missing_mask:
             return X_out, aux, missing_mask.astype(np.float32)
         return X_out, aux
@@ -428,14 +569,21 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
     def _uses_missing_mask(self) -> bool:
         return False
 
+    def _output_dim_for(self, mode: str) -> int:
+        """输出通道布局：基座通道 + (ν 残差 logit + 物理参数通道)。Transformer 子类共用。"""
+        if mode == "tg":
+            base = 5  # [0]直接 | [1]Tg0 | [2]ΔTg | [3]λ | [4]α
+        elif mode == "mechanics":
+            base = 2  # [0]Em | [1]ξ
+        else:
+            base = 1  # [0]直接
+        if self._nu_active_:
+            base += 2  # [base]=ν 残差 logit, [base+1]=物理参数(斜率或 K)
+        return base
+
     def _make_model(self, input_dim: int) -> nn.Module:
         mode = self._mode_ or "generic"
-        if mode == "tg":
-            out_dim = 4
-        elif mode == "mechanics":
-            out_dim = 2
-        else:
-            out_dim = 1
+        out_dim = self._output_dim_for(mode)
         return _MLP(input_dim=input_dim, hidden_dim=int(self.hidden_dim), n_layers=int(self.n_layers),
                     dropout=float(self.dropout), out_dim=out_dim)
 
@@ -444,6 +592,9 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             raise ImportError("EpoxyPINNRegressor 需要 torch，请先安装 torch>=2.1.0")
 
         _set_seed(int(self.seed))
+
+        # 新一轮 fit 清空 transform 缓存（插补器/预处理全部重建）
+        self._transform_cache_ = OrderedDict()
 
         if isinstance(X, pd.DataFrame):
             df_raw = X.copy()
@@ -456,6 +607,16 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         if valid.sum() < 20:
             raise ValueError("有效样本过少（<20），请检查目标列是否包含大量缺失/非数值。")
         df_raw = df_raw.iloc[valid].reset_index(drop=True)
+
+        # 高分子物理指数自动注入（零标签；幂等；无结构列时静默跳过）
+        try:
+            from .polymer_physics import augment_polymer_physics
+            _pf = [s.strip() for s in (self.polymer_physics_features or "").split(",") if s.strip()]
+            df_raw = augment_polymer_physics(
+                df_raw, features=_pf or None, enabled=bool(self.use_polymer_physics)
+            )
+        except Exception:
+            pass
         y_arr = y_arr[valid]
 
         # 防御：目标变量几乎为常数时，任何模型都只能学到常数输出
@@ -467,7 +628,16 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
 
         self._identify_special_columns(df_raw)
 
-        df_num = self._build_numeric_features(df_raw)
+        # ---- ν 实测列：从特征中剥离（防泄漏），作为 ν 潜变量的辅助监督 ----
+        nu_col = (self.nu_column or "").strip()
+        if not nu_col:
+            nu_col = "crosslink_density_mol_m3" if "crosslink_density_mol_m3" in df_raw.columns else ""
+        nu_measured = None
+        if nu_col and nu_col in df_raw.columns:
+            nu_measured = pd.to_numeric(df_raw[nu_col], errors="coerce").to_numpy(dtype=float)
+            df_raw = df_raw.drop(columns=[nu_col])
+
+        df_num = self._build_numeric_features(df_raw, fit_categoricals=True)
         self._prep_ = self._fit_preprocess(df_num)
 
         X_scaled, aux, missing_mask = self._transform(df_raw, return_missing_mask=True)
@@ -489,11 +659,12 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
 
         X_tensor = torch.from_numpy(X_scaled)  # 保持在 CPU 上
         X_missing_tensor = torch.from_numpy(missing_mask)
-        # 为了稳定训练：按目标变量尺度归一化 loss（避免输出被压到一条线）
+        # 为了稳定训练：loss 统一在标准化 y 空间计算（预测与目标同尺度，消除梯度条件数问题）
         y_scale = float(np.nanstd(y_arr))
         if (not np.isfinite(y_scale)) or (y_scale < 1e-8):
             y_scale = 1.0
         self._y_scale_ = y_scale
+        self._y_mean_ = float(np.nanmean(y_arr))
         
         # 计算 Tg 范围缩放因子（用于放宽物理约束）
         y_range = float(np.nanmax(y_arr) - np.nanmin(y_arr))
@@ -513,6 +684,83 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         is_nf_tensor = torch.from_numpy(aux["is_nf"]).view(-1, 1)
         Ef_tensor = torch.from_numpy(aux["Ef"]).view(-1, 1)
         rho_f_tensor = torch.from_numpy(aux["rho_f"]).view(-1, 1)
+
+        self._identify_special_columns(df_raw)
+
+        # ---- ν 中间层张量（在 _transform 之前确定 active 状态，供 out_dim 使用）----
+        log_nu_th = aux["log_nu_theory"].astype(float)
+        log_mc = aux["log_Mc"].astype(float)
+        self._log_nu_ref_ = float(np.nanmedian(log_nu_th)) if np.isfinite(log_nu_th).any() else float(np.log(2000.0))
+        self._log_mc_ref_ = float(np.nanmedian(log_mc)) if np.isfinite(log_mc).any() else float(np.log(2000.0))
+
+        # ---- 阶段1冻结编码器：为全部行提供 ν 物理基线（两阶段架构核心）----
+        encoder = getattr(self, "_nu_encoder_", None)
+        if encoder is None:
+            enc_path = (self.nu_encoder_path or "").strip()
+            if not enc_path:
+                try:
+                    from .crosslink_nu_model import default_encoder_path
+                    enc_path = default_encoder_path()
+                except Exception:
+                    enc_path = ""
+            if enc_path and os.path.exists(enc_path):
+                try:
+                    from .crosslink_nu_model import CrosslinkNuEncoder
+                    encoder = CrosslinkNuEncoder.load(enc_path)
+                    self._nu_encoder_ = encoder
+                except Exception:
+                    encoder = None
+        log_nu_enc: Optional[np.ndarray] = None
+        if encoder is not None:
+            try:
+                log_nu_enc = np.asarray(encoder.predict_log_nu(df_raw), dtype=float)
+                if len(log_nu_enc) != len(df_raw):
+                    log_nu_enc = None
+            except Exception:
+                log_nu_enc = None
+
+        # ν 基线优先级：冻结编码器 > 理论公式 > 参考中位数
+        if log_nu_enc is not None:
+            log_nu_base = np.where(np.isfinite(log_nu_enc), log_nu_enc, log_nu_th)
+        else:
+            log_nu_base = log_nu_th
+
+        theory_frac = float(np.isfinite(log_nu_th).mean())
+        meas_frac = 0.0 if nu_measured is None else float(np.isfinite(nu_measured).mean())
+        enc_frac = 0.0 if log_nu_enc is None else float(np.isfinite(log_nu_enc).mean())
+        self._nu_active_ = bool(
+            float(self.crosslink_physics_weight) > 0.0
+            and (encoder is not None or max(theory_frac, meas_frac) >= 0.2)
+        )
+        if self._nu_active_:
+            base_dim = self._output_dim_for(self._mode_ or "generic") - 2
+            self._nu_ch_ = base_dim
+            self._nu_param_ch_ = base_dim + 1
+
+        nub_np = np.where(np.isfinite(log_nu_base), log_nu_base, self._log_nu_ref_).astype(np.float32)
+        mcb_np = np.where(np.isfinite(log_mc), log_mc, self._log_mc_ref_).astype(np.float32)
+        if nu_measured is not None:
+            with np.errstate(all="ignore"):
+                log_meas = np.where(
+                    np.isfinite(nu_measured) & (nu_measured > 0),
+                    np.log(np.where(nu_measured > 0, nu_measured, 1.0)),
+                    np.nan,
+                )
+            nut_np = np.where(np.isfinite(log_meas), log_meas, nub_np).astype(np.float32)
+            # 实测监督权重 1.0；编码器/理论锚 0.1/0.3；两者皆无 0
+            anchor_w = 0.1 if encoder is not None else 0.3
+            nuw_np = np.where(
+                np.isfinite(log_meas), 1.0, np.where(np.isfinite(log_nu_base), anchor_w, 0.0)
+            ).astype(np.float32)
+        else:
+            nut_np = nub_np.copy()
+            anchor_w = 0.1 if encoder is not None else 0.3
+            nuw_np = np.where(np.isfinite(log_nu_base), anchor_w, 0.0).astype(np.float32)
+
+        nub_tensor = torch.from_numpy(nub_np).view(-1, 1)
+        nut_tensor = torch.from_numpy(nut_np).view(-1, 1)
+        nuw_tensor = torch.from_numpy(nuw_np).view(-1, 1)
+        mcb_tensor = torch.from_numpy(mcb_np).view(-1, 1)
 
         # split train/val（在 CPU 上进行索引操作）
         n = X_tensor.shape[0]
@@ -534,6 +782,10 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             _sub(is_nf_tensor, tr_idx),
             _sub(Ef_tensor, tr_idx),
             _sub(rho_f_tensor, tr_idx),
+            _sub(nub_tensor, tr_idx),
+            _sub(nut_tensor, tr_idx),
+            _sub(nuw_tensor, tr_idx),
+            _sub(mcb_tensor, tr_idx),
         ]
         val_tensors = [
             _sub(X_tensor, val_idx),
@@ -545,6 +797,10 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             _sub(is_nf_tensor, val_idx),
             _sub(Ef_tensor, val_idx),
             _sub(rho_f_tensor, val_idx),
+            _sub(nub_tensor, val_idx),
+            _sub(nut_tensor, val_idx),
+            _sub(nuw_tensor, val_idx),
+            _sub(mcb_tensor, val_idx),
         ]
 
         # 根据系统类型配置 num_workers
@@ -681,6 +937,9 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         print(f"  Batch大小: {effective_batch_size} | 梯度累积: {accumulation_steps}步")
         print(f"  每epoch迭代: {train_steps} | 模型参数: {n_params:,}")
         print(f"  特征维度: {X_tensor.shape[1]} | DataLoader workers: {num_workers}")
+        _nu_status = "已嵌入冻结编码器 ✓" if getattr(self, "_nu_encoder_", None) is not None else (
+            "理论基线" if self._nu_active_ else "未激活")
+        print(f"  ν中间层: {_nu_status} | ν监督权重: {float(self.crosslink_physics_weight):.2f}")
         print(f"  混合精度(AMP): {'已启用 ⚡' if device == 'cuda' else '不适用'}")
         if device == "cuda":
             print(f"  torch.compile: {'已启用 ⚡' if use_compile else '未启用'}")
@@ -739,6 +998,10 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
 
         huber = nn.SmoothL1Loss()
 
+        # 标准化 y 空间的常量张量（loss 与预测同尺度）
+        y_mean_t = torch.tensor(float(getattr(self, "_y_mean_", 0.0)), device=device)
+        y_scale_t = torch.tensor(float(getattr(self, "_y_scale_", 1.0)), device=device)
+
         # 训练曲线（用于 UI 展示）
         self.train_mse_curve = []
         self.test_mse_curve = []
@@ -794,19 +1057,23 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                 for step_idx, batch in enumerate(batch_iter, start=1):
                     _raise_if_cancelled()
                     if data_on_gpu:
-                        xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof = batch
+                        xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb = batch
                     else:
                         # 将数据移到GPU（pin_memory会加速这个过程）
-                        xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof = [t.to(device, non_blocking=True) for t in batch]
+                        xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb = [t.to(device, non_blocking=True) for t in batch]
 
                     # 使用混合精度训练
                     with autocast_ctx():
-                        pred, phys_pen = self._forward_with_physics(xb, xmb, rb, confb, nfw, isnf, Ef, rhof)
-                        loss_data = huber(pred / y_scale, yb / y_scale)
-                        if (self._mode_ or 'generic') == 'tg':
-                            loss = loss_data + phys_w * (phys_pen / (y_scale ** 2))
-                        else:
-                            loss = loss_data + phys_w * phys_pen
+                        pred, phys_pen, log_nu_pred = self._forward_with_physics(xb, xmb, rb, confb, nfw, isnf, Ef, rhof, nub, mcb)
+                        # 统一在标准化 y 空间计算 loss：预测与目标同尺度
+                        loss_data = huber((pred - y_mean_t) / y_scale_t, (yb - y_mean_t) / y_scale_t)
+                        # tg 分支的 phys_pen 已在内部按 y_scale² 自归一，这里不再重复除
+                        loss = loss_data + phys_w * phys_pen
+                        if log_nu_pred is not None:
+                            # ν 潜变量辅助监督：实测标签(1.0) / 理论锚(0.3) 加权 Huber（log 空间）
+                            nu_err = F.smooth_l1_loss(log_nu_pred.float(), nut.float(), reduction="none")
+                            wsum = nuw.float().sum().clamp(min=1.0)
+                            loss = loss + float(self.crosslink_physics_weight) * (nu_err * nuw.float()).sum() / wsum
 
                     loss_to_backward = loss / float(accumulation_steps)
                     if use_amp:
@@ -852,17 +1119,19 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                         _raise_if_cancelled()
                         # 将数据移到GPU
                         if data_on_gpu:
-                            xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof = batch
+                            xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb = batch
                         else:
-                            xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof = [t.to(device, non_blocking=True) for t in batch]
+                            xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb = [t.to(device, non_blocking=True) for t in batch]
                         
                         with autocast_ctx():
-                            pred, phys_pen = self._forward_with_physics(xb, xmb, rb, confb, nfw, isnf, Ef, rhof)
-                            loss_data = huber(pred / y_scale, yb / y_scale)
-                            if (self._mode_ or 'generic') == 'tg':
-                                loss = loss_data + phys_w * (phys_pen / (y_scale ** 2))
-                            else:
-                                loss = loss_data + phys_w * phys_pen
+                            pred, phys_pen, log_nu_pred = self._forward_with_physics(xb, xmb, rb, confb, nfw, isnf, Ef, rhof, nub, mcb)
+                            # 同训练循环：标准化 y 空间 loss + ν 辅助监督
+                            loss_data = huber((pred - y_mean_t) / y_scale_t, (yb - y_mean_t) / y_scale_t)
+                            loss = loss_data + phys_w * phys_pen
+                            if log_nu_pred is not None:
+                                nu_err = F.smooth_l1_loss(log_nu_pred.float(), nut.float(), reduction="none")
+                                wsum = nuw.float().sum().clamp(min=1.0)
+                                loss = loss + float(self.crosslink_physics_weight) * (nu_err * nuw.float()).sum() / wsum
 
                         batch_size = len(yb)
                         val_loss_accum += loss * batch_size
@@ -915,7 +1184,10 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         isnf: torch.Tensor,
         Ef: torch.Tensor,
         rhof: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        nub: Optional[torch.Tensor] = None,
+        mcb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """返回 (pred, phys_pen, log_nu_pred)。log_nu_pred 仅在 ν 中间层激活时非 None。"""
         assert self._model_ is not None
         mode = self._mode_ or "generic"
 
@@ -924,27 +1196,32 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         else:
             out = self._model_(Xb)
 
+        # ν 潜变量：log 空间残差（正定 + 物理底座 + 可外推），ν ∈ [50, 1e5]
+        log_nu_pred: Optional[torch.Tensor] = None
+        if self._nu_active_ and self._nu_ch_ >= 0 and out.shape[1] > self._nu_ch_ and nub is not None:
+            log_nu_pred = torch.clamp(out[:, self._nu_ch_:self._nu_ch_ + 1] + nub, 3.9, 11.5)
+
         if mode == "tg":
             # ============================================================
             # 混合预测策略：结合直接神经网络输出和物理约束
-            # 这样可以避免预测值被物理约束严重截断
+            # 输出统一在标准化 y 空间参数化：out[:,0] 直接是标准化预测
             # ============================================================
             y_scale = getattr(self, '_y_scale_', 100.0)
+            y_mean = getattr(self, '_y_mean_', 0.0)
             y_min = getattr(self, '_y_min_', -50.0)
             y_max = getattr(self, '_y_max_', 300.0)
             y_range = max(y_max - y_min, 100.0)
-            y_center = (y_min + y_max) / 2.0
             
-            # 分支1：直接神经网络预测（主要预测分支，无硬性约束）
-            direct_pred = out[:, 0:1] * y_range * 0.5 + y_center
+            # 分支1：直接神经网络预测（标准化输出 → 原始空间）
+            direct_pred = out[:, 0:1] * y_scale + y_mean
             
             # 分支2：DiBenedetto 物理约束预测（辅助分支）
-            tg0_raw = out[:, 1:2] * y_scale + y_min
-            tg_delta = F.softplus(out[:, 2:3]) * y_range * 0.8 + 20.0
+            tg0_raw = out[:, 1:2] * y_scale + y_mean
+            tg_delta = F.softplus(out[:, 2:3]) * (y_scale * 1.5) + 10.0
             tginf = tg0_raw + tg_delta
             lam = torch.sigmoid(out[:, 3:4]) * 0.8 + 0.1
             
-            # α: 固化度
+            # α: 固化度（独立通道，修复与 λ 共用通道的参数化 bug）
             has_r_info = (confb > 0.5).float()
             amax = alpha_max_from_r_torch(rb)
             amax = has_r_info * amax + (1.0 - has_r_info) * 0.999
@@ -961,10 +1238,18 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                 alpha_clip = torch.clamp(alpha, 0.0, 0.999)
                 fox_pred = 1.0 / ((1.0 - alpha_clip) / tg0_safe + alpha_clip / tginf_safe)
                 physics_pred = 0.5 * physics_pred + 0.5 * fox_pred
+
+            # Fox–Loshaek 交联密度通道：Tg = Tg∞ − K/Mc（ν↑ → Tg↑，单调由参数化保证）
+            if log_nu_pred is not None and mcb is not None:
+                k_raw = out[:, self._nu_param_ch_:self._nu_param_ch_ + 1]
+                k_const = F.softplus(k_raw) * y_scale * 2.0  # °C·kg/mol 量级
+                mc_kg_mol = torch.exp(mcb) / 1000.0
+                fl_pred = tginf - k_const / torch.clamp(mc_kg_mol, min=0.05)
+                physics_pred = 0.5 * physics_pred + 0.5 * fl_pred
             
             # 混合预测：以直接预测为主，物理预测为辅
-            # physics_weight 控制物理约束的影响程度
-            phys_mix = min(float(self.physics_weight), 0.3)  # 最多30%来自物理模型
+            # physics_weight 控制物理约束的影响程度（可配置至 60%）
+            phys_mix = min(float(self.physics_weight), 0.6)
             tg_pred = (1.0 - phys_mix) * direct_pred + phys_mix * physics_pred
             
             # 软正则化：鼓励预测在合理范围内
@@ -981,7 +1266,7 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                 p_high = F.relu(tg_pred - upper)
                 phys_pen = phys_pen + (p_low * p_low + p_high * p_high).mean() / (y_scale ** 2 + 1e-8) * 0.05
 
-            return tg_pred, phys_pen
+            return tg_pred, phys_pen, log_nu_pred
 
         if mode == "mechanics":
             Em = F.softplus(out[:, 0:1]) + 1e-6
@@ -1013,18 +1298,24 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                 p_high = F.relu(pred - upper)
                 phys_pen = phys_pen + (p_low * p_low + p_high * p_high).mean() * 0.05
 
-            return pred, phys_pen
+            return pred, phys_pen, log_nu_pred
 
-        # generic 模式：纯 MLP 回归，无物理约束
+        # generic / thermal 模式：纯 MLP 回归（标准化输出 → 原始空间）
         y_scale = getattr(self, '_y_scale_', 1.0)
-        y_min = getattr(self, '_y_min_', 0.0)
-        y_max = getattr(self, '_y_max_', 100.0)
-        y_center = (y_min + y_max) / 2.0
-        y_range = max(y_max - y_min, 1.0)
-        
-        pred = out[:, 0:1] * y_range * 0.5 + y_center
+        y_mean = getattr(self, '_y_mean_', 0.0)
+
+        pred = out[:, 0:1] * y_scale + y_mean
         phys_pen = torch.zeros((), device=Xb.device)
-        return pred, phys_pen
+
+        # ν 物理读出：y_phys = ȳ + softplus(w)·y_scale·0.5·(log ν − log ν_ref)
+        # softplus 斜率保证对 ν 单调递增（强度/热稳定性随交联密度上升）
+        if log_nu_pred is not None:
+            slope = F.softplus(out[:, self._nu_param_ch_:self._nu_param_ch_ + 1]) * y_scale * 0.5
+            y_phys = y_mean + slope * (log_nu_pred - float(self._log_nu_ref_))
+            pw = min(float(self.physics_weight), 0.6)
+            pred = (1.0 - pw) * pred + pw * y_phys
+
+        return pred, phys_pen, log_nu_pred
 
     def predict(self, X):
         if not TORCH_AVAILABLE:
@@ -1037,6 +1328,23 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         else:
             X_arr = np.asarray(X)
             df_raw = pd.DataFrame(X_arr, columns=[f"feat_{i}" for i in range(X_arr.shape[1])])
+
+        # ν 实测列若存在则剥离（与 fit 一致，防止泄入特征）
+        nu_col = (self.nu_column or "").strip()
+        if not nu_col:
+            nu_col = "crosslink_density_mol_m3" if "crosslink_density_mol_m3" in df_raw.columns else ""
+        if nu_col and nu_col in df_raw.columns:
+            df_raw = df_raw.drop(columns=[nu_col])
+
+        # 高分子物理指数（与拟合时一致；幂等）
+        try:
+            from .polymer_physics import augment_polymer_physics
+            _pf = [s.strip() for s in (self.polymer_physics_features or "").split(",") if s.strip()]
+            df_raw = augment_polymer_physics(
+                df_raw, features=_pf or None, enabled=bool(self.use_polymer_physics)
+            )
+        except Exception:
+            pass
 
         self._identify_special_columns(df_raw)
 
@@ -1054,8 +1362,30 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         Ef_tensor = torch.from_numpy(aux["Ef"]).to(device).view(-1, 1)
         rho_f_tensor = torch.from_numpy(aux["rho_f"]).to(device).view(-1, 1)
 
+        # ν 物理基线（log 空间）：冻结编码器 > 理论公式 > 拟合时参考值
+        log_nu_th = aux["log_nu_theory"].astype(float)
+        log_mc = aux["log_Mc"].astype(float)
+        log_nu_enc = None
+        encoder = getattr(self, "_nu_encoder_", None)
+        if encoder is not None:
+            try:
+                log_nu_enc = np.asarray(encoder.predict_log_nu(df_raw), dtype=float)
+                if len(log_nu_enc) != len(df_raw):
+                    log_nu_enc = None
+            except Exception:
+                log_nu_enc = None
+        if log_nu_enc is not None:
+            log_nu_base = np.where(np.isfinite(log_nu_enc), log_nu_enc, log_nu_th)
+        else:
+            log_nu_base = log_nu_th
+        nub_np = np.where(np.isfinite(log_nu_base), log_nu_base, self._log_nu_ref_).astype(np.float32)
+        mcb_np = np.where(np.isfinite(log_mc), log_mc, self._log_mc_ref_).astype(np.float32)
+        nub_tensor = torch.from_numpy(nub_np).to(device).view(-1, 1)
+        mcb_tensor = torch.from_numpy(mcb_np).to(device).view(-1, 1)
+
         self._model_.eval()
         preds = []
+        nu_out = []
         with torch.no_grad():
             bs = max(256, int(self.batch_size))
             for i in range(0, len(X_tensor), bs):
@@ -1067,7 +1397,13 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                 isnf = is_nf_tensor[i:i+bs]
                 Ef = Ef_tensor[i:i+bs]
                 rhof = rho_f_tensor[i:i+bs]
-                pred, _ = self._forward_with_physics(xb, xmb, rb, cb, nfw, isnf, Ef, rhof)
+                nub = nub_tensor[i:i+bs]
+                mcb = mcb_tensor[i:i+bs]
+                pred, _, log_nu_pred = self._forward_with_physics(xb, xmb, rb, cb, nfw, isnf, Ef, rhof, nub, mcb)
                 preds.append(pred.detach().cpu().numpy())
+                if log_nu_pred is not None:
+                    nu_out.append(torch.exp(log_nu_pred).detach().cpu().numpy())
         y_pred = np.vstack(preds).reshape(-1)
+        if nu_out:
+            self.nu_pred_ = np.vstack(nu_out).reshape(-1)  # 预测的交联密度（可解释中间量）
         return y_pred

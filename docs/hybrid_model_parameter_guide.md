@@ -209,12 +209,32 @@
 
 | 参数 | 作用 | 建议 |
 |---|---|---|
-| `mode` | `tg` / `mechanics` / `generic` / `auto` | 任务明确时不要总用 `auto` |
-| `physics_weight` | 物理约束权重 | 常从 `0.001~0.003` 起 |
+| `mode` | `tg` / `mechanics` / `thermal` / `generic` / `auto`（td5/td10/tmax/char_yield 自动归入 `thermal`） | 任务明确时不要总用 `auto` |
+| `physics_weight` | 物理项混合比例（0–0.5；同时控制 ν 读出头对最终预测的混合占比） | 从 `0.05` 起调，噪声大可降到 `0.02` |
+| `crosslink_physics_weight` | ν（交联密度）潜变量辅助监督权重（log 空间 Huber） | 默认 `0.3`（剂量扫描 0→1.0 单调增益且不过拟合）；无交联密度输入列时置 `0` 可关闭 ν 层 |
+| `nu_column` | 实测交联密度列名（留空自动探测 `crosslink_density_mol_m3`） | 需先按配方哈希将实测 ν 关联到训练表 |
 | `physics_formula` | `standard` / `advanced` | 先 `standard` |
 | `target_name` | 帮 `auto` 识别任务 | 只对 PINN 系列有意义 |
-| `hidden_dim` | MLP 宽度 | 常用 `256~768` |
-| `n_layers` | MLP 深度 | 常用 `3~6` |
+| `hidden_dim` | MLP 宽度 | 默认 `128`，样本充足可到 `192–256` |
+| `n_layers` | MLP 深度 | 默认 `2`，一般不超过 `3` |
+
+高分子物理指数（2026-09 新增，`core/polymer_physics.py`）：
+- **零标签**：从结构 SMILES（`resin_i_structure` / `curing_agent_i_structure` 等）自动计算 5 个物理指数，按 PHR 加权平均；无需手工计算或归一化，幂等注入。
+- 注入指数：`phys_csp3`(sp3 碳分数)、`phys_f_ar`(芳香碳分数)、`phys_flex`(可旋转键/重原子)、`phys_bde_mean`(平均键解离能)、`phys_delta`(Fedors 溶解度参数)。
+- 开关：`use_polymer_physics=True`（默认开启）；`polymer_physics_features` 可自定义指数子集。
+- **实测准入（Spearman）**：csp3→tg_c −0.507、f_ar→tg_c 0.478、bde_mean→tg_c 0.453 / td5_c 0.403、flex→tg_c −0.413。
+- **实测增益（PINN，λ_ν=0.3，physics_weight=0.25）**：tg_c 0.6842→0.7588(+0.075)、td5_c 0.4684→0.5048(+0.036)、tensile_modulus 0.6326→0.6649(+0.032)、strength 多种子均值 +0.050。tg_c 已达 0.759，接近 XGBoost 0.773。
+- **已实测否定（勿再尝试）**：Flory 交联密度公式→实测 ν 仅 0.088；反应模拟网络节点密度→ν 仅 0.145；橡胶弹性 3νRT→玻璃态模量尺度差 94~139 倍、秩相关 0.04~0.24（**仅适用橡胶支路**）；CED/δ→模量 0.02~0.20（CED 变异系数仅 6.6%，区分力不足）；氢键位点密度→tg 0.021。
+- 评估脚本：`scripts/bench_physics_baselines.py`、`scripts/bench_physics_baselines2.py`。
+
+ν 中间层与两阶段架构说明（2026-09 新增）：
+- **两阶段模式（推荐）**：先运行 `scripts/train_nu_encoder.py` 用全部实测 ν（清理后）训练专用嵌入模型，产物 `models/crosslink_nu_encoder.joblib` 会被 PINN **自动发现并冻结嵌入**；ν 基线由编码器从配方特征内部算出（100% 覆盖），**推理时无需输入任何交联密度信息**。
+- **联合模式（无编码器时回退）**：训练表若含实测 `crosslink_density_mol_m3`（或配方哈希关联后含该列），模型自动剥离该列（防泄漏）并用作 ν 潜变量的辅助监督（实测权重 1.0）；无实测值的行退化为理论锚（`core/crosslink_physics.py`）。
+- 基线优先级：冻结编码器 > 理论公式 > 参考中位数；实测 ν 列存在时始终作为强监督（权重 1.0）。
+- `tg` 模式物理分支融合 Fox–Loshaek（Tg = Tg∞ − K/Mc）；`thermal`/`generic` 模式增加 ν 单调读出头（softplus 斜率保证强度/热稳定随 ν 递增）。
+- 预测后可通过 `model.nu_pred_` 读取每个样本的预测交联密度（mol/m³），用作机理可解释中间量。
+- CV 折内自动强制 `median` 插补（多路贝叶斯插补只留给最终模型），折内训练显著加速。
+- **调参提示**：编码器激活后（100% 覆盖），建议将 `physics_weight` 提到 `0.2~0.3`（实测 td5_c/strength/tg_c 三目标均最优）；无编码器时维持 `0.05`。
 
 说明：
 - `physics_weight` 太大时，预测会变“硬”

@@ -39,8 +39,8 @@ class FSFSSelector:
                 - 'correlation': 相关系数
                 - 'variance': 方差
             similarity_metric: 特征相似度度量方法
-                - 'correlation': Pearson相关系数（默认）
-                - 'spearman': Spearman秩相关
+                - 'spearman': Spearman秩相关（默认，对离群值和非线性单调关系更稳健）
+                - 'correlation': Pearson相关系数
                 - 'cosine': 余弦相似度
             task_type: 任务类型 ('regression' 或 'classification')
             random_state: 随机种子
@@ -75,10 +75,16 @@ class FSFSSelector:
                 )
 
         elif self.importance_metric == 'correlation':
+            # Spearman 秩相关（对离群值和非线性单调关系更稳健）：
+            # 先转换为秩次，再计算皮尔逊相关（秩次上的 Pearson = Spearman）
             # 向量化计算：一次性计算所有特征与目标的相关系数
             # 使用矩阵运算代替循环
-            X_centered = X - X.mean(axis=0)
-            y_centered = y - y.mean()
+            from scipy.stats import rankdata
+            X_ranked = rankdata(X, axis=0)
+            y_ranked = rankdata(y)
+
+            X_centered = X_ranked - X_ranked.mean(axis=0)
+            y_centered = y_ranked - y_ranked.mean()
 
             numerator = np.dot(X_centered.T, y_centered)
             X_std = np.sqrt(np.sum(X_centered**2, axis=0))

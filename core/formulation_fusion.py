@@ -52,10 +52,15 @@ class FormulationFusionEngine:
                 return wide_file
         return None
 
-    def compute_formulation_hash(self, row: pd.Series) -> str:
+    def compute_formulation_hash(self, row: pd.Series, ignore_process: bool = False) -> str:
         """
         基于关键化学组分与工艺条件计算配方唯一物理哈希指纹
         抗行乱序、抗列名微小差异
+
+        Args:
+            row: 数据行
+            ignore_process: 是否忽略工艺温度列。用于「主表缺失工艺列」的兜底补齐场景——
+                此时主表无法提供温度参与指纹，必须与母宽表按纯配方指纹对齐。
         """
         parts = []
         # 收集树脂与固化剂结构（严格排除 _format 等元数据列）
@@ -65,16 +70,27 @@ class FormulationFusionEngine:
                 val = str(row[c]).strip() if pd.notna(row[c]) else ""
                 if val and val.lower() not in ["none", "nan", ""]:
                     parts.append(f"{c_str}:{val[:80]}")
-        # 收集最高温度
-        for c in row.index:
-            if "max_temperature" in str(c).lower() or "curing_temp" in str(c).lower():
-                val = row[c]
-                if pd.notna(val):
-                    parts.append(f"temp:{float(val):.1f}")
-                    break
+        # 收集最高温度（ignore_process=True 时跳过，用于纯配方指纹对齐）
+        if not ignore_process:
+            for c in row.index:
+                if "max_temperature" in str(c).lower() or "curing_temp" in str(c).lower():
+                    val = row[c]
+                    if pd.notna(val):
+                        parts.append(f"temp:{float(val):.1f}")
+                        break
 
         sig = "|".join(sorted(parts))
         return hashlib.md5(sig.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _main_has_any_temperature(df: pd.DataFrame) -> bool:
+        """判断主表是否含任何固化温度列（决定指纹对齐是否纳入温度维度）"""
+        for c in df.columns:
+            c_low = str(c).lower()
+            if "max_temperature" in c_low or "curing_temp" in c_low:
+                if df[c].notna().any():
+                    return True
+        return False
 
     def extract_target_name_from_df(self, df: pd.DataFrame, df_wide: Optional[pd.DataFrame] = None, filename: str = "") -> Optional[str]:
         """
@@ -157,8 +173,28 @@ class FormulationFusionEngine:
         if df_wide is None or len(df_wide) == 0:
             return df_main, meta
 
-        # 策略 0: 如果 df_main 已经融合过母宽表（具备关键配比/组分列），直接保留，杜绝重复融合膨胀
+        # 策略 0: 如果 df_main 已经融合过母宽表（具备关键配比/组分列），直接保留，杜绝重复融合膨胀。
+        # [工艺参数兜底] 若主表缺失工艺温度/时间列而母宽表具备（典型场景：旧版融合产物），
+        # 则按「纯配方指纹」（忽略温度维度）补齐工艺列后再返回，无需重建融合。
         if "resin_1_amount_phr" in df_main.columns or "resin_3_structure" in df_main.columns:
+            proc_cols_missing = [
+                c for c in df_wide.columns
+                if c.startswith("process_") and c != "process_id" and c not in df_main.columns
+            ]
+            if proc_cols_missing:
+                hash_fn = lambda r: self.compute_formulation_hash(r, ignore_process=True)
+                main_hashes = df_main.apply(hash_fn, axis=1)
+                wide_hashes = df_wide.apply(hash_fn, axis=1)
+                fused = self._backfill_columns_by_fingerprint(
+                    df_main, df_wide, main_hashes, wide_hashes, proc_cols_missing
+                )
+                if fused is not None:
+                    meta["strategy"] = "already_fused_preserved + process_backfill (fingerprint)"
+                    meta["matched_rows"] = len(fused)
+                    meta["match_rate"] = 1.0
+                    meta["fused_columns_count"] = len(proc_cols_missing)
+                    meta["process_backfilled"] = proc_cols_missing
+                    return fused, meta
             meta["strategy"] = "already_fused_preserved"
             meta["matched_rows"] = len(df_main)
             meta["match_rate"] = 1.0
@@ -215,9 +251,11 @@ class FormulationFusionEngine:
                 return fused, meta
 
         # 策略 3: 配方化学指纹哈希对齐 (Formulation Hash Alignment)
-        # 计算 main 表与 wide 表的指纹
-        main_hashes = df_main.apply(self.compute_formulation_hash, axis=1)
-        wide_hashes = df_wide.apply(self.compute_formulation_hash, axis=1)
+        # 若主表本身缺失温度列而母宽表具备，则温度无法参与指纹，改用纯配方指纹对齐后补齐工艺列
+        ignore_process = not self._main_has_any_temperature(df_main)
+        hash_fn = lambda r: self.compute_formulation_hash(r, ignore_process=ignore_process)
+        main_hashes = df_main.apply(hash_fn, axis=1)
+        wide_hashes = df_wide.apply(hash_fn, axis=1)
 
         # 建立 wide 表 hash 查找字典（只保留第一个匹配）
         wide_hash_dict = {}
@@ -236,8 +274,10 @@ class FormulationFusionEngine:
 
         if matched_count > 0.5 * len(df_main):
             # 取出匹配到的 wide 行
-            # 需要补充的关键列
+            # 需要补充的关键列：配比/当量列 + 工艺参数列（工艺温度、时间等）
             key_phr_cols = [c for c in df_wide.columns if ("amount_phr" in c or "equivalent_weight" in c or "molecular_weight" in c) and c not in df_main.columns]
+            proc_cols = [c for c in df_wide.columns if c.startswith("process_") and c != "process_id" and c not in df_main.columns]
+            key_phr_cols = key_phr_cols + [c for c in proc_cols if c not in key_phr_cols]
             if not key_phr_cols:
                 key_phr_cols = [c for c in df_wide.columns if c not in df_main.columns]
 
@@ -247,7 +287,9 @@ class FormulationFusionEngine:
                     supp_df.iloc[m_i] = df_wide.iloc[w_i][key_phr_cols]
 
             fused = pd.concat([df_main, supp_df], axis=1)
-            meta["strategy"] = "chemical_fingerprint_hash"
+            meta["strategy"] = "chemical_fingerprint_hash" + (" + process_backfill" if proc_cols else "")
+            if proc_cols:
+                meta["process_backfilled"] = proc_cols
             meta["matched_rows"] = matched_count
             meta["match_rate"] = round(matched_count / max(1, len(df_main)), 4)
             meta["fused_columns_count"] = len(key_phr_cols)
@@ -255,6 +297,164 @@ class FormulationFusionEngine:
 
         # 若无法精确对齐，则原样返回
         return df_main, meta
+
+    def _backfill_columns_by_fingerprint(
+        self,
+        df_main: pd.DataFrame,
+        df_wide: pd.DataFrame,
+        main_hashes: pd.Series,
+        wide_hashes: pd.Series,
+        backfill_cols: List[str],
+        min_match_rate: float = 0.5,
+    ) -> Optional[pd.DataFrame]:
+        """
+        通过指纹哈希将母宽表中的指定列回填到主表（严格 1:1，防笛卡尔积膨胀）。
+
+        匹配率低于 min_match_rate 时返回 None（调用方回退原行为），
+        否则返回按原行序补齐后的新 DataFrame（保留主表原 dtype）。
+        """
+        if not backfill_cols or len(df_main) == 0 or len(df_wide) == 0:
+            return None
+
+        wide_first = {}
+        for w_idx, h in enumerate(wide_hashes):
+            if h and h not in wide_first:
+                wide_first[h] = w_idx
+
+        matched_w_idx = [wide_first.get(h) for h in main_hashes]
+        matched_count = sum(1 for w in matched_w_idx if w is not None)
+        if matched_count < min_match_rate * len(df_main):
+            return None
+
+        left = df_main.copy()
+        left["__fp_hash__"] = main_hashes.values
+        right = df_wide[backfill_cols].copy()
+        right["__fp_hash__"] = wide_hashes.values
+        # 同一指纹只取首个匹配，杜绝多对多膨胀
+        right = right.drop_duplicates(subset=["__fp_hash__"], keep="first")
+        fused = left.merge(right, on="__fp_hash__", how="left", sort=False)
+        fused = fused.drop(columns=["__fp_hash__"])
+        if len(fused) != len(df_main):
+            return None
+        # 恢复主表原始行序
+        fused.index = df_main.index
+        return fused
+
+    def _locate_dataset_file(self, filename: str, custom_dir: Optional[str] = None) -> Optional[str]:
+        """在常见数据集目录下定位指定文件"""
+        candidate_dirs = []
+        if custom_dir and os.path.exists(custom_dir):
+            candidate_dirs.append(custom_dir)
+        candidate_dirs.extend([
+            r"C:\Users\wangj\Desktop\ml_dataset",
+            os.path.join(os.getcwd(), "ml_dataset"),
+            os.getcwd(),
+        ])
+        for d in candidate_dirs:
+            if not d or not os.path.exists(d):
+                continue
+            p = os.path.join(d, filename)
+            if os.path.exists(p):
+                return p
+        return None
+
+    def augment_with_test_standards(
+        self,
+        df: pd.DataFrame,
+        standards_path: Optional[str] = None,
+        bridge_path: Optional[str] = None,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        将测试标准信息 (ASTM / ISO / GB / DIN EN ISO / JIS) 关联到融合后的数据集。
+
+        关联策略：
+            1. df 自带 performance_row_id → 直接按性能行关联；
+            2. df 仅有 record_id → 通过性能总表 (ml_performance_all.csv) 的
+               record→performance 映射桥接后关联。
+
+        同一样本引用多个标准时去重聚合并排序，输出三列：
+            - test_standard_organization: 标准组织 ("ASTM; ISO")
+            - test_standard_canonical: 规范标准编号 ("ASTM D3418-1982; ISO 75-1-2004")
+            - test_standard_count: 引用标准数量
+
+        严格左连接、防膨胀；标准文件缺失或关联失败时原样返回。
+        """
+        meta: Dict[str, Any] = {
+            "standards_matched": 0,
+            "standards_coverage": 0.0,
+            "standards_strategy": None,
+        }
+        if df is None or len(df) == 0:
+            return df, meta
+
+        # 1. 定位标准表
+        if not standards_path or not os.path.exists(str(standards_path)):
+            standards_path = self._locate_dataset_file("ml_performance_standards.csv")
+        if not standards_path or not os.path.exists(str(standards_path)):
+            return df, meta
+        try:
+            std = pd.read_csv(standards_path, low_memory=False)
+        except Exception:
+            return df, meta
+        if not {"performance_row_id", "standard_canonical", "standard_organization"}.issubset(std.columns):
+            return df, meta
+        std = std[std["performance_row_id"].notna()].copy()
+
+        def _join_unique(series: pd.Series) -> str:
+            return "; ".join(sorted({x for v in series for x in str(v).split("; ") if x and x.lower() != "nan"}))
+
+        # 2. 性能行级聚合 (一个 perf 行可能引用多个标准)
+        std_agg = std.groupby("performance_row_id").agg(
+            test_standard_canonical=("standard_canonical", _join_unique),
+            test_standard_organization=("standard_organization", _join_unique),
+        ).reset_index()
+        std_agg["test_standard_count"] = std_agg["test_standard_canonical"].str.split("; ").str.len()
+
+        # 3. 选择关联键
+        if "performance_row_id" in df.columns:
+            key = "performance_row_id"
+            meta["standards_strategy"] = "direct_performance_row_id"
+        elif "record_id" in df.columns:
+            # 通过性能总表桥接 record → performance_row_id
+            if not bridge_path or not os.path.exists(str(bridge_path)):
+                bridge_path = self._locate_dataset_file("ml_performance_all.csv")
+            if not bridge_path or not os.path.exists(str(bridge_path)):
+                return df, meta
+            try:
+                bridge = pd.read_csv(bridge_path, low_memory=False, usecols=["record_id", "performance_row_id"])
+            except Exception:
+                return df, meta
+            rec_std = bridge.drop_duplicates(["record_id", "performance_row_id"]).merge(
+                std_agg, on="performance_row_id", how="inner"
+            )
+            if rec_std.empty:
+                return df, meta
+            std_agg = rec_std.groupby("record_id").agg(
+                test_standard_canonical=("test_standard_canonical", _join_unique),
+                test_standard_organization=("test_standard_organization", _join_unique),
+            ).reset_index()
+            std_agg["test_standard_count"] = std_agg["test_standard_canonical"].str.split("; ").str.len()
+            key = "record_id"
+            meta["standards_strategy"] = "record_bridge_via_performance_all"
+        else:
+            return df, meta
+
+        # 4. 防膨胀左连接
+        if std_agg[key].duplicated().any():
+            std_agg = std_agg.drop_duplicates(subset=[key], keep="first")
+        add_cols = [c for c in std_agg.columns if c != key and c not in df.columns]
+        matched = int(df[key].isin(set(std_agg[key])).sum())
+        meta["standards_matched"] = matched
+        meta["standards_coverage"] = round(matched / len(df), 4)
+        if not add_cols:
+            return df, meta
+        fused = df.merge(std_agg[[key] + add_cols], on=key, how="left", sort=False)
+        if len(fused) != len(df):
+            return df, meta
+        fused.index = df.index
+        meta["standards_matched"] = int(fused["test_standard_count"].notna().sum())
+        meta["standards_coverage"] = round(meta["standards_matched"] / len(fused), 4)
+        return fused, meta
 
     def detect_column_roles_with_semantic_check(
         self,
@@ -415,6 +615,52 @@ class FormulationFusionEngine:
 
         return r_val, f_avg, mc, flag_imputed
 
+    # 单组分配方模式需剥离的多组分列前缀
+    _SINGLE_COMPONENT_DROP_PREFIXES = (
+        "resin_2_", "resin_3_", "curing_agent_2_", "curing_agent_3_",
+        "small_additive_1_", "small_additive_2_",
+        # 其他添加剂类组分 (引发剂/促进剂/催化剂/活性稀释剂/增韧剂/填料/其他)
+        # 的具体信息列 (结构、用量、数量统计等)，纯净双组分体系不携带
+        "initiator_", "accelerator_", "catalyst_",
+        "reactive_diluent_", "reactive_toughener_",
+        "filler_", "other_",
+    )
+    # 单组分配方模式下无信息量的组分数量/添加剂总量类列
+    _SINGLE_COMPONENT_DROP_EXACT = (
+        "reactive_diluent_total_phr", "reactive_toughener_total_phr",
+        "small_additive_total_phr", "filler_total_phr", "other_total_phr",
+    )
+
+    def single_component_excluded_columns(self, cols) -> List[str]:
+        """
+        返回单组分配方模式下应从工作表剔除的列：
+        - 多组分列 (resin_2/3, curing_agent_2/3, small_additive_1/2 全部前缀列)
+        - 组分数量统计列 (*_component_count, *_duplicate_component_count)——单组分下恒为 1 或 0，无信息量
+        - 其他添加剂/增韧剂/稀释剂/填料总量列
+        """
+        excluded = []
+        for c in cols:
+            c_low = str(c).lower()
+            if c_low.startswith(self._SINGLE_COMPONENT_DROP_PREFIXES):
+                excluded.append(c)
+            elif c_low.endswith(("_component_count", "_duplicate_component_count")):
+                excluded.append(c)
+            elif c_low in self._SINGLE_COMPONENT_DROP_EXACT:
+                excluded.append(c)
+        return excluded
+
+    @staticmethod
+    def _mask_has_real_value(sub: pd.DataFrame) -> pd.Series:
+        """行级判定：子表中任一列存在真实取值（数值列 0 视为不存在）"""
+        mask = pd.Series(False, index=sub.index)
+        for c in sub.columns:
+            col = sub[c]
+            if pd.api.types.is_numeric_dtype(col):
+                mask = mask | (col.notna() & (col.fillna(0) != 0))
+            else:
+                mask = mask | col.notna()
+        return mask
+
     def clean_features_for_ml(
         self,
         df: pd.DataFrame,
@@ -422,11 +668,12 @@ class FormulationFusionEngine:
         curing_type_filter: Optional[str] = "external_hardener",
         mode: str = "qspr_clean",
         drop_metadata: bool = True,
-        base_df: Optional[pd.DataFrame] = None
+        base_df: Optional[pd.DataFrame] = None,
+        single_component_only: bool = False
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
         面向机器学习训练对融合后的数据集进行纯净化与规范化特征清洗
-        
+
         参数:
             df: 待清洗的 DataFrame (融合后)
             target_col: 目标预测变量 (如 tg_c)
@@ -434,6 +681,9 @@ class FormulationFusionEngine:
             mode: 清洗模式 ('qspr_clean': 紧凑标准 QSPR 模式; 'comprehensive': 全息保留模式)
             drop_metadata: 是否强制剔除元数据、格式列和无预测价值的列
             base_df: 原始窄表 (用于提取原窄表拥有的测试条件列等)
+            single_component_only: 单组分配方模式——仅保留树脂 1 组分 + 固化剂 1 组分、
+                且不含小分子添加剂的样本；工作表同步剔除多组分列与组分数量特征列
+                (单组分下 *_component_count 恒为 1/0，无预测价值)
         """
         stats: Dict[str, Any] = {
             "initial_rows": len(df),
@@ -444,6 +694,9 @@ class FormulationFusionEngine:
             "mode": mode,
             "dropped_columns_sample": [],
             "resin_3_included": False,
+            "single_component_only": bool(single_component_only),
+            "single_filtered_rows": len(df),
+            "single_dropped_cols_count": 0,
         }
 
         out_df = df.copy()
@@ -453,6 +706,19 @@ class FormulationFusionEngine:
             if "curing_type_standard" in out_df.columns:
                 out_df = out_df[out_df["curing_type_standard"] == curing_type_filter].copy()
                 stats["filtered_rows"] = len(out_df)
+
+        # 1.5 单组分配方筛选：剔除多组分 (树脂/固化剂 >1 组分) 与含小分子添加剂 (1 或 2) 的样本
+        if single_component_only:
+            multi_cols = [c for c in out_df.columns if str(c).lower().startswith(("resin_2_", "resin_3_", "curing_agent_2_", "curing_agent_3_"))]
+            small_cols = [c for c in out_df.columns if str(c).lower().startswith(("small_additive_1_", "small_additive_2_"))]
+            mask_drop = pd.Series(False, index=out_df.index)
+            if multi_cols:
+                mask_drop = mask_drop | self._mask_has_real_value(out_df[multi_cols])
+            if small_cols:
+                mask_drop = mask_drop | self._mask_has_real_value(out_df[small_cols])
+            out_df = out_df[~mask_drop].copy()
+            stats["single_filtered_rows"] = len(out_df)
+            stats["filtered_rows"] = len(out_df)
 
         # 2. 彻底剥离机理特征列 (mech_*)：融合流程已废弃机理特征注入，
         #    同时清洗旧宽表中可能残留的 mech_* 列，防止其进入训练矩阵
@@ -529,11 +795,19 @@ class FormulationFusionEngine:
                     ])
 
             final_cols = []
+            # 单组分配方模式：组织特征清单时直接排除多组分列与组分数量特征
+            single_drop = set(self.single_component_excluded_columns(valuable_ordered_cols)) if single_component_only else set()
             for c in valuable_ordered_cols:
-                if c in out_df.columns and c not in final_cols:
+                if c in out_df.columns and c not in final_cols and c not in single_drop:
                     final_cols.append(c)
+            if single_component_only:
+                stats["single_dropped_cols_count"] = len(single_drop)
             for c in target_test_cols:
                 if c in out_df.columns and c not in final_cols:
+                    final_cols.append(c)
+            # 测试标准列 (test_standard_*) 一并保留
+            for c in out_df.columns:
+                if str(c).startswith("test_standard_") and c not in final_cols:
                     final_cols.append(c)
             for c in mech_cols:
                 if c in out_df.columns and c not in final_cols:
@@ -567,6 +841,12 @@ class FormulationFusionEngine:
 
         else:
             # Comprehensive 模式: 保留所有非空特征，但剔除无意义列
+            if single_component_only:
+                single_drop_cols = self.single_component_excluded_columns(out_df.columns)
+                if single_drop_cols:
+                    out_df = out_df.drop(columns=[c for c in out_df.columns if c in set(single_drop_cols)])
+                stats["single_dropped_cols_count"] = len(single_drop_cols)
+
             if drop_metadata:
                 cols_to_drop = [c for c in out_df.columns if is_useless_metadata_col(c)]
                 stats["dropped_columns_sample"] = cols_to_drop[:15]

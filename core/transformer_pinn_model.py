@@ -138,6 +138,11 @@ class TransformerPINNRegressor(EpoxyPINNRegressor):
         missing_n_imputations: int = 5,
         use_missingness_embedding: bool = True,
         use_missingness_attention: bool = True,
+        crosslink_physics_weight: float = 0.1,
+        nu_column: str = "",
+        nu_encoder_path: str = "",
+        use_polymer_physics: bool = True,
+        polymer_physics_features: str = "",
     ):
         super().__init__(
             mode=mode,
@@ -160,6 +165,11 @@ class TransformerPINNRegressor(EpoxyPINNRegressor):
             missing_value_strategy=missing_value_strategy,
             missing_imputer_max_iter=missing_imputer_max_iter,
             missing_n_imputations=missing_n_imputations,
+            crosslink_physics_weight=crosslink_physics_weight,
+            nu_column=nu_column,
+            nu_encoder_path=nu_encoder_path,
+            use_polymer_physics=use_polymer_physics,
+            polymer_physics_features=polymer_physics_features,
         )
         self.d_token = d_token
         self.n_blocks = n_blocks
@@ -194,12 +204,7 @@ class TransformerPINNRegressor(EpoxyPINNRegressor):
         if int(self.d_token) % int(self.attention_n_heads) != 0:
             raise ValueError("d_token must be divisible by attention_n_heads")
         mode = self._mode_ or "generic"
-        if mode == "tg":
-            output_dim = 4
-        elif mode == "mechanics":
-            output_dim = 2
-        else:
-            output_dim = 1
+        output_dim = self._output_dim_for(mode)  # 共享通道布局（含 ν 中间层）
         return _TransformerPINNCore(
             input_dim=int(input_dim),
             output_dim=int(output_dim),

@@ -399,13 +399,13 @@ def _apply_variance_filter_callback(df, candidates, threshold_key):
 
 
 def _apply_correlation_filter_callback(df, target_series, k_key):
-    """相关性筛选回调"""
+    """相关性筛选回调（默认 Spearman 秩相关，对离群值和非线性单调关系更稳健）"""
     try:
         k = st.session_state[k_key]
-        corrs = df.corrwith(target_series).abs().sort_values(ascending=False)
+        corrs = df.corrwith(target_series, method="spearman").abs().sort_values(ascending=False)
         selected = corrs.head(int(k)).index.tolist()
         _update_selection_state(selected)
-        st.session_state['feature_selector_msg'] = f"✅ 相关性筛选完成：已选 Top-{k} 特征"
+        st.session_state['feature_selector_msg'] = f"✅ 相关性筛选完成（Spearman）：已选 Top-{k} 特征"
     except Exception as e:
         st.session_state['feature_selector_error'] = str(e)
 
@@ -1971,15 +1971,15 @@ def render_feature_selector():
                 ["correlation", "mutual_info", "variance"],
                 index=0,
                 key="fsfs_importance",
-                help="correlation: 相关系数（快速，推荐）\nmutual_info: 互信息（慢但准确）\nvariance: 方差（最快）"
+                help="correlation: Spearman秩相关（快速，推荐）\nmutual_info: 互信息（慢但准确）\nvariance: 方差（最快）"
             )
 
             fsfs_similarity = st.selectbox(
                 "相似度度量",
                 ["correlation", "spearman", "cosine"],
-                index=0,
+                index=1,
                 key="fsfs_similarity",
-                help="correlation: Pearson相关（推荐）\nspearman: Spearman秩相关\ncosine: 余弦相似度"
+                help="spearman: Spearman秩相关（默认，对离群值和非线性单调关系更稳健）\ncorrelation: Pearson相关\ncosine: 余弦相似度"
             )
 
         # [新增] 快速模式选项
@@ -3240,7 +3240,8 @@ class SmartSparseDataSelector:
             corr = None
             if valid_samples > 10:
                 try:
-                    corr = col_data.corr(target_series)
+                    # Spearman 秩相关（默认）：对离群值和非线性单调关系更稳健
+                    corr = col_data.corr(target_series, method="spearman")
                 except:
                     corr = None
             

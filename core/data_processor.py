@@ -693,6 +693,474 @@ class AdvancedDataCleaner:
         self.cleaned_data = df.loc[indices_to_keep].reset_index(drop=True)
         return self.cleaned_data
 
+    def balance_group_fixed_count(self, group_cols, fixed_n=1, random_state=42, keep="random"):
+        """组合固定配额平衡：按组合键分组，每个组合固定保留 fixed_n 条样本。
+
+        与 balance_formulation_stratified 的「上限削减」语义不同，本方法面向
+        「每个组合恰好保留固定数量」的需求：
+        - 样本数多于 fixed_n 的组合：按保留策略抽取 fixed_n 条（削减冗余）
+        - 样本数少于等于 fixed_n 的组合：完整保留（数据不足无法凑齐，不重复采样）
+
+        Args:
+            group_cols: 组合键列（str 或 list[str]），多列取值共同定义一个组合
+                （如 ['resin_1_structure', 'curing_agent_1_structure'] 定义 树脂×固化剂 组合）
+            fixed_n: 每个组合固定保留的样本数（>=1）
+            random_state: 随机种子，保证随机抽样可复现
+            keep: 超额组合的保留策略
+                - 'random': 在超额组合内随机抽样（默认，打散原始录入顺序）
+                - 'first': 按数据原始顺序保留前 fixed_n 条（完全确定性）
+
+        Returns:
+            tuple[pd.DataFrame, dict]: 平衡后的 DataFrame 与统计信息字典
+                （字段与 balance_formulation_stratified 保持兼容，便于 UI 复用展示）
+        """
+        df = self.cleaned_data
+        if df is None or df.empty:
+            return self.cleaned_data, {"error": "数据为空"}
+
+        # 1. 校验并构建组合键序列
+        if isinstance(group_cols, (list, tuple)):
+            valid_cols = [c for c in group_cols if c in df.columns]
+        elif isinstance(group_cols, str) and group_cols in df.columns:
+            valid_cols = [group_cols]
+        else:
+            valid_cols = []
+
+        if not valid_cols:
+            raise ValueError("指定的组合键列均不在数据集中，请检查列名。")
+
+        fixed_n = max(1, int(fixed_n))
+        if keep not in ("random", "first"):
+            keep = "random"
+
+        if len(valid_cols) == 1:
+            combo_series = df[valid_cols[0]].fillna("<missing>").astype(str)
+        else:
+            combo_series = df[valid_cols].fillna("<missing>").astype(str).agg(" || ".join, axis=1)
+
+        rng = np.random.RandomState(int(random_state))
+
+        # 2. 逐组合执行固定配额
+        indices_to_keep = []
+        over_quota_combos = []  # 超额被削减的组合明细
+        under_quota_count = 0   # 样本数不足配额、被完整保留的组合数
+
+        for combo_id, grp_idx in combo_series.groupby(combo_series).groups.items():
+            grp_indices = list(grp_idx)
+            m = len(grp_indices)
+            if m <= fixed_n:
+                indices_to_keep.extend(grp_indices)
+                under_quota_count += 1
+            else:
+                over_quota_combos.append(
+                    {"组合": str(combo_id), "原样本数": m, "保留数": fixed_n, "删除数": m - fixed_n}
+                )
+                if keep == "first":
+                    indices_to_keep.extend(grp_indices[:fixed_n])
+                else:
+                    indices_to_keep.extend(rng.choice(grp_indices, size=fixed_n, replace=False).tolist())
+
+        indices_to_keep = sorted(indices_to_keep)
+        self.cleaned_data = df.loc[indices_to_keep].reset_index(drop=True)
+
+        # 3. 聚合统计指标（字段与 balance_formulation_stratified 兼容）
+        total_before = len(df)
+        total_after = len(self.cleaned_data)
+        vc_before = combo_series.value_counts()
+        vc_after = combo_series.loc[indices_to_keep].value_counts() if indices_to_keep else pd.Series(dtype=int)
+
+        max_cnt_before = int(vc_before.iloc[0]) if vc_before.size > 0 else 0
+        max_cnt_after = int(vc_after.iloc[0]) if vc_after.size > 0 else 0
+
+        stats = {
+            "stratify_mode": "fixed_combo_quota",
+            "group_cols": valid_cols,
+            "fixed_n": fixed_n,
+            "keep": keep,
+            "total_before": total_before,
+            "total_after": total_after,
+            "removed_rows": total_before - total_after,
+            "n_groups_before": int(vc_before.size),
+            "n_groups_after": int(vc_after.size),
+            "max_group_count_before": max_cnt_before,
+            "max_group_count_after": max_cnt_after,
+            "max_group_pct_before": float(max_cnt_before / total_before * 100.0) if total_before > 0 else 0.0,
+            "max_group_pct_after": float(max_cnt_after / total_after * 100.0) if total_after > 0 else 0.0,
+            "top_groups_before": vc_before.head(10).to_dict(),
+            "top_groups_after": vc_after.head(10).to_dict(),
+            "target_distribution_before": {},
+            "target_distribution_after": {},
+            "bin_edges": None,
+            # 固定配额特有统计
+            "over_quota_combos": over_quota_combos,
+            "n_over_quota": len(over_quota_combos),
+            "n_under_quota": under_quota_count,
+        }
+        return self.cleaned_data, stats
+
+    def balance_target_bins(
+        self,
+        column,
+        n_bins=10,
+        bin_strategy="uniform",
+        max_per_bin=None,
+        random_state=42,
+    ):
+        """按数值列分箱均衡下采样：削减高频区间样本，稀疏区间完整保留，实现目标分布均衡。
+
+        典型场景：模量数据中软段（低模量区）样本远多于硬段（高模量区）样本。
+        将该列按值域等宽分箱后，对样本密集的高频箱（软段）下采样至每箱上限，
+        稀疏箱（硬段）完整保留，从而让训练数据在软硬段之间接近均衡。
+
+        与 balance_formulation_stratified 的「按配方/类别分层」不同，本方法直接
+        面向连续目标值 y 本身的分布形态，不依赖配方分组列。
+
+        Args:
+            column: 用于分箱均衡的数值列（通常是目标属性 y，如模量、Tg）
+            n_bins: 分箱数量（>=2，实际分箱数会按列的唯一值数自动收缩）
+            bin_strategy: 分箱方式
+                - 'uniform': 等宽区间（按值域均分，推荐——能真实暴露值域上的高频/稀有区间）
+                - 'quantile': 等频分位（每箱样本数接近，适合按分位段微调）
+            max_per_bin: 每箱最大保留样本数。
+                None 时自动取「各箱样本数中位数向上取整」作为上限（自动均衡）；
+                设为最小箱样本数可实现完全均衡；样本数低于上限的箱完整保留不动。
+            random_state: 随机种子，保证下采样可复现
+
+        Returns:
+            tuple[pd.DataFrame, dict]: 均衡后的 DataFrame 与统计信息字典。
+            含无效值（NaN/inf）的行不参与均衡，原样保留。
+        """
+        df = self.cleaned_data
+        if df is None or df.empty:
+            return self.cleaned_data, {"error": "数据为空"}
+        if column not in df.columns:
+            raise ValueError(f"列 '{column}' 不在数据集中")
+
+        # 1. 数值化并识别有效行
+        num = pd.to_numeric(df[column], errors="coerce")
+        finite_mask = np.isfinite(num.to_numpy(dtype=float))
+        n_invalid = int((~finite_mask).sum())
+        if finite_mask.sum() == 0:
+            raise ValueError(f"列 '{column}' 中没有有效数值，无法分箱均衡。")
+
+        num_valid = num.loc[num.index[finite_mask]]
+        actual_bins = max(2, min(int(n_bins), int(num_valid.nunique())))
+
+        # 2. 分箱
+        try:
+            if bin_strategy == "quantile":
+                binned, bin_edges = pd.qcut(num_valid, q=actual_bins, retbins=True, duplicates="drop")
+            else:
+                binned, bin_edges = pd.cut(num_valid, bins=actual_bins, retbins=True)
+        except Exception:
+            binned, bin_edges = pd.cut(num_valid, bins=actual_bins, retbins=True)
+
+        vc = binned.value_counts()
+        vc = vc[vc > 0]  # 空箱不参与
+
+        # 3. 每箱上限（None → 自动均衡：中位数向上取整）
+        if max_per_bin is None:
+            cap = int(np.ceil(float(vc.median()))) if vc.size > 0 else 1
+        else:
+            cap = max(1, int(max_per_bin))
+
+        rng = np.random.RandomState(int(random_state))
+
+        # 4. 逐箱执行均衡：高频箱下采样，稀疏箱全保留；无效值行原样保留
+        indices_to_keep = list(df.index[~finite_mask])
+        reduced_bins = []
+        kept_per_bin = {}
+
+        for label in vc.index:
+            grp_indices = binned.index[binned == label].tolist()
+            m = len(grp_indices)
+            key = str(label)
+            kept_per_bin[key] = min(m, cap)
+            if m <= cap:
+                indices_to_keep.extend(grp_indices)
+            else:
+                chosen = rng.choice(grp_indices, size=cap, replace=False).tolist()
+                indices_to_keep.extend(chosen)
+                reduced_bins.append(
+                    {"分箱区间": key, "原样本数": m, "保留数": cap, "删除数": m - cap}
+                )
+
+        indices_to_keep = sorted(indices_to_keep)
+        self.cleaned_data = df.loc[indices_to_keep].reset_index(drop=True)
+
+        # 5. 聚合统计指标
+        total_before = len(df)
+        total_after = len(self.cleaned_data)
+        max_before = int(vc.iloc[0]) if vc.size > 0 else 0
+        kept_vals = list(kept_per_bin.values())
+        max_after = int(max(kept_vals)) if kept_vals else 0
+
+        stats = {
+            "column": column,
+            "bin_strategy": bin_strategy,
+            "n_bins_actual": int(vc.size),
+            "cap_used": cap,
+            "total_before": total_before,
+            "total_after": total_after,
+            "removed_rows": total_before - total_after,
+            "n_invalid_kept": n_invalid,
+            "n_reduced_bins": len(reduced_bins),
+            "n_full_kept_bins": int(vc.size) - len(reduced_bins),
+            "max_bin_count_before": max_before,
+            "max_bin_count_after": max_after,
+            "max_bin_pct_before": float(max_before / total_before * 100.0) if total_before > 0 else 0.0,
+            "max_bin_pct_after": float(max_after / total_after * 100.0) if total_after > 0 else 0.0,
+            "bin_counts_before": {k: int(v) for k, v in vc.items()},
+            "bin_counts_after": kept_per_bin,
+            "bin_edges": [float(b) for b in bin_edges] if bin_edges is not None else None,
+            "reduced_bins": reduced_bins,
+        }
+        return self.cleaned_data, stats
+
+    def shape_to_normal(
+        self,
+        column,
+        n_bins=15,
+        mu=None,
+        sigma=None,
+        peak_samples=None,
+        bin_strategy="uniform",
+        random_state=42,
+    ):
+        """正态分布整形：将数值列的样本分布修整为近似正态（钟形）分布。
+
+        与 balance_target_bins 的「各箱等量均衡」不同，本方法保留自然数据常见的
+        「中间多、两头少」形态：以 mu 为中心、sigma 为宽度计算每箱的正态权重，
+        高频箱按权重目标下采样，两端箱按比例递减保留，稀疏箱不足目标时完整保留
+        （只削减、不虚构样本）。适合希望训练集分布贴近正态假设、避免硬性均匀化
+        破坏物理梯度连续性的场景。
+
+        Args:
+            column: 用于整形的数值列（通常是目标属性 y，如模量、Tg）
+            n_bins: 分箱数量（>=2）
+            mu: 正态中心。None 时自动取有效数据的均值
+            sigma: 正态宽度（标准差）。None 时自动取有效数据的标准差；
+                σ 越小形状越向中心集中，σ 越大越平坦
+            peak_samples: 中心区间（权重≈1）的最大保留样本数。
+                None 时自动取「最大箱样本数的一半向上取整」
+            bin_strategy: 分箱方式，'uniform' 等宽（推荐，能真实反映形态）
+                或 'quantile' 等频
+            random_state: 随机种子，保证下采样可复现
+
+        Returns:
+            tuple[pd.DataFrame, dict]: 整形后的 DataFrame 与统计信息字典。
+            含无效值（NaN/inf）的行不参与整形，原样保留。
+        """
+        df = self.cleaned_data
+        if df is None or df.empty:
+            return self.cleaned_data, {"error": "数据为空"}
+        if column not in df.columns:
+            raise ValueError(f"列 '{column}' 不在数据集中")
+
+        num = pd.to_numeric(df[column], errors="coerce")
+        finite_mask = np.isfinite(num.to_numpy(dtype=float))
+        n_invalid = int((~finite_mask).sum())
+        if finite_mask.sum() == 0:
+            raise ValueError(f"列 '{column}' 中没有有效数值，无法整形。")
+
+        num_valid = num.loc[num.index[finite_mask]]
+        actual_bins = max(2, min(int(n_bins), int(num_valid.nunique())))
+
+        try:
+            if bin_strategy == "quantile":
+                binned, bin_edges = pd.qcut(num_valid, q=actual_bins, retbins=True, duplicates="drop")
+            else:
+                binned, bin_edges = pd.cut(num_valid, bins=actual_bins, retbins=True)
+        except Exception:
+            binned, bin_edges = pd.cut(num_valid, bins=actual_bins, retbins=True)
+
+        vc = binned.value_counts().sort_index()
+        vc = vc[vc > 0]
+        if vc.size == 0:
+            raise ValueError(f"列 '{column}' 分箱后无有效样本，无法整形。")
+
+        # 自动参数：mu=均值，sigma=标准差（退化时回退值域/4）
+        mu_auto = float(num_valid.mean())
+        sigma_std = float(num_valid.std())
+        if not np.isfinite(sigma_std) or sigma_std <= 0:
+            _span = float(num_valid.max() - num_valid.min())
+            sigma_std = _span / 4.0 if _span > 0 else 1.0
+        mu_f = float(mu) if mu is not None else mu_auto
+        sigma_f = float(sigma) if (sigma is not None and sigma > 0) else sigma_std
+        peak = int(np.ceil(vc.max() * 0.5)) if peak_samples is None else max(1, int(peak_samples))
+
+        rng = np.random.RandomState(int(random_state))
+
+        # 各箱正态权重与保留目标：keep_i = min(实际, ceil(peak × exp(-0.5·z²)))
+        centers = np.array([iv.mid for iv in vc.index], dtype=float)
+        weights = np.exp(-0.5 * ((centers - mu_f) / sigma_f) ** 2)
+
+        indices_to_keep = list(df.index[~finite_mask])
+        plan_rows = []
+        kept_per_bin = {}
+
+        for label, w in zip(vc.index, weights):
+            grp_indices = binned.index[binned == label].tolist()
+            n_i = len(grp_indices)
+            target_i = peak * float(w)
+            keep_i = min(n_i, max(1, int(np.ceil(target_i))))
+            kept_per_bin[str(label)] = keep_i
+            if keep_i >= n_i:
+                indices_to_keep.extend(grp_indices)
+            else:
+                chosen = rng.choice(grp_indices, size=keep_i, replace=False).tolist()
+                indices_to_keep.extend(chosen)
+            plan_rows.append({
+                "分箱区间": str(label),
+                "箱中心": round(float(label.mid), 4) if hasattr(label, "mid") else None,
+                "正态权重": round(float(w), 4),
+                "原样本数": int(n_i),
+                "正态目标数": round(float(target_i), 1),
+                "计划保留": int(keep_i),
+                "计划删除": int(n_i - keep_i),
+            })
+
+        indices_to_keep = sorted(indices_to_keep)
+        self.cleaned_data = df.loc[indices_to_keep].reset_index(drop=True)
+
+        total_before = len(df)
+        total_after = len(self.cleaned_data)
+        kept_vals = list(kept_per_bin.values())
+
+        stats = {
+            "column": column,
+            "shape_mode": "normal",
+            "bin_strategy": bin_strategy,
+            "n_bins_actual": int(vc.size),
+            "mu": mu_f,
+            "sigma": sigma_f,
+            "peak_samples": peak,
+            "total_before": total_before,
+            "total_after": total_after,
+            "removed_rows": total_before - total_after,
+            "n_invalid_kept": n_invalid,
+            "bin_counts_before": {k: int(v) for k, v in vc.items()},
+            "bin_counts_after": kept_per_bin,
+            "bin_edges": [float(b) for b in bin_edges] if bin_edges is not None else None,
+            "max_bin_count_before": int(vc.max()),
+            "max_bin_count_after": int(max(kept_vals)) if kept_vals else 0,
+            "plan": plan_rows,
+        }
+        return self.cleaned_data, stats
+
+    def treat_range(
+        self,
+        column,
+        lower,
+        upper,
+        mode="downsample_ratio",
+        ratio=0.5,
+        n_bins=6,
+        max_per_bin=None,
+        random_state=42,
+    ):
+        """特定区间处理：仅对 [lower, upper] 区间内的样本做处理，区间外样本原样保留。
+
+        适用于「只动某个区段、不碰其他数据」的场景，例如软段区间（低模量 1~4 GPa）
+        样本过多，仅对该区间做下采样或直接删除，而完全不影响硬段（高模量）数据；
+        反之也可只清理某个异常值密集区段。
+
+        Args:
+            column: 目标数值列
+            lower / upper: 区间下限 / 上限（含端点；下限大于上限时自动交换）
+            mode: 区间内处理方式
+                - 'remove': 删除区间内全部样本
+                - 'downsample_ratio': 区间内按比例随机保留
+                - 'downsample_bins': 区间内分箱均衡下采样（区间范围等宽切分，每箱上限 max_per_bin）
+            ratio: 'downsample_ratio' 模式的保留比例 (0,1)
+            n_bins: 'downsample_bins' 模式的区间内分箱数
+            max_per_bin: 'downsample_bins' 模式的每箱上限；None 时自动取区间内各箱样本数中位数
+            random_state: 随机种子
+
+        Returns:
+            tuple[pd.DataFrame, dict]: 处理后的 DataFrame 与统计信息字典
+        """
+        df = self.cleaned_data
+        if df is None or df.empty:
+            return self.cleaned_data, {"error": "数据为空"}
+        if column not in df.columns:
+            raise ValueError(f"列 '{column}' 不在数据集中")
+        if lower is None or upper is None or not (np.isfinite(float(lower)) and np.isfinite(float(upper))):
+            raise ValueError("区间上下限必须为有效数值。")
+        lower, upper = float(lower), float(upper)
+        if lower > upper:
+            lower, upper = upper, lower
+
+        num = pd.to_numeric(df[column], errors="coerce")
+        in_range_mask = ((num >= lower) & (num <= upper)).fillna(False)
+        in_range_idx = df.index[in_range_mask].tolist()
+        n_in = len(in_range_idx)
+
+        rng = np.random.RandomState(int(random_state))
+        indices_to_keep = df.index.difference(in_range_idx).tolist()
+        n_outside = len(indices_to_keep)
+        removed_in = 0
+        kept_per_bin = {}
+
+        if mode == "remove":
+            removed_in = n_in
+        elif mode == "downsample_ratio":
+            r = float(ratio)
+            if not (0.0 < r < 1.0):
+                raise ValueError("保留比例必须在 (0,1) 之间。")
+            if n_in > 0:
+                keep_n = max(1, int(round(n_in * r)))
+                chosen = rng.choice(in_range_idx, size=keep_n, replace=False).tolist()
+                indices_to_keep.extend(chosen)
+                removed_in = n_in - keep_n
+        elif mode == "downsample_bins":
+            if n_in > 0:
+                num_in = num.loc[in_range_idx]
+                # 区间范围显式等宽切分，保证每箱宽度一致
+                edges = np.linspace(lower, upper, max(2, int(n_bins)) + 1)
+                binned_in = pd.cut(num_in, bins=edges)
+                vc_in = binned_in.value_counts().sort_index()
+                vc_in = vc_in[vc_in > 0]
+                if vc_in.size == 0:
+                    raise ValueError("区间内没有有效数值样本可处理。")
+                if max_per_bin is None:
+                    cap = int(np.ceil(float(vc_in.median()))) if vc_in.size > 0 else 1
+                else:
+                    cap = max(1, int(max_per_bin))
+                for label in vc_in.index:
+                    grp = binned_in.index[binned_in == label].tolist()
+                    m = len(grp)
+                    kept_per_bin[str(label)] = min(m, cap)
+                    if m <= cap:
+                        indices_to_keep.extend(grp)
+                    else:
+                        chosen = rng.choice(grp, size=cap, replace=False).tolist()
+                        indices_to_keep.extend(chosen)
+                        removed_in += m - cap
+        else:
+            raise ValueError(f"未知的区间处理方式: {mode}")
+
+        indices_to_keep = sorted(indices_to_keep)
+        self.cleaned_data = df.loc[indices_to_keep].reset_index(drop=True)
+
+        stats = {
+            "column": column,
+            "range_mode": mode,
+            "range_lower": lower,
+            "range_upper": upper,
+            "n_in_range": n_in,
+            "n_outside_kept": n_outside,
+            "removed_in_range": int(removed_in),
+            "ratio": float(ratio) if mode == "downsample_ratio" else None,
+            "n_bins_used": int(n_bins) if mode == "downsample_bins" else None,
+            "cap_used": int(cap) if mode == "downsample_bins" else None,
+            "total_before": len(df),
+            "total_after": len(self.cleaned_data),
+            "removed_rows": len(df) - len(self.cleaned_data),
+            "bin_counts_after": kept_per_bin,
+        }
+        return self.cleaned_data, stats
+
     def balance_formulation_stratified(
         self,
         group_cols,

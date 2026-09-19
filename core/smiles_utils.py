@@ -691,12 +691,17 @@ def bigsmiles_to_smiles(bigsmiles_str: str) -> Optional[str]:
                 for h, lvl in _saved_handlers_level:
                     h.setLevel(lvl)
             # Try common export hooks
+            # [修复] 第三方库(如 bigsmiles 0.0.10)可能把 bond descriptor([<]/[>])
+            # 处理错误，产出无法 kekulize 的无效 SMILES(如七元芳环/O-C-O 三元环)。
+            # 输出必须通过严格解析校验，无效则转走采样代理/启发式 fallback。
             for attr in ("to_smiles", "smiles", "canonical_smiles"):
                 if hasattr(bs, attr):
                     out = getattr(bs, attr)
                     out = out() if callable(out) else out
-                    if out:
+                    if out and _strictly_parseable(str(out)):
                         return str(out)
+                    if out:
+                        break  # 库给出了输出但无效: 停止尝试其它属性, 走 fallback
         except Exception:
             pass
 

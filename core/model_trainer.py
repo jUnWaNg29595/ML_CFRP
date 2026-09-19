@@ -5123,6 +5123,12 @@ class EnhancedModelTrainer:
 
             model_params = params.copy()
 
+            if "PINN" in str(model_name):
+                # CV 折内强制轻量插补：折内重拟合贝叶斯多路插补是 CV 时间成本的大头，
+                # 且折内数据量小、多路插补增益有限；最终模型仍按用户配置插补
+                model_params["missing_value_strategy"] = "median"
+                model_params["missing_n_imputations"] = 1
+
             model_params.setdefault("seed", int(random_state + fold_i))
 
             if _should_pass_target_name(model_name) and "target_name" not in model_params and hasattr(y, "name"):
@@ -5416,6 +5422,10 @@ class EnhancedModelTrainer:
 
         params.pop("train_n_jobs", None)
         model_params = params.copy()
+        if "PINN" in str(model_name):
+            # CV 折内强制轻量插补（与 _cross_validate_pinn_special 一致）
+            model_params["missing_value_strategy"] = "median"
+            model_params["missing_n_imputations"] = 1
         if model_name in RAW_FRAME_MODELS_WITH_SMILES:
             smiles_col = self._resolve_smiles_col(X_df, model_params.pop("smiles_col", None))
             if not smiles_col:

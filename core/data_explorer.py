@@ -38,11 +38,11 @@ class EnhancedDataExplorer:
             if col in self.data.columns and col in self.numeric_cols
         ))
 
-    def correlation_data(self, cols=None):
+    def correlation_data(self, cols=None, method: str = "spearman"):
         cols = self._valid_numeric_columns(cols)
         if len(cols) < 2:
             return pd.DataFrame(index=cols, columns=cols, dtype=float)
-        return self.data.loc[:, cols].corr()
+        return self.data.loc[:, cols].corr(method=method)
 
     def distribution_data(self, cols=None):
         cols = self._valid_numeric_columns(cols)
@@ -78,8 +78,13 @@ class EnhancedDataExplorer:
         width=1200,
         height=800,
         show_sample_count=True,
+        method: str = "spearman",
     ):
-        """绘制相关性热图（支持自定义列子集和样本数显示控制）"""
+        """绘制相关性热图（支持自定义列子集和样本数显示控制）。
+
+        method: 相关系数类型，默认 "spearman"（斯皮尔曼秩相关，对离群值和非线性
+        单调关系更稳健）；可选 "pearson"（皮尔逊线性相关）。
+        """
         # 默认使用全部数值列
         if cols is None:
             cols = self.numeric_cols
@@ -91,7 +96,7 @@ class EnhancedDataExplorer:
             return None
 
         try:
-            corr = self.data[cols].corr()
+            corr = self.data[cols].corr(method=method)
 
             # 计算每对特征的有效样本数
             n_matrix = pd.DataFrame(index=cols, columns=cols, dtype=int)
@@ -177,7 +182,7 @@ class EnhancedDataExplorer:
         fig.update_layout(title='箱线图', width=width, height=height)
         return fig
 
-    def get_high_correlation_pairs(self, cols=None, threshold=0.8):
+    def get_high_correlation_pairs(self, cols=None, threshold=0.8, method: str = "spearman"):
         """返回高相关性特征对（支持自定义列子集）"""
         if cols is None:
             cols = self.numeric_cols
@@ -187,7 +192,7 @@ class EnhancedDataExplorer:
         if len(cols) < 2:
             return []
 
-        corr = self.data[cols].corr()
+        corr = self.data[cols].corr(method=method)
         pairs = []
         for i in range(len(corr.columns)):
             for j in range(i + 1, len(corr.columns)):

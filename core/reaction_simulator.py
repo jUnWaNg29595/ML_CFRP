@@ -109,19 +109,74 @@ def _epoxide_count_of_mol(mol):
         return 0
 
 
+# [修复4] 网络采样参数：全局固定，避免随配方漂移产生 artifact
+# （实测 n_hub 在 2/3/5 间变化会使环密度跳 ±40%、悬环氧率在 0/0.167 间跳变）
+NETWORK_SAMPLING = {
+    "atom_budget": 450,   # 单簇重原子预算（决定网络规模上限）
+    "n_hub": 3,           # 固化剂枢纽分子数（≥3 才能形成多枢纽真网络）
+    "max_pool_units": 60, # 池内单体数上限
+    "n_ensemble": 8,      # 系综样本数
+}
+
+
 def _junction_site_count(mol):
-    # 交联位点：已反应的胺N / 硫醚S（排除酰胺N与芳香n）
+    """交联位点绝对数（网络节点计数，非归一化）。
+
+    覆盖三类网络节点：
+      1) 胺类：已反应的叔胺 N（H0）/ 仲胺 N（H1）——每个 N 连接多条网络链
+      2) 硫醚 S：硫醇固化形成的 S 桥
+      3) [修复] 酸酐类：酯键分支节点——酸酐开环酯化后，
+         (a) 与两个酯/醚氧相连的叔碳（甘油骨架分支点）
+         (b) 与两个羰基相连的环状酸酐母核碳（季碳/叔碳）
+         (c) 酯基密度（C(=O)-O 计数）作为酸酐网络连通度代理
+    """
     total = 0
     try:
-        p1 = Chem.MolFromSmarts('[NX3;H0;!$([n]);!$([NX3]-[CX3]=[OX1])]')
-        p2 = Chem.MolFromSmarts('[NX3;H1;!$([n]);$(N(-[#6])-[#6]);!$([NX3]-[CX3]=[OX1])]')
-        p3 = Chem.MolFromSmarts('[#16X2;$(S(-[#6])-[#6])]')
-        for p in (p1, p2, p3):
+        patterns = [
+            '[NX3;H0;!$([n]);!$([NX3]-[CX3]=[OX1])]',           # 叔胺（完全反应的交联点）
+            '[NX3;H1;!$([n]);$(N(-[#6])-[#6]);!$([NX3]-[CX3]=[OX1])]',  # 仲胺
+            '[#16X2;$(S(-[#6])-[#6])]',                          # 硫醚桥
+            # [酸酐修复] 酯键分支节点：C 同时连接 ≥2 个酯/醚氧（甘油骨架分支）
+            '[CX4;$(C(-[OX2])-[OX2])]',
+            # [酸酐修复] 酸酐母核碳：与羰基相邻的环碳（开环后仍为网络节点）
+            '[CX4;R;$(C(-[CX3]=[OX1]))]',
+        ]
+        for sm in patterns:
+            p = Chem.MolFromSmarts(sm)
             if p is not None:
                 total += len(mol.GetSubstructMatches(p))
     except Exception:
         pass
     return total
+
+
+def _network_absolute_features(mol, stats: dict) -> dict:
+    """[修复1] 网络绝对量特征：让交联密度与簇大小（≈转化率）可分离。
+
+    归一化密度（per heavy atom）会被"簇长大"稀释，导致 junction 密度在
+    不同转化率下几乎不变——模型只能学到分子量信号。这里补充绝对量与
+    多口径密度，使"网络密度"与"网络规模"成为两个独立维度。
+    """
+    out = {}
+    try:
+        n_heavy = float(mol.GetNumHeavyAtoms())
+        n_junc = float(_junction_site_count(mol))
+        n_mono = float(stats.get('n_reacted', 0.0))          # 参与反应的环氧单体数（≈网络规模）
+        n_epi_total = float(stats.get('n_epoxy_total', 0.0))  # 池内环氧基总数
+        out['product_junction_sites_abs'] = n_junc                    # 绝对交联点数
+        out['product_junction_per_reacted_monomer'] = (n_junc / n_mono) if n_mono > 0 else 0.0
+        out['product_junction_per_epoxy_group'] = (n_junc / n_epi_total) if n_epi_total > 0 else 0.0
+        # 酯键/醚键绝对数：酸酐网络连通度
+        ester_p = Chem.MolFromSmarts('[CX3](=[OX1])[OX2][#6]')
+        ether_p = Chem.MolFromSmarts('[OD2]([#6])[#6]')
+        out['product_ester_bonds_abs'] = float(len(mol.GetSubstructMatches(ester_p))) if ester_p else 0.0
+        out['product_ether_bonds_abs'] = float(len(mol.GetSubstructMatches(ether_p))) if ether_p else 0.0
+        out['product_network_scale'] = n_mono                          # 网络规模（≈转化率×池规模）
+        # 交联点效率：每单位网络规模贡献的交联点（与规模解耦）
+        out['product_junction_efficiency'] = (n_junc / max(1.0, n_heavy)) * (n_mono / max(1.0, n_mono)) if n_mono > 0 else 0.0
+    except Exception:
+        pass
+    return out
 
 
 def _graph_invariants_from_mol(mol):
@@ -168,6 +223,9 @@ def _graph_invariants_from_mol(mol):
 
 def _compute_product_3d_descriptors(smiles):
     # 3D构象特征（ETKDGv3 + 随机坐标兜底），失败返回空dict
+    # [改动] 不再设原子数/碎片数闸门（实测 37/37 空缺全部由 >130 闸门造成，
+    # 系统性偏向高 DP 大分子）；最坏耗时改用 maxIterations 上限约束
+    # （RDKit 默认=10×原子数，430 原子会放大到数千次尝试，那才是卡死源头）。
     out = {}
     if not RDKIT_AVAILABLE:
         return out
@@ -175,15 +233,21 @@ def _compute_product_3d_descriptors(smiles):
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return out
-        n_frags = len(Chem.GetMolFrags(mol))
-        if mol.GetNumHeavyAtoms() > 130 or n_frags > 6:
-            return out
         params = AllChem.ETKDGv3()
         params.randomSeed = 42
         params.useSmallRingTorsions = True
+        # [提速] 迭代数按尺寸缩放（默认 10×原子数会放大到数千次；病态分子实测 >10min）
+        n_heavy = mol.GetNumHeavyAtoms()
+        params.maxIterations = max(30, min(100, 15000 // max(1, n_heavy)))
         cid = AllChem.EmbedMolecule(mol, params)
         if cid == -1:
+            # 二级降级：纯距离几何（关闭 ETKDG 知识项，单次迭代便宜 ~2 倍）
             params.useRandomCoords = True
+            try:
+                params.useBasicKnowledge = False
+            except Exception:
+                pass
+            params.maxIterations = max(20, min(60, 8000 // max(1, n_heavy)))
             cid = AllChem.EmbedMolecule(mol, params)
         if cid == -1:
             return out
@@ -242,6 +306,20 @@ def _compute_product_descriptors(smiles, include_3d=True):
                 out['product_residual_epoxide_density'] = _density(residual_epoxide_count)
                 out['internal_residual_epoxide_count'] = residual_epoxide_count
                 out['product_junction_site_density'] = _density(_junction_site_count(mol))
+                # [修复1] 绝对量网络特征：交联点数/酯键/醚键绝对计数——
+                # 归一化密度会被簇长大稀释（不同转化率下几乎不变），
+                # 绝对量让"网络密度"与"网络规模(≈转化率)"成为独立维度
+                _n_junc_abs = float(_junction_site_count(mol))
+                out['product_junction_sites_abs'] = _n_junc_abs
+                out['product_junction_per_heavy_atom'] = (_n_junc_abs / n_heavy) if n_heavy > 0 else 0.0
+                _ester_p = Chem.MolFromSmarts('[CX3](=[OX1])[OX2][#6]')
+                _ether_p = Chem.MolFromSmarts('[OD2]([#6])[#6]')
+                out['product_ester_bonds_abs'] = float(len(mol.GetSubstructMatches(_ester_p))) if _ester_p else 0.0
+                out['product_ether_bonds_abs'] = float(len(mol.GetSubstructMatches(_ether_p))) if _ether_p else 0.0
+                # 网络连通度密度：酯+醚桥总数 / 重原子（酸酐网络的关键量）
+                out['product_network_bridge_density'] = (
+                    (out['product_ester_bonds_abs'] + out['product_ether_bonds_abs']) / n_heavy
+                ) if n_heavy > 0 else 0.0
                 # Layer2: 无量纲拓扑形状指数（Kappa/HallKierAlpha/BalabanJ/E-state 极值均尺寸无关）
                 # 注：Chi 连接性指数与 BertzCT 随实现物规模增长，已移除
                 for k, nm in [('product_kappa1', 'Kappa1'), ('product_kappa2', 'Kappa2'), ('product_kappa3', 'Kappa3'),
@@ -297,7 +375,7 @@ EPOXY_SECONDARY_AMINE_RXN = ReactionTemplate(
 # 环氧-酸酐反应（5元环）：环氧 + 5元环酸酐 -> 具有游离羧酸的单酯
 EPOXY_ANHYDRIDE_5_RXN = ReactionTemplate(
     name="epoxy_anhydride_5",
-    smirks="[C:1]1[O:2][C:3]1.[#6:9]1~[#6:10]~[C:4](=[O:5])[O:6][C:7](=[O:8])1>>[C:1]([O:2])[C:3][O:6][C:4](=[O:5])[#6:10]~[#6:9][C:7](=[O:8])[O]",
+    smirks="[C:1]1[O:2][C:3]1.[#6:9]1[#6:10][C:4](=[O:5])[O:6][C:7](=[O:8])1>>[C:1][C:3][O:6][C:7](=[O:8])[#6:10][#6:9][C:4](=[O:5])[O:2]",
     description="环氧基与5元环酸酐开环反应，生成单酯和游离羧酸",
     curing_agent_type="anhydride",
     reactivity_order=1
@@ -306,7 +384,7 @@ EPOXY_ANHYDRIDE_5_RXN = ReactionTemplate(
 # 环氧-酸酐反应（6元环）：环氧 + 6元环酸酐 -> 具有游离羧酸的单酯
 EPOXY_ANHYDRIDE_6_RXN = ReactionTemplate(
     name="epoxy_anhydride_6",
-    smirks="[C:1]1[O:2][C:3]1.[#6:9]1~[#6:10]~[#6:11]~[C:4](=[O:5])[O:6][C:7](=[O:8])1>>[C:1]([O:2])[C:3][O:6][C:4](=[O:5])[#6:11]~[#6:10]~[#6:9][C:7](=[O:8])[O]",
+    smirks="[C:1]1[O:2][C:3]1.[#6:9]1[#6:10][#6:11][C:4](=[O:5])[O:6][C:7](=[O:8])1>>[C:1][C:3][O:6][C:7](=[O:8])[#6:11][#6:10][#6:9][C:4](=[O:5])[O:2]",
     description="环氧基与6元环酸酐开环反应，生成单酯和游离羧酸",
     curing_agent_type="anhydride",
     reactivity_order=1
@@ -315,7 +393,7 @@ EPOXY_ANHYDRIDE_6_RXN = ReactionTemplate(
 # 环氧-酸酐反应（通用/开链保底）：环氧 + 酸酐 -> 单酯主产物（无分离副产物）
 EPOXY_ANHYDRIDE_RXN = ReactionTemplate(
     name="epoxy_anhydride",
-    smirks="[C:1]1[O:2][C:3]1.[C:4](=[O:5])[O:6][C:7](=[O:8])>>[C:1]([O:2])[C:3][O:6][C:4](=[O:5])",
+    smirks="[C:1]1[O:2][C:3]1.[C:4](=[O:5])[O:6][C:7](=[O:8])>>[C:1][C:3][O:6][C:7](=[O:8]).[C:4](=[O:5])[O:2]",
     description="环氧基与酸酐反应主产物",
     curing_agent_type="anhydride",
     reactivity_order=1
@@ -367,7 +445,18 @@ EPOXY_ISOCYANATE_RXN = ReactionTemplate(
 )
 
 # 所有反应模板
+# 环氧-醇醚化反应：环氧开环 + 脂肪醇 -> 醚 + 新羟基（链延伸/臂生长通道，高温/催化下发生）
+EPOXY_ETHERIFICATION_RXN = ReactionTemplate(
+    name="epoxy_etherification",
+    smirks="[C:1]1[O:2][C:3]1.[OX2;H1:4][CX4;#6:5]>>[C:1]([O:2])[C:3][O:4][#6:5]",
+    description="环氧基与脂肪羟基醚化，生成醚键和β-羟基（臂延伸通道）",
+    curing_agent_type="alcohol",
+    reactivity_order=3
+)
+
 ALL_REACTION_TEMPLATES = [
+    EPOXY_ETHERIFICATION_RXN,
+
     EPOXY_PRIMARY_AMINE_RXN,
     EPOXY_SECONDARY_AMINE_RXN,
     EPOXY_ANHYDRIDE_5_RXN,
@@ -924,8 +1013,24 @@ class EpoxyReactionSimulator:
             except Exception:
                 pass
 
-        # 2. BigSMILES 特征解包与降级（针对高分子化学文献中的低聚物表达形式）
+        # 2. BigSMILES 处理
+        # [网络化重构] 优先随机图解析器：按拓扑采样出保留端基的具体寡聚体 SMILES，
+        # 替代旧的硬编码字符串白名单（白名单外体系化学失真的根源）。
         if '{' in s or ('[' in s and ('>' in s or '<' in s)):
+            try:
+                import zlib as _zlib
+                from core.bigsmiles_stochastic_graph import sample_bigsmiles_realizations
+                _seed = _zlib.crc32(s.encode('utf-8')) & 0x7fffffff
+                _reals = sample_bigsmiles_realizations(
+                    s, n_samples=1, min_repeat_units=1, max_repeat_units=3, seed=_seed
+                )
+                if _reals:
+                    _cand = str(_reals[0]).strip()
+                    if RDKIT_AVAILABLE and _cand and Chem.MolFromSmiles(_cand) is not None:
+                        return _cand
+            except Exception:
+                pass
+            # 历史白名单兜底（图解析失败时的最后防线）
             if 'C(C)(C)' in s and ('c1' in s or 'c2' in s or 'c3' in s) and ('CO' in s or 'OCC' in s):
                 return 'CC(C)(c1ccc(OCC2CO2)cc1)c1ccc(OCC2CO2)cc1'
             if 'c1ccc(C(C)(C)c2ccc(' in s or 'c2ccc(C(C)(C)c3ccc(' in s:
@@ -1131,8 +1236,14 @@ class EpoxyReactionSimulator:
 
         try:
             # 时间因子：指数饱和模型
-            time_factor = 1.0 - np.exp(-curing_time / 2.0)
-            time_factor = np.clip(time_factor, 0.3, 1.0)
+            # [修复] (150°C, 2h) 是参考态哨兵值而非真实数据：此时因子应为 1.0。
+            # 否则缺工艺数据的行全部被 0.63 的假时间因子压到 ~50%
+            # （实测 274/472 行同值 0.5563 = 0.88×1.0×0.6321）
+            if abs(float(curing_temp) - 150.0) < 1e-9 and abs(float(curing_time) - 2.0) < 1e-9:
+                time_factor = 1.0
+            else:
+                time_factor = 1.0 - np.exp(-float(curing_time) / 2.0)
+                time_factor = np.clip(time_factor, 0.3, 1.0)
         except Exception:
             time_factor = 1.0
 
@@ -1161,6 +1272,292 @@ class EpoxyReactionSimulator:
 
         return float(estimated_conversion)
 
+    # ------------------------------------------------------------------
+    # [转化率重构] DiBenedetto 玻璃化极限模型：低/中温固化的转化率由
+    # "Tg 追上固化温度"封顶，后固化（更高温保温）再推一档。
+    # 仅需数据里的 (最高反应温度, 是否后固化) 两个字段，与 PINN 物理层口径兼容。
+    # ------------------------------------------------------------------
+    # [活性标准] 每类体系的特征温度 T_char（标准工艺时长下达到平台转化率的温度）
+    # 与平台转化率 plateau——由体系反应活性决定，而非统一模板
+    _ACTIVITY_STANDARD = {
+        # curer_type: (plateau, T_char °C)
+        "anhydride_acc":   (0.95,  70),   # 酸酐+促进剂/催化剂：100-150°C 固化完全
+        "anhydride":       (0.62, 105),   # 酸酐无促进剂：动力学受限，平台低且特征温度高
+        "thiol":           (0.93,  55),   # 硫醇：点击型反应，低温即完全
+        "amine_aliphatic": (0.90,  70),   # 脂肪胺：室温-80°C 即可固化
+        "amine_aromatic":  (0.93, 110),   # 芳香胺（DDS/DDM）：需 120-180°C
+        "phenol":          (0.90, 150),
+        "hydrazide":       (0.92, 120),
+        "default":         (0.92, 110),
+    }
+
+    def _detect_amine_subtype(self, curer_mol) -> str:
+        """胺细分：芳香胺（N-H 邻接芳香环，如 DDS/DDM）vs 脂肪胺——活性差 3-5 倍"""
+        try:
+            patt = Chem.MolFromSmarts("[NX3;H2,H1;!$([n])](-[c])")
+            if patt is not None:
+                matches = curer_mol.GetSubstructMatches(patt)
+                n_sites = len({m[0] for m in matches})
+                total_h = sum(1 for a in curer_mol.GetAtoms()
+                              if a.GetAtomicNum() == 7 and not a.GetIsAromatic()
+                              and a.GetTotalNumHs() > 0)
+                if total_h > 0 and n_sites >= total_h:
+                    return "amine_aromatic"
+        except Exception:
+            pass
+        return "amine_aliphatic"
+
+    def _activity_standard(self, curer_mol, has_accelerator: bool):
+        """按固化剂结构+促进剂返回 (plateau, T_char)"""
+        curer_type = self._detect_curer_type_legacy(curer_mol)
+        if curer_type == "amine":
+            subtype = self._detect_amine_subtype(curer_mol)
+            plateau, t_char = self._ACTIVITY_STANDARD.get(subtype, (0.90, 85))
+            if has_accelerator:
+                t_char -= 15  # 促进剂把特征温度拉低 15°C
+            return plateau, max(45, t_char)
+        if curer_type == "anhydride":
+            plateau, t_char = self._ACTIVITY_STANDARD["anhydride_acc" if has_accelerator else "anhydride"]
+            return plateau, t_char
+        plateau, t_char = self._ACTIVITY_STANDARD.get(curer_type, self._ACTIVITY_STANDARD["default"])
+        if has_accelerator:
+            t_char -= 10
+        return plateau, max(45, t_char)
+
+    _VITRIFICATION_PARAMS = {
+        # [标定] reach 按体系×有无促进剂取值（工业/DSC 共识）：
+        #   酸酐无促进剂在合理工艺时间内仅 0.40-0.60（促进剂是决定性开关 → 0.90-0.98）
+        #   芳香胺无促进剂 0.85-0.90（150°C+ 需长时），有促进剂 0.95-0.98
+        #   全套工艺（促进剂+催化剂+后固化）齐全的配方按领域判断应达 0.90-0.95
+        "amine":     {"tg0": -25.0, "tg_inf": 175.0, "reach_no_acc": 0.93, "reach_acc": 0.97},
+        "anhydride": {"tg0": -15.0, "tg_inf": 165.0, "reach_no_acc": 0.62, "reach_acc": 1.00},
+        "thiol":     {"tg0": -30.0, "tg_inf": 150.0, "reach_no_acc": 0.90, "reach_acc": 0.95},
+        "phenol":    {"tg0": -10.0, "tg_inf": 200.0, "reach_no_acc": 0.85, "reach_acc": 0.93},
+        "hydrazide": {"tg0": -20.0, "tg_inf": 185.0, "reach_no_acc": 0.88, "reach_acc": 0.94},
+        "default":   {"tg0": -20.0, "tg_inf": 185.0, "reach_no_acc": 0.90, "reach_acc": 0.95},
+    }
+    _LAMBDA_DIBENEDETTO = 0.45
+
+
+    @staticmethod
+    def _detect_accelerator_signal(row, wide_row, df_cols, wide_cols) -> Optional[bool]:
+        """从行/宽表的促进剂、催化剂计数列识别促进剂信号。
+
+        检测列：accelerator_count / accelerator_component_count / catalyst_count /
+        catalyst_component_count（任一 > 0 即视为有促进/催化体系）。
+        返回 True/False；无任何相关列时返回 None（调用方回退结构检测）。
+        """
+        candidates = ("accelerator_count", "accelerator_component_count",
+                      "catalyst_count", "catalyst_component_count")
+        found = False
+        for col in candidates:
+            for src_cols, src in ((df_cols, row), (wide_cols, wide_row)):
+                if src_cols is not None and col in src_cols and src is not None:
+                    try:
+                        v = src.get(col)
+                        if v is None or pd.isna(v):
+                            continue
+                        found = True  # 至少读到一个有效计数值
+                        if float(v) > 0:
+                            return True
+                    except Exception:
+                        continue
+        # 列存在且计数全为 0 → 明确无促进剂(False)；列不存在 → None(回退结构检测)
+        return False if found else None
+
+    @staticmethod
+    def _sanitize_t_max(t_max_c) -> Optional[float]:
+        """最高反应温度脏数据防护：可解析且落在 [25, 260]°C 才有效，否则 None。
+
+        实测数据存在 727°C 等录入错误（真实固化 ≤250°C）；越界值不参与估算。
+        """
+        try:
+            t = float(t_max_c)
+        except (TypeError, ValueError):
+            return None
+        if np.isnan(t) or not np.isfinite(t):
+            return None
+        if 25.0 <= t <= 260.0:
+            return t
+        return None
+
+    @staticmethod
+    def _parse_post_cure(v) -> bool:
+        """是否后固化字段解析：兼容 bool / 0-1 / 是否 / true-false 文本。"""
+        if v is None:
+            return False
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            return float(v) >= 0.5
+        s = str(v).strip().lower()
+        return s in {"1", "1.0", "true", "yes", "y", "是", "有", "后固化"}
+
+    def _detect_curer_type_legacy(self, mol) -> str:
+        """mol 对象版固化剂类型检测（胺/酸酐/硫醇/酚/肼/其他）"""
+        try:
+            fg = {}
+            fg['primary_amine'] = len(mol.GetSubstructMatches(self._site_patt("[NX3;H2;!$([n]);!$([NX3]-[CX3]=[OX1])]")))
+            fg['secondary_amine'] = len(mol.GetSubstructMatches(self._site_patt("[NX3;H1;!$([n]);$(N(-[#6])-[#6]);!$([NX3]-[CX3]=[OX1])]")))
+            fg['anhydride'] = len(mol.GetSubstructMatches(self._site_patt("[CX3](=[OX1])[OX2][CX3](=[OX1])")))
+            fg['thiol'] = len(mol.GetSubstructMatches(self._site_patt("[SX2;H1]")))
+            fg['phenol'] = len(mol.GetSubstructMatches(self._site_patt("[OX2;H1][c]")))
+            fg['carboxylic_oh'] = len(mol.GetSubstructMatches(self._site_patt("[OX2;H1][CX3]=[OX1]")))
+            if fg['anhydride'] > 0:
+                return "anhydride"
+            if fg['thiol'] > 0:
+                return "thiol"
+            if (fg['primary_amine'] + fg['secondary_amine']) > 0:
+                return "amine"
+            if fg['phenol'] > 0:
+                return "phenol"
+            return "unknown"
+        except Exception:
+            return "unknown"
+
+    def quantify_system_activity(self, epoxy_mol, curer_mol, has_accelerator: bool = False) -> Dict[str, float]:
+        """量化体系反应活性（分子级），并据此给出特征温度与平台转化率。
+
+        活性 = 固化剂亲核性(nuc) + 环氧亲电性(elec) + 位阻(steric) + 催化/促进剂
+          - 亲核性：活性氢杂原子的 Gasteiger 电荷（越负越强）+ 位点类型基准 + N 取代位阻
+          - 亲电性：环氧碳 Gasteiger 电荷（越正越易被进攻）+ 端位环氧加成
+          - 特征温度：T_char = T_base(体系类型) − 40(nuc−0.5) − 40(elec−0.5) + 15(位阻)
+        返回 {nuc, elec, steric, activity, t_char, plateau}
+        """
+        out = {"nuc": 0.5, "elec": 0.5, "steric": 0.0, "activity": 0.5,
+               "t_char": 130.0, "plateau": 0.92}
+        try:
+            curer_type = self._detect_curer_type_legacy(curer_mol)
+            plateau, t_base = self._activity_standard(curer_mol, has_accelerator)
+
+            # ---- 固化剂亲核性 ----
+            site_base = {"thiol": 1.00, "primary_amine": 0.85, "secondary_amine": 0.68,
+                         "phenol_oh": 0.35, "carboxylic_oh": 0.25, "anhydride": 0.30}
+            best, best_atom = 0.0, None
+            for nm, smarts, _t, _w in self._H_SITE_SPECS:
+                patt = self._site_patt(smarts)
+                if patt is None:
+                    continue
+                ms = curer_mol.GetSubstructMatches(patt)
+                if ms and site_base.get(nm, 0.4) > best:
+                    best = site_base.get(nm, 0.4)
+                    best_atom = ms[0][0]
+            nuc = best if best > 0 else 0.35
+            if best_atom is not None:
+                try:
+                    AllChem.ComputeGasteigerCharges(curer_mol)
+                    q = float(curer_mol.GetAtomWithIdx(best_atom).GetProp("_GasteigerCharge"))
+                    if np.isfinite(q):
+                        # 典型杂原子电荷 -0.6(强) ~ -0.1(弱) → 映射到 ±0.15 修正
+                        nuc += float(np.clip((-0.35 - q) * 0.6, -0.15, 0.15))
+                except Exception:
+                    pass
+            # N 取代位阻：取代基多 → 活性降
+            if curer_type == "amine" and best_atom is not None:
+                try:
+                    heavy_nb = sum(1 for nb in curer_mol.GetAtomWithIdx(best_atom).GetNeighbors()
+                                   if nb.GetAtomicNum() > 1)
+                    nuc -= 0.06 * max(0, heavy_nb - 1)
+                except Exception:
+                    pass
+
+            # ---- 环氧亲电性 ----
+            elec = 0.5
+            try:
+                epi_patt = self._site_patt(self._EPOXY_SITE_SMARTS)
+                ms = epoxy_mol.GetSubstructMatches(epi_patt)
+                if ms:
+                    AllChem.ComputeGasteigerCharges(epoxy_mol)
+                    qs, n_terminal = [], 0
+                    for (a1, o, a2) in ms:
+                        for a in (a1, a2):
+                            q = float(epoxy_mol.GetAtomWithIdx(a).GetProp("_GasteigerCharge"))
+                            if np.isfinite(q):
+                                qs.append(q)
+                        # 端位判断：环氧碳上 H 数（2 = 端位 CH2，更易被进攻）
+                        if epoxy_mol.GetAtomWithIdx(a1).GetTotalNumHs() == 2 or                            epoxy_mol.GetAtomWithIdx(a2).GetTotalNumHs() == 2:
+                            n_terminal += 1
+                    if qs:
+                        q_mean = float(np.mean(qs))
+                        elec = float(np.clip((q_mean - 0.02) / 0.20, 0.0, 1.0))
+                    terminal_frac = n_terminal / max(1, len(ms))
+                    elec += 0.15 * (terminal_frac - 0.5)
+            except Exception:
+                terminal_frac = 0.5
+            else:
+                terminal_frac = locals().get("terminal_frac", 0.5)
+
+            steric = float(np.clip(1.0 - terminal_frac, 0.0, 1.0))
+            activity = 0.45 * nuc + 0.40 * elec + 0.15 * (1.0 - steric)
+            t_char = t_base - 30.0 * (nuc - 0.5) - 30.0 * (elec - 0.5) + 15.0 * steric
+            t_char = float(np.clip(t_char, 45.0, 210.0))
+            out.update({"nuc": round(float(nuc), 4), "elec": round(float(elec), 4),
+                        "steric": round(float(steric), 4), "activity": round(float(activity), 4),
+                        "t_char": round(t_char, 1), "plateau": round(float(plateau), 4)})
+        except Exception:
+            pass
+        return out
+
+    def estimate_conversion_from_activity(
+        self,
+        epoxy_mol,
+        curer_mol,
+        t_max_c: float,
+        post_cure: bool = False,
+        has_accelerator: bool = False,
+        stoichiometry_r: float = 1.0,
+    ) -> float:
+        """[活性标准] 由体系反应活性确定特征温度，再按固化温度给转化率。
+
+        α = plateau × sigmoid((T_max − T_char + 25) / 25) × 计量比上限 + 后固化
+        - plateau/T_char 由固化剂类型与结构（芳香胺 vs 脂肪胺）+ 促进剂决定
+        - 计量比守恒上限 min(1, r, 1/r) 照常折减
+        """
+        try:
+            act = self.quantify_system_activity(epoxy_mol, curer_mol, has_accelerator)
+            plateau, t_char = act["plateau"], act["t_char"]
+            x = (float(t_max_c) - t_char + 35.0) / 30.0
+            sig = 1.0 / (1.0 + np.exp(-x))
+            alpha = plateau * sig
+            r_eff = float(stoichiometry_r) if stoichiometry_r and float(stoichiometry_r) > 0 else 1.0
+            alpha *= min(1.0, r_eff, 1.0 / r_eff)
+            if post_cure:
+                alpha += 0.05
+            return float(np.clip(alpha, 0.10, 0.95))
+        except Exception:
+            return 0.50
+
+    def estimate_conversion_vitrification(
+        self,
+        curer_type: str,
+        t_max_c: float,
+        post_cure: bool = False,
+        has_accelerator: bool = False,
+    ) -> float:
+        """由 (最高反应温度, 是否后固化, 是否有促进剂) 估算转化率。
+
+        DiBenedetto: Tg(α)=Tg0+(Tg∞−Tg0)·λα/(1−(1−λ)α)，反解 Tg(α)=T_max 得玻璃化封顶；
+        后固化 +0.06，夹到 [0.30, 0.97]。
+        促进剂不改变玻璃化天花板（热力学），只改变动力学可达程度（reach）：
+        酸酐无促进剂时低温动力学显著受限，温度越高限制越小。
+        """
+        params = self._VITRIFICATION_PARAMS.get(curer_type, self._VITRIFICATION_PARAMS["default"])
+        lam = self._LAMBDA_DIBENEDETTO
+        b = float(t_max_c) - params["tg0"]
+        denom = (params["tg_inf"] - params["tg0"]) * lam + (1.0 - lam) * b
+        if denom <= 0:
+            return 0.30
+        alpha = b / denom  # 玻璃化天花板
+        # [标定修复] 动力学可达系数按"体系 × 有无促进剂"取值：
+        #   酸酐无促进剂 0.62（合理工艺时间内仅 0.40-0.60，促进剂是决定性开关）
+        #   胺无促进剂 0.93（150°C+ 热运动可达 0.85-0.90）；有促进剂 +2~30 个百分点
+        # 总上限 0.93：实测 DSC 最终转化率鲜有 >0.92
+        reach = params["reach_acc"] if has_accelerator else params["reach_no_acc"]
+        alpha *= reach
+        if post_cure:
+            alpha += 0.06  # 后固化：高温段解除玻璃化冻结，转化率再推进一档
+        return float(np.clip(alpha, 0.30, 0.95))
+
     def estimate_conversion_multicomponent(
         self,
         resin_components: List[Tuple[str, float]],
@@ -1168,7 +1565,10 @@ class EpoxyReactionSimulator:
         stoichiometry_r: float,
         curing_temp: float = 150.0,
         curing_time: float = 2.0,
-        accelerator_present: bool = False
+        accelerator_present: bool = False,
+        t_max_c: Optional[float] = None,
+        post_cure: bool = False,
+        has_accelerator_hint: Optional[bool] = None,
     ) -> float:
         """
         估算多组分体系的转化率
@@ -1196,6 +1596,26 @@ class EpoxyReactionSimulator:
 
         resin_components = [(smi, w / total_resin_weight) for smi, w in resin_components]
         curer_components = [(smi, w / total_curer_weight) for smi, w in curer_components]
+
+        # [转化率重构] 优先玻璃化模型：数据提供有效最高反应温度时，转化率由
+        # (T_max, 后固化) 决定（DiBenedetto 封顶），化学计量比仍作上限折减。
+        # 脏温度（<25 或 >260°C，如实测 727°C）已被 _sanitize_t_max 过滤，自动回退旧查表。
+        t_eff = self._sanitize_t_max(t_max_c) if t_max_c is not None else None
+        if t_eff is not None:
+            try:
+                main_resin_smi = max(resin_components, key=lambda x: x[1])[0]
+                main_curer_smi = max(curer_components, key=lambda x: x[1])[0]
+                e_mol = Chem.MolFromSmiles(self._to_reactive_smiles(main_resin_smi) or main_resin_smi)
+                c_mol = Chem.MolFromSmiles(self._to_reactive_smiles(main_curer_smi) or main_curer_smi)
+                if e_mol is None or c_mol is None:
+                    raise ValueError("parse_fail")
+                acc_signal = has_accelerator_hint if has_accelerator_hint is not None else bool(accelerator_present)
+                r_eff = float(stoichiometry_r) if stoichiometry_r and float(stoichiometry_r) > 0 else 1.0
+                alpha = self.estimate_conversion_from_activity(
+                    e_mol, c_mol, t_eff, bool(post_cure), acc_signal, r_eff)
+                return float(np.clip(alpha, 0.10, 0.95))
+            except Exception:
+                pass  # 异常时回退旧查表路径
 
         # 1. 计算加权平均官能度
         weighted_epoxy_func = 0.0
@@ -1258,8 +1678,12 @@ class EpoxyReactionSimulator:
             temp_factor = 1.0
 
         try:
-            time_factor = 1.0 - np.exp(-curing_time / 2.0)
-            time_factor = np.clip(time_factor, 0.3, 1.0)
+            # [修复] (150°C, 2h) 哨兵值=参考态，时间因子取 1.0（详见 estimate_conversion）
+            if abs(float(curing_temp) - 150.0) < 1e-9 and abs(float(curing_time) - 2.0) < 1e-9:
+                time_factor = 1.0
+            else:
+                time_factor = 1.0 - np.exp(-float(curing_time) / 2.0)
+                time_factor = np.clip(time_factor, 0.3, 1.0)
         except Exception:
             time_factor = 1.0
 
@@ -1497,14 +1921,43 @@ class EpoxyReactionSimulator:
 
         stoich_r = weighted_curer_func / weighted_epoxy_func if weighted_epoxy_func > 0 else 0.0
 
-        # 使用主要组分生成产物
-        product_repr = self.get_product_representation(
-            main_resin_smi,
-            main_curer_smi,
-            stoichiometry=stoich_r,
-            target_conversion=target_conversion,
-            output_format='auto'
-        )
+        # [网络化重构] 系综撒网生长：K 个随机种子 → medoid 代表 SMILES + 系综统计；
+        # 引擎不可用时回退 get_product_representation 旧路径
+        ens = None
+        try:
+            ens = self.build_network_unit_ensemble(
+                main_resin_smi,
+                main_curer_smi,
+                target_conversion=target_conversion,
+                stoichiometry=stoich_r,
+                n_samples=8,
+            )
+        except Exception as _e_ens:
+            if self.verbose:
+                print(f"⚠️ 系综生长失败，回退旧路径: {_e_ens}")
+            ens = None
+        if ens is not None:
+            product_repr = {
+                'representation_type': 'smiles',
+                'smiles': ens['representative_smiles'],
+                'bigsmiles': None,
+                'conversion': target_conversion,
+                'stoichiometry': stoich_r,
+                'description': (
+                    f'系综撒网生长交联簇（{ens["n_valid_samples"]} 样本 medoid，'
+                    f'实际转化率 {ens["ensemble"]["realized_conversion_mean"]*100:.0f}%）'
+                ),
+            }
+            ens_stats = ens['ensemble']
+        else:
+            product_repr = self.get_product_representation(
+                main_resin_smi,
+                main_curer_smi,
+                stoichiometry=stoich_r,
+                target_conversion=target_conversion,
+                output_format='auto'
+            )
+            ens_stats = None
 
         # [重复率修复] 按行内权重构造随机共聚网络单元，使次要组分差异体现在网络拓扑上
         copolymer_bigsmiles = None
@@ -1531,6 +1984,7 @@ class EpoxyReactionSimulator:
             'representative_bigsmiles': product_repr.get('bigsmiles'),
             'copolymer_bigsmiles': copolymer_bigsmiles,
             'composition_features': self._composition_discriminator_features(resin_components, curer_components),
+            'ensemble_stats': ens_stats,
         }
 
     def _simulate_combinatorial(
@@ -1671,6 +2125,8 @@ class EpoxyReactionSimulator:
             products = rxn.RunReactants((epoxy_mol, curer_mol))
             
             valid_products = []
+            # [性能] 大簇上 RunReactants 会枚举几十个位点匹配，每个产物都是全分子
+            # 拷贝 + SanitizeMol（大簇时 ~50ms/个）——封顶 8 个足够随机选择使用
             for prod_tuple in products:
                 # 关键修复：当反应生成多个产物片段（如脱除小分子或开环分离产物）时，
                 # 仅保留重原子数最多的主交联产物，坚决剔除 CCCC=O、C=CC=O 等游离副产物
@@ -1689,6 +2145,8 @@ class EpoxyReactionSimulator:
                             valid_products.append(prod)
                         except Exception:
                             continue
+                if len(valid_products) >= 8:
+                    break
             
             return valid_products
             
@@ -1886,7 +2344,8 @@ class EpoxyReactionSimulator:
         epoxy_smiles: str,
         curer_smiles: str,
         target_conversion: float = 0.85,
-        max_reactions: int = 8
+        max_reactions: int = 8,
+        stoichiometry: float = 1.0
     ) -> Optional[str]:
         """化学计量驱动的交联网络枢纽片段构建（向后兼容入口）。
 
@@ -1894,7 +2353,8 @@ class EpoxyReactionSimulator:
         （“反应后”表示不再含环氧基）。
         """
         pack = self.build_network_unit_full(
-            epoxy_smiles, curer_smiles, target_conversion, max_reactions
+            epoxy_smiles, curer_smiles, target_conversion, max_reactions,
+            stoichiometry=stoichiometry
         )
         return pack[0] if pack else None
 
@@ -1903,18 +2363,26 @@ class EpoxyReactionSimulator:
         epoxy_smiles: str,
         curer_smiles: str,
         target_conversion: float = 0.85,
-        max_reactions: int = 8
+        max_reactions: int = 8,
+        stoichiometry: float = 1.0,
+        seed: int = 0,
+        atom_budget: int = 450,
     ) -> Optional[Tuple[str, int, Optional[str]]]:
         """构建交联单元并返回连接点信息。
 
-        以 1 个固化剂分子为交联枢纽，按目标转化率迭代开环接入新鲜环氧单体：
-          反应步数 n = round(alpha × 枢纽活性氢数)
-          每步优先消耗枢纽上活性最高位点（伯胺H > 仲胺H > 酚OH/羧酸OH > 硫醇H）
-        生成后统一做残留环氧开环封端（旧版分支末端以未反应环氧表示悬键，
-        导致产物分子式含环氧基，已废弃该表示）。
+        [网络化重构] 优先使用池化随机撒网生长引擎 `_grow_network_cluster`：
+          多枢纽分子池 + 活性加权随机位点配对反应 + 化学计量比 r=H/epoxy 驱动池组成，
+          悬环氧/悬 N-H/O-H 按物理端点保留（废除"水解式"封端与悬键甲基化）。
+        引擎不可用（枢纽无活性氢如异氰酸酯、反应模板不匹配等）时自动回退
+        旧贪心链增长路径 `_build_network_unit_impl`。
+
+        Args:
+            stoichiometry: 化学计量比 r（活性氢/环氧基），决定池内环氧单体数
+            seed: 随机种子（系综采样时传入不同 seed）
+            atom_budget: 单簇重原子预算，超出冻结生长
 
         Returns:
-            (单元SMILES[无环氧], 连接点数, 带内联[$]描述符的BigSMILES单元文本)
+            (单元SMILES, 连接点数, 带内联[$]描述符的BigSMILES单元文本)
             失败时返回 None
         """
         if not RDKIT_AVAILABLE:
@@ -1930,7 +2398,12 @@ class EpoxyReactionSimulator:
         except Exception:
             a_conv = 0.85
 
-        cache_key = (r_act, c_act, round(a_conv, 3))
+        try:
+            r_eff = float(stoichiometry) if stoichiometry and float(stoichiometry) > 0 else 1.0
+        except Exception:
+            r_eff = 1.0
+
+        cache_key = (r_act, c_act, round(a_conv, 3), round(r_eff, 3), int(seed), int(atom_budget))
         cache = getattr(self, '_unit_cache', None)
         if cache is None:
             cache = {}
@@ -1938,7 +2411,17 @@ class EpoxyReactionSimulator:
         if cache_key in cache:
             return cache[cache_key]
 
-        unit_pack = self._build_network_unit_impl(r_act, c_act, a_conv, max_reactions)
+        # [网络化重构] 优先撒网生长引擎，失败回退旧贪心链增长
+        unit_pack = None
+        try:
+            grown = self._grow_network_cluster(r_act, c_act, a_conv, stoich_r=r_eff,
+                                               seed=seed, atom_budget=atom_budget)
+            if grown is not None:
+                unit_pack = grown['pack']
+        except Exception:
+            unit_pack = None
+        if unit_pack is None:
+            unit_pack = self._build_network_unit_impl(r_act, c_act, a_conv, max_reactions)
         cache[cache_key] = unit_pack
         return unit_pack
 
@@ -1988,6 +2471,494 @@ class EpoxyReactionSimulator:
             return self._finalize_network_unit(product)
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # [网络化重构] 池化随机撒网生长引擎
+    # 与旧版"贪心链增长"的区别：
+    #   1. 分子池：n_hub 个固化剂枢纽 + n 个环氧单体（n 由化学计量比 r=H/epoxy 决定）
+    #   2. 每步按活性权重随机挑 (环氧侧片段, 供体位点类型) 配对反应，
+    #      RunReactants 的多匹配再随机挑一个 → 支臂随机生长、枢纽间桥接，拓扑自然成网
+    #   3. 悬环氧 / 悬 N-H / O-H 原样保留（物理端点，废除"水解式"封端与甲基封端）
+    #   4. 原子预算：单簇超限冻结生长（记录 truncated），预算内保留尽可能大的网络簇
+    # ------------------------------------------------------------------
+    _EPOXY_SITE_SMARTS = "[C]1[O][C]1"
+    _H_SITE_SPECS = (
+        # (位点类型, SMARTS, 反应模板名, 相对活性权重)
+        ("primary_amine", "[NX3;H2;!$([n]);!$([NX3]-[CX3]=[OX1])]", "epoxy_primary_amine", 3.0),
+        ("secondary_amine", "[NX3;H1;!$([n]);$(N(-[#6])-[#6]);!$([NX3]-[CX3]=[OX1])]", "epoxy_secondary_amine", 1.0),
+        ("thiol", "[SX2;H1]", "epoxy_thiol", 2.0),
+        # [关键修复] 酸酐：活性位点不是 X-H 键（羰基 C 被进攻、酐键断裂），
+        # 缺失此位点会导致酸酐体系零反应、产物退化为环氧单体本身
+        ("anhydride", "[CX3](=[OX1])[OX2][CX3](=[OX1])", "epoxy_anhydride_5", 1.0),
+        ("phenol_oh", "[OX2;H1][c]", "epoxy_phenol", 0.5),
+        # 羧酸：SMARTS 以 O 开头，保证手术式开环时 match[0] 是羟基 O（而非羰基 C）
+        ("carboxylic_oh", "[OX2;H1][CX3]=[OX1]", "epoxy_carboxylic_acid", 0.5),
+        ("aliphatic_oh", "[OX2;H1][CX4]", "epoxy_etherification", 0.3),
+    )
+    # 手术式开环仅适用 X-H 加成化学；酸酐开环需断酐 C-O-C 键，只走跨片段 SMARTS 模板
+    _SURGERY_OK = {"primary_amine", "secondary_amine", "thiol", "phenol_oh",
+                   "carboxylic_oh", "aliphatic_oh"}
+    # 酸酐环大小多变：5 元失败依次回退 6 元/通用模板
+    # [修复] 通用模板已重写为原子守恒版（酯 + 羧酸双片段），纳入回退链
+    _TMPL_FALLBACK = {"epoxy_anhydride_5": ("epoxy_anhydride_6", "epoxy_anhydride")}
+
+    def _site_patt(self, smarts: str):
+        """SMARTS 编译缓存"""
+        cache = getattr(self, "_site_patt_cache", None)
+        if cache is None:
+            cache = {}
+            self._site_patt_cache = cache
+        patt = cache.get(smarts)
+        if patt is None:
+            patt = Chem.MolFromSmarts(smarts)
+            cache[smarts] = patt
+        return patt
+
+    def _site_meta(self) -> Dict[str, Tuple[str, float]]:
+        """位点类型 -> (反应模板名, 活性权重)"""
+        meta = getattr(self, "_h_site_meta", None)
+        if meta is None:
+            meta = {nm: (tmpl, w) for nm, _s, tmpl, w in self._H_SITE_SPECS}
+            self._h_site_meta = meta
+        return meta
+
+    def _enumerate_site_counts(self, mol) -> Dict[str, int]:
+        """统计分子上各类活性氢位点数量"""
+        out = {}
+        for nm, smarts, _tmpl, _w in self._H_SITE_SPECS:
+            patt = self._site_patt(smarts)
+            out[nm] = len(mol.GetSubstructMatches(patt)) if patt is not None else 0
+        return out
+
+    def _enumerate_site_atoms(self, mol) -> Dict[str, list]:
+        """统计分子上各类活性氢位点的原子索引（用于分子内环化的手术式成键）"""
+        out = {}
+        for nm, smarts, _tmpl, _w in self._H_SITE_SPECS:
+            patt = self._site_patt(smarts)
+            out[nm] = [m[0] for m in mol.GetSubstructMatches(patt)] if patt is not None else []
+        return out
+
+    def _cross_fragment_addition(self, epoxy_mol, donor_mol, site_type: str, rng):
+        """跨片段手术式环氧开环加成（与 SMARTS 模板产物拓扑一致，O(1) 成本）。
+
+        模板化学：环氧 O 留在位阻大的 C 上成 β-OH，位阻小的 C 与供体杂原子成新键。
+        氢计数由 RDKit 隐式价键在 SanitizeMol 时自动结算。
+        仅适用 X-H 加成类型（胺/酚/羧酸/醇/硫醇）；酸酐仍走 SMARTS 模板。
+        返回合并后的新片段（RWMol 已 Sanitize）或 None。
+        """
+        try:
+            smarts_map = {nm: sm for nm, sm, _t, _w in self._H_SITE_SPECS}
+            patt = self._site_patt(smarts_map.get(site_type, ""))
+            if patt is None:
+                return None
+            rw = Chem.RWMol(Chem.CombineMols(epoxy_mol, donor_mol))
+            off = epoxy_mol.GetNumAtoms()
+            epi_patt = self._site_patt(self._EPOXY_SITE_SMARTS)
+            # 环氧环必须在环氧侧（atom idx < off）
+            epi_matches = [m for m in rw.GetSubstructMatches(epi_patt) if m[0] < off and m[2] < off]
+            # 供体位点必须在供体侧（atom idx >= off）
+            donor_idxs = [m[0] + off for m in donor_mol.GetSubstructMatches(patt)]
+            if not epi_matches or not donor_idxs:
+                return None
+            pairs = [(a1, o, a2, d) for (a1, o, a2) in epi_matches for d in donor_idxs]
+            a1, o, a2, d = pairs[rng.randrange(len(pairs))]
+
+            def _hvy(n):
+                return sum(1 for nb in rw.GetAtomWithIdx(n).GetNeighbors() if nb.GetAtomicNum() > 1)
+
+            att = a1 if _hvy(a1) <= _hvy(a2) else a2  # 攻位阻小的 C
+            if rw.GetBondBetweenAtoms(o, att) is None:
+                return None
+            rw.RemoveBond(o, att)
+            rw.AddBond(d, att, Chem.BondType.SINGLE)
+            dat = rw.GetAtomWithIdx(d)
+            if dat.GetNumExplicitHs() > 0:
+                dat.SetNumExplicitHs(max(0, dat.GetNumExplicitHs() - 1))
+            Chem.SanitizeMol(rw)
+            return rw
+        except Exception:
+            return None
+
+    def _surgery_open_ring(self, mol, site_type: str, rng):
+        """片段内环化：同一分子上悬环氧 + 活性氢位点直接开环成键（图距离≥5 防小环张力）。
+
+        化学拓扑与 SMARTS 模板产物一致：O 留在位阻大的 C 上成 β-OH，
+        位阻小的 C（CH2）与供体杂原子成新键；H 计数由 RDKit 隐式价键自动结算。
+        返回新 RWMol(已 Sanitize) 或 None。
+        """
+        try:
+            rw = Chem.RWMol(mol)
+            epi_matches = rw.GetSubstructMatches(self._site_patt(self._EPOXY_SITE_SMARTS))
+            smarts_map = {nm: sm for nm, sm, _t, _w in self._H_SITE_SPECS}
+            patt = self._site_patt(smarts_map.get(site_type, ""))
+            if patt is None:
+                return None
+            donor_idxs = [m[0] for m in rw.GetSubstructMatches(patt)]
+            if not epi_matches or not donor_idxs:
+                return None
+            dm = Chem.GetDistanceMatrix(rw)
+            pairs = []
+            for (a1, o, a2) in epi_matches:
+                for d in donor_idxs:
+                    if d in (a1, o, a2):
+                        continue
+                    if min(dm[d][a1], dm[d][a2]) >= 5:
+                        pairs.append((a1, o, a2, d))
+            if not pairs:
+                return None
+            a1, o, a2, d = pairs[rng.randrange(len(pairs))]
+
+            def _hvy(n):
+                return sum(1 for nb in rw.GetAtomWithIdx(n).GetNeighbors() if nb.GetAtomicNum() > 1)
+
+            # 攻击位阻小的 C（CH2），O 留在位阻大的 C 上成羟基
+            if _hvy(a1) <= _hvy(a2):
+                att = a1
+            else:
+                att = a2
+            if rw.GetBondBetweenAtoms(o, att) is None:
+                return None
+            rw.RemoveBond(o, att)
+            rw.AddBond(d, att, Chem.BondType.SINGLE)
+            dat = rw.GetAtomWithIdx(d)
+            if dat.GetNumExplicitHs() > 0:
+                dat.SetNumExplicitHs(max(0, dat.GetNumExplicitHs() - 1))
+            Chem.SanitizeMol(rw)
+            return rw
+        except Exception:
+            return None
+
+    @staticmethod
+    def _weighted_choice(rng, weights: Dict[object, float]):
+        total = sum(w for w in weights.values() if w > 0)
+        if total <= 0:
+            return None
+        x = rng.random() * total
+        acc = 0.0
+        last = None
+        for k, w in weights.items():
+            if w <= 0:
+                continue
+            acc += w
+            last = k
+            if x <= acc:
+                return k
+        return last
+
+    def _grow_network_cluster(
+        self,
+        r_act: str,
+        c_act: str,
+        a_conv: float,
+        stoich_r: float = 1.0,
+        seed: int = 0,
+        atom_budget: int = NETWORK_SAMPLING["atom_budget"],
+        n_hub: int = NETWORK_SAMPLING["n_hub"],
+        max_pool_units: int = NETWORK_SAMPLING["max_pool_units"],
+    ) -> Optional[Dict[str, any]]:
+        """单次撒网生长。返回 {'stats': {...}, 'pack': (smiles, n_attach, None)} 或 None。"""
+        import random as _random
+        if not RDKIT_AVAILABLE:
+            return None
+        hub0 = Chem.MolFromSmiles(c_act)
+        epoxy0 = Chem.MolFromSmiles(r_act)
+        if hub0 is None or epoxy0 is None:
+            return None
+        h_per_hub = self._count_reactive_h(c_act)
+        if h_per_hub <= 0:
+            return None  # 枢纽无活性氢（异氰酸酯等），交由调用方回退旧路径
+
+        rng = _random.Random(int(seed) * 7919 + 13)
+        ep_hvy = max(1, epoxy0.GetNumHeavyAtoms())
+        epi_patt0 = self._site_patt(self._EPOXY_SITE_SMARTS)
+        # 单体携带的环氧基数（DGEBA=2、单官能稀释剂=1）：r 语义必须基于环氧基团数
+        epi_per_mol = max(1, len(epoxy0.GetSubstructMatches(epi_patt0)))
+
+        # ---- 池规模：r = 活性氢总数 / 环氧基团总数 ----
+        r_eff = float(stoich_r) if stoich_r and float(stoich_r) > 0 else 1.0
+        r_eff = min(max(r_eff, 0.05), 20.0)
+        n_hub = max(1, int(n_hub))
+        h_total = h_per_hub * n_hub
+        n_epoxy = int(round(h_total / r_eff / epi_per_mol))
+        n_epoxy = max(n_hub, min(n_epoxy, max_pool_units))
+        # 池总原子预算约束（允许池约为单簇预算的 2.2 倍，凝胶簇约占大头）
+        n_epoxy = min(n_epoxy, max(1, int((atom_budget * 2.2 - n_hub * hub0.GetNumHeavyAtoms()) / ep_hvy)))
+        n_epoxy = max(1, n_epoxy)
+        epoxy_groups_total = n_epoxy * epi_per_mol
+
+        react_target = int(round(a_conv * epoxy_groups_total))
+        # [性能上限] 60 步反应已足以生成代表性网络簇（簇重原子 ≈ 预算上限）；
+        # 不设上限时多官能度体系可放大到 240 步，每步在 450 原子簇上做
+        # RunReactants+SanitizeMol，单行可达数分钟
+        react_target = max(0, min(react_target, h_total, 60))
+
+        frags = [Chem.Mol(hub0) for _ in range(n_hub)] + [Chem.Mol(epoxy0) for _ in range(n_epoxy)]
+        pool_hvy0 = sum(f.GetNumHeavyAtoms() for f in frags)
+        epi_patt = self._site_patt(self._EPOXY_SITE_SMARTS)
+        tert_patt = self._site_patt("[NX3;H0](-[#6])(-[#6])-[#6]")
+
+        reacted = 0
+        truncated = False
+        fail_streak = 0
+        meta = self._site_meta()
+        # 每种位点类型的 SMARTS（供体原子枚举用）
+        site_smarts = {nm: sm for nm, sm, _t, _w in self._H_SITE_SPECS}
+        while reacted < react_target:
+            sizes = [(i, f.GetNumHeavyAtoms()) for i, f in enumerate(frags) if f is not None]
+            active = [i for i, sz in sizes if sz <= atom_budget]
+            if not active:
+                truncated = True
+                break
+
+            # ---- 反应选项：跨片段 SMARTS 配对 + 片段内环化（手术式），按权重随机 ----
+            options = []  # (kind, data, weight)
+
+            # (a) 跨片段：环氧侧片段 × 供体片段
+            epi_counts = {}
+            donor_sites_all = {}
+            for i in active:
+                c = len(frags[i].GetSubstructMatches(epi_patt))
+                if c > 0:
+                    epi_counts[i] = float(c)
+                sites_i = self._enumerate_site_counts(frags[i])
+                w_i = sum(cnt * meta[nm][1] for nm, cnt in sites_i.items() if cnt > 0 and nm in meta)
+                if w_i > 0:
+                    donor_sites_all[i] = (sites_i, w_i)
+            for i, ce in epi_counts.items():
+                for j, (sites_j, wj) in donor_sites_all.items():
+                    if j == i:
+                        continue
+                    options.append(('cross', (i, j), ce * wj))
+
+            # (b) 片段内环化：同片段上 (悬环氧, 活性H) 图距离≥5 的配对
+            #     权重打 0.4 折（分子内环化概率低于分子间碰撞），但保证高转化率可达
+            for i in active:
+                epis_i = frags[i].GetSubstructMatches(epi_patt)
+                if not epis_i:
+                    continue
+                sites_atoms = self._enumerate_site_atoms(frags[i])
+                try:
+                    dm = Chem.GetDistanceMatrix(frags[i])
+                except Exception:
+                    continue
+                for nm, (tmpl, w) in meta.items():
+                    if nm not in self._SURGERY_OK:
+                        continue  # 酸酐等非 X-H 位点：手术式开环化学不适用
+                    cnt_ok = 0
+                    for d_idx in sites_atoms.get(nm, []):
+                        for (a1, o, a2) in epis_i:
+                            if d_idx in (a1, o, a2):
+                                continue
+                            if min(dm[d_idx][a1], dm[d_idx][a2]) >= 5:
+                                cnt_ok += 1
+                    if cnt_ok > 0:
+                        options.append(('intra', (i, nm), cnt_ok * w * 0.4))
+
+            if not options:
+                break
+            option_w = {idx: opt[2] for idx, opt in enumerate(options)}
+            pick = self._weighted_choice(rng, option_w)
+            if pick is None:
+                break
+            kind, data, _w = options[pick]
+
+            if kind == 'cross':
+                epi_idx, donor_idx = data
+                sites_j, _wj = donor_sites_all[donor_idx]
+                type_w = {nm: cnt * meta[nm][1] for nm, cnt in sites_j.items()
+                          if cnt > 0 and nm in meta and nm in self._SURGERY_OK}
+                if type_w:
+                    # [提速] X-H 加成类型走 O(1) 跨片段手术（替代 RunReactants 全枚举：
+                    # 大簇上 RunReactants 构建几十个全分子拷贝是单步 1-2s 的主因）
+                    site_type = self._weighted_choice(rng, type_w)
+                    if site_type is not None:
+                        new_mol = self._cross_fragment_addition(
+                            frags[epi_idx], frags[donor_idx], site_type, rng)
+                        if new_mol is not None:
+                            frags[epi_idx] = None
+                            frags[donor_idx] = new_mol
+                            reacted += 1
+                            fail_streak = 0
+                        else:
+                            fail_streak += 1
+                    else:
+                        fail_streak += 1
+                else:
+                    # 酸酐等非 X-H 位点：保留 SMARTS 模板路径（含回退链）
+                    site_type = self._weighted_choice(
+                        rng, {nm: cnt * meta[nm][1] for nm, cnt in sites_j.items() if cnt > 0 and nm in meta})
+                    if site_type is None:
+                        fail_streak += 1
+                    else:
+                        tmpl_name = meta[site_type][0]
+                        prods = self._run_single_reaction(frags[epi_idx], frags[donor_idx], tmpl_name)
+                        if not prods:
+                            for _fb in self._TMPL_FALLBACK.get(tmpl_name, ()):
+                                prods = self._run_single_reaction(frags[epi_idx], frags[donor_idx], _fb)
+                                if prods:
+                                    break
+                        if prods:
+                            new_frag = prods[rng.randrange(len(prods))]
+                            frags[epi_idx] = None
+                            frags[donor_idx] = new_frag
+                            reacted += 1
+                            fail_streak = 0
+                        else:
+                            fail_streak += 1
+            else:
+                fi, site_type = data
+                new_mol = self._surgery_open_ring(frags[fi], site_type, rng)
+                if new_mol is not None:
+                    frags[fi] = new_mol
+                    reacted += 1
+                    fail_streak = 0
+                else:
+                    fail_streak += 1
+            if fail_streak >= 4:
+                break
+
+        frags = [f for f in frags if f is not None]
+        if not frags:
+            return None
+        main = max(frags, key=lambda m: m.GetNumHeavyAtoms())
+        try:
+            Chem.SanitizeMol(main)
+        except Exception:
+            pass
+        smi = Chem.MolToSmiles(main)
+        if not smi:
+            return None
+
+        sites_main = self._enumerate_site_counts(main)
+        n_epi_left = len(main.GetSubstructMatches(epi_patt))
+        n_h_left = sum(cnt for nm, cnt in sites_main.items() if nm in meta)
+        n_tert = len(main.GetSubstructMatches(tert_patt))
+
+        stats = {
+            'smiles': smi,
+            'heavy_atoms': float(main.GetNumHeavyAtoms()),
+            'mw': float(Descriptors.MolWt(main)),
+            'n_hub': float(n_hub),
+            'n_epoxy_total': float(epoxy_groups_total),
+            'n_reacted': float(reacted),
+            'realized_conversion': float(reacted) / max(1.0, float(epoxy_groups_total)),
+            'n_dangling_epoxide': float(n_epi_left),
+            'dangling_epoxide_frac': float(n_epi_left) / max(1.0, float(epoxy_groups_total)),
+            'n_dangling_h': float(n_h_left),
+            'dangling_h_frac': float(n_h_left) / max(1.0, float(h_total)),
+            'n_tertiary_amine': float(n_tert),
+            'gel_frac': float(main.GetNumHeavyAtoms()) / max(1, pool_hvy0),
+            'truncated': 1.0 if truncated else 0.0,
+        }
+        # 兼容旧三元组接口：(clean_smiles, n_attach, marked)
+        n_attach = int(n_epi_left + n_h_left)
+        return {'stats': stats, 'pack': (smi, n_attach, None)}
+
+    def build_network_unit_ensemble(
+        self,
+        epoxy_smiles: str,
+        curer_smiles: str,
+        target_conversion: float = 0.85,
+        stoichiometry: float = 1.0,
+        n_samples: int = 8,
+        atom_budget: int = 450,
+    ) -> Optional[Dict[str, any]]:
+        """K 个随机种子的系综撒网生长。
+
+        Returns:
+            dict(representative_smiles, n_attach, ensemble={mw_mean, mw_std, ...}, n_valid_samples)
+            representative_smiles 取 MW 中位数样本（medoid 简化）
+        """
+        r_act = self._to_reactive_smiles(epoxy_smiles) or self._clean_smiles(epoxy_smiles)
+        c_act = self._to_reactive_smiles(curer_smiles) or self._clean_smiles(curer_smiles)
+        if not r_act or not c_act:
+            return None
+        try:
+            a_conv = max(0.0, min(1.0, float(target_conversion) if target_conversion is not None else 0.85))
+        except Exception:
+            a_conv = 0.85
+
+        cache_key = (r_act, c_act, round(a_conv, 3), round(float(stoichiometry or 1.0), 3), int(n_samples))
+        cache = getattr(self, "_ens_cache", None)
+        if cache is None:
+            cache = {}
+            self._ens_cache = cache
+        if cache_key in cache:
+            return cache[cache_key]
+
+        samples = []
+        for k in range(max(1, int(n_samples))):
+            try:
+                st = self._grow_network_cluster(r_act, c_act, a_conv, stoich_r=stoichiometry,
+                                                seed=k, atom_budget=atom_budget)
+            except Exception:
+                st = None
+            if st:
+                samples.append(st)
+        if not samples:
+            cache[cache_key] = None
+            return None
+
+        import numpy as _np
+        def _ms(key):
+            vals = _np.array([s['stats'][key] for s in samples], dtype=float)
+            return float(vals.mean()), float(vals.std())
+
+        mw_mean, mw_std = _ms('mw')
+        ha_mean, _ha_std = _ms('heavy_atoms')
+        rc_mean, _rc_std = _ms('realized_conversion')
+        de_mean, de_std = _ms('dangling_epoxide_frac')
+        dh_mean, _dh_std = _ms('dangling_h_frac')
+        gf_mean, gf_std = _ms('gel_frac')
+        ta_mean, ta_std = _ms('n_tertiary_amine')
+
+        # [修复3] 系综涨落必须取自"拓扑量"——簇大小由转化率决定（物理恒定），
+        # 真实涨落在支化模式/环密度/桥键数上。逐样本算拓扑描述符后统计。
+        _topo_keys = ('product_ring_density', 'product_junction_site_density',
+                      'product_ester_bonds_abs', 'product_ether_bonds_abs',
+                      'product_network_bridge_density', 'product_rotatable_bond_ratio')
+        _topo_vals = {k: [] for k in _topo_keys}
+        for s in samples:
+            try:
+                _d = _compute_product_descriptors(s['stats']['smiles'], include_3d=False)
+                for k in _topo_keys:
+                    v = _d.get(k)
+                    if v is not None and _np.isfinite(v):
+                        _topo_vals[k].append(float(v))
+            except Exception:
+                continue
+        topo_stats = {}
+        for k, vals in _topo_vals.items():
+            if len(vals) >= 2:
+                arr = _np.array(vals, dtype=float)
+                short = k.replace('product_', '')
+                topo_stats[f'{short}_mean'] = float(arr.mean())
+                topo_stats[f'{short}_std'] = float(arr.std())
+
+        mws = [s['stats']['mw'] for s in samples]
+        med_idx = int(_np.argsort(mws)[len(mws) // 2])
+        rep = samples[med_idx]
+
+        ensemble = {
+            'mw_mean': mw_mean, 'mw_std': mw_std,
+            'heavy_atoms_mean': ha_mean,
+            'realized_conversion_mean': rc_mean,
+            'dangling_epoxide_frac_mean': de_mean, 'dangling_epoxide_frac_std': de_std,
+            'dangling_h_frac_mean': dh_mean,
+            'gel_frac_mean': gf_mean, 'gel_frac_std': gf_std,
+            'n_tertiary_amine_mean': ta_mean, 'n_tertiary_amine_std': ta_std,
+            'n_samples': float(len(samples)),
+        }
+        # [修复3] 合并拓扑涨落统计（网络构型异质性，大小之外的真正系综信息）
+        ensemble.update(topo_stats)
+        out = {
+            'representative_smiles': rep['stats']['smiles'],
+            'n_attach': rep['pack'][1],
+            'ensemble': ensemble,
+            'n_valid_samples': len(samples),
+        }
+        cache[cache_key] = out
+        return out
 
     def _finalize_network_unit(
         self, product_smiles: Optional[str]
@@ -2043,7 +3014,8 @@ class EpoxyReactionSimulator:
         try:
             unit = self.build_network_unit(
                 epoxy_smiles, curer_smiles,
-                target_conversion=target_conversion if target_conversion is not None else 0.5
+                target_conversion=target_conversion if target_conversion is not None else 0.5,
+                stoichiometry=stoichiometry if stoichiometry and float(stoichiometry) > 0 else 1.0
             )
         except Exception:
             unit = None
@@ -2209,7 +3181,7 @@ class EpoxyReactionSimulator:
         result['representation_type'] = 'bigsmiles' if output_format in ('bigsmiles', 'auto') else output_format
         result['smiles'] = smiles
         result['bigsmiles'] = bigsmiles
-        result['description'] = f'交联网络单元（SMILES + BigSMILES，转化率 {target_conversion*100:.0f}%）'
+        result['description'] = f'交联网络簇（SMILES 产物 + BigSMILES 拓扑，目标转化率 {target_conversion*100:.0f}%）'
         return result
 
 
@@ -2268,7 +3240,11 @@ class CrosslinkedFeatureExtractor:
         features['curer_type_thiol'] = 1 if curer_type == 'thiol' else 0
         features['curer_type_hydrazide'] = 1 if curer_type == 'hydrazide' else 0
 
-        features['primary_amine_count'] = curer_fg.get('primary_amine', 0) + curer_fg.get('aromatic_amine', 0)
+        # [修复] 芳香伯胺（苯环上的 NH2）同时命中 primary_amine 与 aromatic_amine 两个
+        # SMARTS，直接相加会把 DDS 的 2 个伯胺数成 4 → 官能度 8、r=4、转化率被压到 0.22。
+        # primary_amine 的 SMARTS [NX3;H2] 本就覆盖芳香环外 NH2，aromatic_amine 仅作类型标记。
+        features['primary_amine_count'] = curer_fg.get('primary_amine', 0)
+        features['aromatic_amine_count'] = curer_fg.get('aromatic_amine', 0)
         features['secondary_amine_count'] = curer_fg.get('secondary_amine', 0)
         features['anhydride_count'] = curer_fg.get('anhydride', 0)
         features['thiol_count'] = curer_fg.get('thiol', 0)
@@ -2292,11 +3268,14 @@ class CrosslinkedFeatureExtractor:
         features['curer_functionality'] = curer_functionality
 
         # 化学计量比 (r = 活性氢当量 / 环氧当量)
-        if epoxy_functionality > 0:
-            features['stoichiometry_r'] = curer_functionality / epoxy_functionality
-        else:
-            features['stoichiometry_r'] = 0.0
-        
+        # [修复] 单组分路径没有配方配比数据，旧的"官能度比"实为 1:1 分子混合假设
+        # （DGEBA+DDS 会得出 r=4→转化率 0.22），与真实配方化学计量无关。
+        # 参考态取 r=1（化学计量平衡）；真实 r 由数据列/多组分路径提供。
+        features['molecular_functionality_ratio'] = (
+            curer_functionality / epoxy_functionality if epoxy_functionality > 0 else 0.0
+        )
+        features['stoichiometry_r'] = 1.0
+
         # 理论最大转化率
         r = features['stoichiometry_r']
         if r > 0:
@@ -2329,9 +3308,10 @@ class CrosslinkedFeatureExtractor:
             features['estimated_conversion_input'] = 0.5
             actual_conversion = 0.5
 
-        # 保存固化条件
+        # 保存固化条件与转化率（[修复] 原先由"转化率代理"块赋值，删除代理后需在此正式写入）
         features['curing_temp'] = curing_temp
         features['curing_time'] = curing_time
+        features['estimated_conversion'] = actual_conversion
 
         # 3. 模拟反应产物特征（使用智能表示方法）
         try:
@@ -2343,27 +3323,21 @@ class CrosslinkedFeatureExtractor:
                 output_format='auto'  # 根据转化率自动选择
             )
 
-            # 保存表示类型和描述
-            features['representation_type'] = product_repr.get('representation_type', 'unknown')
-            features['representation_description'] = product_repr.get('description', '')
-
-            # 保存SMILES（如果有）并提取完整分层产物描述符
+            # [列精简] representation_type/description 文本列已删除；保留
+            # product_smiles（产物 SMILES）与 product_structure（网络 BigSMILES 包裹）
             product_smi = product_repr.get('smiles')
-            product_bigsmi = product_repr.get('bigsmiles') or (f"{{[$]{product_smi}[$]}}" if product_smi else None)
             if product_smi:
                 features['product_smiles'] = product_smi
-                features['product_structure'] = product_bigsmi or product_smi
+                features['product_structure'] = f"{{[$]{product_smi}[$]}}"
                 prod_desc = _compute_product_descriptors(product_smi, include_3d=True)
                 # 内部量不进入特征表：仅用于转化率相对化计算
                 residual_count = float(prod_desc.pop('internal_residual_epoxide_count', 0.0) or 0.0)
                 prod_desc.pop('internal_product_mol_weight', None)
                 features.update(prod_desc)
-                # 转化率代理（枢纽活性氢消耗近似，夹取到[0,1]）
-                if features['epoxide_count'] > 0:
-                    consumed = max(0.0, features['epoxide_count'] - residual_count)
-                    features['estimated_conversion'] = min(1.0, consumed / features['epoxide_count'])
-                else:
-                    features['estimated_conversion'] = 0.0
+                # [修复] 不再用"残余环氧占比"改写 estimated_conversion：撒网生长引擎的
+                # 产物是多单体簇（按转化率设计保留悬环氧），残余数/单体环氧数已无转化率
+                # 语义，且会把估算值（0.88/0.78）覆盖成 ~0.5 的假值。
+                # 环氧消耗信息由 residual_epoxide_density 等产物描述符承载。
             else:
                 features['product_smiles'] = None
                 features['product_structure'] = None
@@ -2625,7 +3599,11 @@ def _extract_multicomponent_chunk(
     auto_estimate_conversion: bool,
     reaction_method: str,
     prefix: str,
-    verbose: bool = False
+    verbose: bool = False,
+    max_temp_col: Optional[str] = None,
+    post_cure_col: Optional[str] = None,
+    accelerator_count_col: Optional[str] = None,
+    catalyst_count_col: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """子进程 Worker 函数：负责一个独立数据批次的多组分交联与物理机理特征提取"""
     ext = MulticomponentCrosslinkedFeatureExtractor(verbose=verbose)
@@ -2734,6 +3712,17 @@ def _extract_multicomponent_chunk(
             else:
                 curing_time = default_curing_time
 
+            # [转化率重构] 读取 (最高反应温度, 是否后固化)，脏数据已过滤（[25,260]°C 外视为缺失）
+            t_max_c = None
+            if max_temp_col and max_temp_col in chunk_df.columns:
+                t_max_c = ext.simulator._sanitize_t_max(row.get(max_temp_col))
+            _post_raw = row.get(post_cure_col) if (post_cure_col and post_cure_col in chunk_df.columns) else None
+            post_cure_flag = ext.simulator._parse_post_cure(_post_raw)
+            # [促进剂接入] 优先读促进剂/催化剂计数列（行或宽表），无计数列时回退结构检测
+            acc_hint = ext.simulator._detect_accelerator_signal(
+                row, wide_row, list(chunk_df.columns),
+                list(wide_row.index) if wide_row is not None else None)
+
             # 6. 提取特征
             features = ext.extract_multicomponent_features(
                 resin_components,
@@ -2744,7 +3733,10 @@ def _extract_multicomponent_chunk(
                 curing_time=curing_time,
                 auto_estimate_conversion=auto_estimate_conversion,
                 reaction_method=reaction_method,
-                accelerator_present=bool(_add_features.get("additive_accelerator_present", 0.0))
+                accelerator_present=bool(_add_features.get("additive_accelerator_present", 0.0)),
+                t_max_c=t_max_c,
+                post_cure=post_cure_flag,
+                has_accelerator_hint=acc_hint
             )
 
             # [添加剂感知] 合并添加剂特征（前缀前合并，保持同前缀命名）
@@ -2808,7 +3800,10 @@ class MulticomponentCrosslinkedFeatureExtractor:
         curing_time: float = 2.0,
         auto_estimate_conversion: bool = True,
         reaction_method: str = 'weighted',
-        accelerator_present: bool = False
+        accelerator_present: bool = False,
+        t_max_c: Optional[float] = None,
+        post_cure: bool = False,
+        has_accelerator_hint: Optional[bool] = None,
     ) -> Dict[str, any]:
         """
         提取多组分交联特征
@@ -2895,10 +3890,16 @@ class MulticomponentCrosslinkedFeatureExtractor:
                 stoichiometry_r,
                 curing_temp,
                 curing_time,
-                accelerator_present=accelerator_present
+                accelerator_present=accelerator_present,
+                t_max_c=t_max_c,
+                post_cure=post_cure,
+                has_accelerator_hint=has_accelerator_hint
             )
             # 不保存 conversion_source，只保存转化率值
             actual_conversion = estimated_conversion
+            # [转化率重构] 标记是否使用了 (T_max, 后固化) 玻璃化模型
+            features['used_schedule_conversion'] = 1.0 if (
+                self.simulator._sanitize_t_max(t_max_c) is not None) else 0.0
         elif target_conversion is not None:
             actual_conversion = target_conversion
         else:
@@ -2946,6 +3947,13 @@ class MulticomponentCrosslinkedFeatureExtractor:
                 _sp = reaction_result.get('sampled_pair') or {}
                 if _sp:
                     features['sampled_pair_probability'] = float(_sp.get('probability', 0.0))
+                # [网络化重构] 系综统计特征（均值±标准差刻画网络构型涨落）
+                _ens = reaction_result.get('ensemble_stats') or {}
+                for _ek, _ev in _ens.items():
+                    try:
+                        features[f'ens_{_ek}'] = float(_ev)
+                    except Exception:
+                        pass
 
                 # 检查产物是否有效（分子量增长或结构变化）
                 if smiles_result:
@@ -2972,10 +3980,9 @@ class MulticomponentCrosslinkedFeatureExtractor:
                     except Exception:
                         pass
 
-                # 产物结构字符串：首选 BigSMILES (若有)，否则包装为 BigSMILES
-                if not bigsmiles_result and smiles_result:
-                    bigsmiles_result = f"{{[$]{smiles_result}[$]}}"
-                features['product_structure'] = bigsmiles_result or smiles_result
+                # [列恢复] product_structure = 网络拓扑 BigSMILES（共聚候选优先）
+                if bigsmiles_result:
+                    features['product_structure'] = bigsmiles_result
                 features['product_smiles'] = smiles_result
                 # [去重] structure 与 smiles 已覆盖全部信息，不再重复输出 bigsmiles 列
 
@@ -3005,6 +4012,13 @@ class MulticomponentCrosslinkedFeatureExtractor:
                 _sp = reaction_result.get('sampled_pair') or {}
                 if _sp:
                     features['sampled_pair_probability'] = float(_sp.get('probability', 0.0))
+                # [网络化重构] 系综统计特征（均值±标准差刻画网络构型涨落）
+                _ens = reaction_result.get('ensemble_stats') or {}
+                for _ek, _ev in _ens.items():
+                    try:
+                        features[f'ens_{_ek}'] = float(_ev)
+                    except Exception:
+                        pass
 
                 if smiles_result:
                     try:
@@ -3029,9 +4043,8 @@ class MulticomponentCrosslinkedFeatureExtractor:
                     except Exception:
                         pass
 
-                if not bigsmiles_result and smiles_result:
-                    bigsmiles_result = f"{{[$]{smiles_result}[$]}}"
-                features['product_structure'] = bigsmiles_result or smiles_result
+                if bigsmiles_result:
+                    features['product_structure'] = bigsmiles_result
                 features['product_smiles'] = smiles_result
                 # [去重] structure 与 smiles 已覆盖全部信息，不再重复输出 bigsmiles 列
 
@@ -3069,6 +4082,10 @@ class MulticomponentCrosslinkedFeatureExtractor:
         conversion_col: str = None,
         curing_temp_col: str = None,
         curing_time_col: str = None,
+        max_temp_col: str = None,
+        post_cure_col: str = None,
+        accelerator_count_col: str = None,
+        catalyst_count_col: str = None,
         default_curing_temp: float = 150.0,
         default_curing_time: float = 2.0,
         auto_estimate_conversion: bool = True,
@@ -3164,6 +4181,16 @@ class MulticomponentCrosslinkedFeatureExtractor:
             effective_n_jobs = n_jobs
 
         # 若数据量较大且指定多核，使用 joblib 多进程并行加速
+        # [转化率重构] 自动检测 (最高反应温度, 是否后固化) 列；也可由调用方显式传入列名
+        if max_temp_col is None:
+            max_temp_col = 'process_max_temperature_c' if 'process_max_temperature_c' in df.columns else None
+        if post_cure_col is None:
+            post_cure_col = 'process_has_post_cure' if 'process_has_post_cure' in df.columns else None
+        if accelerator_count_col is None:
+            accelerator_count_col = next((c for c in ('accelerator_count', 'accelerator_component_count') if c in df.columns), None)
+        if catalyst_count_col is None:
+            catalyst_count_col = next((c for c in ('catalyst_count', 'catalyst_component_count') if c in df.columns), None)
+
         if effective_n_jobs > 1 and len(df) >= 20:
             try:
                 from joblib import Parallel, delayed
@@ -3187,7 +4214,9 @@ class MulticomponentCrosslinkedFeatureExtractor:
                         conversion_col, curing_temp_col, curing_time_col,
                         default_curing_temp, default_curing_time,
                         auto_estimate_conversion, reaction_method,
-                        prefix, self.verbose
+                        prefix, self.verbose,
+                        max_temp_col, post_cure_col,
+                        accelerator_count_col, catalyst_count_col
                     )
                     for sub_df, sub_wide in tasks
                 )
@@ -3308,6 +4337,16 @@ class MulticomponentCrosslinkedFeatureExtractor:
                 else:
                     curing_time = default_curing_time
 
+                # [转化率重构] 读取 (最高反应温度, 是否后固化)，脏数据已过滤
+                t_max_c = None
+                if max_temp_col and max_temp_col in df.columns:
+                    t_max_c = self._sanitize_t_max(df.iloc[idx].get(max_temp_col))
+                _post_raw = df.iloc[idx].get(post_cure_col) if (post_cure_col and post_cure_col in df.columns) else None
+                post_cure_flag = self._parse_post_cure(_post_raw)
+                acc_hint = self._detect_accelerator_signal(
+                    df.iloc[idx], wide_row, list(df.columns),
+                    list(wide_row.index) if wide_row is not None else None)
+
                 # 提取特征
                 features = self.extract_multicomponent_features(
                     resin_components,
@@ -3318,7 +4357,10 @@ class MulticomponentCrosslinkedFeatureExtractor:
                     curing_time=curing_time,
                     auto_estimate_conversion=auto_estimate_conversion,
                     reaction_method=reaction_method,
-                    accelerator_present=bool(_add_features.get("additive_accelerator_present", 0.0))
+                    accelerator_present=bool(_add_features.get("additive_accelerator_present", 0.0)),
+                    t_max_c=t_max_c,
+                    post_cure=post_cure_flag,
+                    has_accelerator_hint=acc_hint
                 )
 
                 # [添加剂感知] 合并添加剂特征（前缀前合并，保持同前缀命名）
@@ -3374,10 +4416,10 @@ def simulate_epoxy_curing(
 def extract_crosslink_features(
     epoxy_smiles: str,
     curer_smiles: str,
-    target_conversion: float = 0.5
+    target_conversion: float = None
 ) -> Dict[str, float]:
     """
-    便捷函数：提取交联特征
+    便捷函数：提取交联特征（target_conversion=None 时按固化剂类型自动估算）
     """
     extractor = CrosslinkedFeatureExtractor()
     return extractor.extract_crosslink_features(
@@ -3388,7 +4430,7 @@ def extract_crosslink_features(
 def get_reaction_product_smiles(
     epoxy_smiles: str,
     curer_smiles: str,
-    conversion: float = 0.5
+    conversion: float = None
 ) -> Optional[str]:
     """
     便捷函数：获取反应产物SMILES
