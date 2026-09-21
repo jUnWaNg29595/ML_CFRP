@@ -756,6 +756,24 @@ class FormulationFusionEngine:
             return False
 
         if mode == "qspr_clean":
+            # [逐组分物理量补齐] 窄表原本缺少逐组分 MW/EEW/AHEW，导致
+            # crosslink_physics 的 hybrid 分支不可达（f_avg 恒 NaN）。
+            # 这里按 文献 → 当量×官能度 → 结构直算 分层补齐，
+            # BigSMILES 采样代理与多片段单元格的 MW 会被拒绝（见 component_physics）。
+            # 失败不阻断清洗流程。
+            cp_available = False
+            try:
+                from .component_physics import enrich_narrow_table
+
+                _enriched = enrich_narrow_table(out_df)
+                if _enriched is not None and len(_enriched) == len(out_df):
+                    out_df = _enriched
+                    cp_available = True
+                    stats["component_physics_enriched"] = True
+            except Exception as _cp_err:
+                stats["component_physics_enriched"] = False
+                stats["component_physics_error"] = str(_cp_err)
+
             # 类似 ml_qspr_model_ 结构的标准特征组织
             valuable_ordered_cols = [
                 # 结构列 (包含三组分)
@@ -770,6 +788,11 @@ class FormulationFusionEngine:
                 "curing_agent_1_amount_phr", "curing_agent_2_amount_phr", "curing_agent_3_amount_phr",
                 "curing_agent_1_molecular_weight_g_mol", "curing_agent_2_molecular_weight_g_mol", "curing_agent_3_molecular_weight_g_mol",
                 "curing_agent_1_active_hydrogen_equivalent_count", "curing_agent_2_active_hydrogen_equivalent_count",
+                # [新增] 逐组分当量重（EEW/AHEW）与逐组分等效组
+                "resin_1_equivalent_weight_g_eq", "resin_2_equivalent_weight_g_eq", "resin_3_equivalent_weight_g_eq",
+                "curing_agent_1_equivalent_weight_g_eq", "curing_agent_2_equivalent_weight_g_eq", "curing_agent_3_equivalent_weight_g_eq",
+                "resin_1_equivalent_group_count", "resin_2_equivalent_group_count",
+                "curing_agent_1_equivalent_group_count", "curing_agent_2_equivalent_group_count",
                 # 配方宏观基准当量
                 "initiator_present", "formulation_resin_total_eew_g_eq", "formulation_hardener_total_ahew_g_eq",
                 "formulation_resin_hardener_equivalent_ratio", "formulation_r_value", "formulation_epoxy_binder_total_phr",
@@ -783,6 +806,35 @@ class FormulationFusionEngine:
                 "reactive_diluent_component_count", "reactive_toughener_component_count", "reactive_toughener_total_phr",
                 "filler_component_count", "other_component_count",
             ]
+
+            if cp_available:
+                # [新增] component_physics 补齐后的逐组分物理量与配方级汇总量。
+                # 单位约定：所有交联密度量均为 mol/m³（SI 体积摩尔浓度）。
+                _cp_extra: List[str] = []
+                for _side in ("resin", "curing_agent"):
+                    for _i in (1, 2, 3):
+                        _p = f"{_side}_{_i}_"
+                        if f"{_p}mw_resolved" not in out_df.columns:
+                            continue
+                        _cp_extra += [
+                            f"{_p}mw_resolved",
+                            f"{_p}ew_resolved",
+                            f"{_p}f_stoich",
+                            f"{_p}f_network",
+                        ]
+                _cp_extra += [
+                    "cp_balance",
+                    "cp_f_r",
+                    "cp_f_h_stoich", "cp_f_h_network", "cp_f_avg_network",
+                    "cp_W_g_per_epoxy",
+                    "cp_epoxy_conc_mol_m3", "cp_dilution",
+                ]
+                for _c in _cp_extra:
+                    if _c in out_df.columns and _c not in valuable_ordered_cols:
+                        valuable_ordered_cols.append(_c)
+                stats["component_physics_cols"] = len(
+                    [c for c in _cp_extra if c in out_df.columns]
+                )
 
             # 提取与当前目标相关的测试条件列 (如 tg_c_test_method 等)
             target_test_cols = []

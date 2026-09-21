@@ -1783,9 +1783,17 @@ def extract_features_from_config(
 
             if hardener_smiles is None:
                 return pd.DataFrame(), "hardener smiles required"
+            # [分层数据源] 将当前数据表传入，使环氧反应特征可以优先使用
+            # 已有的逐组分文献 MW/EEW/AHEW 与 component_physics 补齐列，
+            # 而非只能用结构直算（实测 EEW 一致率 50% → 100%）。
+            # 行数不一致时由提取器内部自行降级，不会错位取值。
+            _src_df = (mf_cfg or {}).get("_source_df")
+            if _src_df is not None and len(_src_df) != len(resin_smiles):
+                _src_df = None
             extractor = EpoxyDomainFeatureExtractor(
                 enable_reaction_simulation=bool(params.get("enable_reaction_simulation", True)),
                 target_conversion=float(params.get("target_conversion", 0.5)),
+                source_df=_src_df,
             )
             features_df, valid_indices = extractor.extract_features(
                 resin_smiles, hardener_smiles, params.get("phr_list"), params.get("stoich_mode", "theoretical")

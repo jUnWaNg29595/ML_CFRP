@@ -371,6 +371,192 @@ class AllNaNColumnDropper(BaseEstimator, TransformerMixin):
         return X_arr[:, self.keep_mask_]
 
 
+#: 目标变量变换名称 → 前向/逆向函数
+#: 注意 log1p 与 log 在 ν（mol/m³，量级 1e2~1e4）上几乎等价（log1p 偏度 6.20 vs log 5.83），
+#: 但 log1p 对接近 0 的值更安全（ν 最小值 0.05）。
+TARGET_TRANSFORM_LOG1P = "log1p"
+TARGET_TRANSFORM_LOG = "log"
+TARGET_TRANSFORM_NONE = "none"
+
+#: 目标变换合理区间 (mol/m³)。超出此区间的样本在物理上不可能
+#: （ν>1e4 → Mc<120 g/mol；ν<1 → Mc>1.2e6 g/mol），是单位错误或数据录入错误。
+TARGET_SANE_RANGE = (1.0, 1.0e4)
+
+
+def _target_transform_forward(y, kind: str):
+    """目标变量前向变换（原始 → 训练空间）"""
+    y = np.asarray(y, dtype=float)
+    if kind == TARGET_TRANSFORM_LOG1P:
+        if np.any(y <= -1.0):
+            raise ValueError(
+                "log1p 变换要求所有目标值 > -1，检测到非法值。"
+                "请检查目标列是否含有负数或异常值。"
+            )
+        return np.log1p(y)
+    if kind == TARGET_TRANSFORM_LOG:
+        if np.any(y <= 0.0):
+            raise ValueError(
+                "log 变换要求所有目标值 > 0，检测到非正值。"
+                "若数据含 0，请改用 log1p。"
+            )
+        return np.log(y)
+    return y
+
+
+def _target_transform_inverse(z, kind: str):
+    """目标变量逆向变换（训练空间 → 原始空间）"""
+    z = np.asarray(z, dtype=float)
+    if kind == TARGET_TRANSFORM_LOG1P:
+        return np.expm1(z)
+    if kind == TARGET_TRANSFORM_LOG:
+        return np.exp(z)
+    return z
+
+
+class TargetLogTransformer(BaseEstimator, RegressorMixin):
+    """目标变量对数变换包装器（sklearn 兼容）。
+
+    设计要点
+    --------
+    1. **对下游透明**：``predict()`` 返回**原始空间**的值，因此
+       ``Pipeline.predict`` / 预测页 / SHAP / 残差图全部无需改动。
+    2. **保持 sklearn 契约**：实现 ``get_params`` / ``set_params``，
+       可直接放进 Pipeline 并 joblib 序列化。
+    3. **兼容早停**：``fit`` 转发 ``**fit_kwargs``（eval_set / sample_weight 等），
+       并对 eval_set 的 y 同步变换，否则早停会在错误量纲上评估。
+    4. **自动回退**：逆向变换后若产生 NaN/Inf（极少数外推情形），
+       对该点退回用原始空间预测，避免污染指标。
+
+    参数
+    ----
+    estimator : 被包装的回归器
+    transform : 'log1p' | 'log' | 'none'
+    """
+
+    def __init__(self, estimator=None, transform: str = TARGET_TRANSFORM_LOG1P):
+        self.estimator = estimator
+        self.transform = transform
+
+    # ---- sklearn 兼容 ----
+    def get_params(self, deep: bool = True):
+        params = {"estimator": self.estimator, "transform": self.transform}
+        if deep and self.estimator is not None and hasattr(self.estimator, "get_params"):
+            for k, v in self.estimator.get_params(deep=True).items():
+                params[f"estimator__{k}"] = v
+        return params
+
+    def set_params(self, **params):
+        est_params = {}
+        for k, v in params.items():
+            if k == "transform":
+                self.transform = v
+            elif k == "estimator":
+                self.estimator = v
+            elif k.startswith("estimator__"):
+                est_params[k[len("estimator__"):]] = v
+            else:
+                est_params[k] = v
+        if est_params and self.estimator is not None and hasattr(self.estimator, "set_params"):
+            self.estimator.set_params(**est_params)
+        return self
+
+    def __sklearn_clone__(self):
+        try:
+            from sklearn.base import clone as _clone
+
+            return TargetLogTransformer(
+                estimator=_clone(self.estimator), transform=self.transform
+            )
+        except Exception:
+            return self
+
+    @property
+    def active(self) -> bool:
+        return self.transform in (TARGET_TRANSFORM_LOG1P, TARGET_TRANSFORM_LOG)
+
+    # ---- 训练 / 预测 ----
+    def fit(self, X, y=None, **fit_kwargs):
+        if self.estimator is None:
+            raise ValueError("TargetLogTransformer 需要传入 estimator")
+        if not self.active:
+            self.estimator.fit(X, y, **fit_kwargs)
+            return self
+
+        y_arr = np.asarray(y, dtype=float).ravel()
+        y_t = _target_transform_forward(y_arr, self.transform)
+
+        # eval_set 的 y 必须同步变换，否则早停指标量纲错误
+        if "eval_set" in fit_kwargs and fit_kwargs["eval_set"]:
+            converted = []
+            for item in fit_kwargs["eval_set"]:
+                if isinstance(item, (tuple, list)) and len(item) >= 2:
+                    ev_X, ev_y = item[0], item[1]
+                    ev_y_t = _target_transform_forward(
+                        np.asarray(ev_y, dtype=float).ravel(), self.transform
+                    )
+                    converted.append((ev_X, ev_y_t))
+                else:
+                    converted.append(item)
+            fit_kwargs = dict(fit_kwargs)
+            fit_kwargs["eval_set"] = converted
+
+        self.estimator.fit(X, y_t, **fit_kwargs)
+        return self
+
+    def predict(self, X):
+        if self.estimator is None:
+            raise ValueError("TargetLogTransformer 尚未训练")
+        raw = np.asarray(self.estimator.predict(X), dtype=float).ravel()
+        if not self.active:
+            return raw
+        out = _target_transform_inverse(raw, self.transform)
+        # 外推时 exp 可能溢出 → 该点退回原始空间，避免 NaN/Inf 污染指标
+        bad = ~np.isfinite(out)
+        if np.any(bad):
+            out = np.where(bad, raw, out)
+        return out
+
+    def __getattr__(self, item):
+        # 透传未定义的属性（feature_importances_ / evals_result_ 等），
+        # 让 SHAP、特征重要性、训练曲线提取继续可用
+        if item in ("estimator", "transform"):
+            raise AttributeError(item)
+        est = self.__dict__.get("estimator")
+        if est is not None and hasattr(est, item):
+            return getattr(est, item)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {item!r}"
+        )
+
+    #: 这些属性由训练流程通过 setattr 写入，必须透传到被包装的估计器
+    #: （如 TF/BNN 的 validation_data），否则模型内部看不到外部验证集
+    _FORWARD_SET_ATTRS = (
+        "validation_data",
+        "validation_split",
+        "feature_importances_",
+        "evals_result_",
+    )
+
+    def __setattr__(self, key, value):
+        if key in ("estimator", "transform") or key.startswith("_"):
+            object.__setattr__(self, key, value)
+            return
+        est = self.__dict__.get("estimator")
+        if key in self._FORWARD_SET_ATTRS and est is not None:
+            try:
+                setattr(est, key, value)
+            except Exception:
+                pass
+        object.__setattr__(self, key, value)
+
+    # ---- 序列化（避免 __getattr__ 在反序列化期递归） ----
+    def __getstate__(self):
+        return {"estimator": self.estimator, "transform": self.transform}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+
 class FeatureMaskTransformer(BaseEstimator, TransformerMixin):
     """应用特征掩码的转换器，用于删除训练时被移除的特征"""
 
@@ -3823,9 +4009,24 @@ class EnhancedModelTrainer:
         feature_contract_context=None,
         val_mode=VALIDATION_MODE_AUTO,
         val_size=_VALIDATION_DEFAULT_SIZE,
+        target_transform: str = TARGET_TRANSFORM_NONE,
+        target_outlier_filter: bool = False,
         **params
     ):
-        """训练单个模型（支持随机/分层/分组划分）"""
+        """训练单个模型（支持随机/分层/分组划分）
+
+        参数
+        ----
+        target_transform : 'none' | 'log1p' | 'log'
+            目标变量对数变换。包装为 TargetLogTransformer 后放入 Pipeline，
+            `predict()` 仍返回原始空间，对下游透明。
+            适用场景：目标右偏且不存在物理上不可能的极端值。
+            **注意**：当目标含极端异常值时，对数变换会压低它们的权重，
+            使 R² 在原始空间反而下降（详见 UI 提示）。
+        target_outlier_filter : bool
+            是否剔除物理上不可能的极端目标值（见 TARGET_SANE_RANGE）。
+            这是解决 R² 被少数异常值主导的**根本手段**。
+        """
         if feature_contract_context is not None:
             from .training_contract import assert_training_context
             assert_training_context(feature_contract_context, getattr(X, "columns", []))
@@ -3965,6 +4166,51 @@ class EnhancedModelTrainer:
         if len(y_arr) == 0:
             raise ValueError("所有样本的目标变量均无效（NaN/Inf），无法训练模型，请检查数据")
 
+        # [目标异常值过滤] 物理上不可能的极端目标值（单位错误/录入错误）会独占 R² 分母，
+        # 使指标彻底失真。实测：交联密度数据中误差最大的 1 个样本贡献 95.7% 的 R² 分母，
+        # 10 个样本贡献 99.6%，而全样本 R²=0.776 实为假象（MAE=8.04e12 无物理意义）。
+        # 默认关闭以保持行为兼容，由 UI 显式开启。
+        target_outlier_removed = 0
+        if target_outlier_filter:
+            lo, hi = TARGET_SANE_RANGE
+            sane = (y_arr >= lo) & (y_arr <= hi)
+            target_outlier_removed = int((~sane).sum())
+            if target_outlier_removed > 0:
+                if sane.sum() < 10:
+                    print(
+                        f"[WARNING] 目标异常值过滤将删除 {target_outlier_removed} 行，"
+                        f"仅剩 {int(sane.sum())} 行，样本过少，已自动跳过过滤"
+                    )
+                    target_outlier_removed = 0
+                else:
+                    y_arr = y_arr[sane]
+                    if X_df is not None:
+                        X_df = X_df.loc[sane].reset_index(drop=True)
+                        X_arr = X_df.values
+                        feature_names = X_df.columns.tolist()
+                    else:
+                        X_arr = X_arr[sane]
+                    if groups is not None:
+                        groups = np.asarray(groups)[sane]
+                    print(
+                        f"✓ 目标异常值过滤: 删除 {target_outlier_removed} 行超出 "
+                        f"[{lo:g}, {hi:g}] 的样本，剩余 {len(y_arr)} 行"
+                    )
+
+        # [目标对数变换] 校验可行性（负值/零值会在包装器内部报错，提前给出可读信息）
+        _tgt_tf = str(target_transform or TARGET_TRANSFORM_NONE).strip().lower()
+        if _tgt_tf not in (TARGET_TRANSFORM_NONE, TARGET_TRANSFORM_LOG1P, TARGET_TRANSFORM_LOG):
+            print(f"[WARNING] 未知的目标变换 '{target_transform}'，已回退为 none")
+            _tgt_tf = TARGET_TRANSFORM_NONE
+        if _tgt_tf == TARGET_TRANSFORM_LOG and (y_arr <= 0).any():
+            print("[WARNING] log 变换要求目标 > 0，检测到非正值，已自动改用 log1p")
+            _tgt_tf = TARGET_TRANSFORM_LOG1P
+        if _tgt_tf != TARGET_TRANSFORM_NONE:
+            print(
+                f"✓ 目标对数变换已启用: {_tgt_tf}"
+                f"（训练空间为 log 空间，预测结果已自动还原到原始空间）"
+            )
+
         print(f"✓ 有效样本数: {len(y_arr)} 行（已删除目标列缺失值）")
 
         # 确保 X_arr 是数值类型（所有模型都需要）
@@ -4056,6 +4302,24 @@ class EnhancedModelTrainer:
             model_params.setdefault("loss_name", "mse")
 
         base_model = self._get_model(model_name, **model_params)
+
+        # [目标对数变换] 用 sklearn 兼容包装器包住 base_model。
+        # 包装后：训练在 log 空间，predict() 返回原始空间，对下游（Pipeline/预测页/
+        # SHAP/残差图）完全透明。
+        # 与 ANN 的 normalize_target（StandardScaler）互斥：两者都改目标尺度，
+        # 叠加会导致 y_scaler 在 log 空间上再标准化，且逆变换顺序错乱。
+        if _tgt_tf != TARGET_TRANSFORM_NONE:
+            if model_name == "人工神经网络" and bool(model_params.get("normalize_target", False)):
+                print(
+                    "[WARNING] 目标对数变换与 ANN 的目标归一化（normalize_target）互斥，"
+                    "已自动关闭 normalize_target 以避免双重尺度变换"
+                )
+                model_params["normalize_target"] = False
+                try:
+                    base_model.set_params(normalize_target=False)
+                except Exception:
+                    pass
+            base_model = TargetLogTransformer(estimator=base_model, transform=_tgt_tf)
 
         def emit_transformer_postprocessing(message, progress_ratio, **extra):
             if model_name != "Transformer + BNN" or not callable(progress_callback):
@@ -5584,6 +5848,8 @@ class EnhancedModelTrainer:
         process_pls_config=None,
         use_process_pls=False,
         feature_contract_context=None,
+        target_transform: str = TARGET_TRANSFORM_NONE,
+        target_outlier_filter: bool = False,
         **params
     ):
         """交叉验证（输出每折分数 + OOF 预测）
@@ -5592,6 +5858,9 @@ class EnhancedModelTrainer:
             - repeated_kfold: RepeatedKFold
             - stratified_kfold: 对 y 分箱后用 StratifiedKFold
             - group_kfold: GroupKFold（需要 groups）
+
+        target_transform / target_outlier_filter: 语义与 train_model 完全一致，
+            保证 CV 分数与最终测试集分数在同一口径下可比。
         """
         if feature_contract_context is not None:
             from .training_contract import assert_training_context
@@ -5732,6 +6001,40 @@ class EnhancedModelTrainer:
 
         print(f"✓ 交叉验证有效样本数: {len(y_arr)} 行（已删除目标列缺失值）")
 
+        # [目标异常值过滤] 与 train_model 同口径，保证 CV 与测试集分数可比
+        if target_outlier_filter:
+            lo, hi = TARGET_SANE_RANGE
+            sane = (y_arr >= lo) & (y_arr <= hi)
+            removed = int((~sane).sum())
+            if removed > 0 and sane.sum() >= 10:
+                y_arr = y_arr[sane]
+                if X_df is not None:
+                    X_df = X_df.loc[sane].reset_index(drop=True)
+                    X_arr = X_df.values
+                    feature_names = X_df.columns.tolist()
+                else:
+                    X_arr = X_arr[sane]
+                if groups is not None:
+                    groups = np.asarray(groups)[sane]
+                print(
+                    f"✓ [CV] 目标异常值过滤: 删除 {removed} 行超出 [{lo:g}, {hi:g}] 的样本，"
+                    f"剩余 {len(y_arr)} 行"
+                )
+            elif removed > 0:
+                print(
+                    f"[WARNING] [CV] 过滤后样本不足（剩 {int(sane.sum())} 行），已自动跳过过滤"
+                )
+
+        # [目标对数变换] 与 train_model 同口径
+        _tgt_tf = str(target_transform or TARGET_TRANSFORM_NONE).strip().lower()
+        if _tgt_tf not in (TARGET_TRANSFORM_NONE, TARGET_TRANSFORM_LOG1P, TARGET_TRANSFORM_LOG):
+            _tgt_tf = TARGET_TRANSFORM_NONE
+        if _tgt_tf == TARGET_TRANSFORM_LOG and (y_arr <= 0).any():
+            print("[WARNING] [CV] log 变换要求目标 > 0，已自动改用 log1p")
+            _tgt_tf = TARGET_TRANSFORM_LOG1P
+        if _tgt_tf != TARGET_TRANSFORM_NONE:
+            print(f"✓ [CV] 目标对数变换已启用: {_tgt_tf}")
+
         # 确保 X_arr 是数值类型（所有模型都需要）
         if X_df is not None:
             try:
@@ -5844,6 +6147,8 @@ class EnhancedModelTrainer:
                     pass
 
                 base_model = self._get_model(model_name, **fold_params)
+                if _tgt_tf != TARGET_TRANSFORM_NONE:
+                    base_model = TargetLogTransformer(estimator=base_model, transform=_tgt_tf)
                 fold_balance = _build_target_balance_info(
                     y_arr[tr_idx],
                     enabled=target_balance_enabled,
@@ -5917,6 +6222,8 @@ class EnhancedModelTrainer:
             # 串行训练（原有逻辑）
             for fold_i, (tr_idx, va_idx) in enumerate(split_iter):
                 base_model = self._get_model(model_name, **model_params)
+                if _tgt_tf != TARGET_TRANSFORM_NONE:
+                    base_model = TargetLogTransformer(estimator=base_model, transform=_tgt_tf)
                 if process_pls_enabled:
                     X_train_fold = X_df.iloc[tr_idx].reset_index(drop=True)
                     X_valid_fold = X_df.iloc[va_idx].reset_index(drop=True)

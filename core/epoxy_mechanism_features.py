@@ -11,7 +11,7 @@ core/epoxy_mechanism_features.py
    - 理论凝胶点转化率 alpha_gel (Flory-Stockmayer 凝胶理论)
    - 平均官能度 f_avg
    - 理论交联点间分子量 Mc = M_bar / (f_avg - 2)
-   - 理论交联密度代理 rho_c = 1000 / Mc
+   - 理论交联密度（**主口径 mol/m³**；另附 mmol/g 兼容口径）
 2. 多组分前线轨道能差矩阵与动力学指标 (Delta E):
    - delta_E_min: 先发活性通道 (决定凝胶与起始温度)
    - delta_E_max: 最钝迟钝通道 (决定未反应缺陷与深层固化风险)
@@ -360,12 +360,19 @@ class EpoxyMechanismEngine:
             alpha_gel = 1.0
 
         # 混合体系平均分子官能度 f_avg
-        # 摩尔分数加权
+        # [口径修复] Flory 的 f_avg 是**摩尔加权**，必须用摩尔数作权重。
+        # 历史 bug：分子用 quality 权重（weighted_f_r/f_h 来自 phr 质量分数）
+        # 除以摩尔数加权分母，分子分母口径不一致，f_avg 无物理意义。
+        # 现统一为：f_avg = Σ n_i·f_i / Σ n_i，n_i = phr_i / MW_i。
         mol_r = sum(r["norm_weight"] / max(r["mw"], 10.0) for r in valid_resins)
         mol_h = sum(c["norm_weight"] / max(c["mw"], 10.0) for c in valid_curers) * r_val
         total_mols = mol_r + mol_h
         if total_mols > 0:
-            f_avg = (mol_r * weighted_f_r + mol_h * weighted_f_h) / total_mols
+            f_r_molw = (sum(r["functionality"] * (r["norm_weight"] / max(r["mw"], 10.0))
+                            for r in valid_resins) / mol_r) if mol_r > 0 else weighted_f_r
+            f_h_molw = (sum(c["functionality"] * (c["norm_weight"] / max(c["mw"], 10.0))
+                            for c in valid_curers) / mol_h) if mol_h > 0 else weighted_f_h
+            f_avg = (mol_r * f_r_molw + mol_h * f_h_molw) / total_mols
         else:
             f_avg = (weighted_f_r + weighted_f_h) / 2.0
 
@@ -375,13 +382,19 @@ class EpoxyMechanismEngine:
         total_phr_est = 100.0 + 100.0 * (weighted_ahew / weighted_eew) * r_val
         formula_mw = (100.0 * mw_r_avg + (total_phr_est - 100.0) * mw_h_avg) / total_phr_est
 
-        # 交联点间分子量 Mc
+        # 理论交联点间分子量 Mc
         # Flory-Stockmayer: Mc = M_unit / (f_avg - 2)
         theoretical_Mc = formula_mw / max(f_avg - 2.0, 0.08)
         theoretical_Mc = float(np.clip(theoretical_Mc, 50.0, 5000.0))
 
-        # 理论交联密度代理 (mmol/g 或相对指数)
-        crosslink_density_proxy = 1000.0 / theoretical_Mc
+        # [口径对齐] 理论交联密度：统一输出 mol/m³（SI 体积摩尔浓度）
+        #   ν [mol/m³] = ρ [g/m³] / Mc [g/mol]
+        # 历史 bug：此处原为 1000/Mc，量纲是 **mmol/g**（每克树脂的交联点毫摩尔数），
+        # 与 core/crosslink_physics 的 mol/m³ 相差 1000 倍，两者却都叫“交联密度”。
+        # 现同时输出两种口径并显式命名，避免下游混用。
+        rho_g_cm3 = 1.2                      # 环氧网络典型密度
+        crosslink_density_mol_m3 = (rho_g_cm3 * 1.0e6) / theoretical_Mc
+        crosslink_density_mmol_g = crosslink_density_mol_m3 / (rho_g_cm3 * 1.0e3)
 
         # 5. 多组分成对前线轨道能差 (Delta E)
         delta_e_list = []
@@ -432,7 +445,11 @@ class EpoxyMechanismEngine:
             "mech_weighted_curer_func": round(weighted_f_h, 3),
             "mech_average_functionality": round(f_avg, 3),
             "mech_theoretical_Mc": round(theoretical_Mc, 2),
-            "mech_crosslink_density_proxy": round(crosslink_density_proxy, 4),
+            # [口径对齐] 主口径 mol/m³；mmol/g 保留兼容但显式区分命名
+            "mech_crosslink_density_mol_m3": round(crosslink_density_mol_m3, 4),
+            "mech_crosslink_density_mmol_g": round(crosslink_density_mmol_g, 6),
+            # 废弃名保留一版兼容旧下游，值等于 mmol/g（历史行为）
+            "mech_crosslink_density_proxy": round(crosslink_density_mmol_g, 6),
             "mech_delta_E_min": round(delta_e_min, 4),
             "mech_delta_E_max": round(delta_e_max, 4),
             "mech_delta_E_span": round(delta_e_span, 4),

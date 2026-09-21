@@ -23,7 +23,11 @@ import re
 from collections import Counter, defaultdict
 from joblib import Parallel, delayed
 import multiprocessing
-from .model_interpreter import compute_xgboost_native_shap
+from .model_interpreter import (
+    compute_xgboost_native_shap,
+    resolve_feature_names_for_matrix,
+    _is_placeholder_feature_name,
+)
 from .process_pls import ProcessPLSTransformer, process_pls_config_to_dict
 
 warnings.filterwarnings('ignore')
@@ -563,6 +567,140 @@ def _warn_pca_fallback(stage: str, bad_cols):
     if len(bad_cols) > 8:
         preview += f" 等 {len(bad_cols)} 列"
     st.warning(f"⚠️ {stage} 前检测到非有限值列，系统已自动按 0 兜底处理：{preview}")
+
+
+def _expected_shap_feature_count(model, pipeline=None):
+    """尽力推断已训练估计器实际消费的特征数（用于特征掩码对齐）。"""
+    for obj in (pipeline, model):
+        if obj is None:
+            continue
+        try:
+            n_features = getattr(obj, "n_features_in_", None)
+        except Exception:
+            n_features = None
+        if isinstance(n_features, (int, np.integer)) and int(n_features) > 0:
+            return int(n_features)
+        try:
+            names = getattr(obj, "feature_names_in_", None)
+        except Exception:
+            names = None
+        if names is not None and len(names) > 0:
+            return len(names)
+    if model is not None and hasattr(model, "get_booster"):
+        try:
+            n_features = int(model.get_booster().num_features())
+            if n_features > 0:
+                return n_features
+        except Exception:
+            pass
+    return None
+
+
+def _as_feature_frame(matrix, names=None):
+    """把特征矩阵（DataFrame / ndarray / list）统一成数值型 DataFrame。"""
+    if matrix is None:
+        return None
+    if isinstance(matrix, pd.DataFrame):
+        frame = matrix.copy()
+    else:
+        arr = np.asarray(matrix)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        if arr.ndim != 2:
+            raise ValueError("特征矩阵必须是二维数组")
+        frame = pd.DataFrame(arr)
+
+    if names is not None and len(names) == frame.shape[1]:
+        frame.columns = [str(name) for name in names]
+
+    for col in frame.columns:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    return frame.reset_index(drop=True)
+
+
+def _prepare_shap_feature_frame(
+    matrix,
+    model,
+    pipeline,
+    name_candidates,
+    feature_mask,
+    fallback_names=None,
+):
+    """为 SHAP 计算准备 DataFrame：兼容 ndarray 输入、占位列名与训练期特征掩码。
+
+    返回 (frame, names)。frame 的列数已与模型实际消费的特征数对齐（若可判定），
+    因此调用方可以安全使用 .sample / .iloc / .columns。
+    """
+    mask = None
+    if feature_mask is not None:
+        try:
+            mask = np.asarray(feature_mask, dtype=bool).ravel()
+        except Exception:
+            mask = None
+        if mask is not None and mask.size == 0:
+            mask = None
+
+    resolved = None
+    placeholder_fallback = None
+    for candidate in list(name_candidates or []):
+        if candidate is None:
+            continue
+        try:
+            names = resolve_feature_names_for_matrix(
+                matrix,
+                feature_names=candidate,
+                model=model,
+                pipeline=pipeline,
+                feature_mask=mask,
+            )
+        except Exception:
+            continue
+        if not names:
+            continue
+        names = [str(name) for name in names]
+        if all(_is_placeholder_feature_name(name) for name in names):
+            if placeholder_fallback is None:
+                placeholder_fallback = names
+            continue
+        resolved = names
+        break
+
+    if resolved is None:
+        if fallback_names is not None and len(list(fallback_names)):
+            resolved = [str(name) for name in fallback_names]
+        else:
+            resolved = placeholder_fallback
+
+    frame = _as_feature_frame(matrix, resolved)
+
+    # 数据侧特征掩码：仅当矩阵仍是“掩码前”的完整宽度、且模型期望更少的特征时裁剪，
+    # 避免对已经裁剪过的矩阵重复施加掩码。
+    if mask is not None and int(mask.sum()) < mask.size and frame.shape[1] == mask.size:
+        expected = _expected_shap_feature_count(model, pipeline)
+        if expected is None or expected == int(mask.sum()):
+            frame = frame.loc[:, mask].reset_index(drop=True)
+
+    names = [str(name) for name in frame.columns]
+    return frame, names
+
+
+def _normalize_shap_values(shap_values):
+    """把 SHAP 输出（Explanation / list / 3D / 1D）统一成二维 ndarray。"""
+    values = shap_values
+    if not isinstance(values, (list, tuple, np.ndarray)) and hasattr(values, "values"):
+        # shap.Explanation（新版 TreeExplainer 默认返回）
+        values = getattr(values, "values")
+    if isinstance(values, (list, tuple)):
+        values = values[0] if len(values) else np.empty((0, 0))
+
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 3:
+        arr = arr.mean(axis=-1) if arr.shape[-1] > 1 else arr[..., 0]
+    elif arr.ndim > 3:
+        arr = arr.reshape(arr.shape[0], -1)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    return arr
 
 
 def _apply_pca_callback(pca, scaler, numeric_df, current_df, feature_candidates, fill_strategy: str = "mean", pc_prefix: str = "PC"):
@@ -2895,23 +3033,28 @@ def render_feature_selector():
                 if X_train is None or X_test is None:
                     st.warning("⚠️ 缺少训练/测试数据，请先完成模型训练")
                 else:
+                    # [修复] 数据可能是 ndarray（无 .columns），这里只用 len() 取样本数，
+                    # 并保证 number_input 的 min/max/value 始终满足 min<=value<=max。
+                    n_test_samples = int(len(X_test))
+                    n_train_samples = int(len(X_train))
+
                     # SHAP计算参数
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         max_samples = st.number_input(
                             "SHAP计算样本数",
-                            min_value=50,
-                            max_value=min(5000, len(X_test)),
-                            value=min(1000, len(X_test)),
+                            min_value=1,
+                            max_value=max(1, min(5000, n_test_samples)),
+                            value=max(1, min(1000, n_test_samples)),
                             step=100,
                             help="样本数越多越准确，512核服务器可以处理更多样本"
                         )
                     with col2:
                         background_samples = st.number_input(
                             "背景样本数（仅KernelExplainer）",
-                            min_value=20,
-                            max_value=min(500, len(X_train)),
-                            value=min(100, len(X_train)),
+                            min_value=1,
+                            max_value=max(1, min(500, n_train_samples)),
+                            value=max(1, min(100, n_train_samples)),
                             step=20,
                             help="仅用于非树模型，样本数越多越准确但越慢"
                         )
@@ -2967,8 +3110,42 @@ def render_feature_selector():
                                 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
                                 import multiprocessing as mp
 
-                                # 采样数据
-                                X_sample = X_test.sample(n=int(max_samples), random_state=42) if len(X_test) > max_samples else X_test.copy()
+                                # [修复] X_test 可能是 ndarray（如 GNN/PINN/导入模型路径），
+                                # 旧代码直接调用 X_test.sample(...)/X_sample.iloc[...] 会抛
+                                # AttributeError: 'numpy.ndarray' object has no attribute 'iloc'。
+                                # 这里统一规范为 DataFrame，并对齐真实特征名与训练期特征掩码。
+                                train_result = st.session_state.get('train_result') or {}
+                                if not isinstance(train_result, dict):
+                                    train_result = {}
+                                feature_mask = st.session_state.get('feature_mask')
+                                if feature_mask is None:
+                                    feature_mask = train_result.get('feature_mask')
+                                name_candidates = [
+                                    train_result.get('feature_names'),
+                                    st.session_state.get('feature_cols'),
+                                ]
+                                X_test_frame, resolved_names = _prepare_shap_feature_frame(
+                                    X_test,
+                                    model=model,
+                                    pipeline=st.session_state.get('pipeline'),
+                                    name_candidates=name_candidates,
+                                    feature_mask=feature_mask,
+                                )
+                                X_train_frame, _ = _prepare_shap_feature_frame(
+                                    X_train,
+                                    model=model,
+                                    pipeline=st.session_state.get('pipeline'),
+                                    name_candidates=name_candidates,
+                                    feature_mask=feature_mask,
+                                    fallback_names=resolved_names,
+                                )
+
+                                # 采样数据（此时一定是 DataFrame）
+                                if len(X_test_frame) > max_samples:
+                                    X_sample = X_test_frame.sample(n=int(max_samples), random_state=42)
+                                else:
+                                    X_sample = X_test_frame.copy()
+                                X_sample = X_sample.reset_index(drop=True)
 
                                 st.info(f"🚀 使用 {int(n_jobs)} 个核心进行并行计算，样本数: {len(X_sample)}")
 
@@ -2997,7 +3174,7 @@ def render_feature_selector():
                                     except Exception as tree_err:
                                         st.warning(f"TreeExplainer失败: {str(tree_err)[:100]}")
                                         st.info("尝试使用KernelExplainer作为备选...")
-                                        background = shap.sample(X_train, min(100, len(X_train)))
+                                        background = shap.sample(X_train_frame, min(100, len(X_train_frame)))
                                         explainer = shap.KernelExplainer(model.predict, background)
 
                                         # KernelExplainer使用并行计算
@@ -3014,18 +3191,18 @@ def render_feature_selector():
                                         with ThreadPoolExecutor(max_workers=int(n_jobs)) as executor:
                                             batch_results = list(executor.map(compute_batch_shap, batches))
 
-                                        shap_values = np.vstack(batch_results)
+                                        shap_values = np.vstack([_normalize_shap_values(r) for r in batch_results])
 
                                 elif model_name in ['线性回归', 'Ridge回归', 'Lasso回归', 'ElasticNet']:
                                     st.info(f"✓ 检测到线性模型，使用LinearExplainer")
-                                    background = shap.sample(X_train, min(200, len(X_train)))
+                                    background = shap.sample(X_train_frame, min(200, len(X_train_frame)))
                                     explainer = shap.LinearExplainer(model, background)
                                     # 禁用SHAP内部进度条，避免与Streamlit冲突
                                     shap_values = explainer.shap_values(X_sample)
 
                                 else:
                                     st.info(f"✓ 使用KernelExplainer（较慢，适用于任意模型）")
-                                    background = shap.sample(X_train, int(background_samples))
+                                    background = shap.sample(X_train_frame, int(background_samples))
                                     explainer = shap.KernelExplainer(model.predict, background)
 
                                     # KernelExplainer并行计算
@@ -3040,21 +3217,20 @@ def render_feature_selector():
                                     with ThreadPoolExecutor(max_workers=int(n_jobs)) as executor:
                                         batch_results = list(executor.map(compute_batch_shap, batches))
 
-                                    shap_values = np.vstack(batch_results)
+                                    shap_values = np.vstack([_normalize_shap_values(r) for r in batch_results])
+
+                                # 统一 SHAP 输出形状（兼容 shap.Explanation / 多输出 / 3D）
+                                shap_values = _normalize_shap_values(shap_values)
 
                                 # 计算平均绝对SHAP值作为重要性
-                                if isinstance(shap_values, list):  # 多输出情况
-                                    shap_values = shap_values[0]
-
                                 mean_abs_shap = np.abs(shap_values).mean(axis=0)
 
-                                # 获取特征名
-                                if hasattr(model, 'feature_names_in_'):
-                                    feature_names = model.feature_names_in_
-                                elif st.session_state.get('feature_cols'):
-                                    feature_names = np.array(st.session_state.feature_cols)
-                                else:
-                                    feature_names = X_sample.columns.values
+                                # 获取特征名（优先已解析出的真实名，避免错误长度列表）
+                                feature_names = list(X_sample.columns)
+                                if len(feature_names) != len(mean_abs_shap):
+                                    feature_names = resolved_names if resolved_names else None
+                                    if feature_names is None or len(feature_names) != len(mean_abs_shap):
+                                        feature_names = [f"Feature_{i}" for i in range(len(mean_abs_shap))]
 
                                 # 创建重要性DataFrame
                                 shap_imp_df = pd.DataFrame({

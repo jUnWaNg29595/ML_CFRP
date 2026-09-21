@@ -507,11 +507,35 @@ _NON_MOLECULAR_PATTERNS = (
 _NON_MOLECULAR_RE = re.compile("|".join(_NON_MOLECULAR_PATTERNS))
 
 
+#: 指纹族特征名模式：{前缀}_{Resin|Hardener|MACCS|Morgan|ECFP|FP}_{i}
+#: 这些是位向量，逐个试探会触发 N 次完整提取（167 位 → 167 次），必须一次批量算完。
+#: 注意：Resin_/Hardener_ 要排在裸 MACCS 前面，否则 resin_Hardener_MACCS_0
+#: 会被误解析成 prefix='resin_Hardener'（而不是 prefix='resin', 角色=hardener）。
+_FINGERPRINT_FAMILY_RE = re.compile(
+    r"^(?P<prefix>.+?)_(?P<kind>Resin_MACCS|Hardener_MACCS|Resin_Morgan|Hardener_Morgan|"
+    r"MACCS|Morgan|ECFP|FCFP|FP|Fingerprint)_(?P<idx>\d+)$",
+    re.IGNORECASE,
+)
+
+
+def parse_fingerprint_feature(feature: str) -> Optional[Tuple[str, str, int]]:
+    """解析指纹族特征名 → (结构前缀, 指纹类型, 位索引)。非指纹族返回 None。
+
+    类型里保留 Resin_/Hardener_ 前缀，因为平台用「双组分拼接指纹」：
+        resin_Resin_MACCS_i    ← 只用树脂部分算的指纹
+        resin_Hardener_MACCS_i ← 只用固化剂部分算的指纹
+    """
+    m = _FINGERPRINT_FAMILY_RE.match(str(feature).strip())
+    if not m:
+        return None
+    return m.group("prefix"), m.group("kind").upper(), int(m.group("idx"))
+
+
 def looks_molecular(feature: str) -> bool:
     """判断特征名是否可能由分子结构计算得到。
 
-    用途：过滤掉工艺/测试/配方计数类列，不对它们启动分子提取后端。
-    保守策略：只拦明显非分子的（命中 _NON_MOLECULAR_RE 且不含结构/描述符关键词）。
+    用途：过滤掉工艺/测试/性能/配方类列，不对它们启动分子提取后端。
+    保守策略：只拦明显非分子的（命中模式且不含结构/描述符关键词）。
     """
     key = normalize_name(feature)
     if not key:
@@ -526,14 +550,39 @@ def looks_molecular(feature: str) -> bool:
     )
     if any(re.search(p, key) for p in aggregate_patterns):
         return False
-    # 明确含分子语义的，直接放行
+    # 测试/性能/工艺类：这些是“测量出来的”或“工艺设定”的量，不可能从结构算出。
+    # 必须在 molecular_hints 之前判：否则 curing_mechanism 会被 hint "ring"
+    # （curing 的子串）误命中，cure_* 会被 "mw"/"eew" 等误命中。
+    measurement_patterns = (
+        # 工艺阶段与温度时间（cure_/post_cure_/gel_/heat_treatment_…）
+        r"^cure_", r"^post_cure_", r"^total_cure_", r"_cure_stage",
+        r"(^|_)stage_count$", r"(^|_)total_time", r"(^|_)max_temperature",
+        r"(^|_)final_temperature", r"(^|_)temp_time_integral",
+        r"(^|_)time_weighted_avg_temperature", r"(^|_)heating_rate",
+        r"(^|_)temperature_range", r"(^|_)temperature_c$", r"^gel_time",
+        r"^has_post_cure$", r"(^|_)pressure_mpa$",
+        # 固化机理/类型（分类列，非分子描述符）
+        r"^curing_mechanism$", r"^curing_type", r"(^|_)curing_type",
+        # 测试条件
+        r"^test_", r"_test_", r"(^|_)standard", r"(^|_)crosshead_speed",
+        r"(^|_)sample_mass", r"(^|_)frequency_hz", r"(^|_)atmosphere$",
+        # 性能目标值（模型要预测的，或作为输入的已测量值）
+        r"^tg_c?$", r"^td\d+_c$", r"^tmax_c$", r"(^|_)char_yield",
+        r"(^|_)tensile_", r"(^|_)flexural_", r"(^|_)compressive_",
+        r"(^|_)storage_modulus", r"(^|_)shear_", r"(^|_)impact_",
+        r"(^|_)elongation", r"(^|_)strain_at_break", r"(^|_)modulus_gpa$",
+        r"(^|_)strength_mpa$", r"(^|_)degree_of_cure", r"(^|_)phr_basis_type$",
+    )
+    if any(re.search(p, key) for p in measurement_patterns):
+        return False
+    # 明确含分子语义的，直接放行（这些词几乎只出现在结构派生特征里）
     molecular_hints = (
         "structure", "smiles", "bigsmiles", "selfies", "maccs", "morgan", "fp_",
         "molecular_weight", "molwt", "mw", "logp", "tpsa", "hbd", "hba", "ring",
         "heavy", "hac", "rotb", "rotatable", "atom", "bond", "element", "count_c",
         "epoxy", "epoxide", "oxirane", "amine", "hydroxyl", "carboxyl", "ester",
-        "amide", "ether", "aromatic", "aliphatic", "fragment", "xtb", "ff_", "energy",
-        "homo", "lumo", "gap", "dipole", "charge", "polar", "refractivity", "tpsa",
+        "amide", "ether", "aromatic", "aliphatic", "fragment", "xtb", "ff_",
+        "homo", "lumo", "dipole", "refractivity",
         "active_hydrogen", "eew", "ahew", "functionality",
     )
     if any(h in key for h in molecular_hints):
@@ -692,7 +741,14 @@ _FORMULATION_PROP_CACHE: Dict[str, Tuple[float, float, float, float]] = {}
 
 
 def compute_formulation_feature(df: pd.DataFrame, feature: str) -> Optional[pd.Series]:
-    """配方级特征：EEW / AHEW / 官能度 / 化学计量比。需要树脂与固化剂结构列。"""
+    """配方级特征：EEW / AHEW / 官能度 / 化学计量比。需要树脂与固化剂结构列。
+
+    口径约定（与 core/molecular_features.EpoxyDomainFeatureExtractor 一致）：
+        - ``hardener_functionality`` 系列返回**网络支化口径**（酸酐=2），
+          供 Flory 凝胶点 / Mc / 交联密度使用。
+        - ``ahew`` / 当量比系列用**化学计量口径**（酸酐=1，1:1 消耗环氧）。
+        两者不可混用：用 f_stoich=1 代入 (f−2) 项会得到负交联密度。
+    """
     if not RDKIT_AVAILABLE:
         return None
     resin_col = _find_column(df, ("resin_1_structure", "resin_1_smiles", "resin_smiles", "resin_1_bigsmiles"))
@@ -703,7 +759,12 @@ def compute_formulation_feature(df: pd.DataFrame, feature: str) -> Optional[pd.S
     key = normalize_name(feature)
     cache = _FORMULATION_PROP_CACHE  # 模块级缓存：跨特征调用复用，避免重复解析同一分子
 
+    # 环状酸酐通用模式：兼容 RDKit 芳构化感知（PMDA/BTDA 型稠环芳酐的羰基骨架
+    # 会被感知为芳香体系，传统 C(=O)OC(=O) 模式完全匹配不上）
+    _ANH_PAT = Chem.MolFromSmarts("[o,OX2]1~[#6](=[OX1])~[#6]~[#6]~[#6](=[OX1])~1") if RDKIT_AVAILABLE else None
+
     def props(smiles: Any) -> Tuple[float, float, float, float]:
+        """返回 (MW, 环氧基数, 酸酐基数, 活泼氢数)。"""
         text = clean_smiles(smiles) if isinstance(smiles, str) else None
         if text in cache:
             return cache[text]
@@ -714,26 +775,77 @@ def compute_formulation_feature(df: pd.DataFrame, feature: str) -> Optional[pd.S
             if mol is None:
                 out = (np.nan, np.nan, np.nan, np.nan)
             else:
+                n_anh = 0
+                if _ANH_PAT is not None:
+                    try:
+                        # 以唯一中心氧原子计数，避免对称环双向匹配重复计数
+                        n_anh = len({m[0] for m in mol.GetSubstructMatches(_ANH_PAT)})
+                    except Exception:
+                        n_anh = 0
                 out = (
                     float(Descriptors.MolWt(mol)),
                     float(_count_smarts(mol, "C1OC1")),
-                    float(_count_smarts(mol, "C(=O)OC(=O)")),
+                    float(n_anh),
                     float(_count_active_hydrogen(mol)),
                 )
         if len(cache) < 50000:
             cache[text] = out
         return out
 
+    def _stoich_functionality(smiles: Any) -> float:
+        """化学计量口径：酸酐=1（1:1 消耗环氧），其余取活泼氢数。"""
+        _, _, n_anh, n_ah = props(smiles)
+        if n_anh > 0:
+            return float(n_anh)
+        return float(n_ah) if n_ah > 0 else np.nan
+
+    def _network_functionality(smiles: Any) -> float:
+        """网络支化口径：酸酐=2（开环酯化后桥接 2 条链），其余与化学计量口径相同。"""
+        _, _, n_anh, n_ah = props(smiles)
+        if n_anh > 0:
+            return float(2.0 * n_anh)
+        return float(n_ah) if n_ah > 0 else np.nan
+
     resin = df[resin_col] if resin_col else pd.Series([None] * len(df), index=df.index)
     curer = df[curer_col] if curer_col else pd.Series([None] * len(df), index=df.index)
 
-    if key in ("eew", "epoxy_equivalent_weight", "resin_eew", "formulation_resin_total_eew_g_eq"):
+    if key in ("eew", "epoxy_equivalent_weight", "resin_eew", "formulation_resin_total_eew_g_eq",
+               "eew_g_eq", "resin_eew_g_eq", "epoxy_equivalent_weight_g_eq"):
         return pd.Series([(lambda t: t[0] / t[1] if t[1] > 0 else np.nan)(props(s)) for s in resin], index=df.index)
 
-    if key in ("ahew", "amine_hydrogen_equivalent_weight", "resin_ahew", "formulation_hardener_total_ahew_g_eq"):
+    # 组分个数（树脂/固化剂字符串里有几个片段）
+    if key in ("resin_smiles_n_components", "resin_n_components", "resin_component_count_from_smiles"):
+        def _ncomp(s):
+            text = clean_smiles(s) if isinstance(s, str) else None
+            if not text:
+                return np.nan
+            try:
+                from .smiles_utils import split_smiles_cell
+                frags = split_smiles_cell(text)
+            except Exception:
+                frags = [f for f in re.split(r"[.;]", text) if f.strip()]
+            return float(len(frags)) if frags else np.nan
+        return pd.Series([_ncomp(s) for s in resin], index=df.index)
+
+    if key in ("curing_agent_smiles_n_components", "hardener_smiles_n_components",
+               "curing_agent_n_components", "hardener_n_components"):
+        def _ncomp_c(s):
+            text = clean_smiles(s) if isinstance(s, str) else None
+            if not text:
+                return np.nan
+            try:
+                from .smiles_utils import split_smiles_cell
+                frags = split_smiles_cell(text)
+            except Exception:
+                frags = [f for f in re.split(r"[.;]", text) if f.strip()]
+            return float(len(frags)) if frags else np.nan
+        return pd.Series([_ncomp_c(s) for s in curer], index=df.index)
+
+    if key in ("ahew", "amine_hydrogen_equivalent_weight", "resin_ahew", "formulation_hardener_total_ahew_g_eq",
+               "ahew_g_eq", "hardener_ahew_g_eq", "amine_hydrogen_equivalent_weight_g_eq"):
         def _ahew(s):
-            mw, _, n_anh, n_ah = props(s)
-            f = n_ah if n_ah > 0 else (2 * n_anh if n_anh > 0 else np.nan)
+            mw = props(s)[0]
+            f = _stoich_functionality(s)   # 当量重必须用化学计量口径
             return mw / f if f and f > 0 else np.nan
         return pd.Series([_ahew(s) for s in curer], index=df.index)
 
@@ -742,16 +854,15 @@ def compute_formulation_feature(df: pd.DataFrame, feature: str) -> Optional[pd.S
 
     if key in ("hardener_functionality", "curer_functionality", "curing_agent_active_hydrogen_total",
                "curing_agent_active_hydrogen_equivalent_count"):
-        def _f(s):
-            _, _, n_anh, n_ah = props(s)
-            return n_ah if n_ah > 0 else (2 * n_anh if n_anh > 0 else np.nan)
-        return pd.Series([_f(s) for s in curer], index=df.index)
+        # [口径切换] 返回**网络支化口径**（酸酐=2），与 EpoxyDomainFeatureExtractor 一致。
+        # 这些特征的主用途是 Flory 凝胶点 / Mc / 交联密度。
+        return pd.Series([_network_functionality(s) for s in curer], index=df.index)
 
     if key in ("formulation_r_value", "formulation_resin_hardener_equivalent_ratio", "stoichiometric_ratio_r"):
         def _r(sr, sc):
             mwr, nepr, _, _ = props(sr)
-            mwc, _, nanh, nah = props(sc)
-            fc = nah if nah > 0 else (2 * nanh if nanh > 0 else np.nan)
+            mwc = props(sc)[0]
+            fc = _stoich_functionality(sc)   # 当量比必须用化学计量口径
             if nepr > 0 and fc and fc > 0:
                 return (mwr / nepr) / (mwc / fc)
             return np.nan
@@ -781,11 +892,20 @@ def _find_column(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
 
 
 def detect_structure_columns(df: pd.DataFrame) -> List[str]:
-    """自动识别结构列（列名含 structure/smiles/bigsmiles，或内容像 SMILES）。"""
+    """自动识别结构列（列名以 structure/smiles/bigsmiles 结尾，或内容像 SMILES）。
+
+    关键：必须用**后缀**匹配，不能用子串。workflow 回放会产出大量派生列
+    （resin_1_structure_xtb_homo、resin_1_structure_polymer_char_len …），
+    子串匹配会把它们全当结构列（实测 397 个），导致后续逐行查表极慢。
+    """
     cols: List[str] = []
     for c in df.columns:
-        name = str(c).lower()
-        if any(k in name for k in ("structure", "smiles", "bigsmiles")):
+        name = str(c).lower().strip()
+        # 精确后缀：xxx_structure / xxx_smiles / xxx_bigsmiles / xxx_selfies
+        if re.search(r"(_|\.)(structure|smiles|bigsmiles|selfies)$", name):
+            cols.append(c)
+        # 裸列名（如 'smiles'、'structure'）
+        elif name in ("structure", "smiles", "bigsmiles", "selfies"):
             cols.append(c)
     if cols:
         return cols
@@ -1111,6 +1231,7 @@ class AutoFeatureResolver:
         self._fingerprint_index: Optional[Dict[str, Dict[str, Any]]] = None
         self._fingerprint_cols: Optional[List[str]] = None
         self._derived_index: Optional[Dict[str, pd.DataFrame]] = None
+        self._scan_cache: Dict[Any, Any] = {}
 
     # -- 整行指纹匹配 -------------------------------------------------------
     # 场景：工作区数据就是从某张总表（如 ml_dataset/ml_wide_samples.csv）导出的
@@ -1714,32 +1835,69 @@ class AutoFeatureResolver:
         return index
 
     def _scan_master_column(self, key: str, feature: str) -> Any:
-        """按需扫描：只在总表里找该特征列，按结构键取值（用于超宽表）。"""
+        """按需扫描：只在总表里找该特征列，按结构键取值（用于超宽表）。
+
+        性能关键：结果必须缓存。否则每行都会重算 detect_structure_columns
+        + 全部结构键（实测单特征 200 行要 16~36s）。
+        """
         fkey = normalize_name(feature)
+        cache = self._scan_cache
+        ck = (fkey, key)
+        if ck in cache:
+            return cache[ck]
+        result = np.nan
         for _tname, frame in self.master_tables:
-            actual = None
-            for c in frame.columns:
-                if normalize_name(c) == fkey:
-                    actual = c
-                    break
+            actual = self._find_master_feature_column(frame, fkey)
             if actual is None:
                 continue
-            struct_cols = detect_structure_columns(frame)
+            struct_cols = self._master_struct_cols(_tname, frame)
             if not struct_cols:
                 continue
-            # 选组分最契合的结构列
-            scored = sorted(
-                struct_cols, key=lambda sc: -self._structure_scope(feature, sc)
-            )
+            scored = sorted(struct_cols, key=lambda sc: -self._structure_scope(feature, sc))
             arr = frame[actual].to_numpy()
+            hit = False
             for sc in scored:
                 if self._structure_scope(feature, sc) <= 0:
                     break
-                keys = [self._structure_key(v) for v in frame[sc].tolist()]
+                keys = self._master_struct_keys(_tname, sc, frame)
                 vals = [arr[i] for i, k in enumerate(keys) if k == key and not _is_blank(arr[i])]
                 if vals:
-                    return _collapse_values(vals)
-        return np.nan
+                    result = _collapse_values(vals)
+                    hit = True
+                    break
+            if hit:
+                break
+        if len(cache) < 500000:
+            cache[ck] = result
+        return result
+
+    @staticmethod
+    def _find_master_feature_column(frame: pd.DataFrame, fkey: str) -> Optional[str]:
+        """在总表里找归一化后等于 fkey 的列（带缓存）。"""
+        col_map = getattr(frame, "_afr_col_map", None)
+        if col_map is None:
+            col_map = {normalize_name(c): c for c in frame.columns}
+            try:
+                frame._afr_col_map = col_map
+            except Exception:
+                pass
+        return col_map.get(fkey)
+
+    def _master_struct_cols(self, tname: str, frame: pd.DataFrame) -> List[str]:
+        ck = ("_struct_cols", tname)
+        if ck in self._scan_cache:
+            return self._scan_cache[ck]
+        cols = detect_structure_columns(frame)
+        self._scan_cache[ck] = cols
+        return cols
+
+    def _master_struct_keys(self, tname: str, sc: str, frame: pd.DataFrame) -> List[Optional[str]]:
+        ck = ("_struct_keys", tname, sc)
+        if ck in self._scan_cache:
+            return self._scan_cache[ck]
+        keys = [self._structure_key(v) for v in frame[sc].tolist()]
+        self._scan_cache[ck] = keys
+        return keys
 
     def lookup_master_multi(
         self,
@@ -1957,6 +2115,122 @@ class AutoFeatureResolver:
         )
         return scored[0] if scored else None
 
+    def _compute_fingerprint_family(
+        self,
+        df: pd.DataFrame,
+        prefix: str,
+        kind: str,
+        features: Sequence[str],
+        limit: Optional[int],
+    ) -> Dict[str, Optional[pd.Series]]:
+        """一次算出整个指纹族（如 resin_Resin_MACCS_0..166）。
+
+        为什么必须批量：模型常带 167/2048 位指纹，逐个试探会触发 N 次完整
+        RDKit 提取（实测 334 个指纹 → 卡死数分钟），而一次提取就能拿到全部位。
+        """
+        if not RDKIT_AVAILABLE:
+            return {f: None for f in features}
+        # kind 形如 RESIN_MACCS / HARDENER_MACCS / MACCS；带 Resin_/Hardener_ 时
+        # 表示“双组分拼接指纹”里的对应组分，需选树脂列或固化剂列。
+        role = None
+        base_kind = kind
+        if kind.startswith("RESIN_"):
+            role, base_kind = "resin", kind[len("RESIN_"):]
+        elif kind.startswith("HARDENER_"):
+            role, base_kind = "curing_agent", kind[len("HARDENER_"):]
+        col = self._find_structure_column_for_prefix(df, role or prefix)
+        if col is None:
+            return {f: None for f in features}
+        values = df[col].head(limit) if limit else df[col]
+        if not values.notna().any():
+            return {f: None for f in features}
+
+        bits: List[Optional[Any]] = []
+        for v in values:
+            mol = _parse_molecule_cached(v)
+            if mol is None:
+                bits.append(None)
+                continue
+            try:
+                bits.append(self._fingerprint_bits(mol, base_kind))
+            except Exception:
+                bits.append(None)
+
+        out: Dict[str, Optional[pd.Series]] = {}
+        for f in features:
+            parsed = parse_fingerprint_feature(f)
+            if parsed is None:
+                out[f] = None
+                continue
+            _p, _k, idx = parsed
+            vals: List[Any] = []
+            any_ok = False
+            for b in bits:
+                if b is None:
+                    vals.append(np.nan)
+                    continue
+                try:
+                    vals.append(float(b[idx]) if idx < len(b) else np.nan)
+                    any_ok = True
+                except Exception:
+                    vals.append(np.nan)
+            if any_ok:
+                s = pd.Series(vals, index=values.index, dtype=float)
+                out[f] = s.reindex(df.index)
+            else:
+                out[f] = None
+        return out
+
+    @staticmethod
+    def _fingerprint_bits(mol: Any, kind: str) -> List[int]:
+        """取指纹位向量（按 kind 选择 MACCS / Morgan 等）。"""
+        from rdkit.Chem import rdMolDescriptors
+        k = kind.upper()
+        if "MACCS" in k:
+            fp = rdMolDescriptors.GetMACCSKeysFingerprint(mol)
+        elif "MORGAN" in k or "ECFP" in k:
+            from rdkit.Chem import AllChem
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+        elif "FCFP" in k:
+            from rdkit.Chem import AllChem
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048, useFeatures=True)
+        else:
+            from rdkit.Chem import rdFingerprintGenerator
+            fp = rdFingerprintGenerator.GetRDKitFPGenerator(fpSize=2048).GetFingerprint(mol)
+        return list(fp)
+
+    @staticmethod
+    def _find_structure_column_for_prefix(df: pd.DataFrame, prefix: str) -> Optional[str]:
+        """按前缀找结构列：'resin' → resin_1_structure（有 resin_2 则先试 resin_1）。
+
+        注意：normalize_name 已把 _structure/_smiles 后缀去掉（resin_1_structure
+        → resin_1），所以这里用原始列名判断后缀，用归一化名做前缀比较。
+        """
+        pkey = normalize_name(prefix)
+        raw_struct_cols = [
+            c for c in df.columns
+            if _STRUCT_SUFFIX_RE.search(str(c).lower()) or _STRUCT_SUFFIX_RE.search(normalize_name(c))
+        ]
+        if not raw_struct_cols:
+            # 退化：用 detect_structure_columns 的结果
+            raw_struct_cols = detect_structure_columns(df)
+        # 1) 精确：归一化后的结构列名 == prefix
+        for c in raw_struct_cols:
+            if normalize_name(c) == pkey:
+                return c
+        # 2) prefix 是结构列名前缀（resin → resin_1_structure）
+        for c in raw_struct_cols:
+            if normalize_name(c).startswith(pkey):
+                return c
+        # 3) 角色匹配（resin_2 → resin_1_structure）
+        prole = _ROLE_RE.match(pkey)
+        if prole:
+            for c in raw_struct_cols:
+                crole = _ROLE_RE.match(normalize_name(c))
+                if crole and crole.group(1) == prole.group(1):
+                    return c
+        return None
+
     def _batch_compute(
         self,
         df: pd.DataFrame,
@@ -1968,10 +2242,26 @@ class AutoFeatureResolver:
         再把该行能提供的全部特征一次算出。
 
         这避免了逐特征重算（1400 个特征 × N 行 = 巨量重复 RDKit 调用）。
+        指纹族（Resin_MACCS_0..166）单独走一次批量提取，而不是 167 次。
         """
         out: Dict[str, pd.Series] = {}
         remaining = list(features)
         limit = max_rows or self.backend.max_rows
+
+        # ---- 先处理指纹族：一次提取算出整族 ----
+        fp_families: Dict[Tuple[str, str], List[str]] = {}
+        for f in remaining:
+            parsed = parse_fingerprint_feature(f)
+            if parsed is None:
+                continue
+            prefix, kind, _idx = parsed
+            fp_families.setdefault((prefix, kind), []).append(f)
+        for (prefix, kind), feats in fp_families.items():
+            series_map = self._compute_fingerprint_family(df, prefix, kind, feats, limit)
+            for f, s in series_map.items():
+                if s is not None and s.notna().any():
+                    out[f] = s
+                    remaining.remove(f)
 
         for col in struct_cols:
             if not remaining:

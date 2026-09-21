@@ -35,6 +35,7 @@ from rdkit.Chem import MACCSkeys
 from tqdm import tqdm
 import warnings
 from collections import OrderedDict, Counter
+import math  # Flory-Stockmayer 凝胶点计算（alpha_gel = 1/sqrt((f_r-1)(f_h-1))）
 import re  # 新增: 用于分割多组分 SMILES
 import shutil
 import signal
@@ -4104,6 +4105,11 @@ class XTBFeatureExtractor:
             return self._parse_xtb_output(out + "\n" + err)
 
     def _calc_features(self, smiles: str):
+        # 快速退出：xTB 可执行文件不存在时，后续的 3D 嵌入与外部进程调用全是白做。
+        # 实测：储能模量模型的 workflow 有 5 个 xTB 步骤，未装 xTB 时每步都要
+        # 对每个分子做 ETKDG 3D 嵌入（28 个分子 ≈ 40s），累计 ~70s 纯浪费。
+        if not self.AVAILABLE:
+            return None
         if smiles is None or (hasattr(pd, "isna") and pd.isna(smiles)):
             return None
         s = str(smiles).strip()
@@ -4484,16 +4490,24 @@ class ExternalMDFeatureExtractor:
             valid_indices = list(range(len(features_df)))
         return features_df, valid_indices
 
-def _epoxy_domain_worker_chunk(chunk_items, stoich_mode, enable_reaction_simulation, target_conversion):
-    """子进程 Worker 函数：负责批量提取单个数据块的环氧双组分领域特征"""
+def _epoxy_domain_worker_chunk(chunk_items, stoich_mode, enable_reaction_simulation, target_conversion,
+                               wide_records=None, narrow_records=None):
+    """子进程 Worker 函数：负责批量提取单个数据块的环氧双组分领域特征
+
+    wide_records / narrow_records: 与 chunk 行序对齐的 dict 列表（子进程可 pickle）。
+        为 None 时退化为纯结构口径。
+    """
     ext = EpoxyDomainFeatureExtractor(
         enable_reaction_simulation=enable_reaction_simulation,
-        target_conversion=target_conversion
+        target_conversion=target_conversion,
+        wide_df=pd.DataFrame(wide_records) if wide_records else None,
+        narrow_df=pd.DataFrame(narrow_records) if narrow_records else None,
     )
     features_list = []
     valid_indices = []
-    for orig_idx, smi_r, smi_h, stoich_val in chunk_items:
-        feat = ext._extract_single_pair(smi_r, smi_h, stoich_val, stoich_mode)
+    for pos, (orig_idx, smi_r, smi_h, stoich_val) in enumerate(chunk_items):
+        # row_idx 必须在【传给 worker 的切片】内定位，而不是全局索引
+        feat = ext._extract_single_pair(smi_r, smi_h, stoich_val, stoich_mode, row_idx=pos)
         if feat is not None:
             features_list.append(feat)
             valid_indices.append(orig_idx)
@@ -4501,13 +4515,34 @@ def _epoxy_domain_worker_chunk(chunk_items, stoich_mode, enable_reaction_simulat
 
 
 class EpoxyDomainFeatureExtractor:
-    """环氧树脂领域知识特征提取器 (增强版：加入电子效应模拟 + 反应产物模拟)"""
+    """环氧树脂领域知识特征提取器 (增强版：加入电子效应模拟 + 反应产物模拟)
 
-    def __init__(self, enable_reaction_simulation: bool = True, target_conversion: float = 0.5):
+    物理量取值采用**分层数据源**（信任层级从高到低）：
+        L1 窄表优化列   cp_* / *_mw_resolved / *_ew_resolved（component_physics 补齐后）
+        L2 宽表文献值   *_molecular_weight_g_mol / *_equivalent_weight_g_eq / *_amount_phr
+        L3 结构直算     RDKit SMARTS 计数 + MolWt（BigSMILES 采样代理的 MW 被拒绝）
+    任一层缺失时自动降级，全部不可用时才回退到旧的纯结构口径。
+    """
+
+    def __init__(
+        self,
+        enable_reaction_simulation: bool = True,
+        target_conversion: float = 0.5,
+        wide_df=None,
+        narrow_df=None,
+        source_df=None,
+    ):
         """
         Args:
             enable_reaction_simulation: 是否启用环氧-固化剂反应模拟（生成交联产物特征）
             target_conversion: 目标转化率（0-1），用于模拟不同固化程度
+            wide_df: 母配方宽表（可选）。行序与待提取数据严格对齐时生效，
+                提供逐组分文献 MW / EEW / AHEW / PHR。
+            narrow_df: 已优化的窄表（可选，优先级高于 wide_df），
+                提供 cp_* 与 *_mw_resolved / *_ew_resolved 列。
+            source_df: 单一数据源便利参数。当工作区只有一个 DataFrame
+                （如“模型补齐数据”页面的当前数据）时用它，等价于
+                wide_df=narrow_df=source_df —— 分层查找会自行判断哪些列存在。
         """
         if not RDKIT_AVAILABLE:
             raise ImportError("需要安装 rdkit")
@@ -4518,6 +4553,22 @@ class EpoxyDomainFeatureExtractor:
         # 性能优化：记忆化缓存，避免高频单体重复解析与电荷计算
         self._electronic_cache = {}
         self._crosslink_cache = {}
+
+        # 分层数据源（行序对齐时生效）
+        if source_df is not None and len(source_df) > 0:
+            if wide_df is None or len(wide_df) == 0:
+                wide_df = source_df
+            if narrow_df is None or len(narrow_df) == 0:
+                narrow_df = source_df
+        self._wide_df = wide_df if (wide_df is not None and len(wide_df) > 0) else None
+        self._narrow_df = narrow_df if (narrow_df is not None and len(narrow_df) > 0) else None
+        self._physics_engine = None
+        try:
+            from .component_physics import resolve_component as _rc
+
+            self._physics_engine = _rc
+        except Exception:
+            self._physics_engine = None
 
         # 尝试加载反应模拟模块
         self._reaction_simulator = None
@@ -4530,6 +4581,79 @@ class EpoxyDomainFeatureExtractor:
             except ImportError:
                 print("⚠️ reaction_simulator 模块未找到，反应模拟功能将被禁用")
                 self.enable_reaction_simulation = False
+
+    # ------------------------------------------------------------------
+    # 分层数据源：从窄表/宽表按行取逐组分物理量
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _cell(df, row_idx: int, col: str):
+        """安全取单元格；列不存在或行越界返回 None。"""
+        if df is None or col not in getattr(df, "columns", []):
+            return None
+        try:
+            if row_idx is None or row_idx < 0 or row_idx >= len(df):
+                return None
+            v = df.iloc[row_idx][col]
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return None
+            if isinstance(v, str) and not v.strip():
+                return None
+            return v
+        except Exception:
+            return None
+
+    def _lookup_physics(self, side: str, comp_i: int, row_idx, structure: str):
+        """按信任层级解析单组分物理量。返回 (mw, ew, f_stoich, f_network, source)。
+
+        L1 窄表优化列 → L2 宽表文献值 → L3 结构直算
+        """
+        mw = ew = None
+        f_lit = None
+        source = "structure"
+
+        # ---- L1: 窄表 component_physics 优化列 ----
+        if self._narrow_df is not None:
+            mw = self._cell(self._narrow_df, row_idx, f"{side}_{comp_i}_mw_resolved")
+            ew = self._cell(self._narrow_df, row_idx, f"{side}_{comp_i}_ew_resolved")
+            f_lit = self._cell(self._narrow_df, row_idx, f"{side}_{comp_i}_f_stoich")
+            if mw is not None or ew is not None:
+                source = "narrow_table"
+
+        # ---- L2: 宽表文献值 ----
+        if self._wide_df is not None and (mw is None and ew is None):
+            mw = self._cell(self._wide_df, row_idx, f"{side}_{comp_i}_molecular_weight_g_mol")
+            ew = self._cell(self._wide_df, row_idx, f"{side}_{comp_i}_equivalent_weight_g_eq")
+            if f_lit is None:
+                if side == "resin":
+                    f_lit = self._cell(self._wide_df, row_idx, f"resin_{comp_i}_epoxy_group_count")
+                else:
+                    f_lit = self._cell(
+                        self._wide_df, row_idx, f"curing_agent_{comp_i}_active_hydrogen_equivalent_count"
+                    )
+            if mw is not None or ew is not None:
+                source = "wide_table"
+
+        # ---- L3: 结构直算（经 component_physics 分层校验）----
+        is_resin = side == "resin"
+        if self._physics_engine is not None:
+            try:
+                resolved = self._physics_engine(
+                    structure,
+                    is_resin=is_resin,
+                    mw_literature=mw,
+                    ew_literature=ew,
+                    f_literature=f_lit,
+                )
+                return (
+                    resolved.mw if np.isfinite(resolved.mw) else None,
+                    resolved.equivalent_weight if np.isfinite(resolved.equivalent_weight) else None,
+                    resolved.f_stoich,
+                    resolved.f_network,
+                    source if source != "structure" else resolved.mw_source,
+                )
+            except Exception:
+                pass
+        return None, None, 0.0, 0.0, source
 
     def _get_epoxide_count(self, mol):
         patt = Chem.MolFromSmarts("[C]1[O][C]1")
@@ -4617,7 +4741,14 @@ class EpoxyDomainFeatureExtractor:
         except Exception:
             return {}
 
-    def _extract_single_pair(self, smi_r: str, smi_h: str, stoich_val=None, stoich_mode: str = 'Resin/Hardener (总质量比, R/H)'):
+    def _extract_single_pair(self, smi_r: str, smi_h: str, stoich_val=None,
+                             stoich_mode: str = 'Resin/Hardener (总质量比, R/H)',
+                             row_idx=None):
+        """提取一对树脂-固化剂的领域特征。
+
+        row_idx: 当前行在 wide_df/narrow_df 中的位置（行序对齐时生效）。
+            为 None 时完全退化为纯结构口径，保持向后兼容。
+        """
         if pd.isna(smi_r) or pd.isna(smi_h):
             return None
 
@@ -4635,16 +4766,44 @@ class EpoxyDomainFeatureExtractor:
         if mol_r is None or mol_h is None:
             return None
 
-        mw_r = Descriptors.MolWt(mol_r)
-        mw_h = Descriptors.MolWt(mol_h)
-        f_epoxy = self._get_epoxide_count(mol_r)
-        # 优先按固化剂类型取当量官能度（酸酐 1:1、硫醇按巯基数），
-        # 回退到全部 N-H 计数（胺类路径与原逻辑一致）
-        _curer_type_h, f_curer = self._detect_curer_type(mol_h)
-        f_amine = f_curer if f_curer > 0 else self._get_active_hydrogen_count(mol_h)
+        # ---- 分层数据源解析（窄表 → 宽表 → 结构直算）----
+        mw_r, ew_r, f_r_stoich, f_r_network, src_r = self._lookup_physics(
+            "resin", 1, row_idx, str(smi_r)
+        )
+        mw_h, ew_h, f_h_stoich, f_h_network, src_h = self._lookup_physics(
+            "curing_agent", 1, row_idx, str(smi_h)
+        )
 
-        eew = mw_r / f_epoxy if f_epoxy > 0 else mw_r
-        ahew = mw_h / f_amine if f_amine > 0 else mw_h
+        # 官能度：结构口径兜底（分层解析失败时）
+        f_epoxy = self._get_epoxide_count(mol_r) if f_r_stoich <= 0 else f_r_stoich
+        if f_h_stoich <= 0:
+            _curer_type_h, f_curer = self._detect_curer_type(mol_h)
+            f_h_stoich = float(f_curer) if f_curer > 0 else float(self._get_active_hydrogen_count(mol_h))
+        if f_h_network <= 0:
+            # 酸酐的网络支化官能度是化学计量口径的 2 倍（开环酯化后桥接 2 条链）
+            _ct = self._detect_curer_type(mol_h)[0]
+            f_h_network = f_h_stoich * 2.0 if _ct == "anhydride" else f_h_stoich
+
+        # 分子量：结构口径兜底
+        if mw_r is None:
+            mw_r = float(Descriptors.MolWt(mol_r))
+        if mw_h is None:
+            mw_h = float(Descriptors.MolWt(mol_h))
+
+        # 当量重：文献/优化值优先，否则由 MW 与官能度推算
+        eew = float(ew_r) if ew_r is not None else (mw_r / f_epoxy if f_epoxy > 0 else mw_r)
+        ahew = float(ew_h) if ew_h is not None else (mw_h / f_h_stoich if f_h_stoich > 0 else mw_h)
+
+        # [口径切换] Hardener_Functionality 改为**网络支化口径**。
+        #
+        # 理由：该特征的主用途是交联网络建模（Flory 凝胶点 / Mc / 交联密度），
+        # 这些公式中的 f 是“每分子形成的网络分支数”：
+        #     酸酐：1 个酸酐消耗 1 个环氧（f_stoich=1），但开环酯化后桥接 2 条链
+        #           （f_network=2）—— 用 f_stoich=1 代入 (f−2) 项会得到**负交联密度**。
+        #     胺：伯胺 2 氢既消耗 2 环氧也形成 2 个分支，两口径相同。
+        #
+        # 化学计量用途（理论 PHR / 当量比）仍用 f_stoich，不受影响。
+        f_amine = f_h_network
 
         theo_phr = (ahew / eew) * 100 if eew > 0 else 0
 
@@ -4713,7 +4872,14 @@ class EpoxyDomainFeatureExtractor:
             try:
                 alpha_gel = 1.0 / math.sqrt((f_epoxy - 1) * (f_amine - 1))
                 alpha_gel = min(1.0, alpha_gel)
-            except Exception:
+            except ZeroDivisionError:
+                # (f-1) 乘积为 0 → 体系不可能凝胶
+                alpha_gel = 1.0
+            except Exception as _gel_err:
+                # [修复] 原先这里静默吞掉所有异常，导致 `math` 未导入时的
+                # NameError 被隐藏，Gel_Point_Conversion 长期恒为 1.0。
+                # 现在保留可见性（不中断主流程）。
+                print(f"⚠️ 凝胶点计算失败（f_r={f_epoxy}, f_h={f_amine}）: {type(_gel_err).__name__}: {_gel_err}")
                 alpha_gel = 1.0
         else:
             alpha_gel = 1.0
@@ -4721,6 +4887,45 @@ class EpoxyDomainFeatureExtractor:
         features['Theoretical_Max_Conversion'] = theo_alpha_max
         features['Gel_Point_Conversion'] = alpha_gel
         features['Stoich_Balance_Factor'] = 1.0 - abs(1.0 - r_val) if r_val <= 2.0 else 0.0
+
+        # ---- [新增] 双口径官能度与网络交联密度 ----
+        # 酸酐的 f_stoich=1（1:1 消耗环氧）与 f_network=2（开环酯化后桥接 2 条链）
+        # 是两套不可混用的口径。
+        # 注：Hardener_Functionality（上方已赋值）== Hardener_Functionality_Network，
+        # 后者为显式别名，便于下游按语义取用。
+        features['Hardener_Functionality_Stoich'] = f_h_stoich
+        features['Hardener_Functionality_Network'] = f_h_network
+        features['Resin_Functionality_Network'] = f_r_network if f_r_network > 0 else f_epoxy
+
+        # 每 mol 环氧基的配方质量 (g)：W = EEW + r·AHEW
+        r_effective = r_val if r_val > 0 else 1.0
+        W_g_per_epoxy = eew + r_effective * ahew
+        features['W_g_per_epoxy'] = round(W_g_per_epoxy, 4)
+
+        # 环氧基摩尔浓度 (mol/m³)：ρ=1.2 g/cm³ → 1.2e6 g/m³
+        if W_g_per_epoxy > 0:
+            features['Epoxy_Conc_mol_m3'] = round(1.2e6 / W_g_per_epoxy, 4)
+        else:
+            features['Epoxy_Conc_mol_m3'] = 0.0
+
+        # 网络交联密度 (mol/m³)：ν = [ep]·(f_h,net−1)/f_h,net·bal
+        # 与 core/crosslink_physics 同口径（单位统一 mol/m³）
+        if f_h_network > 1.0 and W_g_per_epoxy > 0:
+            _conn = (f_h_network - 1.0) / f_h_network
+            _bal = min(r_effective, 1.0 / r_effective)
+            _nu = (1.2e6 / W_g_per_epoxy) * _conn
+            _ct_name = self._detect_curer_type(mol_h)[0]
+            if _ct_name == 'anhydride':
+                _nu *= _bal
+            features['Crosslink_Density_Network_mol_m3'] = round(_nu, 4)
+            features['Mc_g_mol'] = round(1.2e6 / _nu, 2) if _nu > 0 else 0.0
+        else:
+            features['Crosslink_Density_Network_mol_m3'] = 0.0
+            features['Mc_g_mol'] = 0.0
+
+        # 物理量来源标记（便于诊断分层数据源是否命中）
+        features['Physics_Source_Resin'] = src_r
+        features['Physics_Source_Hardener'] = src_h
 
         lumo_proxy = -1.0 * r_pos_chg * 5.0 - 0.5
         homo_proxy = h_neg_chg * 4.0 - 6.0
@@ -4734,7 +4939,31 @@ class EpoxyDomainFeatureExtractor:
 
         return features
 
-    def extract_features(self, resin_smiles_list, hardener_smiles_list, stoichiometry_list=None, stoich_mode: str = 'Resin/Hardener (总质量比, R/H)', n_jobs: int = 1):
+    def extract_features(self, resin_smiles_list, hardener_smiles_list, stoichiometry_list=None,
+                         stoich_mode: str = 'Resin/Hardener (总质量比, R/H)', n_jobs: int = 1,
+                         wide_df=None, narrow_df=None):
+        """批量提取。
+
+        wide_df / narrow_df: 可选分层数据源（行序与输入列表严格对齐）。
+            narrow_df（优化后窄表，含 cp_* / *_mw_resolved）优先级高于 wide_df。
+            两者均缺时自动降级为纯结构口径。
+        """
+        # 分层数据源优先用显式参数，否则回退到构造时传入的
+        if wide_df is None:
+            wide_df = self._wide_df
+        if narrow_df is None:
+            narrow_df = self._narrow_df
+        _aligned_wide = wide_df if (wide_df is not None and len(wide_df) == len(resin_smiles_list)) else None
+        _aligned_narrow = narrow_df if (narrow_df is not None and len(narrow_df) == len(resin_smiles_list)) else None
+        if (wide_df is not None or narrow_df is not None) and _aligned_wide is None and _aligned_narrow is None:
+            print(
+                "⚠️ 分层数据源行数与输入不匹配，已降级为纯结构口径"
+                f"（wide={0 if wide_df is None else len(wide_df)}, "
+                f"narrow={0 if narrow_df is None else len(narrow_df)}, input={len(resin_smiles_list)}）"
+            )
+        self._wide_df = _aligned_wide
+        self._narrow_df = _aligned_narrow
+
         features_list = []
         valid_indices = []
         error_count = 0
@@ -4773,11 +5002,23 @@ class EpoxyDomainFeatureExtractor:
 
                 chunks = [list(c) for c in np.array_split(all_items, n_chunks) if len(c) > 0]
                 print(f"🚀 启动服务器多核并行提取 (Workers: {effective_n_jobs}, 样本数: {len(resin_smiles_list)})...")
+                # 分层数据源按 chunk 行序切片后传给子进程（保持与 chunk 内 pos 对齐）
+                _w_records, _n_records = [], []
+                for c in chunks:
+                    if _aligned_wide is not None:
+                        _w_records.append(_aligned_wide.iloc[[it[0] for it in c]].to_dict("records"))
+                    else:
+                        _w_records.append(None)
+                    if _aligned_narrow is not None:
+                        _n_records.append(_aligned_narrow.iloc[[it[0] for it in c]].to_dict("records"))
+                    else:
+                        _n_records.append(None)
                 nested_res = Parallel(n_jobs=effective_n_jobs, backend='loky')(
                     delayed(_epoxy_domain_worker_chunk)(
-                        c, stoich_mode, self.enable_reaction_simulation, self.target_conversion
+                        c, stoich_mode, self.enable_reaction_simulation, self.target_conversion,
+                        _w_records[_ci], _n_records[_ci],
                     )
-                    for c in chunks
+                    for _ci, c in enumerate(chunks)
                 )
                 features_list = [f for sub_f, _ in nested_res for f in sub_f]
                 valid_indices = [idx for _, sub_idx in nested_res for idx in sub_idx]
@@ -4791,7 +5032,7 @@ class EpoxyDomainFeatureExtractor:
         for idx, (smi_r, smi_h) in enumerate(zip(resin_smiles_list, hardener_smiles_list)):
             try:
                 st_val = stoichiometry_list[idx] if stoichiometry_list is not None and idx < len(stoichiometry_list) else None
-                feat = self._extract_single_pair(smi_r, smi_h, st_val, stoich_mode)
+                feat = self._extract_single_pair(smi_r, smi_h, st_val, stoich_mode, row_idx=idx)
                 if feat is not None:
                     features_list.append(feat)
                     valid_indices.append(idx)

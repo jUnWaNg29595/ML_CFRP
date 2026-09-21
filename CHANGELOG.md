@@ -8,6 +8,117 @@
 ## [Unreleased]
 
 ### 新增
+- 【虚拟筛选：模型外部特征统一输入】高通量筛选页新增「🧩 自动取值 + 批量确认」填充策略（默认）：
+  - **痛点**：筛选会消费模型的**全部**输入特征。分子特征能从候选 SMILES 算出，但**工艺/测试/配方特征**（`cure_*`/`post_cure_*`/`curing_pressure_mpa`/`tg_heating_rate_c_min` 等）无法从结构推导，必须在筛选前给定统一值——它们是**筛选的设计变量**。旧实现只有「训练集中位数 / 0 / 模板行」三种填充，等于**伪造工艺条件**（如 `Tg-XGBoost` 的 27 个工艺列在工作区里全部缺失）
+  - **新面板 `_render_screening_uniform_inputs`**：① 自动从工作区取代表值（数值→中位数，类别→众数）② 用**一张 `st.data_editor` 表**让用户逐项确认/修改（三列：模型特征 / 值 / 来源，前两列只读）③ 留空 = 交给模型内置 imputer
+  - **优先级**：用户确认的统一输入**覆盖** base_row 的中位数/0/模板行（它们是显式给定的设计变量）
+  - 实测：`储能模量.joblib` 的 36 个非分子特征 → **29 个自动取值**（`process_max_temperature_c=140`、`formulation_resin_total_eew_g_eq=187.27` …）、7 个需手工；`Tg-XGBoost` 的 27 个工艺列工作区全无 → 全部列在表里等用户填
+
+### 修复
+- 【workflow 回放裁剪失效】`_prune_workflow_to_needed_steps` 不再按模型真实需求裁剪，导致全量执行无用步骤：
+  - **根因**：旧逻辑只认 `step.feature_names`，但平台导出的 workflow **步骤里没有这个字段**（只有 `prefix`/`source_columns`/`params`）→ `names` 恒为空 → `not names` 为真 → **全部保留**
+  - **改用 `workflow.feature_source_map`**（`{特征名: step_id}`，导出时生成，最权威）：直接知道每个特征是哪步算的
+  - **产出未登记时的 prefix 校验**：实测 `dsc初始温度` 的 22 个 xTB 步骤全部「产出 0」，若一律保守保留就白跑 3 分钟。改用 **prefix 前缀 + 方法标志双重校验**（`_is_method_output`），防止短前缀陷阱（如指纹步 `prefix='resin_'` 会误命中 `resin_3_f_stoich` 这种非指纹列）
+  - **重复步骤识别**：`single_4`(源 resin_1+2) 与 `single_7`(源 resin_1+2+3) 产出**同名列**（都是 `resin_Resin_MACCS_*`），后者已产出全部需要的列 → 按 `(method, prefix)` 判重裁掉前者
+  - **`needed` 口径扩展**：`input_feature_cols ∪ feature_cols ∪ feature_audit.canonical/effective`，宁可多算不可漏算
+  - **同步裁剪 `feature_source_map` / `merge_order`**
+  - 实测效果：`dsc初始温度` **31 步 → 3 步**（裁 28）、`dsc放热峰` 25 → 2 步、`model_TabPFN` 15 → 8 步、`储能模量` 5 → 5 步（本就精简）
+  - 端到端验证：`dsc初始温度` workflow 回放 **3 分钟+ → 2.8s**；新增 909 列；模型输入列 **518/526 就绪**；补齐 8 个 + 预测 2.5s → ✅ 526/526 预测 656 行
+- 【模型补齐页交互优化】解决「点任何控件都刷屏、页面卡」问题（四层优化）：
+  - **① 未解析特征分类，不再为无法映射的特征渲染控件**（**主要瓶颈**）：旧实现给**全部** 805 个未解析特征各渲染一个 `st.selectbox`（每个 657 个选项）→ **52.9 万 DOM 选项**。但其中 668 个是**指纹位**（从 SMILES 算得，根本无法手工映射）、55 个是**分子特征**（走提取引擎），真正值得人工确认的只有 80 个工艺/测试列。现改为三类分开展示，只对 80 个可映射特征渲染控件
+  - **② 用 `st.data_editor` + `SelectboxColumn` 替代 N 个 selectbox**：一张表 + 一列下拉，DOM 选项数从 77,891 → 1 个表格，降幅 **99.9%**
+  - **③ 缓存 augmenter 实例**：模型反序列化首次实测 **8.6s**（含模块导入），旧代码每次 rerun 都重建。改用「文件名 + 大小 + 前 1MB md5」签名做 key（计算仅 0.001s），内容不变则复用 session_state 里的实例
+  - **④ 整个面板包成 `@st.fragment`**：面板内交互只重跑本函数，不再重跑整个页面（含其他面板与工作区数据读取）。项目已有同类先例 `_page_frag_upload`
+  - 附带：一次性汇总提示「共 N 个特征由计算流程自动产出，无需手工映射；真正需要人工确认的只有 M 个」；指纹位/分子特征折叠为 expander 提示；`app_lib.py` 补 `from typing import Any`（此前靠 `from __future__ import annotations` 未暴露）
+  - 验证：无头渲染异常数 0，selectbox 数 **800+ → 0**；分类耗时 0.57s；签名计算 0.0013s
+- 【级联模型支持】「模型补齐数据」页现可导入**特征依赖其他模型预测值**的模型：
+  - **自动发现依赖**：模型 B 的输入特征名 == 模型 A 的 `target_col` 时，自动建立 A→B 依赖边。实测真实案例 `XGBoost_artifact(2).joblib`(target=`tg_c`，需要 `tensile_modulus_gpa`) 与 `拉伸模量-XGBoost-0.965.joblib`(target=`tensile_modulus_gpa`，需要 `tg_c`) **互相引用**，此前两个都跑不起来
+  - **拓扑分层求解**：Tarjan 求强连通分量（SCC）+ 缩点拓扑排序，先算上游、把预测值写回，再作为下游模型的输入特征
+  - **环处理**：多节点 SCC（互引）无法拓扑排序，按「依赖的**环外可获得性**」择优打破环——优先用手工映射（×100）> 工作区真值（×50）> 环外上游预测（×30），平局时比可解析特征比例
+  - **优先级铁律**：**工作区已有的真实值一定胜过模型预测值**。级联解析排在 `exact`/`case_insensitive`/`normalized`/`alias` 之后、`pattern`/`fuzzy` 之前
+  - **UI**：新增「🔗 级联依赖关系」面板（依赖表 + 求解层 + 环提示 + 外部需补特征数）、「🔗 启用级联模型求解」开关（默认开）、结果表新增「层」与「级联输入」列；诊断表把「待上游预测」从「未获取」里区分出来，不再误导手工映射
+  - 新 API：`ModelDependencyGraph`（`upstream_of`/`layers`/`scc_layers`/`cycles`/`describe`）、`ExternalFeatureAugmenter.cascade_info()`/`cascade_external_features()`、`_dep_key()`、`_order_layer()`、`describe_cascade()`；`resolve_features`/`diagnose_entry` 新增 `cascade_sources` 参数；`augment`/`augment_with_models` 新增 `enable_cascade` 参数
+  - 验证：3 模型链 A→B→C 逐层正确、C 精确复用 B 的预测值（误差 0）；互引环在有真值/手工映射时正确改序；关掉级联则回退旧行为（缺特征全 NaN）
+- 【环氧反应特征分层数据源】`EpoxyDomainFeatureExtractor` 支持按信任层级取值，任一层缺失自动降级：
+  - **L1 窄表优化列**（`cp_*` / `*_mw_resolved` / `*_ew_resolved`，优先级最高）→ **L2 宽表文献值**（`*_molecular_weight_g_mol` / `*_equivalent_weight_g_eq` / `*_amount_phr`）→ **L3 结构直算**（SMARTS + MolWt，BigSMILES 采样代理的 MW 被拒绝）
+  - **修正 EEW 系统偏差**：旧实现只用结构 `MolWt/f`，与文献 EEW 一致率仅 **50.0%**（商用树脂含低聚物，结构算 EEW≈170 而文献值 197~208）；接入宽表后提升到 **100.0%**
+  - **修复酰胺假阳性**：旧 `_get_active_hydrogen_count` 数所有 N-H（含不可反应的酰胺），新路径改用 `component_physics` 的机制感知识别
+  - **新增酸酐双口径**：`Hardener_Functionality_Stoich`(=1) 与 `Hardener_Functionality_Network`(=2) 分离，避免用化学计量口径代入 Flory `(f-2)` 项得到**负交联密度**
+  - 新增物理特征：`W_g_per_epoxy`、`Epoxy_Conc_mol_m3`、`Crosslink_Density_Network_mol_m3`、`Mc_g_mol`（与 `crosslink_physics` 同口径，单位 mol/m³），以及来源标记 `Physics_Source_Resin` / `Physics_Source_Hardener`
+  - 行序安全：宽表/窄表行数与输入不一致时**整体降级**为结构口径（不按位置错位取值）；多进程路径按 chunk 切片传递，`row_idx` 在 chunk 内定位（已测单线程与多进程逐行一致）
+  - `core/molecular_features.py` 单组分路径接入宽表/窄表（此前仅多组分路径传了 `wide_df`）
+  - **模型补齐数据页面同步**：`execute_molecular_feature_workflow` 新增 `use_data_source` 参数（默认 True），把当前数据表作为分层数据源透传给提取器；`virtual_screening.extract_features_from_config` 支持 `_source_df`。这样回放模型自带 workflow 时，某些**不在宽表中**的特征也能用工作区已有的优化列（`cp_*` / `*_resolved`）而非只能结构直算
+- 【目标对数变换】训练页新增「目标变量变换」面板，支持 `log1p` / `log` / 不变换，并新增「剔除物理不可能的目标值」开关：
+  - `core/model_trainer.py` 新增 `TargetLogTransformer`（sklearn 兼容包装器）：训练在 log 空间，`predict()` 返回**原始空间**，对下游（Pipeline / 预测页 / SHAP / 残差图）完全透明，无需改动任何消费方
+  - 关键正确性保证：`fit` 会**同步变换 eval_set 的 y**，否则早停会在错误量纲上评估（实测不变量纲时 RMSE 为原始尺度，变换后为 log 尺度 0.02）
+  - 与 ANN 的 `normalize_target` 互斥（两者都改目标尺度），启用 log 时自动关闭后者
+  - `train_model` 与 `cross_validate_model` 同口径支持，保证 CV 分数与测试集分数可比
+  - UI 现场诊断：显示目标偏度与越界样本数；当检测到异常值时直接提示「优先做异常值过滤而非 log 变换」
+- 【逐组分物理量补齐】新增 `core/component_physics.py`，为窄表补齐各组分 MW / EEW|AHEW / 官能度，解决交联密度模型 R² 上不去的特征瓶颈：
+  - **根因**：窄表原本没有逐组分分子量列（`resin_1_molecular_weight_g_mol` 全仓只被读取、从未被生成），导致 `crosslink_physics` 的 `hybrid` 分支恒不可达（`f_avg` 永远 NaN），理论 ν 全部退化为 `aggregate` 粗口径
+  - 分层补齐（信任层级）：L1 文献值 → L2 当量×官能度（`MW = EEW × f`，实测合法性：树脂侧 `(MW/f)/EEW` 中位 1.000、86.5% 落在 0.9–1.1；固化剂侧中位 1.000、99.4% 落在 0.9–1.1）→ L3 结构直算
+  - 覆盖率提升：树脂 MW 17.6% → **98.2%**，固化剂 MW 52.6% → **95.4%**
+  - **BigSMILES 妥善处理**：`bigsmiles_to_smiles` 返回的是采样代理，重复单元数 n 与采样长度人为设定，其 MolWt **无物理意义**（实测与文献 EEW 自洽率仅 3.5%、`convMW/origMW` 中位 0.196），但官能度 f 可靠。因此 BigSMILES 只采信 f、MW 强制走 L2，并对代理 MW 与多片段单元格做拒绝校验（实测 119 条 BigSMILES 行中 0 条误用代理 MW）
+  - **官能度双口径分离**：酸酐 `f_stoich=1`（1 酸酐:1 环氧）与 `f_network=2`（开环酯化后桥接 2 条链）严格分开，避免用 `f_stoich` 代入 Flory `(f-2)` 项得到**负交联密度**
+
+### 变更
+- 【交联密度口径对齐】`core/crosslink_physics.py` 全面重写，单位统一为 **mol/m³**：
+  - 新增机制感知理论 ν：`ν = [ep]·(f_h,net−1)/f_h,net`，其中 `bal = min(r,1/r)` 仅对酸酐/羧基类机制生效（胺类过量胺本身起链终止作用，实测不需要 bal：0.229 vs 0.157；酸酐类需要：0.328 vs 0.056）。5 折交叉验证中该形式 5/5 折均被选中
+  - 修复官能度污染：文献列 `active_hydrogen_equivalent_count`（化学计量口径）不再覆盖结构解析出的 `f_network`（此前使酸酐 `f_h` 由 2.0 变 3.0，ν 秩相关由 0.242 掉到 0.192）
+  - 修复 `xl_alpha_gel` 恒为全空（`f_r_curated` 仅在逐组分文献列存在时为 True，而窄表恰好没有）
+  - 新增 `xl_epoxy_conc_mol_m3` / `xl_W_g_per_epoxy` / `xl_f_h_stoich` / `xl_nu_junction_mol_m3` / `xl_mechanism` / `xl_coverage`
+  - 新增显式换算函数 `nu_mol_per_m3_to_mmol_per_g` / `mmol_per_g_to_nu_mol_per_m3`（往返偏差 < 1e-12）
+- 【口径统一】`core/epoxy_mechanism_features.py` 理论交联密度由 `1000/Mc`（**mmol/g**）改为主口径 mol/m³，同时保留 `mech_crosslink_density_mmol_g` 兼容；修正 `f_avg` 分子分母加权口径不一致（分子用 phr 质量权重、分母用摩尔数）
+- 【窄表接入】`core/formulation_fusion.py` 在 `qspr_clean` 清洗中调用 `enrich_narrow_table`，并把逐组分当量重与新派生列加入 `valuable_ordered_cols` 白名单
+
+### 验证
+- 5 折 CV（XGBoost，目标 log ν，n=1373）：基线 R²(log)=+0.5519 → 补逐组分 EEW/AHEW **+0.5851** → 补 MW+EEW **+0.5978** → 再加理论ν+alpha_gel **+0.6011**（+0.049）
+- 对照实验：加 8 列纯噪声 R² 降至 +0.4039（证明模型无「加列即涨分」假象）；MW 列置换打乱后降至基线以下（证明增益非列数效应）
+- 回归测试：全量 pytest 失败数与改动前**逐条完全一致**（21 项既有失败，零新增回归）
+
+### 变更
+- 【官能度口径切换】`Hardener_Functionality` 改为**网络支化口径**（酸酐=2）：
+  - 理由：该特征主用于 Flory 凝胶点 / Mc / 交联密度，公式中的 f 是“每分子形成的网络分支数”。酸酐 1:1 消耗环氧（`f_stoich=1`），但开环酯化后桥接 2 条链（`f_network=2`）
+  - 同步修改 `core/auto_feature_resolver.compute_formulation_feature`（总表查不到特征时的现场计算路径），保证两条路径口径一致
+  - **当量重/当量比仍用化学计量口径**（`AHEW`、`formulation_r_value`），不受影响；新增 `Hardener_Functionality_Stoich` 供化学计量用途显式取用
+
+### 变更
+- 【当量重去重】`enrich_narrow_table` 不再另起 `cp_eew`/`cp_ahew`/`cp_r_value` 列，
+  改为**写回原表列名**（`formulation_resin_total_eew_g_eq` /
+  `formulation_hardener_total_ahew_g_eq` / `formulation_r_value`）：
+  - 原实现下 `cp_eew` 与原表 EEW 在 756 条重叠样本上 **100% 相同**，属完全重复特征
+  - 下游 `crosslink_physics._EEW_COL`、特征白名单、`auto_feature_resolver` 均按原名引用，改名会断链
+  - 采用**原表实测值优先、仅填补空位**（非覆盖）：
+    | 指标 | 原表非空 | 补齐后 |
+    |---|---|---|
+    | EEW  | 756 (49%) | **1455 (94%)** |
+    | AHEW | 439 (28%) | **1341 (86%)** |
+    | r 值 | 958 (62%) | **1379 (89%)** |
+  - 为何不反过来用结构直算覆盖：受控子集（n=352 两套都有值，仅换 EEW/AHEW，
+    目标=实测 ν）原表 spearman=**+0.236** vs 结构直算 **+0.080**。同一 DGEBA
+    结构在原表中有 105 个不同 EEW（134~288，中位 196）—— 这是实测/文献值，
+    反映真实低聚物分布（n=0~0.15 同系物混合物）；结构直算恒为单体值 170.21，
+    丢失了低聚物分布信息。而原表缺失时补齐值本身有效（535 条 spearman=+0.243）。
+- 【元数据列不进表】新增 `is_metadata_column()`：`*_mw_source` / `*_ew_source` /
+  `*_f_source` / `*_mw_trust` / `*_mechanism` / `cp_mechanism` / `cp_coverage`
+  等字符串标记列**不再写入数据集**（此前会让它们进入特征白名单、污染训练矩阵）。
+  新增列中的字符串列数：22 → **0**。需调试时用 `keep_metadata=True`。
+- `cp_f_r` / `cp_f_h_stoich` **保留**（不与原表列重复）：原表 `resin_epoxy_group_total`
+  是简单求和，`cp_f_r` 是摩尔加权。实测差异集中在多组分样本（差异样本 2/3 组分
+  占 84%；相同样本 1 组分占 82%），语义不同。
+
+### 修复
+- **`Gel_Point_Conversion` 长期静默失效**（`core/molecular_features.py`）：
+  - 根因：模块从未 `import math`，`math.sqrt` 抛 `NameError`，却被 `except Exception: alpha_gel = 1.0` 静默吞掉 → 该特征**恒为 1.0**（等价于“永不凝胶”），实测 400 行样本 100% 受影响
+  - 修复：补上 `import math`；`except` 拆分为 `ZeroDivisionError`（真正的不可凝胶）与通用异常（打印告警但不中断主流程），避免同类 bug 再被隐藏
+  - 修复后：恒为 1.0 的比例从 100% 降至 31.8%，253/371 行获得有效凝胶点
+- 模型解释页 SHAP 分析多次运行后，图表与结果面板堆叠在同一页面（旧图 + 新图、重复的排名图/饼图/下载按钮）：
+  - 根因：SHAP tab 内渲染顺序缺陷 —— 上方缓存面板（`cached_shap_*`）在 `if run_shap:` 计算分支**之前**执行，点击计算的那次 rerun 会先用旧缓存渲染一遍；XGBoost 分支计算后调用了 `st.rerun()` 所以页面被重建（正常），而非 XGBoost 分支（TabPFN/神经网络等）直接 `st.image` 新图后 `return`，导致旧面板与新面板叠加
+  - `app_lib.py` 非 XGBoost 分支改为与 XGBoost 分支一致：写入 `session_state`（图/CSV/Origin 三套导出）后立即 `st.rerun()`，由缓存面板统一渲染唯一一份最新结果；完成提示改为写入 `shap_last_status`（rerun 后由缓存面板顶部展示），不再在计算轮直接 `st.success` + `st.image`
+  - `run_shap` 入口统一先清空上一轮结果缓存（`shap_plot_png` / `shap_plot_path` / `shap_csv_*` / `shap_origin_*` / `shap_*_cache_key`），计算期间与计算失败时都不再残留过期图表
+  - 加载模型时清理 SHAP 缓存补全遗漏键（`shap_origin_beeswarm_bytes` / `shap_origin_bar_bytes` / `shap_origin_beeswarm_path` / `shap_origin_bar_path`），避免切换模型后旧 Origin 导出数据驻留内存
+
+### 新增
 - 【总表特征自动解析】`core/auto_feature_resolver.py` 大幅增强，解决「预测时从总表按结构查不到特征」的问题：
   - 结构指纹匹配：新增 `_row_fingerprint` / `_build_fingerprint_index` / `lookup_by_fingerprint`，用工作区行的结构列组合做指纹索引，命中总表同结构行后取特征，替代原先只能靠单一列名精确匹配的做法
   - 派生列索引：新增 `_build_derived_index` / `_lookup_derived` / `_match_derived_column`，支持从关联表 join 出来的派生特征回填

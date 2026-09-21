@@ -55,7 +55,7 @@ from types import SimpleNamespace
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 def _configure_safe_console_output():
     """Avoid Windows console encoding crashes from debug prints."""
@@ -14260,9 +14260,62 @@ def page_molecular_features():
                         for i in range(min(3, len(hardener_list))):
                             st.write(f"  [{i}] {hardener_list[i]}")
 
+                    # [分层数据源] 单组分路径同样接入母配方宽表：
+                    # 宽表提供逐组分文献 MW / EEW / AHEW / PHR，能修正结构直算的系统偏差。
+                    # 实测：EEW 一致率从 50.0% 提升到 100.0%（商用树脂含低聚物，
+                    # 结构算 EEW≈170 而文献值 197~208）。
+                    # 若工作区已有优化后窄表（含 cp_* / *_mw_resolved），其优先级高于宽表。
+                    _wide_df_single = None
+                    if 'auto_fuse_wide' in locals() and auto_fuse_wide and '_default_wide_path' in locals() and _default_wide_path and os.path.exists(_default_wide_path):
+                        try:
+                            _wide_df_single = pd.read_csv(_default_wide_path, low_memory=False)
+                            # 行序对齐校验：只有行数一致才能按位置取值
+                            if len(_wide_df_single) != len(smiles_list):
+                                st.caption(
+                                    f"ℹ️ 母宽表 {len(_wide_df_single)} 行与当前 {len(smiles_list)} 行不一致，"
+                                    "将仅使用结构直算口径"
+                                )
+                                _wide_df_single = None
+                            else:
+                                st.info(
+                                    f"🔗 已接入母配方宽表（{len(_wide_df_single)} 行，行序对齐）"
+                                    "—— 逐组分文献 EEW/AHEW/MW 优先，缺失时自动降级为结构直算"
+                                )
+                        except Exception as _e_w:
+                            st.warning(f"⚠️ 无法读取母配方宽表: {_e_w}")
+                            _wide_df_single = None
+
+                    # 优化后窄表优先（含 component_physics 补齐列）
+                    _narrow_df_single = None
+                    _narrow_candidates = []
+                    try:
+                        if '_default_wide_path' in locals() and _default_wide_path:
+                            _nd = os.path.dirname(os.path.abspath(_default_wide_path))
+                            for _fn in os.listdir(_nd):
+                                if _fn.startswith("ml_qspr_model_") and _fn.endswith(".csv"):
+                                    _narrow_candidates.append(os.path.join(_nd, _fn))
+                    except Exception:
+                        _narrow_candidates = []
+                    for _np_path in _narrow_candidates:
+                        try:
+                            _ndf = pd.read_csv(_np_path, low_memory=False)
+                            _has_cp = any(str(c).startswith("cp_") for c in _ndf.columns)
+                            _has_res = any(str(c).endswith("_mw_resolved") for c in _ndf.columns)
+                            if (_has_cp or _has_res) and len(_ndf) == len(smiles_list):
+                                _narrow_df_single = _ndf
+                                st.info(
+                                    f"🧬 已接入优化后窄表（{os.path.basename(_np_path)}），"
+                                    "优先使用 component_physics 补齐的逐组分物理量"
+                                )
+                                break
+                        except Exception:
+                            continue
+
                     extractor = EpoxyDomainFeatureExtractor(
                         enable_reaction_simulation=_enable_rxn,
-                        target_conversion=None  # [修复] None→按固化剂类型自动估算（旧值 0.5 硬编码使所有行转化率恒 50%）
+                        target_conversion=None,  # [修复] None→按固化剂类型自动估算（旧值 0.5 硬编码使所有行转化率恒 50%）
+                        wide_df=_wide_df_single,
+                        narrow_df=_narrow_df_single,
                     )
                     _cpu_jobs = locals().get('epoxy_cpu_workers', 1)
                     features_df, valid_indices = extractor.extract_features(
@@ -16657,6 +16710,84 @@ def page_model_training():
                 "最终测试集不重采样、不加权。"
             )
 
+        # --- [目标变量变换] 对数变换 + 异常值过滤 ---
+        st.markdown("### 🎯 目标变量变换")
+        if str(model_name).endswith("分类"):
+            target_transform = "none"
+            target_outlier_filter = False
+            st.caption("分类模型不做目标变换。")
+        else:
+            _y_probe = None
+            try:
+                if target_col and "df" in locals() and target_col in df.columns:
+                    _y_probe = pd.to_numeric(df[target_col], errors="coerce").dropna()
+            except Exception:
+                _y_probe = None
+
+            # 现场诊断：用真实数据告诉用户该不该做 log，而不是只给一个开关
+            if _y_probe is not None and len(_y_probe) >= 20:
+                try:
+                    _skew = float(_y_probe.skew())
+                    _lo, _hi = 1.0, 1.0e4
+                    _bad = int(((_y_probe < _lo) | (_y_probe > _hi)).sum())
+                    _m1, _m2 = st.columns(2)
+                    _m1.metric("目标偏度 (skew)", f"{_skew:+.2f}")
+                    _m2.metric("超出物理区间样本", f"{_bad}")
+
+                    if _bad > 0:
+                        _se = (_y_probe - _y_probe.mean()) ** 2
+                        _share = float(_se.nlargest(min(10, len(_se))).sum() / _se.sum() * 100)
+                        st.warning(
+                            f"⚠️ 检测到 **{_bad}** 个超出物理合理区间 [{_lo:g}, {_hi:g}] 的目标值。"
+                            f"由于 R² 分母是平方误差之和，**误差最大的 10 个样本就占据了 R² 分母的 {_share:.1f}%**。"
+                            "此时 R² 会被这几十个点完全支配，既不反映整体预测能力，数值也常常是假象（同时 MAE 会大到无物理意义）。\n\n"
+                            "**建议优先开启下方的「剔除物理不可能的目标值」**（这是治本手段），"
+                            "而不是先做对数变换——对数变换只会压低这些点的权重，让原始空间的 R² 反而下降。"
+                        )
+                    elif abs(_skew) > 1.0:
+                        st.info(
+                            f"目标偏度 {_skew:+.2f}（右偏），且未发现越界样本。"
+                            "这是对数变换的理想场景：可开启下方开关，让分布接近正态。"
+                        )
+                    else:
+                        st.caption(f"目标偏度 {_skew:+.2f}，分布已较对称，对数变换收益有限。")
+                except Exception:
+                    pass
+
+            target_transform = st.selectbox(
+                "目标变换",
+                options=["none", "log1p", "log"],
+                index=0,
+                format_func=lambda v: {
+                    "none": "不做变换（保持原值）",
+                    "log1p": "log1p —— 训练在 log(1+y) 空间，预测自动还原",
+                    "log": "log —— 训练在 log(y) 空间（要求目标全为正）",
+                }.get(v, v),
+                help=(
+                    "训练时对目标做对数变换、预测时逆变换还原，全程对下游透明"
+                    "（预测页/SHAP/残差图看到的仍是原始单位）。\n\n"
+                    "适用：目标右偏且**不存在物理上不可能的极端值**。\n"
+                    "注意：若目标含极端异常值，对数变换会压低它们的权重，"
+                    "使原始空间的 R² 下降（但对数空间的 R² 会上升）——此时应先做异常值过滤。"
+                ),
+            )
+
+            target_outlier_filter = st.checkbox(
+                "剔除物理不可能的目标值",
+                value=False,
+                help=(
+                    "删除超出 [1, 1e4] mol/m³ 的目标样本。对交联密度而言，ν>1e4 意味着 "
+                    "Mc<120 g/mol（物理上不可能），通常是单位错误或录入错误。\n\n"
+                    "这是解决「R² 被少数异常值支配」的根本手段：实测交联密度数据中，"
+                    "误差最大的 1 个样本独占 R² 分母的 95.7%，10 个样本占 99.6%。"
+                ),
+            )
+            if target_transform != "none":
+                st.caption(
+                    "✓ 已启用：模型在 log 空间拟合，`predict()` 输出已自动还原为原始单位，"
+                    "无需在预测端做任何额外处理。"
+                )
+
         # --- 内部验证集（早停用） ---
         st.markdown("### 🧪 内部验证集（早停用）")
         validation_aware_models = {
@@ -18154,6 +18285,8 @@ def page_model_training():
                             balance_max_weight=float(balance_max_weight),
                             val_mode=str(val_mode),
                             val_size=float(val_size),
+                            target_transform=str(locals().get("target_transform", "none")),
+                            target_outlier_filter=bool(locals().get("target_outlier_filter", False)),
                             process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
                             use_process_pls=use_process_pls_for_training,
                             feature_contract_context=model_training_context,
@@ -18252,6 +18385,8 @@ def page_model_training():
                             target_balance_enabled=bool(target_balance_enabled),
                             balance_n_bins=int(balance_n_bins),
                             balance_max_weight=float(balance_max_weight),
+                            target_transform=str(locals().get("target_transform", "none")),
+                            target_outlier_filter=bool(locals().get("target_outlier_filter", False)),
                             process_pls_config=process_pls_workflow if use_process_pls_for_training else None,
                             use_process_pls=use_process_pls_for_training,
                             feature_contract_context=model_training_context,
@@ -19107,15 +19242,26 @@ def page_model_interpretation():
                         # 获取 scaler（如果有的话）
                         scaler = st.session_state.get("scaler", None)
 
+                        # 关键修复：计算开始前先清空上一轮结果缓存。
+                        # 否则本次 rerun 里上方的缓存面板已按旧缓存渲染过（旧图 +
+                        # 旧排名图/饼图/下载按钮），与新结果叠加成一页。
+                        for _stale_key in (
+                            "shap_plot_png",
+                            "shap_plot_path",
+                            "shap_csv_bytes",
+                            "shap_csv_path",
+                            "shap_origin_beeswarm_bytes",
+                            "shap_origin_bar_bytes",
+                            "shap_origin_beeswarm_path",
+                            "shap_origin_bar_path",
+                            "shap_plot_cache_key",
+                            "shap_cache_key",
+                            "shap_cache_model_name",
+                        ):
+                            st.session_state.pop(_stale_key, None)
+
                         if is_xgboost_model:
                             append_runtime_debug("xgb_shap: submit_clicked")
-                            st.session_state.pop("shap_plot_png", None)
-                            st.session_state.pop("shap_plot_path", None)
-                            st.session_state.pop("shap_csv_bytes", None)
-                            st.session_state.pop("shap_csv_path", None)
-                            st.session_state.pop("shap_plot_cache_key", None)
-                            st.session_state.pop("shap_cache_key", None)
-                            st.session_state.pop("shap_cache_model_name", None)
                             shap_job = run_xgboost_shap_subprocess(
                                 model=model,
                                 X_train=X_train,
@@ -19277,11 +19423,13 @@ def page_model_interpretation():
                                 st.session_state.pop("shap_origin_bar_bytes", None)
                                 st.session_state.pop("shap_csv_path", None)
                             st.session_state.shap_last_status = "SHAP analysis completed."
-                            shap_png_bytes = st.session_state.shap_plot_png
-                            shap_csv_bytes = st.session_state.get("shap_csv_bytes")
-                            shap_origin_beeswarm_bytes = st.session_state.get("shap_origin_beeswarm_bytes")
-                            shap_origin_bar_bytes = st.session_state.get("shap_origin_bar_bytes")
-
+                            # 关键修复：不要在本轮 rerun 里直接渲染新图。
+                            # 上方缓存面板（见本段之前的 cached_shap_* 块）已经用
+                            # “本次计算前的旧缓存”渲染过一遍，若此处再直接 st.image 新图，
+                            # 页面就会同时保留旧结果面板 + 新结果面板（包括重复的排名图/
+                            # 饼图/下载按钮），表现为“多次分析后图堆在同一页”。
+                            # 改为与 XGBoost 分支一致：写完 session_state 后立即 rerun，
+                            # 由缓存面板统一渲染唯一一份最新结果。
                             if model_name == "XGBoost":
                                 st.session_state.pop("shap_cache_key", None)
                                 st.session_state.pop("shap_cache_model_name", None)
@@ -19295,55 +19443,10 @@ def page_model_interpretation():
                                 pass
                             import gc
                             gc.collect()
-                            st.success("✅ SHAP 分析完成！高清可视化图与 Origin 绘图数据已就绪。")
-                            st.image(shap_png_bytes, width="stretch")
-                            
-                            st.markdown("##### 📊 Origin / SCI 论文绘图专用数据导出")
-                            st.caption("为方便在 Origin 中一键绘制专业出版级 Beeswarm 蜂群散点图与 Bar 柱状图，系统已自动按规范结构化导出：")
-                            o_col1, o_col2, o_col3 = st.columns(3)
-                            with o_col1:
-                                if shap_origin_beeswarm_bytes:
-                                    st.download_button(
-                                        "📥 蜂群图数据 (Origin Beeswarm)",
-                                        shap_origin_beeswarm_bytes,
-                                        "origin_shap_beeswarm_data.csv",
-                                        "text/csv",
-                                        key="shap_origin_beeswarm_download",
-                                        help="包含 Feature, SHAP_Value, Feature_Value 及 0~1 归一化颜色值。在 Origin 中以 Feature 为分组，X 轴设为 SHAP_Value，颜色映射设为 Normalized_Value 即可完美还原 Beeswarm 图！",
-                                        use_container_width=True,
-                                    )
-                            with o_col2:
-                                if shap_origin_bar_bytes:
-                                    st.download_button(
-                                        "📥 重要性排序表 (Origin Bar)",
-                                        shap_origin_bar_bytes,
-                                        "origin_shap_importance_ranking.csv",
-                                        "text/csv",
-                                        key="shap_origin_bar_download",
-                                        help="包含 Feature, Mean_Abs_SHAP, Median 及 Std。在 Origin 中直接绘制水平/垂直柱状图。",
-                                        use_container_width=True,
-                                    )
-                            with o_col3:
-                                if shap_csv_bytes:
-                                    st.download_button(
-                                        "📥 原始 SHAP 矩阵 (Matrix CSV)",
-                                        shap_csv_bytes,
-                                        "shap_values_matrix.csv",
-                                        "text/csv",
-                                        key="shap_csv_current_run",
-                                        help="每个样本对应每一列特征的原始局部 SHAP 贡献值宽表矩阵。",
-                                        use_container_width=True,
-                                    )
-
-                            current_shap_df = load_shap_export_frame(csv_bytes=shap_csv_bytes)
-                            if current_shap_df is not None and not current_shap_df.empty:
-                                render_shap_importance_outputs(
-                                    current_shap_df,
-                                    key_prefix="shap_live_aux",
-                                    feature_classification=feature_classification,
-                                    default_top_n=max_display,
-                                )
-                            return
+                            st.session_state.shap_last_status = (
+                                "✅ SHAP 分析完成！高清可视化图与 Origin 绘图数据已就绪。"
+                            )
+                            st.rerun()
                             print("[DEBUG] ========== 图表显示完成 ==========")
 
                             if df_shap is not None:
@@ -21571,6 +21674,113 @@ def page_prediction():
                             import traceback
                             st.code(traceback.format_exc())
 
+def _render_screening_uniform_inputs(
+    feature_cols: List[str],
+    *,
+    df_ref,
+    key_prefix: str = "vs_uniform",
+) -> Dict[str, Any]:
+    """渲染「模型外部特征统一输入」面板：自动取值 + 批量确认。
+
+    虚拟筛选会消费模型的**全部**输入特征。其中分子特征能从候选 SMILES 算出，
+    但**工艺/测试/配方特征**（cure_*、post_cure_*、curing_pressure_mpa、
+    tg_heating_rate_c_min 等）无法从结构推导，必须在筛选前给定统一值
+    ——它们是**筛选的设计变量**，不是候选属性。
+
+    旧实现只有「中位数 / 0 / 模板行」三种填充，等于伪造工艺条件。
+    本面板：
+      1. 自动从工作区数据取代表值（数值→中位数，类别→众数）
+      2. 用**一张表**让用户逐项确认/修改（替代几十个 selectbox）
+      3. 留空 = 交给模型内置 imputer
+
+    返回 {特征名: 值}，只含用户确认要用的项。
+    """
+    cols = [str(c) for c in (feature_cols or [])]
+    if not cols:
+        return {}
+    ws = df_ref if isinstance(df_ref, pd.DataFrame) else None
+
+    # ---- 自动取代表值（工作区已有的列）----
+    auto_vals: Dict[str, Any] = {}
+    if ws is not None and len(ws):
+        for c in cols:
+            if c not in ws.columns:
+                continue
+            s = ws[c]
+            num = pd.to_numeric(s, errors="coerce")
+            if num.notna().any():
+                auto_vals[c] = float(num.median())
+            else:
+                nn = s.dropna()
+                if len(nn):
+                    try:
+                        auto_vals[c] = str(nn.mode().iloc[0])
+                    except Exception:
+                        auto_vals[c] = str(nn.iloc[0])
+
+    st.markdown("#### 3b) 模型外部特征统一输入")
+    st.caption(
+        f"模型需要 **{len(cols)}** 个非分子特征（工艺/测试/配方），"
+        "它们不能从候选 SMILES 算出，必须在筛选前给定统一值。"
+        "下表已尝试从**工作区自动取值**，请确认或修改；"
+        "留空表示交给模型内置填充（若模型无 imputer 会失败）。"
+    )
+    if auto_vals:
+        st.success(
+            f"✅ 已从工作区自动取值 **{len(auto_vals)}/{len(cols)}** 个"
+        )
+    missing = [c for c in cols if c not in auto_vals]
+    if missing:
+        _preview = "、".join(f"`{c}`" for c in missing[:12])
+        st.warning(
+            f"⚠️ 以下 **{len(missing)}** 个工作区里没有，请手工填写（或留空）："
+            + _preview
+            + (" ..." if len(missing) > 12 else "")
+        )
+
+    edit_df = pd.DataFrame(
+        [
+            {
+                "模型特征": c,
+                "值": auto_vals.get(c, ""),
+                "来源": "工作区自动" if c in auto_vals else "需手工",
+            }
+            for c in cols
+        ]
+    )
+    edited = st.data_editor(
+        edit_df,
+        use_container_width=True,
+        hide_index=True,
+        key=f"{key_prefix}_editor",
+        disabled=["模型特征", "来源"],
+        column_config={
+            "值": st.column_config.TextColumn("值", width="medium", required=False),
+        },
+    )
+
+    out: Dict[str, Any] = {}
+    for row in edited.to_dict("records"):
+        raw = row.get("值")
+        if raw is None:
+            continue
+        txt = str(raw).strip()
+        if not txt or txt.lower() in ("nan", "none", "null"):
+            continue
+        try:
+            out[str(row["模型特征"])] = float(txt)
+        except (TypeError, ValueError):
+            out[str(row["模型特征"])] = txt
+    if out:
+        st.caption(f"✔️ 已确认 **{len(out)}** 个统一输入值，将应用于全部候选。")
+    return out
+
+
+# 性能关键：整个面板包成 st.fragment。
+# 面板内有大量交互控件（总表配置表单、批量映射表、执行按钮），
+# 不包 fragment 时每个控件交互都会重跑**整个页面**（含模型反序列化、
+# 工作区数据读取、其他面板重建）。fragment 让交互只重跑本函数。
+@st.fragment
 def _render_external_feature_augmentation():
     """通用外部模型特征补齐：任意模型 → 预测 → 新增特征列。"""
     st.markdown("---")
@@ -21598,18 +21808,34 @@ def _render_external_feature_augmentation():
         return
 
     try:
-        from core.external_feature_augmenter import ExternalFeatureAugmenter
+        from core.external_feature_augmenter import ExternalFeatureAugmenter, _dep_key as _dep_key_of
     except Exception as exc:
         st.error(f"❌ 无法加载补齐模块: {exc}")
         return
 
     blobs = [f.read() for f in uploaded]
     names = [getattr(f, 'name', f'模型{i + 1}') for i, f in enumerate(uploaded)]
-    try:
-        augmenter = ExternalFeatureAugmenter(blobs, model_names=names)
-    except Exception as exc:
-        st.error(f"❌ 模型加载失败: {exc}")
-        return
+    # ── 性能关键：缓存 augmenter 实例 ──────────────────────────────────
+    # Streamlit 每次交互都重跑整个脚本。模型反序列化（首次含模块导入）
+    # 实测 8.6s，若每次 rerun 都重建，用户感受为“改任何选项都卡 9 秒”。
+    # 用文件指纹（名字+大小+hash）做 key，内容不变则复用实例。
+    _blob_sig = tuple(
+        (nm, len(b), hashlib.md5(b[:1 << 20]).hexdigest())
+        for nm, b in zip(names, blobs)
+    )
+    _aug_cache = st.session_state.get('ext_aug_augmenter_cache')
+    if _aug_cache and _aug_cache.get('sig') == _blob_sig:
+        augmenter = _aug_cache['augmenter']
+    else:
+        try:
+            augmenter = ExternalFeatureAugmenter(blobs, model_names=names)
+        except Exception as exc:
+            st.error(f"❌ 模型加载失败: {exc}")
+            return
+        st.session_state['ext_aug_augmenter_cache'] = {
+            'sig': _blob_sig,
+            'augmenter': augmenter,
+        }
 
     st.success(f"✅ 已加载 {len(augmenter.entries)} 个模型")
 
@@ -21662,31 +21888,86 @@ def _render_external_feature_augmentation():
                     + "（回放时自动补空，对应特征为 NaN）"
                 )
 
+    # ---- 级联模型检测（B 的输入特征 = A 的预测目标）----
+    # 关键：有些模型的特征列本身就是别的模型的预测目标，
+    # 例：XGBoost_artifact(2) target=tg_c 需要 tensile_modulus_gpa；
+    #     拉伸模量 target=tensile_modulus_gpa 需要 tg_c —— 互相引用。
+    # 单独导入任一个都跑不起来，必须成链求解。
+    _cascade = augmenter.cascade_info()
+    if _cascade['has_dependency']:
+        _cycle_txt = (
+            "　⚠️ 其中 **" + " ↔ ".join(_cascade['cycles'][0])
+            + "** 互相依赖（互为对方的输入特征），将自动择优打破环。"
+            if _cascade['cycles'] else ""
+        )
+        st.success(
+            f"🔗 检测到 **级联模型**：{len(_cascade['dependencies'])} 个模型的输入特征"
+            f"其实是其他模型的预测目标，将**自动按依赖顺序求解**。" + _cycle_txt
+        )
+        with st.expander("🔗 级联依赖关系", expanded=True):
+            _rows = []
+            for _d in _cascade['dependencies']:
+                for _dep in _d['depends_on']:
+                    _rows.append({
+                        '模型': _d['model'],
+                        '目标列': _d['target_col'],
+                        '需要的特征': _dep['feature'],
+                        '由哪个模型提供': _dep['provided_by'],
+                        '上游目标': _dep['provider_target'],
+                    })
+            st.dataframe(pd.DataFrame(_rows), use_container_width=True)
+            st.caption(
+                "🔢 求解层（同层无依赖，可并行；层号小先算）："
+                + "　→　".join(
+                    f"第{i}层：{'、'.join(L)}" for i, L in enumerate(_cascade['layers'])
+                )
+            )
+            st.caption(
+                f"📉 级联后需从**外部**补齐的特征：**{len(_cascade['external_features'])}** 个"
+                f"（共需 {len(augmenter.required_features())} 个，"
+                f"差额 {len(augmenter.required_features()) - len(_cascade['external_features'])} 个"
+                "由**上游模型预测**提供，不会去总表里找）"
+            )
+            _cyc = _cascade['cycles']
+            if _cyc:
+                st.info(
+                    "♻️ 环内求解策略：优先用**工作区已有的真实值**或**手工映射**打破环；"
+                    "都没有时，按“谁的特征更齐全”先算谁。"
+                    "若你希望指定顺序，可在下方手工映射里把上游目标列指到具体列。"
+                )
+
     # ---- 总表配置（用于自动查询算不出的特征）----
+    # 用 st.form 包住配置项：未点「应用配置」前不会重跑，避免勾选/输字符时
+    # 反复触发昂贵的特征提取（每次 ≈10s，用户感受为“页面总在刷新”）。
     st.markdown("#### 1️⃣ 自动特征提取配置")
-    with st.expander("📚 总表设置（自动提取算不出的特征时，按结构查总表）", expanded=True):
-        master_uploaded = st.file_uploader(
-            "上传总表（含结构列 + 已算好的特征，可多选；按上传顺序优先命中）",
-            type=['csv', 'xlsx', 'xls'],
-            accept_multiple_files=True,
-            key="ext_aug_master",
-        )
-        use_ml_dataset = st.checkbox(
-            "使用 ml_dataset 全表（推荐）", value=True, key="ext_aug_use_mlds",
-            help="加载 ml_dataset/ml_wide_samples.csv；同目录的 ml_performance_*.csv "
-                 "会自动用于关系表 join（test_standard_* 这类需跨表取的特征）",
-        )
-        mlds_dir = st.text_input(
-            "ml_dataset 目录",
-            value=st.session_state.get('ext_aug_mlds_dir', r"C:/Users/wangj/Desktop/ml_dataset"),
-            key="ext_aug_mlds_dir_input",
-            disabled=not use_ml_dataset,
-        )
-        st.session_state['ext_aug_mlds_dir'] = mlds_dir
-        use_workspace_master = st.checkbox(
-            "同时使用平台内置参考数据", value=False, key="ext_aug_use_builtin",
-            help="平台自带的 data_fixed / results 目录中的旧表（列名与 ml_dataset 不同，一般不勾）",
-        )
+    with st.form("ext_aug_config_form", clear_on_submit=False):
+        with st.expander("📚 总表设置（自动提取算不出的特征时，按结构查总表）", expanded=True):
+            master_uploaded = st.file_uploader(
+                "上传总表（含结构列 + 已算好的特征，可多选；按上传顺序优先命中）",
+                type=['csv', 'xlsx', 'xls'],
+                accept_multiple_files=True,
+                key="ext_aug_master",
+            )
+            use_ml_dataset = st.checkbox(
+                "使用 ml_dataset 全表（推荐）", value=True, key="ext_aug_use_mlds",
+                help="加载 ml_dataset/ml_wide_samples.csv；同目录的 ml_performance_*.csv "
+                     "会自动用于关系表 join（test_standard_* 这类需跨表取的特征）",
+            )
+            mlds_dir = st.text_input(
+                "ml_dataset 目录",
+                value=st.session_state.get('ext_aug_mlds_dir', r"C:/Users/wangj/Desktop/ml_dataset"),
+                key="ext_aug_mlds_dir_input",
+                disabled=not use_ml_dataset,
+                help="输入完成后按回车或点下方「应用配置」（输入过程中不会重跑页面）",
+            )
+            use_workspace_master = st.checkbox(
+                "同时使用平台内置参考数据", value=False, key="ext_aug_use_builtin",
+                help="平台自带的 data_fixed / results 目录中的旧表（列名与 ml_dataset 不同，一般不勾）",
+            )
+        st.form_submit_button("✅ 应用配置并提取特征", type="primary", use_container_width=True)
+
+    # 表单提交后的值（存 session_state，供后续渲染使用）
+    st.session_state['ext_aug_mlds_dir'] = mlds_dir
 
     # 注意：必须把**路径**传给 resolver（而不是 DataFrame），
     # 否则 _master_paths 为空，关系表 join 无法发现同目录的 ml_performance_*.csv。
@@ -21747,6 +22028,9 @@ def _render_external_feature_augmentation():
     df_enriched = df
     wf_replay_reports: List[Dict[str, Any]] = []
     auto_report: Dict[str, Any] = {'computed': {}, 'from_master': {}, 'unresolved': [], 'columns_added': []}
+    # already_map 必须在分支外初始化：缓存命中时也要用它渲染诊断表（否则 UnboundLocalError）
+    already_map: Dict[str, str] = {}
+    required_all: List[str] = augmenter.required_features()
 
     _cache_key = (
         tuple(sorted(names)),
@@ -21762,6 +22046,7 @@ def _render_external_feature_augmentation():
         df_enriched = _cached['df_enriched']
         wf_replay_reports = _cached.get('wf_replay_reports') or []
         auto_report = _cached.get('auto_report') or auto_report
+        already_map = {f: f for f in required_all if f in df_enriched.columns}
         st.caption("♻️ 复用上次的特征提取结果（未重新计算）")
     else:
         if any(augmenter.has_molecular_workflow(e) for e in augmenter.entries):
@@ -21773,12 +22058,7 @@ def _render_external_feature_augmentation():
                     df_enriched = df
                     wf_replay_reports = []
 
-        all_columns = list(df_enriched.columns)
-        required_all = augmenter.required_features()
-        already_map: Dict[str, str] = {}
-        for feat in required_all:
-            if feat in df_enriched.columns:
-                already_map[feat] = feat
+        already_map = {f: f for f in required_all if f in df_enriched.columns}
 
         # 自动补齐：现场计算 → 总表查询 → 提取引擎（仅对 workflow 未覆盖的少量特征）
         if resolver_ready and resolver is not None:
@@ -21837,18 +22117,87 @@ def _render_external_feature_augmentation():
     # 手工映射（仅针对自动提取仍失败的）
     manual_overrides: Dict[str, str] = {}
     all_columns = list(df_enriched.columns)
+    # 级联来源：{依赖键: 提供它的上游模型名}，用于把“待上游模型预测”的特征
+    # 从“未获取”里区分出来，避免误导用户去手工映射。
+    _casc_provider: Dict[str, str] = {}
+    for _e in augmenter.entries:
+        for _k, _j in (_e.get('cascade_inputs') or {}).items():
+            _casc_provider[_k] = str(augmenter.entries[_j]['name'])
+    # 诊断用的级联来源：只登记**工作区已有的模型目标列真值**。
+    # 不能把全部工作区列都登记进去——_dep_key 会剥掉 _value/_est 等后缀，
+    # 可能把 tg_c_value 误当成 tg_c 的来源。真值的同名匹配已由
+    # resolve_features 的 exact/case/normalized 分支处理。
+    _diag_cascade_sources: Dict[str, str] = {}
+    for _e in augmenter.entries:
+        _t = str(_e.get('target_col') or '')
+        if _t and _t in df_enriched.columns:
+            _diag_cascade_sources[_dep_key_of(_t)] = _t
+
+    # ── 性能关键：未解析特征分类 ────────────────────────────────────────
+    # 旧实现给**全部**未解析特征都渲染 selectbox（每个 657 个选项），
+    # 实测 805 个 → 528,885 个 DOM 选项，每次交互都卡。
+    # 但其中 668 个是指纹位（从 SMILES 算出来的），**根本无法手工映射**，
+    # 55 个是分子特征（应走提取流程），只有 82 个工艺/测试列值得手工映射。
+    # 所以：只有“可手工映射”的才渲染控件，其余折叠成提示。
+    from core.auto_feature_resolver import (
+        parse_fingerprint_feature as _pff,
+        looks_molecular as looks_molecular,
+    )
+    _diag_all: List[Dict[str, Any]] = []
+    _manual_candidates: List[Dict[str, Any]] = []
     for entry in augmenter.entries:
-        diag = augmenter.diagnose_entry(df_enriched, entry)
-        badge = "✅" if not diag['unresolved'] else "⚠️"
+        # 传入已有的级联来源（工作区真值 + 上游预测），让诊断与真实求解一致
+        diag = augmenter.diagnose_entry(
+            df_enriched, entry, cascade_sources=_diag_cascade_sources
+        )
+        # 排除“由上游模型提供”的伪未解析项，否则徽标永远显示⚠️
+        real_unresolved = [
+            f for f in diag['unresolved']
+            if _dep_key_of(f) not in _casc_provider
+        ]
+        # 再分成三类：指纹位 / 分子特征 / 可手工映射
+        # 用单次字典推导缓存 looks_molecular 结果，避免每列调两次
+        fp_bits = [f for f in real_unresolved if _pff(f) is not None]
+        rest = [f for f in real_unresolved if _pff(f) is None]
+        _mol_flag = {f: looks_molecular(f) for f in rest}
+        mol_feats = [f for f in rest if _mol_flag[f]]
+        manual_feats = [f for f in rest if not _mol_flag[f]]
+        diag['_fp_bits'] = fp_bits
+        diag['_mol_feats'] = mol_feats
+        diag['_manual_feats'] = manual_feats
+        diag['_real_unresolved'] = real_unresolved
+        _diag_all.append(diag)
+        for f in manual_feats:
+            _manual_candidates.append({'entry': entry, 'feature': f})
+
+    # 一次性提示（避免逐模型重复渲染大表）
+    _n_fp = sum(len(d['_fp_bits']) for d in _diag_all)
+    _n_mol = sum(len(d['_mol_feats']) for d in _diag_all)
+    _n_man = len(_manual_candidates)
+    if _n_fp or _n_mol:
+        st.info(
+            f"🧮 共 {_n_fp + _n_mol} 个特征由**计算流程自动产出**，无需手工映射"
+            f"（指纹位 {_n_fp} 个从结构算得、分子特征 {_n_mol} 个走提取引擎）；"
+            + (f"真正需要人工确认的只有 **{_n_man}** 个。" if _n_man else "无需人工确认。")
+        )
+
+    for entry, diag in zip(augmenter.entries, _diag_all):
+        _real_unresolved = diag['_real_unresolved']
+        badge = "✅" if not _real_unresolved else "⚠️"
         with st.expander(
             f"{badge} 【{diag['name']}】→ `{diag['output_col']}` "
             f"（{diag['n_resolved']}/{diag['n_required']} 特征就绪）",
-            expanded=bool(diag['unresolved']),
+            expanded=bool(diag['_manual_feats']),
         ):
             rows = []
             for r in diag['features']:
                 feat = r['feature']
-                if feat in already_map:
+                _prov = _casc_provider.get(_dep_key_of(feat))
+                if r['strategy'] == 'cascade':
+                    origin = "🔗 级联（上游预测）"
+                elif _prov and feat not in already_map:
+                    origin = f"🔗 待『{_prov}』预测"
+                elif feat in already_map:
                     origin = "工作区已有"
                 elif feat in (auto_report.get('computed') or {}):
                     origin = "🖩 现场计算"
@@ -21867,45 +22216,104 @@ def _render_external_feature_augmentation():
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             if diag['needs_review']:
                 st.warning("🔍 模糊匹配，建议确认：" + ", ".join(f"{k} → {v}" for k, v in diag['needs_review'].items()))
-            if diag['unresolved']:
-                st.markdown("**仍需手工指定**（自动提取与总表都未命中）：")
-                for feat in diag['unresolved']:
-                    options = ["<不指定>"] + all_columns
-                    picked = st.selectbox(
-                        f"`{feat}` ←", options, key=f"ext_aug_map_{entry['index']}_{feat}",
-                    )
-                    if picked != "<不指定>":
-                        manual_overrides[feat] = picked
+            # 指纹位 / 分子特征：只给提示，不渲染控件（渲染了也映射不了）
+            if diag['_fp_bits']:
+                with st.expander(f"🧬 {len(diag['_fp_bits'])} 个指纹位（由结构计算，无需映射）"):
+                    st.caption("、".join(diag['_fp_bits'][:80]))
+            if diag['_mol_feats']:
+                with st.expander(f"⚗️ {len(diag['_mol_feats'])} 个分子特征（走提取引擎）"):
+                    st.caption("、".join(diag['_mol_feats'][:80]))
+            if diag['_manual_feats']:
+                st.caption(
+                    f"⚠️ 以下 {len(diag['_manual_feats'])} 个特征多为工艺/测试列，"
+                    "总表里没有；如工作区已有对应列，可在下方「批量手工映射」里指定。"
+                )
 
-    # ---- 输出配置 ----
-    st.markdown("#### 3️⃣ 输出配置")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        mode_label = st.radio(
-            "写入方式",
-            ["新增预测列", "只补目标列缺失值", "覆盖目标列全部值"],
-            index=0,
-            key="ext_aug_mode",
+    # ── 批量手工映射（用 data_editor 一次完成，替代 N 个 selectbox）────
+    # 旧实现：每个特征一个 selectbox × 657 选项，805 个 = 52 万 DOM 选项。
+    # 新实现：一张表 + 一列下拉，只针对真正可手工映射的少量特征。
+    if _manual_candidates:
+        with st.expander(
+            f"✏️ 批量手工映射（{_n_man} 个可选特征）",
+            expanded=False,
+        ):
+            st.caption(
+                "只在自动提取、总表查询都失败、且**不是**分子特征/指纹位时才需要。"
+                "在「指定列」里选工作区对应的列即可，留空表示不指定。"
+            )
+            _map_df = pd.DataFrame([
+                {
+                    '模型': str(c['entry']['name']),
+                    '模型特征': c['feature'],
+                    '指定列': '<不指定>',
+                }
+                for c in _manual_candidates
+            ])
+            _edited = st.data_editor(
+                _map_df,
+                use_container_width=True,
+                hide_index=True,
+                key='ext_aug_manual_map_editor',
+                disabled=['模型', '模型特征'],
+                column_config={
+                    '指定列': st.column_config.SelectboxColumn(
+                        '指定列',
+                        options=['<不指定>'] + all_columns,
+                        default='<不指定>',
+                        width='medium',
+                        required=False,
+                    ),
+                },
+            )
+            for _row in _edited.to_dict('records'):
+                _pick = _row.get('指定列')
+                if _pick and _pick != '<不指定>':
+                    manual_overrides[str(_row['模型特征'])] = str(_pick)
+            if manual_overrides:
+                st.success(f"已指定 {len(manual_overrides)} 个手工映射，点下方「开始预测并补齐」生效。")
+
+    # ---- 输出配置 + 执行（合并为一个表单：一次点击完成预测，避免多次重跑）----
+    st.markdown("#### 3️⃣ 输出配置与执行")
+    with st.form("ext_aug_run_form", clear_on_submit=False):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            mode_label = st.radio(
+                "写入方式",
+                ["新增预测列", "只补目标列缺失值", "覆盖目标列全部值"],
+                index=0,
+                key="ext_aug_mode",
+            )
+        with col2:
+            suffix = st.text_input("新列后缀", value="_pred", key="ext_aug_suffix")
+        with col3:
+            add_flag = st.checkbox(
+                "附带来源标记列", value=False, key="ext_aug_flag",
+                help="勾选后会额外生成 `{目标列}_source` 列，标记每行是 observed（原值）还是 predicted（预测值）",
+            )
+
+        keep_intermediate = st.checkbox(
+            "同时保留中间特征列（默认不保留）", value=False, key="ext_aug_keep_intermediate",
+            help="模型预测需要上千个中间特征（指纹/量子化学等）。默认只把预测值写回，"
+                 "不把中间特征灌进工作区（否则列数从几十变成上千）。",
         )
-    with col2:
-        suffix = st.text_input("新列后缀", value="_pred", key="ext_aug_suffix")
-    with col3:
-        add_flag = st.checkbox("附带来源标记列", value=True, key="ext_aug_flag")
 
-    mode = {"新增预测列": "new_column", "只补目标列缺失值": "fill_missing", "覆盖目标列全部值": "overwrite"}[mode_label]
-    if mode == "new_column":
-        preview_cols = ", ".join(str(e["target_col"]) + suffix for e in augmenter.entries)
-        st.caption(f"将新增列：{preview_cols}")
+        enable_cascade = st.checkbox(
+            "🔗 启用级联模型求解（推荐）", value=True, key="ext_aug_cascade",
+            help="当模型 B 的输入特征就是模型 A 的预测目标时（如 Tg ↔ 拉伸模量互引），"
+                 "先算 A 再把预测值当 B 的输入。关掉则各算各的，互相依赖的特征全置 NaN。",
+        )
 
-    keep_intermediate = st.checkbox(
-        "同时保留中间特征列（默认不保留）", value=False, key="ext_aug_keep_intermediate",
-        help="模型预测需要上千个中间特征（指纹/量子化学等）。默认只把预测值写回，"
-             "不把中间特征灌进工作区（否则列数从几十变成上千）。",
-    )
+        mode = {"新增预测列": "new_column", "只补目标列缺失值": "fill_missing", "覆盖目标列全部值": "overwrite"}[mode_label]
+        if mode == "new_column":
+            preview_cols = ", ".join(str(e["target_col"]) + suffix for e in augmenter.entries)
+            st.caption(f"将新增列：{preview_cols}")
 
-    # ---- 执行 ----
-    st.markdown("#### 4️⃣ 执行补齐")
-    if st.button("🚀 开始预测并补齐", type="primary", key="ext_aug_run"):
+        st.markdown("#### 4️⃣ 执行补齐")
+        _run_clicked = st.form_submit_button(
+            "🚀 开始预测并补齐", type="primary", use_container_width=True
+        )
+
+    if _run_clicked:
         with st.spinner("正在预测并写入特征列..."):
             try:
                 out, reports = augmenter.augment(
@@ -21916,6 +22324,8 @@ def _render_external_feature_augmentation():
                     add_source_flag=add_flag,
                     # workflow 已在第 2 步回放过，避免重复计算上千个特征
                     replay_workflow=False,
+                    # 级联：按模型间依赖拓扑顺序求解（B 用 A 的预测值当输入）
+                    enable_cascade=enable_cascade,
                 )
             except Exception as exc:
                 st.error(f"❌ 补齐失败: {exc}")
@@ -22011,15 +22421,40 @@ def _render_external_feature_augmentation():
                         + "、".join(filled)
                     )
 
-        model_reports = [r for r in reports if r.get('kind') != 'molecular_workflow_replay']
+        model_reports = [
+            r for r in reports
+            if r.get('kind') not in ('molecular_workflow_replay', 'cascade_summary')
+        ]
+        # 级联汇总：展示依赖链与求解层
+        _casc = next((r for r in reports if r.get('kind') == 'cascade_summary'), None)
+        if _casc:
+            st.info(f"🔗 **级联求解**：{_casc.get('note', '')}")
+            _deps = _casc.get('dependencies') or []
+            if _deps:
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            '模型': d['model'],
+                            '需要的特征': x['feature'],
+                            '由哪个模型提供': x['provided_by'],
+                        }
+                        for d in _deps for x in d['depends_on']
+                    ]),
+                    use_container_width=True,
+                )
         st.dataframe(
             pd.DataFrame(
                 [
                     {
                         '模型': r['name'],
+                        '层': r.get('layer'),
                         '输出列': r['output_col'],
                         '状态': {'ok': '✅ 成功', 'skipped': '⏭️ 跳过', 'error': '❌ 失败', 'noop': '➖ 无需处理'}.get(r['status'], r['status']),
                         '特征': f"{r['n_features_resolved']}/{r['n_features_required']}",
+                        '级联输入': (
+                            '、'.join(f"{k}←{v}" for k, v in (r.get('from_cascade') or {}).items())
+                            or '—'
+                        ),
                         '预测行数': r['n_predicted'],
                         '覆盖率': f"{r['coverage'] * 100:.0f}%",
                         '预测均值': round(r['pred_mean'], 3) if r['pred_mean'] is not None else None,
@@ -22034,6 +22469,16 @@ def _render_external_feature_augmentation():
         for r in reports:
             if r['status'] == 'error':
                 st.error(f"【{r['name']}】{r['note']}")
+                _un = r.get('unresolved') or []
+                if _un:
+                    st.caption(
+                        f"   缺 {len(_un)} 个特征：" + "、".join(f"`{c}`" for c in _un[:6])
+                        + (" …" if len(_un) > 6 else "")
+                    )
+                    st.caption(
+                        "   ↳ 这些多为工艺/测试列（cure_*、post_cure_*、test_* 等），"
+                        "总表里没有。请在上方「手工映射」里指定，或确认工作区已包含这些列。"
+                    )
             elif r['status'] == 'skipped':
                 st.warning(f"【{r['name']}】{r['note']}")
 
@@ -22076,7 +22521,8 @@ def _render_external_feature_augmentation():
                     + (f"（新增 {len(new_cols)} 列）" if new_cols else "")
                 )
                 st.info("💡 现在可以到「特征选择」/「模型训练」等页面使用这些新列")
-                st.rerun()
+                # 不调 st.rerun()：当前这一轮已经把状态和界面都更新了，
+                # 再 rerun 会多一次全页重跑（用户感受为“点了两次”）
         with col_b:
             if _already_applied:
                 st.caption("✓ 当前工作区已包含这批补齐列（无需重复应用）")
@@ -22086,32 +22532,30 @@ def _render_external_feature_augmentation():
                     + (f"（新增 {len(new_cols)} 列）" if new_cols else "")
                 )
 
-        # ---- 导出 ----
-        _exp_col, _exp_btn = st.columns([2, 3])
-        with _exp_col:
-            _fmt = st.radio(
-                "导出格式", ["CSV", "Excel"], horizontal=True,
-                key="ext_aug_export_fmt", label_visibility="collapsed",
-            )
-        with _exp_btn:
+        # ---- 导出（两个并列下载按钮，不用 radio——避免切换格式时重跑页面）----
+        st.markdown("**导出**")
+        _exp_a, _exp_b = st.columns(2)
+        with _exp_a:
             try:
-                if _fmt == "Excel":
-                    _payload = dataframe_to_excel_bytes(_pending)
-                    st.download_button(
-                        "📥 下载补齐后的数据（.xlsx）", _payload,
-                        "augmented_features.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="ext_aug_download_xlsx",
-                    )
-                else:
-                    _csv = _pending.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button(
-                        "📥 下载补齐后的数据（.csv）", _csv,
-                        "augmented_features.csv", "text/csv",
-                        key="ext_aug_download_csv",
-                    )
+                st.download_button(
+                    "📥 下载 CSV",
+                    _pending.to_csv(index=False, encoding='utf-8-sig'),
+                    "augmented_features.csv", "text/csv",
+                    key="ext_aug_download_csv", use_container_width=True,
+                )
             except Exception as _exc:
-                st.caption(f"导出准备失败：{_exc}")
+                st.caption(f"CSV 导出准备失败：{_exc}")
+        with _exp_b:
+            try:
+                st.download_button(
+                    "📥 下载 Excel",
+                    dataframe_to_excel_bytes(_pending),
+                    "augmented_features.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="ext_aug_download_xlsx", use_container_width=True,
+                )
+            except Exception as _exc:
+                st.caption(f"Excel 导出准备失败：{_exc}")
 
 
 def page_model_imputation():
@@ -26702,13 +27146,30 @@ def _page_virtual_screening_formula():
 
     # --- 非分子特征填充 ---
     st.markdown("### 3) 非分子特征填充")
-    fill_modes = ["保持NaN（交给模型/Imputer）", "填充为0"]
+    fill_modes = [
+        "🧩 自动取值 + 批量确认（推荐）",
+        "保持NaN（交给模型/Imputer）",
+        "填充为0",
+    ]
     has_train = st.session_state.get("train_result") is not None
     if has_train and "X_train_raw" in st.session_state.train_result:
-        fill_modes.insert(0, "使用训练集特征中位数")
+        fill_modes.insert(1, "使用训练集特征中位数")
     fill_modes.append("使用模板行（上传文件）")
 
     fill_mode = st.selectbox("填充策略", fill_modes, index=0)
+
+    # 自动取值 + 批量确认：对模型的**非分子特征**（工艺/测试/配方）统一取值。
+    # 它们是筛选的设计变量，不能从候选 SMILES 推导；旧实现的 0/中位数等于伪造。
+    screening_uniform: Dict[str, Any] = {}
+    if fill_mode.startswith("🧩 自动取值"):
+        _uniform_df = st.session_state.get('processed_data')
+        if _uniform_df is None:
+            _uniform_df = st.session_state.get('data')
+        screening_uniform = _render_screening_uniform_inputs(
+            post_feature_model_cols,
+            df_ref=_uniform_df,
+        )
+
     if fill_mode.startswith("保持NaN") and pipeline is None and imputer is None:
         st.caption("提示：当前模型没有 imputer，缺失特征可能导致预测失败。建议使用中位数/模板行填充。")
     template_row = None
@@ -26924,6 +27385,14 @@ def _page_virtual_screening_formula():
             base_row = pd.Series({c: 0.0 for c in feature_cols})
         elif fill_mode.startswith("使用模板行") and template_row is not None:
             base_row = template_row
+
+        # 自动取值 + 批量确认：把用户确认的统一输入覆盖到 base_row。
+        # 这些是**显式给定**的工艺/测试设计变量，优先级高于中位数/0/模板行。
+        if screening_uniform:
+            if base_row is None:
+                base_row = pd.Series(dtype=float)
+            for _k, _v in screening_uniform.items():
+                base_row[_k] = _v
 
         if use_target and target_value_num is not None and base_row is None:
             target_row = None
@@ -29037,6 +29506,10 @@ def page_training_records():
                             "shap_plot_cache_key",
                             "shap_csv_bytes",
                             "shap_csv_path",
+                            "shap_origin_beeswarm_bytes",
+                            "shap_origin_bar_bytes",
+                            "shap_origin_beeswarm_path",
+                            "shap_origin_bar_path",
                             "shap_last_status",
                             "xgb_shap_last_job_dir",
                         ):
