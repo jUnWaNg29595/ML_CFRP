@@ -109,8 +109,13 @@ def _source_candidates(
     extra = extra if isinstance(extra, Mapping) else {}
     workflow = extra.get("molecular_feature_workflow")
     workflow = workflow if isinstance(workflow, Mapping) else {}
+    audit = extra.get("feature_audit")
+    audit = audit if isinstance(audit, Mapping) else {}
 
     candidates = [
+        # canonical 是 feature_mask **之前**的完整列清单（如 2070 列），
+        # 当 pipeline 第一层按 mask 前列数 fit 时必须优先用它。
+        ("artifact.extra.feature_audit.canonical_feature_cols", _as_columns(audit.get("canonical_feature_cols"))),
         ("artifact.extra.effective_feature_cols", _as_columns(extra.get("effective_feature_cols"))),
         ("artifact.extra.workflow.final_feature_names", _as_columns(workflow.get("final_feature_names"))),
         ("artifact.feature_cols", _as_columns(artifact.get("feature_cols"))),
@@ -133,6 +138,88 @@ def _apply_mask(columns: list[str], mask: np.ndarray | None) -> tuple[list[str],
 
 def _normalized_set(columns: list[str]) -> set[str]:
     return {"".join(column.split()).lower() for column in columns}
+
+
+def _widen_columns_to_expected(
+    *,
+    expected: int,
+    model_columns: list[str],
+    mask: np.ndarray | None,
+    candidates: list[tuple[str, list[str]]],
+    audit: Mapping[str, Any] | None = None,
+) -> list[str] | None:
+    """用 feature_mask 把模型公开的（mask 后）列名还原为 pipeline 期望的（mask 前）列清单。
+
+    场景：``Pipeline(imputer(N) → feature_mask(N→M) → scaler(M) → model(M))``。
+    模型只暴露 mask 后的 M 个列名，而 pipeline 第一层按 N 列 fit。
+
+    还原条件（全部满足才返回，否则返回 None 由调用方报错）：
+    1. ``mask`` 存在且长度为 ``expected``；
+    2. ``mask`` 中 True 的数量等于 ``len(model_columns)``；
+    3. 存在一个候选列清单，其长度 == ``expected``，且用 mask 过滤后
+       **恰好等于** ``model_columns``（逐列比对，确保不是巧合）。
+
+    额外处理：某些 artifact 的 ``canonical_feature_cols`` 会比实际多记录 1 列
+    （重复列/常量列处理差异），而 mask 是按真实列数 fit 的。此时用
+    ``feature_audit.removed_feature_cols`` 逐个试删一列，找到能让
+    ``canonical − drop`` 重建出的 mask 与真实 mask 完全一致的那一列。
+    （实测：TabPFN artifact 的 canonical 为 2071，而 pipeline 期望 2070，
+    冗余列为 ``resin_3_molecular_weight_g_mol``。）
+
+    返回：mask 之前的完整列清单（长度 == expected）；不满足则 None。
+    """
+    if mask is None or len(mask) != expected:
+        return None
+    if int(np.count_nonzero(mask)) != len(model_columns):
+        return None
+
+    model_norm = _normalized_set(model_columns)
+    mask_list = [bool(keep) for keep in mask]
+    for _source, columns in candidates:
+        if len(columns) == expected:
+            kept = [column for column, keep in zip(columns, mask_list) if keep]
+            if _normalized_set(kept) == model_norm:
+                return list(columns)
+            continue
+        # 候选列数偏多：尝试按 removed_feature_cols 删掉冗余列后重新校验
+        if len(columns) <= expected:
+            continue
+        repaired = _repair_columns_to_length(columns, expected, audit, mask_list, model_norm)
+        if repaired is not None:
+            return repaired
+    return None
+
+
+def _repair_columns_to_length(
+    columns: list[str],
+    expected: int,
+    audit: Mapping[str, Any] | None,
+    mask_list: list[bool],
+    model_norm: set[str],
+) -> list[str] | None:
+    """逐个试删 ``removed_feature_cols`` 中的一列，使重建的 mask 与真实 mask 一致。
+
+    与 ``core/external_feature_augmenter._repair_columns_to_length`` 同思路：
+    ``canonical − drop`` 后，按 ``drop 之后`` 的列顺序重建掩码（列在 effective 里
+    则为 True），要求与真实 mask 完全相等，且保留列依次等于模型公开列名。
+    """
+    if not isinstance(audit, Mapping):
+        return None
+    removed = _as_columns(audit.get("removed_feature_cols"))
+    if not removed:
+        return None
+    removed_set = set(removed)
+    for drop in removed:
+        built = [column for column in columns if column != drop]
+        if len(built) != expected:
+            continue
+        rebuilt_mask = [column not in removed_set for column in built]
+        if rebuilt_mask != mask_list:
+            continue
+        kept = [column for column, keep in zip(built, mask_list) if keep]
+        if _normalized_set(kept) == model_norm:
+            return built
+    return None
 
 
 def resolve_prediction_feature_contract(
@@ -170,9 +257,34 @@ def resolve_prediction_feature_contract(
         selected = model_columns
         source = "model.feature_names_in_"
         if expected is not None and len(selected) != expected:
-            errors.append(
-                f"模型公开了 {len(selected)} 个特征名，但 n_features_in_ 为 {expected}。"
-            )
+            # 模型公开的列名数少于 pipeline 期望数 → 典型是
+            # Pipeline(imputer(N) → feature_mask(N→M) → scaler(M) → model(M))：
+            # 模型看到的是 mask **之后**的 M 列名，而 pipeline 的输入契约是
+            # mask **之前**的 N 列。此时不能直接把 M 与 N 对比报错，
+            # 而应用 feature_mask 从更宽的候选列还原出 N 列。
+            #
+            # 实测背景：TabPFN artifact 的 model.feature_names_in_ 为 1408 列，
+            # pipeline.n_features_in_ 为 2070，feature_mask 为 2070 位
+            # （True 数 = 1408）→ 旧逻辑必然报「1408 vs 2070」而无法启用模型。
+            widened = None
+            if len(selected) < expected:
+                widened = _widen_columns_to_expected(
+                    expected=expected,
+                    model_columns=selected,
+                    mask=mask,
+                    candidates=candidates,
+                    audit=(artifact.get("extra") or {}).get("feature_audit")
+                    if isinstance(artifact.get("extra"), Mapping)
+                    else None,
+                )
+            if widened is not None:
+                selected = widened
+                source = "feature_mask(canonical)"
+                masked_source = True
+            else:
+                errors.append(
+                    f"模型公开了 {len(selected)} 个特征名，但 n_features_in_ 为 {expected}。"
+                )
     else:
         for candidate_source, columns in candidates:
             masked, used_mask = _apply_mask(columns, mask)
@@ -234,6 +346,13 @@ def resolve_prediction_feature_contract(
             "候选特征列多于模型输入，且没有模型列名或有效 feature_mask，无法安全判断应删除哪些列。"
         )
 
+    # 被 feature_mask 剔除的列：记录下来供审计（不得静默丢弃）
+    removed_features: list[str] = []
+    if masked_source and mask is not None and len(mask) == len(selected):
+        removed_features = [
+            column for column, keep in zip(selected, mask) if not bool(keep)
+        ]
+
     return {
         "ok": not errors,
         "feature_cols": selected,
@@ -243,5 +362,6 @@ def resolve_prediction_feature_contract(
         "extra_features": extra_features,
         "duplicate_features": [],
         "order_mismatch": order_mismatch,
+        "removed_features": removed_features,
         "errors": errors,
     }

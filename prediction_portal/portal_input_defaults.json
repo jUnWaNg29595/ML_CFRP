@@ -1,0 +1,760 @@
+{
+  "defaults": {
+    "activation_energy_ea_kj_mol": {
+      "fields": {
+        "activation_energy_ea_kj_mol_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.5308,
+          "source_table": "ml_performance_all.csv",
+          "support": 577,
+          "value": "N2"
+        }
+      },
+      "sample_size": 1087,
+      "target_col": "activation_energy_ea_kj_mol"
+    },
+    "char_yield_pct": {
+      "fields": {
+        "char_yield_pct_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.8804,
+          "source_table": "ml_performance_all.csv",
+          "support": 4577,
+          "value": 10.0
+        },
+        "char_yield_pct_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.7342,
+          "source_table": "ml_performance_all.csv",
+          "support": 3817,
+          "value": "N2"
+        },
+        "char_yield_pct_test_method": {
+          "field": "test_method",
+          "share": 0.9829,
+          "source_table": "ml_performance_all.csv",
+          "support": 5110,
+          "value": "TGA"
+        }
+      },
+      "sample_size": 5199,
+      "target_col": "char_yield_pct"
+    },
+    "charpy_impact_kj_m2": {
+      "fields": {
+        "charpy_impact_kj_m2_test_method": {
+          "field": "test_method",
+          "share": 1.0,
+          "source_table": "ml_performance_all.csv",
+          "support": 5,
+          "value": "impact"
+        }
+      },
+      "sample_size": 5,
+      "target_col": "charpy_impact_kj_m2"
+    },
+    "compressive_modulus_gpa": {
+      "fields": {
+        "compressive_modulus_gpa_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.6021,
+          "source_table": "ml_performance_all.csv",
+          "support": 227,
+          "value": 1.3
+        },
+        "compressive_modulus_gpa_test_method": {
+          "field": "test_method",
+          "share": 0.382,
+          "source_table": "ml_performance_all.csv",
+          "support": 144,
+          "value": "shear"
+        },
+        "compressive_modulus_gpa_test_temperature_c": {
+          "field": "test_temperature_c",
+          "share": 0.4589,
+          "source_table": "ml_performance_all.csv",
+          "support": 173,
+          "value": 25.0
+        }
+      },
+      "sample_size": 377,
+      "target_col": "compressive_modulus_gpa"
+    },
+    "compressive_strength_mpa": {
+      "fields": {
+        "compressive_strength_mpa_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.4694,
+          "source_table": "ml_performance_all.csv",
+          "support": 307,
+          "value": 1.3
+        },
+        "compressive_strength_mpa_test_method": {
+          "field": "test_method",
+          "share": 0.341,
+          "source_table": "ml_performance_all.csv",
+          "support": 223,
+          "value": "compression"
+        },
+        "compressive_strength_mpa_test_temperature_c": {
+          "field": "test_temperature_c",
+          "share": 0.3731,
+          "source_table": "ml_performance_all.csv",
+          "support": 244,
+          "value": 25.0
+        }
+      },
+      "sample_size": 654,
+      "target_col": "compressive_strength_mpa"
+    },
+    "crosslink_density_mol_m3": {
+      "fields": {
+        "crosslink_density_mol_m3_frequency_hz": {
+          "field": "frequency_hz",
+          "share": 0.6613,
+          "source_table": "ml_performance_all.csv",
+          "support": 1347,
+          "value": 1.0
+        },
+        "crosslink_density_mol_m3_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.7064,
+          "source_table": "ml_performance_all.csv",
+          "support": 1439,
+          "value": 3.0
+        },
+        "crosslink_density_mol_m3_test_method": {
+          "field": "test_method",
+          "share": 0.755,
+          "source_table": "ml_performance_all.csv",
+          "support": 1538,
+          "value": "DMA"
+        }
+      },
+      "sample_size": 2037,
+      "target_col": "crosslink_density_mol_m3"
+    },
+    "cte_glassy_per_k": {
+      "fields": {
+        "cte_glassy_per_k_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.7177,
+          "source_table": "ml_performance_all.csv",
+          "support": 361,
+          "value": 5.0
+        }
+      },
+      "sample_size": 503,
+      "target_col": "cte_glassy_per_k"
+    },
+    "cte_rubbery_per_k": {
+      "fields": {
+        "cte_rubbery_per_k_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.7128,
+          "source_table": "ml_performance_all.csv",
+          "support": 201,
+          "value": 5.0
+        }
+      },
+      "sample_size": 282,
+      "target_col": "cte_rubbery_per_k"
+    },
+    "cure_reaction_enthalpy_j_g": {
+      "fields": {
+        "cure_reaction_enthalpy_j_g_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.856,
+          "source_table": "ml_performance_all.csv",
+          "support": 1314,
+          "value": 10.0
+        },
+        "cure_reaction_enthalpy_j_g_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.7225,
+          "source_table": "ml_performance_all.csv",
+          "support": 1109,
+          "value": "N2"
+        }
+      },
+      "sample_size": 1535,
+      "target_col": "cure_reaction_enthalpy_j_g"
+    },
+    "degree_of_cure_pct": {
+      "fields": {
+        "degree_of_cure_pct_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.3333,
+          "source_table": "ml_performance_all.csv",
+          "support": 84,
+          "value": 10.0
+        },
+        "degree_of_cure_pct_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.3175,
+          "source_table": "ml_performance_all.csv",
+          "support": 80,
+          "value": "N2"
+        }
+      },
+      "sample_size": 252,
+      "target_col": "degree_of_cure_pct"
+    },
+    "dsc_cure_onset_c": {
+      "fields": {
+        "dsc_cure_onset_c_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.9636,
+          "source_table": "ml_performance_all.csv",
+          "support": 1245,
+          "value": 10.0
+        },
+        "dsc_cure_onset_c_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.6711,
+          "source_table": "ml_performance_all.csv",
+          "support": 867,
+          "value": "N2"
+        }
+      },
+      "sample_size": 1292,
+      "target_col": "dsc_cure_onset_c"
+    },
+    "dsc_cure_peak_c": {
+      "fields": {
+        "dsc_cure_peak_c_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.9491,
+          "source_table": "ml_performance_all.csv",
+          "support": 2557,
+          "value": 10.0
+        },
+        "dsc_cure_peak_c_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.7283,
+          "source_table": "ml_performance_all.csv",
+          "support": 1962,
+          "value": "N2"
+        }
+      },
+      "sample_size": 2694,
+      "target_col": "dsc_cure_peak_c"
+    },
+    "dsc_cure_time_h": {
+      "fields": {
+        "dsc_cure_time_h_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.5634,
+          "source_table": "ml_performance_all.csv",
+          "support": 40,
+          "value": "N2"
+        }
+      },
+      "sample_size": 71,
+      "target_col": "dsc_cure_time_h"
+    },
+    "flexural_modulus_gpa": {
+      "fields": {
+        "flexural_modulus_gpa_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.6464,
+          "source_table": "ml_performance_all.csv",
+          "support": 1320,
+          "value": 2.0
+        },
+        "flexural_modulus_gpa_test_method": {
+          "field": "test_method",
+          "share": 0.526,
+          "source_table": "ml_performance_all.csv",
+          "support": 1074,
+          "value": "flexural"
+        },
+        "flexural_modulus_gpa_test_standard": {
+          "field": "standard_canonical",
+          "share": 0.3595,
+          "source_table": "ml_performance_standards.csv",
+          "support": 734,
+          "value": "ASTM D790"
+        }
+      },
+      "sample_size": 2042,
+      "target_col": "flexural_modulus_gpa"
+    },
+    "flexural_strength_mpa": {
+      "fields": {
+        "flexural_strength_mpa_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.5993,
+          "source_table": "ml_performance_all.csv",
+          "support": 1645,
+          "value": 2.0
+        },
+        "flexural_strength_mpa_test_method": {
+          "field": "test_method",
+          "share": 0.5279,
+          "source_table": "ml_performance_all.csv",
+          "support": 1449,
+          "value": "flexural"
+        },
+        "flexural_strength_mpa_test_standard": {
+          "field": "standard_canonical",
+          "share": 0.3169,
+          "source_table": "ml_performance_standards.csv",
+          "support": 870,
+          "value": "ASTM D790"
+        }
+      },
+      "sample_size": 2745,
+      "target_col": "flexural_strength_mpa"
+    },
+    "fracture_toughness_kic_mpa_m05": {
+      "fields": {
+        "fracture_toughness_kic_mpa_m05_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.6181,
+          "source_table": "ml_performance_all.csv",
+          "support": 89,
+          "value": 2.0
+        },
+        "fracture_toughness_kic_mpa_m05_test_method": {
+          "field": "test_method",
+          "share": 0.375,
+          "source_table": "ml_performance_all.csv",
+          "support": 54,
+          "value": "fracture"
+        }
+      },
+      "sample_size": 144,
+      "target_col": "fracture_toughness_kic_mpa_m05"
+    },
+    "gel_time_min": {
+      "fields": {
+        "gel_time_min_frequency_hz": {
+          "field": "frequency_hz",
+          "share": 0.3748,
+          "source_table": "ml_performance_all.csv",
+          "support": 238,
+          "value": 1.0
+        },
+        "gel_time_min_test_temperature_c": {
+          "field": "test_temperature_c",
+          "share": 0.8331,
+          "source_table": "ml_performance_all.csv",
+          "support": 529,
+          "value": 105.0
+        }
+      },
+      "sample_size": 635,
+      "target_col": "gel_time_min"
+    },
+    "gic_j_m2": {
+      "fields": {
+        "gic_j_m2_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.6415,
+          "source_table": "ml_performance_all.csv",
+          "support": 34,
+          "value": 1.0
+        },
+        "gic_j_m2_test_method": {
+          "field": "test_method",
+          "share": 0.3774,
+          "source_table": "ml_performance_all.csv",
+          "support": 20,
+          "value": "fracture"
+        },
+        "gic_j_m2_test_standard": {
+          "field": "standard_canonical",
+          "share": 0.5094,
+          "source_table": "ml_performance_standards.csv",
+          "support": 27,
+          "value": "ASTM D5045"
+        },
+        "gic_j_m2_test_temperature_c": {
+          "field": "test_temperature_c",
+          "share": 0.3396,
+          "source_table": "ml_performance_all.csv",
+          "support": 18,
+          "value": 24.0
+        }
+      },
+      "sample_size": 53,
+      "target_col": "gic_j_m2"
+    },
+    "impact_strength_kj_m2": {
+      "fields": {
+        "impact_strength_kj_m2_test_method": {
+          "field": "test_method",
+          "share": 0.5208,
+          "source_table": "ml_performance_all.csv",
+          "support": 825,
+          "value": "impact"
+        }
+      },
+      "sample_size": 1584,
+      "target_col": "impact_strength_kj_m2"
+    },
+    "lap_shear_strength_mpa": {
+      "fields": {
+        "lap_shear_strength_mpa_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.7567,
+          "source_table": "ml_performance_all.csv",
+          "support": 678,
+          "value": 5.0
+        },
+        "lap_shear_strength_mpa_specimen_geometry": {
+          "field": "specimen_geometry",
+          "share": 0.3013,
+          "source_table": "ml_performance_all.csv",
+          "support": 270,
+          "value": "single_lap"
+        },
+        "lap_shear_strength_mpa_test_method": {
+          "field": "test_method",
+          "share": 0.6239,
+          "source_table": "ml_performance_all.csv",
+          "support": 559,
+          "value": "shear"
+        },
+        "lap_shear_strength_mpa_test_temperature_c": {
+          "field": "test_temperature_c",
+          "share": 0.433,
+          "source_table": "ml_performance_all.csv",
+          "support": 388,
+          "value": 25.0
+        }
+      },
+      "sample_size": 896,
+      "target_col": "lap_shear_strength_mpa"
+    },
+    "shear_strength_mpa": {
+      "fields": {
+        "shear_strength_mpa_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.5518,
+          "source_table": "ml_performance_all.csv",
+          "support": 293,
+          "value": 2.5
+        },
+        "shear_strength_mpa_test_method": {
+          "field": "test_method",
+          "share": 0.5782,
+          "source_table": "ml_performance_all.csv",
+          "support": 307,
+          "value": "shear"
+        },
+        "shear_strength_mpa_test_temperature_c": {
+          "field": "test_temperature_c",
+          "share": 0.4708,
+          "source_table": "ml_performance_all.csv",
+          "support": 250,
+          "value": 25.0
+        }
+      },
+      "sample_size": 531,
+      "target_col": "shear_strength_mpa"
+    },
+    "storage_modulus_25c_gpa": {
+      "fields": {
+        "storage_modulus_25c_gpa_frequency_hz": {
+          "field": "frequency_hz",
+          "share": 0.8262,
+          "source_table": "ml_performance_all.csv",
+          "support": 2267,
+          "value": 1.0
+        },
+        "storage_modulus_25c_gpa_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.8305,
+          "source_table": "ml_performance_all.csv",
+          "support": 2279,
+          "value": 3.0
+        },
+        "storage_modulus_25c_gpa_test_method": {
+          "field": "test_method",
+          "share": 0.8557,
+          "source_table": "ml_performance_all.csv",
+          "support": 2348,
+          "value": "DMA"
+        }
+      },
+      "sample_size": 2744,
+      "target_col": "storage_modulus_25c_gpa"
+    },
+    "tan_delta_peak_value": {
+      "fields": {
+        "tan_delta_peak_value_frequency_hz": {
+          "field": "frequency_hz",
+          "share": 0.8635,
+          "source_table": "ml_performance_all.csv",
+          "support": 329,
+          "value": 1.0
+        },
+        "tan_delta_peak_value_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.9344,
+          "source_table": "ml_performance_all.csv",
+          "support": 356,
+          "value": 3.0
+        },
+        "tan_delta_peak_value_test_method": {
+          "field": "test_method",
+          "share": 0.8451,
+          "source_table": "ml_performance_all.csv",
+          "support": 322,
+          "value": "DMA"
+        }
+      },
+      "sample_size": 381,
+      "target_col": "tan_delta_peak_value"
+    },
+    "td10_c": {
+      "fields": {
+        "td10_c_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.8947,
+          "source_table": "ml_performance_all.csv",
+          "support": 1436,
+          "value": 10.0
+        },
+        "td10_c_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.7053,
+          "source_table": "ml_performance_all.csv",
+          "support": 1132,
+          "value": "N2"
+        },
+        "td10_c_test_method": {
+          "field": "test_method",
+          "share": 0.9819,
+          "source_table": "ml_performance_all.csv",
+          "support": 1576,
+          "value": "TGA"
+        }
+      },
+      "sample_size": 1605,
+      "target_col": "td10_c"
+    },
+    "td50_c": {
+      "fields": {
+        "td50_c_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.8952,
+          "source_table": "ml_performance_all.csv",
+          "support": 914,
+          "value": 10.0
+        },
+        "td50_c_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.6827,
+          "source_table": "ml_performance_all.csv",
+          "support": 697,
+          "value": "N2"
+        },
+        "td50_c_test_method": {
+          "field": "test_method",
+          "share": 0.9687,
+          "source_table": "ml_performance_all.csv",
+          "support": 989,
+          "value": "TGA"
+        }
+      },
+      "sample_size": 1021,
+      "target_col": "td50_c"
+    },
+    "td5_c": {
+      "fields": {
+        "td5_c_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.901,
+          "source_table": "ml_performance_all.csv",
+          "support": 4616,
+          "value": 10.0
+        },
+        "td5_c_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.723,
+          "source_table": "ml_performance_all.csv",
+          "support": 3704,
+          "value": "N2"
+        },
+        "td5_c_test_method": {
+          "field": "test_method",
+          "share": 0.9912,
+          "source_table": "ml_performance_all.csv",
+          "support": 5078,
+          "value": "TGA"
+        }
+      },
+      "sample_size": 5123,
+      "target_col": "td5_c"
+    },
+    "tensile_modulus_gpa": {
+      "fields": {
+        "tensile_modulus_gpa_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.7361,
+          "source_table": "ml_performance_all.csv",
+          "support": 3543,
+          "value": 2.0
+        },
+        "tensile_modulus_gpa_test_method": {
+          "field": "test_method",
+          "share": 0.7058,
+          "source_table": "ml_performance_all.csv",
+          "support": 3397,
+          "value": "tensile"
+        },
+        "tensile_modulus_gpa_test_temperature_c": {
+          "field": "test_temperature_c",
+          "share": 0.4542,
+          "source_table": "ml_performance_all.csv",
+          "support": 2186,
+          "value": 25.0
+        }
+      },
+      "sample_size": 4813,
+      "target_col": "tensile_modulus_gpa"
+    },
+    "tensile_strain_at_break_pct": {
+      "fields": {
+        "tensile_strain_at_break_pct_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.7775,
+          "source_table": "ml_performance_all.csv",
+          "support": 4222,
+          "value": 5.0
+        },
+        "tensile_strain_at_break_pct_test_method": {
+          "field": "test_method",
+          "share": 0.73,
+          "source_table": "ml_performance_all.csv",
+          "support": 3964,
+          "value": "tensile"
+        },
+        "tensile_strain_at_break_pct_test_temperature_c": {
+          "field": "test_temperature_c",
+          "share": 0.442,
+          "source_table": "ml_performance_all.csv",
+          "support": 2400,
+          "value": 25.0
+        }
+      },
+      "sample_size": 5430,
+      "target_col": "tensile_strain_at_break_pct"
+    },
+    "tensile_strength_mpa": {
+      "fields": {
+        "tensile_strength_mpa_loading_rate_mm_min": {
+          "field": "loading_rate_mm_min",
+          "share": 0.737,
+          "source_table": "ml_performance_all.csv",
+          "support": 5291,
+          "value": 5.0
+        },
+        "tensile_strength_mpa_test_method": {
+          "field": "test_method",
+          "share": 0.7149,
+          "source_table": "ml_performance_all.csv",
+          "support": 5132,
+          "value": "tensile"
+        },
+        "tensile_strength_mpa_test_temperature_c": {
+          "field": "test_temperature_c",
+          "share": 0.404,
+          "source_table": "ml_performance_all.csv",
+          "support": 2900,
+          "value": 25.0
+        }
+      },
+      "sample_size": 7179,
+      "target_col": "tensile_strength_mpa"
+    },
+    "tg_c": {
+      "fields": {
+        "tg_c_frequency_hz": {
+          "field": "frequency_hz",
+          "share": 0.4175,
+          "source_table": "ml_performance_all.csv",
+          "support": 5711,
+          "value": 1.0
+        },
+        "tg_c_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.8423,
+          "source_table": "ml_performance_all.csv",
+          "support": 11522,
+          "value": 5.0
+        },
+        "tg_c_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.3127,
+          "source_table": "ml_performance_all.csv",
+          "support": 4278,
+          "value": "N2"
+        },
+        "tg_c_test_method": {
+          "field": "test_method",
+          "share": 0.414,
+          "source_table": "ml_performance_all.csv",
+          "support": 5664,
+          "value": "DMA"
+        }
+      },
+      "sample_size": 13680,
+      "target_col": "tg_c"
+    },
+    "tmax_c": {
+      "fields": {
+        "tmax_c_heating_rate_c_min": {
+          "field": "heating_rate_c_min",
+          "share": 0.8897,
+          "source_table": "ml_performance_all.csv",
+          "support": 4349,
+          "value": 10.0
+        },
+        "tmax_c_test_atmosphere": {
+          "field": "test_atmosphere",
+          "share": 0.6743,
+          "source_table": "ml_performance_all.csv",
+          "support": 3296,
+          "value": "N2"
+        },
+        "tmax_c_test_method": {
+          "field": "test_method",
+          "share": 0.9859,
+          "source_table": "ml_performance_all.csv",
+          "support": 4819,
+          "value": "TGA"
+        }
+      },
+      "sample_size": 4888,
+      "target_col": "tmax_c"
+    }
+  },
+  "generated_at": "2026-09-22",
+  "min_share": 0.3,
+  "recipe_defaults": {
+    "curing_type_standard": {
+      "share": 0.8663,
+      "source_table": "ml_qspr_selected.csv",
+      "support": 8816,
+      "value": "external_hardener"
+    },
+    "formulation_resin_phr_basis_type": {
+      "share": 0.6842,
+      "source_table": "ml_qspr_selected.csv",
+      "support": 6963,
+      "value": "resin_100_basis"
+    },
+    "initiator_present": {
+      "share": 0.9425,
+      "source_table": "ml_qspr_selected.csv",
+      "support": 9592,
+      "value": false
+    }
+  },
+  "schema_version": 1,
+  "source_dataset": "ml_dataset"
+}

@@ -37,37 +37,58 @@ def _contract() -> dict:
     }
 
 
-def test_partition_groups_required_and_optional_manual():
+def test_partition_groups_manual_fields_by_user_intent():
+    """人工输入字段按用户心智模型分组（配方 / 固化制度 / 测试条件）。
+
+    原设计按 required/optional 分组；已改为按语义分组（见 spec §4.4），
+    因为用户关心的是「配什么料、怎么固化、按什么标准测」。
+    """
     plan = build_input_partition_plan(_contract())
     groups = {section["group"]: section for section in plan}
-    assert groups["required_manual"]["features"] == ["固化温度"]
-    assert groups["optional_manual"]["features"] == ["测试方法"]
+    # 「固化温度」/「测试方法」均归入测试条件（默认保守分类）
+    editable = (
+        groups["recipe"]["features"]
+        + groups["cure_schedule"]["features"]
+        + groups["test_conditions"]["features"]
+    )
+    assert sorted(editable) == sorted(["固化温度", "测试方法"])
 
 
-def test_partition_molecular_group_has_workflow_source_slot():
+def test_partition_has_five_sections():
+    """分区计划固定为 5 组（配方/固化制度/测试条件/推导/计算）。"""
+    plan = build_input_partition_plan(_contract())
+    assert [section["group"] for section in plan] == [
+        "recipe",
+        "cure_schedule",
+        "test_conditions",
+        "derived",
+        "computed",
+    ]
+
+
+def test_partition_display_groups_are_readonly():
+    """推导与计算分区必须只读，且分别列出 derived / molecular 特征。"""
     plan = build_input_partition_plan(_contract())
     groups = {section["group"]: section for section in plan}
-    assert "molecular" in groups
-    assert groups["molecular"]["kind"] == "workflow_source"
-
-
-def test_partition_computed_group_lists_workflow_and_derived():
-    plan = build_input_partition_plan(_contract())
-    groups = {section["group"]: section for section in plan}
-    computed = groups["computed"]["features"]
-    assert "MolWt_resin" in computed
-    assert "fp_bit_1" in computed
+    assert groups["derived"]["kind"] == "display"
     assert groups["computed"]["kind"] == "display"
+    assert groups["derived"]["features"] == ["MolWt_resin"]
+    assert groups["computed"]["features"] == ["fp_bit_1"]
     # 系统计算特征绝不出现在人工输入组
-    assert "MolWt_resin" not in groups["required_manual"]["features"]
-    assert "MolWt_resin" not in groups["optional_manual"]["features"]
+    editable = (
+        groups["recipe"]["features"]
+        + groups["cure_schedule"]["features"]
+        + groups["test_conditions"]["features"]
+    )
+    assert "MolWt_resin" not in editable
+    assert "fp_bit_1" not in editable
 
 
 def test_partition_with_empty_contract_returns_default_groups():
     plan = build_input_partition_plan({})
     assert plan
     for section in plan:
-        assert section["features"] == [] or section["kind"] == "workflow_source"
+        assert section["features"] == []
 
 
 def test_partition_with_screening_fixed_input_cols():
@@ -76,6 +97,7 @@ def test_partition_with_screening_fixed_input_cols():
     plan = build_input_partition_plan(contract)
     fixed = [section for section in plan if section["group"] == "fixed_inputs"]
     assert fixed and fixed[0]["features"] == ["固化温度"]
+    assert fixed[0]["kind"] == "display"
 
 
 def test_model_contract_summary_fields():

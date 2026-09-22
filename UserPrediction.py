@@ -104,6 +104,137 @@ def fallback_input_mode(error: Any) -> str:
     return "manual" if isinstance(error, (str, Exception)) else "manual"
 
 
+#: 多轮对话保留的最大历史轮数（避免上下文无限增长）
+AI_CONVERSATION_MAX_TURNS = 12
+
+
+def build_ai_field_descriptions(field_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """构造传给 AI 的字段描述。
+
+    **硬约束**：``allow_ai_generation`` 一律为 False —— AI 只能提取和整理
+    用户提供的信息，不得生成 EEW/AHEW/PHR/分子特征/工艺参数等计算量。
+    这些量必须由 Python 侧按公式推导（见 core/portal_formulation_inputs.py）。
+    """
+    return [
+        {
+            "name": item.get("name"),
+            "label": item.get("label"),
+            "kind": item.get("kind"),
+            "required": bool(item.get("required", False)),
+            "allow_ai_generation": False,
+        }
+        for item in (field_defs or [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+
+
+def build_ai_conversation_context(
+    state: Dict[str, Any], field_labels: Dict[str, str] | None = None
+) -> Dict[str, Any]:
+    """构造本轮对话的上下文（供 AI 理解「修改」语义）。
+
+    关键：必须把**已确认字段**带进去，否则 AI 不知道「温度」指哪个字段，
+    也不知道其他字段已经定下来。被用户拒绝的字段不传（避免 AI 再提）。
+    """
+    state = state if isinstance(state, dict) else {}
+    rejected = {str(f) for f in (state.get("rejected_fields") or set())}
+    confirmed_fields: Dict[str, Any] = {}
+    for name, detail in (state.get("fields") or {}).items():
+        if name in rejected or not isinstance(detail, dict):
+            continue
+        value = detail.get("value")
+        if value is None or value == "":
+            continue
+        confirmed_fields[str(name)] = value
+    return {
+        "confirmed_fields": confirmed_fields,
+        "rejected_fields": sorted(rejected),
+        "field_labels": dict(field_labels or {}),
+    }
+
+
+def build_ai_conversation_messages(
+    turns: List[Dict[str, Any]], current_text: str
+) -> List[Dict[str, str]]:
+    """拼接对话消息：有界历史 + 当前输入。"""
+    history = [
+        {"role": str(t.get("role") or "user"), "text": str(t.get("text") or "")}
+        for t in (turns or [])
+        if isinstance(t, dict)
+    ][-AI_CONVERSATION_MAX_TURNS:]
+    return history + [{"role": "user", "text": str(current_text or "")}]
+
+
+def append_conversation_turn(
+    turns: List[Dict[str, Any]], *, role: str, text: str
+) -> List[Dict[str, Any]]:
+    """追加一轮对话（返回新列表，不原地修改）。"""
+    updated = list(turns or [])
+    updated.append({"role": str(role), "text": str(text)})
+    return updated
+
+
+def merge_ai_conversation_state(
+    previous: Dict[str, Any], response: Any
+) -> Dict[str, Any]:
+    """把新一轮 AI 响应合并进已有状态（增量修正，不丢历史字段）。
+
+    规则：
+    1. 新一轮未提及的字段**保留原值**（不得清空）；
+    2. 已拒绝字段在新一轮不得被静默恢复；
+    3. 新提取的字段状态仍为 suggested/recognized，**必须用户确认**；
+    4. 警告累积。
+    """
+    previous = previous if isinstance(previous, dict) else {}
+    # 兼容两种 AI 响应形态：
+    #   (a) 标准形态 {recognized_fields / suggestions / warnings}（build_ai_confirmation_state 消费）
+    #   (b) 已是 fields 形态 {fields: {name: {value, state}}}（多轮对话/测试常用）
+    if isinstance(response, dict) and isinstance(response.get("fields"), dict):
+        fresh = {
+            "fields": {
+                str(name): (
+                    {
+                        "value": detail.get("value"),
+                        # 新提取字段一律不得是 confirmed —— 必须用户确认（门禁不放松）
+                        "state": str(detail.get("state") or "suggested"),
+                        "confidence": detail.get("confidence"),
+                    }
+                    if isinstance(detail, dict)
+                    else {"value": detail, "state": "suggested", "confidence": None}
+                )
+                for name, detail in response["fields"].items()
+            },
+            "warnings": list(response.get("warnings") or []),
+        }
+    else:
+        fresh = build_ai_confirmation_state(response)
+
+    merged_fields: Dict[str, Dict[str, Any]] = {}
+    for name, detail in (previous.get("fields") or {}).items():
+        merged_fields[str(name)] = copy.deepcopy(detail) if isinstance(detail, dict) else {"value": detail}
+
+    rejected = {str(f) for f in (previous.get("rejected_fields") or set())}
+    for name, detail in (fresh.get("fields") or {}).items():
+        if name in rejected:
+            # 已拒绝：保持拒绝，不恢复
+            continue
+        merged_fields[str(name)] = dict(detail)
+
+    merged_confirmed = {str(f) for f in (previous.get("confirmed_fields") or set())}
+    merged_warnings = list(previous.get("warnings") or [])
+    for warning in fresh.get("warnings") or []:
+        if warning not in merged_warnings:
+            merged_warnings.append(warning)
+
+    return {
+        "fields": merged_fields,
+        "confirmed_fields": merged_confirmed,
+        "rejected_fields": rejected,
+        "warnings": merged_warnings,
+        "assumptions": list(previous.get("assumptions") or []),
+    }
+
+
 def render_task_snapshot(snapshot: Dict[str, Any]) -> str:
     task_id = html_escape(str(snapshot.get("task_id") or ""))
     stage = html_escape(str(snapshot.get("stage_label") or snapshot.get("stage") or ""))
@@ -163,17 +294,31 @@ def _model_contract(model: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, An
 
 
 def _is_publishable_ui_model(model: Dict[str, Any]) -> bool:
+    """判断模型是否可在预测页使用（第二道门禁）。
+
+    硬条件（必须全满足）：已启用、已发布、门禁报告 ok 且 valid。
+
+    注册表审核要求（v2 契约才强制）：契约 schema_version==2 时，仍要求
+    registry_snapshot 存在、model_profile.status==approved、全部 feature approved。
+
+    legacy(schema-1) 导入模型：从训练平台导出的 artifact 不带 registry_snapshot，
+    契约 schema_version 为 None/1。这类模型已经过 publish_imported_entry 的
+    validate_publication_artifact 门禁，不应因缺少 v2 注册表快照而被永久拒绝
+    （否则所有训练平台下载的模型都无法启用）。
+    """
     if not isinstance(model, dict) or model.get("enabled") is not True or str(model.get("publication_status") or "").strip().lower() != "published":
         return False
     gate = model.get("gate_report")
     if not isinstance(gate, dict) or gate.get("ok") is not True or str(gate.get("status") or "").strip().lower() != "valid":
         return False
     contract, snapshot = _model_contract(model)
-    profile = snapshot.get("model_profile") if isinstance(snapshot, dict) else None
-    if contract.get("schema_version") != 2 or not snapshot or not isinstance(profile, dict) or profile.get("status") != "approved":
-        return False
-    if any(not isinstance(item, dict) or item.get("status") != "approved" for item in snapshot.get("features") or []):
-        return False
+    if contract.get("schema_version") == 2:
+        # v2 契约：保持注册表审核的严格语义
+        profile = snapshot.get("model_profile") if isinstance(snapshot, dict) else None
+        if not snapshot or not isinstance(profile, dict) or profile.get("status") != "approved":
+            return False
+        if any(not isinstance(item, dict) or item.get("status") != "approved" for item in snapshot.get("features") or []):
+            return False
     artifact = model.get("_artifact")
     if isinstance(artifact, dict):
         report = validate_publication_artifact(
@@ -214,19 +359,84 @@ def toggle_model_enabled(
 def _ai_parse_input(
     material_key: str, target_key: str, user_text: str,
     contract: Dict[str, Any] | None, registry_snapshot: Dict[str, Any] | None, service: Dict[str, Any],
+    *, context: Dict[str, Any] | None = None, force_refresh: bool = False,
 ) -> Dict[str, Any]:
-    """调用 AI 输入助手解析用户文本，返回统一的确认状态（供首页全自动流程与手动解析按钮复用）。"""
+    """调用 AI 输入助手解析用户文本，返回统一的确认状态。
+
+    供首页全自动流程、手动解析按钮与多轮对话复用。
+
+    缓存（core/portal_ai_cache.py）：相同 service/model/输入直接复用，
+    不重复消耗额度；``force_refresh=True`` 绕过读取但仍写入新结果。
+
+    ``context`` 为多轮对话上下文（已确认字段），使 AI 理解「温度改成 200 度」
+    这类增量修改的语义。
+    """
     contract = contract if isinstance(contract, dict) else {}
     registry_snapshot = registry_snapshot if isinstance(registry_snapshot, dict) else {}
     field_defs = build_manual_input_fields(contract, registry_snapshot) + build_workflow_source_fields(contract, registry_snapshot)
-    response = PortalAIClient(_ai_service_dataclass(service)).parse_input({
-        'material_type': material_key, 'target': target_key,
-        'field_descriptions': [
-            {'name': item.get('name'), 'label': item.get('label'), 'kind': item.get('kind'), 'required': item.get('required', False), 'allow_ai_generation': False}
-            for item in field_defs
-        ], 'user_text': user_text,
-    })
+    field_descriptions = build_ai_field_descriptions(field_defs)
+
+    service_id = str(service.get("service_id") or "")
+    model_name = str(service.get("model") or "")
+    prompt_kind = "input_parse"
+    cache = _ai_cache()
+    cache_text = str(user_text)
+    if context and context.get("confirmed_fields"):
+        # 上下文参与缓存键：同一句话在不同已确认字段下语义不同
+        cache_text = cache_text + "\x1e" + repr(sorted(context["confirmed_fields"].items()))
+    if cache is not None and not force_refresh:
+        hit = cache.get(
+            service_id=service_id, model=model_name, prompt_kind=prompt_kind, text=cache_text
+        )
+        if hit is not None and isinstance(hit.get("value"), dict):
+            return build_ai_confirmation_state(hit["value"])
+
+    payload = {
+        'material_type': material_key,
+        'target': target_key,
+        'field_descriptions': field_descriptions,
+        'user_text': user_text,
+    }
+    if context:
+        payload['context'] = context
+    response = PortalAIClient(_ai_service_dataclass(service)).parse_input(payload)
+
+    if cache is not None:
+        try:
+            raw = {
+                "recognized_fields": getattr(response, "recognized_fields", {}) or {},
+                "suggestions": [
+                    {
+                        "field": getattr(item, "field", None),
+                        "value": getattr(item, "value", None),
+                        "state": getattr(item, "state", "suggested"),
+                        "confidence": getattr(item, "confidence", None),
+                    }
+                    for item in (getattr(response, "suggestions", None) or [])
+                ],
+                "warnings": list(getattr(response, "warnings", None) or []),
+                "assumptions": list(getattr(response, "assumptions", None) or []),
+            }
+            cache.put(
+                service_id=service_id,
+                model=model_name,
+                prompt_kind=prompt_kind,
+                text=cache_text,
+                value=raw,
+            )
+        except Exception:
+            pass
     return build_ai_confirmation_state(response)
+
+
+def _ai_cache():
+    """获取 AI 缓存实例；任何异常降级为 None（缓存不可用不得阻断主流程）。"""
+    try:
+        from core.portal_ai_cache import PortalAICache
+
+        return PortalAICache(root=PROJECT_ROOT)
+    except Exception:
+        return None
 
 
 def _sync_ai_state_to_manual(material_key: str, target_key: str, state: Dict[str, Any]) -> None:
@@ -293,6 +503,74 @@ def render_ai_assistant_tab(
                 st.success('解析完成，请逐项确认或拒绝。')
             except PortalAIError as exc:
                 st.warning(f'AI 不可用：{exc}；已保留手动输入模式。')
+
+    # ------------------------------------------------------------------
+    # 多轮对话（st.chat_message / st.chat_input）
+    #
+    # 目的：用户不会一次说全配方。第二轮把**已确认字段**作为上下文传给 AI，
+    # 使 AI 理解「温度改成 200 度」这类增量修改的语义。
+    # 约束：AI 仍只能提取/整理，不得生成计算量；结果仍需用户确认。
+    # ------------------------------------------------------------------
+    st.markdown('##### 💬 多轮对话修正')
+    st.caption('先解析一次，然后可直接说「温度改成 200 度」这类修改；系统会把已确认字段作为上下文。')
+    turns_key = f'ai_turns_{material_key}_{target_key}'
+    turns = st.session_state.setdefault(turns_key, [])
+    for turn in turns[-AI_CONVERSATION_MAX_TURNS:]:
+        with st.chat_message('user' if turn.get('role') == 'user' else 'assistant'):
+            st.markdown(str(turn.get('text') or ''))
+
+    chat_text = st.chat_input(
+        '继续描述或修正（例如：温度改成 200 度）',
+        key=f'ai_chat_{material_key}_{target_key}',
+    )
+    if chat_text:
+        state = st.session_state.get(state_key) or {'fields': {}, 'confirmed_fields': set(), 'rejected_fields': set(), 'warnings': []}
+        context = build_ai_conversation_context(state)
+        st.session_state[turns_key] = append_conversation_turn(turns, role='user', text=chat_text)
+        try:
+            with st.spinner('AI 正在理解你的修正…'):
+                fresh = _ai_parse_input(
+                    material_key, target_key, chat_text, contract, registry_snapshot, service,
+                    context=context,
+                )
+            merged = merge_ai_conversation_state(state, fresh)
+            st.session_state[state_key] = merged
+            changed = [
+                name for name in (fresh.get('fields') or {})
+                if name in (merged.get('fields') or {})
+            ]
+            reply = (
+                f"已更新 {len(changed)} 个字段：{'、'.join(changed[:6])}"
+                if changed else '本轮未识别到可更新的字段，请换种说法再试。'
+            )
+            st.session_state[turns_key] = append_conversation_turn(
+                st.session_state[turns_key], role='assistant', text=reply
+            )
+        except PortalAIError as exc:
+            st.session_state[turns_key] = append_conversation_turn(
+                st.session_state[turns_key], role='assistant', text=f'AI 不可用：{exc}'
+            )
+        st.rerun()
+
+    col_cache1, col_cache2 = st.columns([1, 1])
+    with col_cache1:
+        if st.button('🔄 强制重新解析（忽略缓存）', key=f'ai_force_{material_key}_{target_key}'):
+            if not user_text.strip():
+                st.warning('请先输入待解析的文本。')
+            else:
+                try:
+                    st.session_state[state_key] = _ai_parse_input(
+                        material_key, target_key, user_text, contract, registry_snapshot, service,
+                        force_refresh=True,
+                    )
+                    st.success('已忽略缓存重新解析。')
+                except PortalAIError as exc:
+                    st.warning(f'AI 不可用：{exc}')
+    with col_cache2:
+        cache = _ai_cache()
+        if cache is not None:
+            st.caption(f'缓存条目：{cache.size()}')
+
     state = st.session_state.get(state_key)
     if not state:
         st.info('解析结果会显示在这里。')
@@ -708,70 +986,163 @@ def sync_parameters_from_features(target_cfg: Dict[str, Any], feature_cols: List
     return True
 
 
-def build_input_partition_plan(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """按 contract 分区生成输入分组计划（纯函数，可独立测试）。
+#: 输入分区的固定顺序（UI 依赖此顺序渲染）
+AUTOFILL_SECTION_GROUPS = ("recipe", "cure_schedule", "test_conditions")
 
-    返回列表，每项 {group, title, description, features, kind}：
-    - required_manual：必填人工输入（manual 分区中 required_for_prediction=True）
-    - optional_manual：可选人工输入
-    - molecular：分子/结构输入（workflow_source_fields）
-    - workflow：工艺源字段（workflow_source_fields 中非分子列，当前实现并入 molecular 组由角色标注）
-    - computed：系统计算特征（derived/molecular workflow 输出，仅展示无输入框）
+#: 配方类字段关键词（配方计量与组分描述）
+_RECIPE_FIELD_TOKENS = (
+    "resin_", "curing_agent_", "hardener_", "formulation_", "initiator_",
+    "accelerator_", "catalyst_", "reactive_diluent", "reactive_toughener",
+    "small_additive", "other_component", "_total_phr", "_phr_basis",
+    "curing_type_standard", "curing_mechanism", "_component_count",
+    "_equivalent_group_total", "_epoxy_group_total", "_active_hydrogen_total",
+    "_total_eew", "_total_ahew", "_r_value", "_equivalent_ratio",
+)
+
+#: 固化制度（工艺）类字段关键词
+_CURE_FIELD_TOKENS = (
+    "process_", "cure_", "post_cure", "_cure_temperature", "_cure_time",
+    "atmosphere", "pressure", "ramp", "dwell",
+)
+
+#: 测试条件类字段关键词
+_TEST_FIELD_TOKENS = (
+    "_test_method", "_test_standard", "_test_atmosphere", "_analysis_method",
+    "_specimen_geometry", "_frequency_hz", "_heating_rate", "_loading_rate",
+    "_strain_rate", "_test_temperature",
+)
+
+
+def classify_manual_field_group(feature: str) -> str:
+    """把人工输入字段归入 3 个可编辑分区之一（纯函数）。
+
+    优先级：测试条件 → 固化制度 → 配方 → 默认测试条件。
+    默认落在测试条件（保守：不误入配方区，避免把测试标准当成配方输入）。
+    """
+    name = str(feature or "").strip().lower()
+    if not name:
+        return "test_conditions"
+    if any(token in name for token in _TEST_FIELD_TOKENS):
+        return "test_conditions"
+    if any(token in name for token in _CURE_FIELD_TOKENS):
+        return "cure_schedule"
+    if any(token in name for token in _RECIPE_FIELD_TOKENS):
+        return "recipe"
+    return "test_conditions"
+
+
+def build_autofilled_summary(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """构造「已自动填充 N 项」明细（纯函数）。
+
+    空值（None / ""）不计入，避免虚报项数；0 是合法取值，应计入。
+    """
+    rows: List[Dict[str, Any]] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("value")
+        if value is None or value == "":
+            continue
+        rows.append({
+            "feature": str(entry.get("feature") or ""),
+            "value": value,
+            "origin": str(entry.get("origin") or "default"),
+            "detail": str(entry.get("detail") or ""),
+        })
+    count = len(rows)
+    title = f"已自动填充 {count} 项" if count else "未自动填充任何字段"
+    return {"count": count, "rows": rows, "title": title}
+
+
+def build_input_partition_plan(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """按用户心智模型生成输入分区计划（纯函数，可独立测试）。
+
+    返回列表，每项 {group, title, description, features, kind}，固定顺序：
+
+    ① recipe          配方（必填）——可编辑
+    ② cure_schedule   固化制度——可编辑（默认预填）
+    ③ test_conditions 高级测试条件——可编辑（默认预填）
+    ④ derived         自动推导——只读（kind=display）
+    ⑤ computed        系统计算特征——只读（kind=display）
+
+    ④⑤ 绝不出现在可编辑分区：它们必须由 workflow 真实计算，允许手填
+    会让用户覆盖系统值，造成静默的预测错误。
     分区缺失时给出默认空组，保证 UI 不崩溃。
     """
     contract = contract if isinstance(contract, dict) else {}
     manual_cols = [str(c) for c in contract.get("manual_input_feature_cols") or [] if str(c).strip()]
     molecular_cols = [str(c) for c in contract.get("molecular_workflow_feature_cols") or [] if str(c).strip()]
     derived_cols = [str(c) for c in contract.get("derived_feature_cols") or [] if str(c).strip()]
-    definitions = {
-        str(item.get("name")): item
-        for item in contract.get("feature_definitions") or []
-        if isinstance(item, dict) and item.get("name")
-    }
 
-    required_manual: List[str] = []
-    optional_manual: List[str] = []
+    # legacy(schema-1) 契约没有分区字段，但模型仍需这些显式特征。
+    # 此时按 core.portal_prediction._explicit_model_feature_names 的口径补齐：
+    #   manual = contract.feature_cols − workflow.final_feature_names
+    # 否则 UI 会一个输入框都不渲染，用户无法预测（真实 artifact 就是这种情况）。
+    if not manual_cols and not molecular_cols and not derived_cols:
+        workflow_features = {
+            str(name)
+            for name in contract.get("workflow_final_feature_names") or []
+            if str(name).strip()
+        }
+        all_features = [
+            str(c) for c in contract.get("feature_cols") or [] if str(c).strip()
+        ]
+        if workflow_features:
+            manual_cols = [c for c in all_features if c not in workflow_features]
+        elif all_features:
+            # 无 workflow 信息时不能判断哪些是系统计算的，全部交给用户输入
+            # （宁可多问，不可静默使用臆造值）
+            manual_cols = list(all_features)
+
+    buckets: Dict[str, List[str]] = {
+        "recipe": [],
+        "cure_schedule": [],
+        "test_conditions": [],
+    }
     for name in manual_cols:
-        definition = definitions.get(name, {})
-        if bool(definition.get("required_for_prediction", True)):
-            required_manual.append(name)
-        else:
-            optional_manual.append(name)
+        buckets[classify_manual_field_group(name)].append(name)
 
     plan: List[Dict[str, Any]] = [
         {
-            "group": "required_manual",
-            "title": "① 必填人工输入",
-            "description": "工艺/测试/人工记录字段；缺失时预测将被阻断，系统不会自动补 0。",
-            "features": required_manual,
+            "group": "recipe",
+            "title": "① 配方（必填）",
+            "description": "树脂/固化剂结构、配比（phr）与组分构成。只填配方即可预测，其余条件系统已按全表统计预填。",
+            "features": buckets["recipe"],
             "kind": "input",
         },
         {
-            "group": "optional_manual",
-            "title": "② 可选人工输入",
-            "description": "可留空的人工输入字段；留空值按契约声明处理并记录。",
-            "features": optional_manual,
+            "group": "cure_schedule",
+            "title": "② 固化制度",
+            "description": "固化温度、时间、阶段、后固化与气氛。已按典型值预填，请按实际实验修改。",
+            "features": buckets["cure_schedule"],
             "kind": "input",
         },
         {
-            "group": "molecular",
-            "title": "③ 分子/结构输入",
-            "description": "树脂/固化剂 SMILES 等原始结构；由当前模型 workflow 消费。",
-            "features": [],  # workflow_source_fields 由调用方填充（需要 source field 结构）
-            "kind": "workflow_source",
+            "group": "test_conditions",
+            "title": "③ 高级测试条件",
+            "description": "测试方法/标准/频率/升温速率。已按全表主流口径预填，不修改也可预测。",
+            "features": buckets["test_conditions"],
+            "kind": "input",
+        },
+        {
+            "group": "derived",
+            "title": "④ 自动推导（只读）",
+            "description": "由配方按物理/化学公式推导，无需填写；下方展示推导依据。",
+            "features": derived_cols,
+            "kind": "display",
         },
         {
             "group": "computed",
-            "title": "④ 系统计算特征",
-            "description": "以下特征由系统按登记的 workflow 自动计算，无需手动填写。",
-            "features": molecular_cols + derived_cols,
+            "title": "⑤ 系统计算（只读）",
+            "description": "由登记的分子特征 workflow 从结构自动计算，无需填写。",
+            "features": molecular_cols,
             "kind": "display",
         },
     ]
     if contract.get("screening_fixed_input_cols"):
-        plan.insert(3, {
+        plan.append({
             "group": "fixed_inputs",
-            "title": "③-B 固定工艺条件",
+            "title": "固定工艺条件（只读）",
             "description": "当前预测任务使用的固定工艺/测试条件（契约 screening_fixed_input_cols）。",
             "features": [str(c) for c in contract.get("screening_fixed_input_cols") or [] if str(c).strip()],
             "kind": "display",
@@ -1193,6 +1564,48 @@ PORTAL_PRESET_HARDENERS = {
 
 # 课题组经典常用配方库：树脂 + 固化剂 + 配比 + 固化制度（一键整体载入）
 # phr 为按当量化学计量的参考值；temp/time 为代表性等效单阶段固化制度，可按文献/实验调整。
+def validate_recipe_schedule(
+    schedule: str, *, declared_stages: int | None = None
+) -> List[Tuple[float, float]]:
+    """解析固化制度并校验阶段数（防止静默丢阶段）。
+
+    背景：``core.process_features._schedule_pairs`` 的正则要求温度是数字，
+    **非数字温度会被静默丢弃且不报错**：
+
+        '室温/24 h + 80 °C/2 h'   → [(80.0, 2.0)]              ← 室温阶段丢失
+        '25 °C/24 h + 80 °C/2 h'  → [(25.0,24.0),(80.0,2.0)]    ← 正确
+
+    因此配方库一律使用**显式数字温度**，并在加载时用本函数断言阶段数一致。
+
+    参数
+    ----
+    schedule : 形如 ``"80 °C/2 h + 150 °C/3 h"``
+    declared_stages : 声明的阶段数；给定且与实际解析数不符时抛错
+
+    抛出
+    ----
+    ValueError : 无法解析，或阶段数与声明不符
+    """
+    from core.process_features import _schedule_pairs
+
+    text = str(schedule or "").strip()
+    if not text:
+        raise ValueError("固化制度为空。")
+    try:
+        pairs = _schedule_pairs(text)
+    except ValueError as exc:
+        raise ValueError(f"固化制度无法解析：{text!r}（{exc}）") from exc
+    if not pairs:
+        raise ValueError(f"固化制度无法解析：{text!r}")
+    if declared_stages is not None and len(pairs) != int(declared_stages):
+        raise ValueError(
+            f"固化制度阶段数不符：声明 {int(declared_stages)} 阶段，"
+            f"实际解析出 {len(pairs)} 阶段（{text!r}）。"
+            "请检查是否使用了非数字温度（如「室温」会被静默丢弃）。"
+        )
+    return [(float(temperature), float(duration)) for temperature, duration in pairs]
+
+
 PORTAL_PRESET_RECIPES = [
     {
         "name": "E-51 / DDM 通用结构",
@@ -1204,6 +1617,8 @@ PORTAL_PRESET_RECIPES = [
         "phr": 26.0,
         "temp": 120.0,
         "time": 3.0,
+        "cure_schedule": "80 °C/2 h + 120 °C/2 h",
+        "cure_stages": 2,
         "note": "标准双酚A环氧结构配方；典型制度 80 °C/2 h + 120 °C/2 h 阶段固化，此处取代表性等效单阶段。",
     },
     {
@@ -1216,6 +1631,8 @@ PORTAL_PRESET_RECIPES = [
         "phr": 33.0,
         "temp": 160.0,
         "time": 4.0,
+        "cure_schedule": "130 °C/2 h + 180 °C/2 h",
+        "cure_stages": 2,
         "note": "DDS 砜基高刚性交联网络；典型制度 130 °C/2 h + 180 °C/2 h，取等效 160 °C/4 h。",
     },
     {
@@ -1228,6 +1645,8 @@ PORTAL_PRESET_RECIPES = [
         "phr": 50.0,
         "temp": 170.0,
         "time": 4.0,
+        "cure_schedule": "130 °C/1 h + 180 °C/2 h",
+        "cure_stages": 2,
         "note": "经典航空预浸料基体体系（5208 类）；典型制度 130 °C/1 h + 180 °C/2 h，取等效 170 °C/4 h。",
     },
     {
@@ -1240,6 +1659,8 @@ PORTAL_PRESET_RECIPES = [
         "phr": 85.0,
         "temp": 130.0,
         "time": 4.0,
+        "cure_schedule": "80 °C/2 h + 140 °C/4 h",
+        "cure_stages": 2,
         "note": "酸酐体系常配合叔胺促进剂（如 DMP-30）；典型制度 80 °C/2 h + 140 °C/4 h，取等效 130 °C/4 h。",
     },
     {
@@ -1252,7 +1673,12 @@ PORTAL_PRESET_RECIPES = [
         "phr": 25.0,
         "temp": 80.0,
         "time": 4.0,
-        "note": "脂环胺体系低粘度高韧性；典型制度 室温/24 h + 80 °C/2 h 后固化，取等效 80 °C/4 h。",
+        # 原写法为「室温/24 h + 80 °C/2 h」——「室温」是非数字温度，会被
+        # core.process_features._schedule_pairs 静默丢弃（26 h 误算为 2 h），
+        # 故改写为显式 25 °C。配方库一律使用数字温度。
+        "cure_schedule": "25 °C/24 h + 80 °C/2 h",
+        "cure_stages": 2,
+        "note": "脂环胺体系低粘度高韧性；典型制度 25 °C/24 h + 80 °C/2 h 后固化，取等效 80 °C/4 h。",
     },
     {
         "name": "E-51 / m-PDA 中温经典",
@@ -1264,6 +1690,8 @@ PORTAL_PRESET_RECIPES = [
         "phr": 14.0,
         "temp": 100.0,
         "time": 3.0,
+        "cure_schedule": "80 °C/2 h + 150 °C/2 h",
+        "cure_stages": 2,
         "note": "间苯二胺经典中温体系；典型制度 80 °C/2 h + 150 °C/2 h，取等效 100 °C/3 h。",
     },
     {
@@ -1276,6 +1704,8 @@ PORTAL_PRESET_RECIPES = [
         "phr": 28.0,
         "temp": 160.0,
         "time": 4.0,
+        "cure_schedule": "130 °C/2 h + 180 °C/2 h",
+        "cure_stages": 2,
         "note": "含氟体系低吸湿低介电；典型制度 130 °C/2 h + 180 °C/2 h，取等效 160 °C/4 h。",
     },
     {
@@ -1288,9 +1718,36 @@ PORTAL_PRESET_RECIPES = [
         "phr": 28.0,
         "temp": 150.0,
         "time": 4.0,
+        "cure_schedule": "100 °C/2 h + 150 °C/3 h",
+        "cure_stages": 2,
         "note": "酚醛环氧多官能高交联密度；典型制度 100 °C/2 h + 150 °C/3 h，取等效 150 °C/4 h。",
     },
 ]
+
+
+def _self_check_preset_recipe_schedules() -> None:
+    """模块加载时自检配方库：每个 cure_schedule 的阶段数必须与声明一致。
+
+    防止未来新增配方时误写非数字温度（如「室温」），导致阶段被静默丢弃、
+    工艺特征（process_total_time_h 等）算出错误值。
+
+    自检失败即**在导入时立即报错**，而不是等到用户预测时才发现。
+    """
+    problems: List[str] = []
+    for recipe in PORTAL_PRESET_RECIPES:
+        name = recipe.get("name") or "<未命名>"
+        try:
+            validate_recipe_schedule(
+                recipe.get("cure_schedule") or "",
+                declared_stages=recipe.get("cure_stages"),
+            )
+        except (ValueError, TypeError) as exc:
+            problems.append(f"{name}: {exc}")
+    if problems:
+        raise ValueError("配方库固化制度自检失败：\n  - " + "\n  - ".join(problems))
+
+
+_self_check_preset_recipe_schedules()
 
 
 @st.cache_data(show_spinner=False, max_entries=256)
@@ -1610,7 +2067,60 @@ def default_integer(value: Any, fallback: int = 0) -> int:
         return fallback
 
 
-def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str, recipe: Dict[str, Any] | None = None) -> Tuple[pd.DataFrame, List[str]]:
+def _portal_default_for_field(
+    field: Dict[str, Any], *, target_col: str
+) -> Dict[str, Any] | None:
+    """查字段的全表统计默认值（仅 manual_input 分区）。
+
+    spec 硬约束：只有 manual_input 字段可以拿到默认值。本函数的调用方
+    （``render_parameter_inputs``）只处理 manual 字段，此处再传
+    ``partition="manual_input"`` 双保险 —— 模块内已强制非 manual 分区返回 None。
+
+    任何异常都降级为无默认值（门户不能因缺 JSON 而崩溃）。
+    """
+    try:
+        from core.portal_input_defaults import default_for_feature
+
+        return default_for_feature(
+            str(field.get("name") or ""),
+            partition="manual_input",
+            target_col=str(target_col or ""),
+        )
+    except Exception:
+        return None
+
+
+def _portal_default_display_value(record: Dict[str, Any] | None) -> Any:
+    """把默认值记录转成可直接预填的值（无记录时 None）。"""
+    if not isinstance(record, dict):
+        return None
+    value = record.get("value")
+    return None if value is None or value == "" else value
+
+
+def _portal_default_audit_detail(record: Dict[str, Any] | None) -> str:
+    """生成默认值的审计说明（供「已自动填充」明细条展示）。"""
+    if not isinstance(record, dict):
+        return ""
+    share = record.get("share")
+    support = record.get("support")
+    table = record.get("source_table") or ""
+    parts = []
+    if isinstance(share, (int, float)):
+        parts.append(f"占比 {share:.1%}")
+    if isinstance(support, (int, float)):
+        parts.append(f"n={int(support)}")
+    if table:
+        parts.append(str(table))
+    return "全表统计：" + "，".join(parts) if parts else "全表统计默认值"
+
+
+def render_parameter_inputs(
+    parameters: List[Dict[str, Any]],
+    scope_key: str,
+    recipe: Dict[str, Any] | None = None,
+    target_col: str = "",
+) -> Tuple[pd.DataFrame, List[str]]:
     if not parameters:
         st.info("当前性能项还没有配置输入参数。请先在管理页面设置参数。")
         return pd.DataFrame([{}]), ["未配置参数"]
@@ -1657,11 +2167,27 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str, re
             display_label = f"{label}{unit_suffix}" if not label.endswith(")") else label
 
             recipe_value = _recipe_value_for_field(field, recipe) if recipe is not None else None
+            # 配方库优先；无配方时用全表统计默认值预填（仅 manual_input 分区）
+            default_record = None
+            if recipe_value is None:
+                default_record = _portal_default_for_field(field, target_col=target_col)
+            portal_default = _portal_default_display_value(default_record)
+            effective_default = recipe_value if recipe_value is not None else portal_default
+            if effective_default is not None:
+                field.setdefault("_autofill", []).append({
+                    "feature": field["name"],
+                    "value": effective_default,
+                    "origin": "recipe" if recipe_value is not None else "default",
+                    "detail": (
+                        "配方库预填" if recipe_value is not None
+                        else _portal_default_audit_detail(default_record)
+                    ),
+                })
 
             with columns[index % 2]:
                 if kind == "number":
-                    if recipe_value is not None:
-                        st.session_state[f"{key_base}_number"] = default_number(recipe_value, 0.0)
+                    if effective_default is not None:
+                        st.session_state[f"{key_base}_number"] = default_number(effective_default, 0.0)
                         value = st.number_input(
                             display_label,
                             key=f"{key_base}_number",
@@ -1677,8 +2203,8 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str, re
                             format="%.4f",
                         )
                 elif kind == "integer":
-                    if recipe_value is not None:
-                        st.session_state[f"{key_base}_integer"] = default_integer(recipe_value, 0)
+                    if effective_default is not None:
+                        st.session_state[f"{key_base}_integer"] = default_integer(effective_default, 0)
                         value = st.number_input(
                             display_label,
                             key=f"{key_base}_integer",
@@ -1696,11 +2222,17 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str, re
                     value = None if value is None else int(value)
                 elif kind == "select":
                     options = parse_options(field.get("options"))
-                    default_value = str(field.get("default", "") or "")
+                    default_value = str(
+                        effective_default if effective_default is not None
+                        else field.get("default", "") or ""
+                    )
                     if not options:
                         options = [""]
                     elif not default_value:
                         options = [""] + options
+                    if default_value and default_value not in options:
+                        # 统计默认值可能不在契约枚举内（如 DMA 未列入 options）→ 补入并置于首位
+                        options = [default_value] + options
                     default_index = options.index(default_value) if default_value in options else 0
                     value = st.selectbox(
                         display_label,
@@ -1709,8 +2241,8 @@ def render_parameter_inputs(parameters: List[Dict[str, Any]], scope_key: str, re
                         key=f"{key_base}_select",
                         help=field.get("help") or None,
                     )
-                elif recipe_value is not None:
-                    st.session_state[f"{key_base}_text"] = _recipe_display_value(recipe_value)
+                elif effective_default is not None:
+                    st.session_state[f"{key_base}_text"] = _recipe_display_value(effective_default)
                     value = st.text_input(
                         display_label,
                         key=f"{key_base}_text",
@@ -2036,39 +2568,94 @@ def render_user_page(config: Dict[str, Any]) -> None:
         # 输入分区：必填人工 / 可选人工 / 分子结构 / 系统计算，全部由当前 contract 驱动。
         partition_plan = build_input_partition_plan(selected_contract)
         all_input_fields: List[Dict[str, Any]] = []
+
+        # 分子/结构输入块（workflow source）：不属于 5 个可编辑分区，
+        # 它是 workflow 的原始输入（SMILES），单独置于配方区之前。
+        if workflow_fields:
+            st.markdown("#### 分子结构输入")
+            st.caption("树脂/固化剂 SMILES 等原始结构；由当前模型 workflow 消费。")
+            source_df, source_errors = render_parameter_inputs(
+                workflow_fields,
+                f"manual_{selected_material}_{selected_target}_molecular",
+                recipe=active_recipe,
+            )
+
         for section in partition_plan:
-            st.markdown(f"#### {section['title']}")
-            st.caption(section["description"])
-            if section["kind"] == "workflow_source":
-                if workflow_fields:
-                    section_df, section_errors = render_parameter_inputs(
-                        workflow_fields, f"manual_{selected_material}_{selected_target}_molecular", recipe=active_recipe
+            # ① 配方 / ② 固化制度 / ③ 高级测试条件：可编辑
+            # ③ 默认折叠（已按全表统计预填，不修改也能预测）
+            # ④⑤ 只读展示
+            if section["kind"] == "display":
+                st.markdown(f"#### {section['title']}")
+                st.caption(section["description"])
+                if section["features"]:
+                    st.info(
+                        "系统将自动计算："
+                        + "、".join(section["features"][:12])
+                        + ("…" if len(section["features"]) > 12 else "")
                     )
                 else:
-                    section_df, section_errors = pd.DataFrame([{}]), []
-                    st.info("当前模型契约未声明分子/结构源字段。")
-            elif section["kind"] == "display":
-                if section["features"]:
-                    st.info("系统将自动计算：" + "、".join(section["features"][:12]) + ("…" if len(section["features"]) > 12 else ""))
-                else:
                     st.caption("该模型契约未声明此分区。")
-                section_df, section_errors = pd.DataFrame([{}]), []
-            elif section["features"]:
-                section_input_fields = [field for field in manual_fields if field["name"] in section["features"]]
+                all_input_fields.append(pd.DataFrame([{}]))
+                continue
+
+            section_input_fields = [
+                field for field in manual_fields if field["name"] in section["features"]
+            ]
+            collapsed = section["group"] == "test_conditions"
+            container = (
+                st.expander(f"{section['title']}（已预填，可展开修改）", expanded=False)
+                if collapsed
+                else st.container()
+            )
+            with container:
+                st.markdown(f"#### {section['title']}") if not collapsed else None
+                st.caption(section["description"])
                 if section_input_fields:
                     section_df, section_errors = render_parameter_inputs(
-                        section_input_fields, f"manual_{selected_material}_{selected_target}_{section['group']}", recipe=active_recipe
+                        section_input_fields,
+                        f"manual_{selected_material}_{selected_target}_{section['group']}",
+                        recipe=active_recipe,
+                        target_col=selected_target,
                     )
                 else:
                     section_df, section_errors = pd.DataFrame([{}]), []
                     st.caption("当前模型契约未声明此分区的可输入字段。")
-            else:
-                section_df, section_errors = pd.DataFrame([{}]), []
-                st.caption("当前模型契约未声明此分区。")
             all_input_fields.append(section_df)
             if section_errors:
                 for err in section_errors:
                     st.warning(err)
+
+        # 「已自动填充 N 项」明细条：让用户看得见、可追溯系统代填了什么
+        autofill_entries: List[Dict[str, Any]] = []
+        for field in manual_fields:
+            autofill_entries.extend(field.get("_autofill") or [])
+        if workflow_fields:
+            source_df, source_errors = render_parameter_inputs(
+                workflow_fields,
+                f"manual_{selected_material}_{selected_target}_molecular",
+                recipe=active_recipe,
+            )
+            all_input_fields.append(source_df)
+            for err in source_errors:
+                st.warning(err)
+        autofill_summary = build_autofilled_summary(autofill_entries)
+        if autofill_summary["count"]:
+            with st.expander(f"📋 {autofill_summary['title']}（点击查看依据）", expanded=False):
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "字段": row["feature"],
+                                "取值": row["value"],
+                                "来源": "配方库" if row["origin"] == "recipe" else "全表统计",
+                                "依据": row["detail"],
+                            }
+                            for row in autofill_summary["rows"]
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
         # 合并各分区输入帧（dict 合并保持向后单行结构）
         merged_values: Dict[str, Any] = {}
         for frame in all_input_fields:

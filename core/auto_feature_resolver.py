@@ -531,6 +531,94 @@ def parse_fingerprint_feature(feature: str) -> Optional[Tuple[str, str, int]]:
     return m.group("prefix"), m.group("kind").upper(), int(m.group("idx"))
 
 
+# ---------------------------------------------------------------------------
+# 配方物理量特征识别（component_physics / enrich_narrow_table 的产物）
+# ---------------------------------------------------------------------------
+#: 这些特征训练时由 ``core.component_physics.enrich_narrow_table`` 生成：
+#: cp_* 配方级汇总、逐组分 *_mw_resolved / *_ew_resolved / *_f_network 等。
+#: 它们**不是**分子提取后端的产物——提取引擎（RDKit/Mordred/3D/环氧反应…）
+#: 永远产不出这些列名，对它们启动重后端纯属浪费
+#: （实测一轮全引擎扫描 >2 分钟且全部落空，还误导用户以为在“按工作流”计算）。
+_PHYSICS_UNSET: Any = object()
+
+_PHYSICS_FEATURE_EXACT = frozenset({
+    "formulation_resin_total_eew_g_eq",
+    "formulation_resin_eew_g_eq",
+    "formulation_hardener_total_ahew_g_eq",
+    "formulation_hardener_ahew_g_eq",
+    "formulation_r_value",
+    "formulation_resin_hardener_equivalent_ratio",
+    "curing_agent_active_hydrogen_total",
+    "resin_epoxy_group_total",
+    "curing_agent_equivalent_group_total",
+    "resin_equivalent_group_total",
+})
+
+_PHYSICS_FEATURE_RE = re.compile(
+    # 注意 cp_W_g_per_epoxy 含大写 W，cp_ 段必须允许大写字母
+    r"^(?:cp_[A-Za-z0-9_]+"
+    r"|(?:resin|curing_agent|small_additive)_\d+_(?:mw_resolved|ew_resolved|f_network|f_stoich"
+    r"|molecular_weight_g_mol|equivalent_weight_g_eq|epoxy_group_count"
+    r"|active_hydrogen_equivalent_count))$"
+)
+
+
+def is_physics_feature(feature: Any) -> bool:
+    """是否为配方物理量特征（component_physics/enrich_narrow_table 的产物）。
+
+    用途：① 这些特征不走分子提取后端（产不出列名，白跑）；② 走平台自己的
+    物理量引擎补齐（见 ``AutoFeatureResolver._physics_frames``）。
+    """
+    name = str(feature or "").strip()
+    if not name:
+        return False
+    if name in _PHYSICS_FEATURE_EXACT:
+        return True
+    return bool(_PHYSICS_FEATURE_RE.match(name))
+
+
+#: 模型契约里的特征名 → 物理量帧列名。与 enrich_narrow_table 的口径对齐：
+#: cp_eew 与原表 formulation_resin_total_eew_g_eq 在重叠样本上 100% 相同
+#: （component_physics 内有实证注释），cp_r_value 与 formulation_r_value 同理。
+_PHYSICS_ALIAS_EXACT: Dict[str, str] = {
+    "formulation_resin_total_eew_g_eq": "cp_eew",
+    "formulation_resin_eew_g_eq": "cp_eew",
+    "formulation_hardener_total_ahew_g_eq": "cp_ahew",
+    "formulation_hardener_ahew_g_eq": "cp_ahew",
+    "formulation_r_value": "cp_r_value",
+    "formulation_resin_hardener_equivalent_ratio": "cp_r_value",
+}
+
+_PHYSICS_COMPONENT_RE = re.compile(
+    r"^(?P<side>resin|curing_agent|small_additive)_(?P<idx>\d+)_(?P<kind>.+)$"
+)
+
+#: 逐组分宽表文献列 → 分层补齐列。mw_resolved/ew_resolved 已内嵌
+#: “L1 文献值 → L2 当量×官能度 → L3 结构直算”的信任层级；
+#: 树脂官能度=环氧基数、固化剂活泼氢当量数=化学计量官能度。
+_PHYSICS_KIND_MAP: Dict[str, str] = {
+    "molecular_weight_g_mol": "mw_resolved",
+    "equivalent_weight_g_eq": "ew_resolved",
+    "epoxy_group_count": "f_stoich",
+    "active_hydrogen_equivalent_count": "f_stoich",
+}
+
+
+def _physics_alias(feature: Any) -> Optional[str]:
+    """把模型契约里的物理量特征名映射到物理量帧里的列名；无映射返回 None。"""
+    name = str(feature or "").strip()
+    hit = _PHYSICS_ALIAS_EXACT.get(name)
+    if hit:
+        return hit
+    match = _PHYSICS_COMPONENT_RE.match(name)
+    if not match:
+        return None
+    kind = _PHYSICS_KIND_MAP.get(match.group("kind"))
+    if not kind:
+        return None
+    return f"{match.group('side')}_{match.group('idx')}_{kind}"
+
+
 def looks_molecular(feature: str) -> bool:
     """判断特征名是否可能由分子结构计算得到。
 
@@ -539,6 +627,11 @@ def looks_molecular(feature: str) -> bool:
     """
     key = normalize_name(feature)
     if not key:
+        return False
+    # 配方物理量（component_physics 分层补齐产物）：cp_* / 逐组分 *_resolved 等。
+    # 提取引擎永远产不出这些列名，对它们启动重后端纯属浪费
+    # （实测一轮全引擎扫描 >2 分钟且全部落空）。必须最先拦截。
+    if is_physics_feature(feature):
         return False
     # 先拦配方级聚合/工艺类：这些含 phr / component_count / equivalent_*_total
     # 等词，虽与化学沾边，但必须从配方表取，不能从单个分子算。
@@ -2007,9 +2100,41 @@ class AutoFeatureResolver:
                 sub_keys = self._row_fingerprint(result, usable)
                 fp_hits[tname] = [info["bucket"].get(k) for k in sub_keys]
 
+        # 配方物理量帧懒加载（component_physics）：首个物理量特征才计算，全批次复用
+        physics_frames: Any = _PHYSICS_UNSET
+
         for feature in required_features:
             if feature in already or feature in result.columns:
                 continue
+
+            # --- A0) 配方物理量（component_physics 分层补齐：文献值 → 当量×官能度 → 结构直算）---
+            #     训练时这些列由 enrich_narrow_table 生成，**不是**分子提取后端的产物；
+            #     步骤 D 的提取引擎永远产不出这些列名，对它们跑重后端纯属浪费
+            #     （实测一轮全引擎扫描 >2 分钟且全部落空）。
+            if is_physics_feature(feature):
+                if physics_frames is _PHYSICS_UNSET:
+                    physics_frames = self._physics_frames(result)
+                if physics_frames:
+                    comp_f, summary_f = physics_frames
+                    alias = _physics_alias(feature)
+                    src = None
+                    if feature in summary_f.columns:
+                        src = summary_f[feature]
+                    elif feature in comp_f.columns:
+                        src = comp_f[feature]
+                    elif alias is not None and alias in summary_f.columns:
+                        src = summary_f[alias]
+                    elif alias is not None and alias in comp_f.columns:
+                        src = comp_f[alias]
+                    if src is not None:
+                        series = pd.to_numeric(src, errors="coerce")
+                        if series.notna().any():
+                            result[feature] = series
+                            report["computed"][feature] = f"配方物理量（{alias or feature}）"
+                            report["columns_added"].append(feature)
+                            continue
+                # 物理量引擎算不出 → 落到后续步骤（总表查询等）；步骤 D 已用
+                # is_physics_feature 拦截，不会对它们启动提取引擎。
 
             # --- A) 配方级组合量 ---
             series = None
@@ -2090,7 +2215,8 @@ class AutoFeatureResolver:
                     continue
 
             # --- D) 提取引擎（仅对可能来自分子的特征，避免无谓重后端调用）---
-            if looks_molecular(feature):
+            #     配方物理量特征已在 A0 处理；重后端永远产不出这些列名，必须拦截。
+            if looks_molecular(feature) and not is_physics_feature(feature):
                 extracted = self._extract_feature(result, feature, struct_cols)
                 if extracted is not None and extracted.notna().any():
                     result[feature] = extracted
@@ -2102,6 +2228,43 @@ class AutoFeatureResolver:
 
         report["skipped_non_molecular"] = skipped_non_molecular
         return result, report
+
+    def _physics_frames(
+        self, df: pd.DataFrame
+    ) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
+        """一次算好配方物理量帧（逐组分明细 + 配方级汇总），供本批次所有特征复用。
+
+        与训练侧的 ``enrich_narrow_table`` 同口径（L1 文献值 → L2 当量×官能度 →
+        L3 结构直算），因此补齐得到的 cp_* / 逐组分 *_resolved 与训练时一致。
+        结构列缺失或计算失败时返回 None（调用方按未解析处理，不进重后端）。
+        """
+        has_structure_col = any(
+            re.search(r"(_|\.)(structure|smiles|bigsmiles)$", str(c).lower())
+            for c in df.columns
+        )
+        if not has_structure_col:
+            return None
+        try:
+            from .component_physics import (
+                compute_component_physics,
+                compute_formulation_summary,
+            )
+        except ImportError:  # pragma: no cover
+            try:
+                from component_physics import (
+                    compute_component_physics,
+                    compute_formulation_summary,
+                )
+            except ImportError:
+                return None
+        try:
+            comp = compute_component_physics(df)
+            summary = compute_formulation_summary(df, comp)
+            return comp, summary
+        except Exception as exc:
+            if self.verbose:
+                print(f"[配方物理量] 计算失败: {exc}")
+            return None
 
     def _pick_lookup_column(
         self, feature: str, struct_cols: Sequence[str], df: pd.DataFrame
@@ -2344,6 +2507,7 @@ class AutoFeatureResolver:
         """不实际写入，先看每个特征能从哪来（供 UI 预览）。"""
         struct_cols = self.structure_columns or detect_structure_columns(df)
         rows: List[Dict[str, Any]] = []
+        diag_physics: Any = _PHYSICS_UNSET  # 配方物理量帧懒加载（同 resolve 的 A0）
         for feature in required_features:
             if feature in df.columns:
                 rows.append({"feature": feature, "source": "工作区已有列", "detail": feature, "available": True})
@@ -2379,8 +2543,32 @@ class AutoFeatureResolver:
             if hit:
                 continue
 
-            # 重后端探测
-            for col in ordered:
+            # 配方物理量：平台物理量引擎可算（component_physics 分层补齐）；
+            # 重后端永远产不出这些列名，无论成败都不探测。
+            if is_physics_feature(feature):
+                if diag_physics is _PHYSICS_UNSET:
+                    diag_physics = self._physics_frames(probe_df)
+                if diag_physics:
+                    _c, _s = diag_physics
+                    _alias = _physics_alias(feature)
+                    _src = None
+                    if feature in _s.columns:
+                        _src = _s[feature]
+                    elif feature in _c.columns:
+                        _src = _c[feature]
+                    elif _alias is not None and _alias in _s.columns:
+                        _src = _s[_alias]
+                    elif _alias is not None and _alias in _c.columns:
+                        _src = _c[_alias]
+                    if _src is not None and pd.to_numeric(_src, errors="coerce").notna().any():
+                        rows.append({"feature": feature, "source": "配方物理量",
+                                     "detail": "component_physics 分层补齐", "available": True})
+                        hit = True
+            if hit:
+                continue
+
+            # 重后端探测（配方物理量特征除外——提取引擎永远产不出这些列名）
+            for col in ([] if is_physics_feature(feature) else ordered):
                 if col not in probe_df.columns:
                     continue
                 try:

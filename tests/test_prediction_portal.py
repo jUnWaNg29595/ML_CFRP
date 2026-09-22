@@ -147,7 +147,54 @@ def test_publication_rejects_missing_molecular_workflow_for_molecular_sources():
     assert any("workflow" in error.lower() for error in report["errors"])
 
 
-def test_publication_rejects_workflow_feature_gap_before_activation():
+def test_publication_accepts_workflow_superset_and_runtime_enforces_missing_features():
+    """workflow 多产出契约未声明特征时放行；缺失的非 workflow 特征由运行时拦截。
+
+    原测试名 test_publication_rejects_workflow_feature_outside_contract_and_audit
+    断言「契约完全未知的特征必须被拒绝」。该策略已根据实测修正（见 spec §4.1.1）：
+    ``core/portal_prediction`` 会 ``reindex(columns=contract['feature_cols'])``
+    把 workflow 的多余产出安全丢弃，因此不应用发布门禁阻断。
+
+    实测背景：TabPFN artifact 的 workflow 有 2131 个特征名，contract 只有 2070 个，
+    多出的 115 个 xtb/ff 描述符既不在 effective 也不在 removed 中，但不影响预测。
+    """
+    artifact = {
+        "model": _NamedModel(),
+        "pipeline": None,
+        "feature_cols": ["resin_xtb_gap", "curing_agent_xtb_gap"],
+        "target_col": "Tg",
+        "extra": {
+            "molecular_feature_workflow": {
+                "schema_version": 3,
+                "workflow_hash": "workflow-123",
+                "steps": [],
+                "merge_order": [],
+                "final_feature_names": ["resin_xtb_gap", "totally_unknown_gap"],
+            }
+        },
+    }
+    contract = _molecular_contract(
+        feature_cols=["resin_xtb_gap", "curing_agent_xtb_gap"],
+    )
+
+    report = validate_publication_artifact(artifact, contract)
+
+    assert not any(
+        "final_feature_names" in error for error in report["errors"]
+    ), report["errors"]
+
+    # 运行时仍强制要求补齐缺失的非 workflow 特征
+    from core.portal_prediction import _explicit_model_feature_names
+
+    explicit = _explicit_model_feature_names(
+        contract=contract,
+        workflow=artifact["extra"]["molecular_feature_workflow"],
+    )
+    assert "curing_agent_xtb_gap" in explicit
+
+
+def test_publication_accepts_workflow_subset_but_runtime_still_requires_missing_features():
+    """workflow 是子集时发布门禁放行，但缺失特征仍由运行时强制（非静默丢失）。"""
     artifact = {
         "model": _NamedModel(),
         "pipeline": None,
@@ -169,9 +216,19 @@ def test_publication_rejects_workflow_feature_gap_before_activation():
 
     report = validate_publication_artifact(artifact, contract)
 
-    assert report["ok"] is False
-    assert any("final_feature_names" in error for error in report["errors"])
-    assert any("curing_agent_xtb_gap" in error for error in report["errors"])
+    # 发布门禁不再因 workflow 缺少 curing_agent_xtb_gap 而阻断
+    assert not any(
+        "final_feature_names" in error for error in report["errors"]
+    ), report["errors"]
+
+    # 但运行时仍强制要求补齐：缺失即抛错，不存在静默丢特征
+    from core.portal_prediction import _explicit_model_feature_names
+
+    explicit = _explicit_model_feature_names(
+        contract=contract,
+        workflow=artifact["extra"]["molecular_feature_workflow"],
+    )
+    assert "curing_agent_xtb_gap" in explicit
 
 
 def test_legacy_artifact_needs_validation_and_is_not_publishable():

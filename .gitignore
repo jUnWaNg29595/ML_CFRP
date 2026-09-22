@@ -95,3 +95,10 @@ tmp*.py
 
 # bigsmiles_ui 生成资源
 bigsmiles_ui/bigsmiles_ui/generated/
+
+# 门户输入默认值：离线统计产物，是默认值的审计依据，必须随代码版本化提交
+# （由 scripts/build_portal_input_defaults.py 生成，不含敏感数据）
+!prediction_portal/portal_input_defaults.json
+
+# 门户模型管理审计日志：运行时产物，随本地操作不断追加，不纳入版本控制
+prediction_portal/model_management_audit.jsonl

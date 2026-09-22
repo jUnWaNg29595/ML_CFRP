@@ -12,6 +12,7 @@ Format:
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import contextlib
 import io
 import time
 
@@ -135,13 +136,209 @@ def dumps_artifact(artifact: Dict[str, Any], *, compress: int = 3) -> bytes:
     return buf.getvalue()
 
 
+def _cuda_device_usable(index: int) -> bool:
+    """判断 ``cuda:{index}`` 在当前机器是否可用。"""
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available()) and 0 <= index < int(torch.cuda.device_count())
+    except Exception:  # pragma: no cover - torch 为可选依赖
+        return False
+
+
+def _portable_map_location(storage, location):
+    """torch.load 的 map_location 钩子：设备存在则原地恢复，不存在才留在 CPU。
+
+    这是本函数与“一律 map to cpu”的关键区别：
+
+    - 模型保存时权重在 ``cuda:0``，且当前机器有该设备 → 权重回 ``cuda:0``。
+      这一点至关重要：模型 pickle 里通常还保存着 ``self.device = 'cuda:0'``
+      这样的**普通字符串属性**（map_location 改不了它）。若把权重强制改到 CPU，
+      而 forward 里 ``x.to(self.device)`` 仍把输入搬到 ``cuda:0``，就会报
+      ``Expected all tensors to be on the same device, but found at least two
+      devices, cpu and cuda:0!``（实测自建 NN 模型踩中）。
+    - 模型保存在 ``cuda:1``，而当前机器只有 1 块 GPU → 返回原 storage
+      （torch 重建 storage 时先在 CPU 上分配，返回它即留在 CPU），
+      否则反序列化直接失败（用户实测报错）。
+
+    注意：可调用版 map_location 在 torch 的 legacy/zip 两条路径里都要求
+    **返回 storage 对象**（不是设备字符串）。进入本函数时 storage 已经在
+    CPU 上重建完毕，因此“留在 CPU”就是原样返回。
+    """
+    text = str(location or "").strip().lower()
+    if not text.startswith("cuda"):
+        return storage
+    raw = text.split(":", 1)[1] if ":" in text else "0"
+    try:
+        index = int(raw)
+    except (TypeError, ValueError):
+        index = 0
+    if not _cuda_device_usable(index):
+        return storage  # 已在 CPU：保持不变
+    try:
+        moved = storage.cuda(index)
+        return moved if moved is not None else storage
+    except Exception:  # pragma: no cover - 特殊 storage 类型不支持 .cuda()
+        return storage
+
+
+def _repair_stale_device_attributes(obj: Any, *, max_depth: int = 4) -> None:
+    """尽力修复“device 字符串属性指向不存在的 CUDA 设备”的模型。
+
+    背景：即使 tensor 被映射回 CPU，模型 pickle 里的 ``self.device = 'cuda:1'``
+    仍是不变的普通属性。若该设备在当前机器不存在，forward 会因设备不一致失败。
+
+    修复条件（全部满足才改，尽量保守）：
+    1. 对象是 ``torch.nn.Module``；
+    2. 它有名为 ``device`` 的字符串属性，形如 ``cuda:N`` 且该设备**不可用**；
+    3. 它的全部参数与 buffer 都已在 CPU 上。
+
+    只把属性改成 ``"cpu"``（这是唯一可行的目标设备）；不改动任何 tensor。
+    """
+    try:
+        import torch
+        import torch.nn as nn
+    except Exception:  # pragma: no cover
+        return
+    if not isinstance(obj, nn.Module):
+        return
+
+    device_attr = getattr(obj, "device", None)
+    if not (isinstance(device_attr, str) and device_attr.strip().lower().startswith("cuda")):
+        return
+    raw = device_attr.strip().lower().split(":", 1)[1] if ":" in device_attr else "0"
+    try:
+        index = int(raw)
+    except (TypeError, ValueError):
+        index = 0
+    if _cuda_device_usable(index):
+        return  # 设备可用，不动
+
+    tensors = list(obj.parameters(recurse=True)) + list(obj.buffers(recurse=True))
+    if tensors and all(t.device.type == "cpu" for t in tensors):
+        try:
+            obj.device = "cpu"
+        except Exception:  # pragma: no cover - 属性只读等罕见情况
+            return
+
+    if max_depth <= 0:
+        return
+    for child in obj.children():
+        _repair_stale_device_attributes(child, max_depth=max_depth - 1)
+
+
+def _repair_loaded_object_devices(obj: Any) -> None:
+    """遍历刚加载的 artifact，修复指向不存在 CUDA 设备的 ``device`` 属性。"""
+    try:
+        import torch.nn as nn
+    except Exception:  # pragma: no cover
+        return
+
+    seen = 0
+    limit = 512
+
+    def visit(node, depth):
+        nonlocal seen
+        if seen >= limit or depth > 3:
+            return
+        if isinstance(node, nn.Module):
+            seen += 1
+            _repair_stale_device_attributes(node, max_depth=3)
+            for child in node.children():
+                visit(child, depth + 1)
+            return
+        if isinstance(node, dict):
+            for value in list(node.values())[:64]:
+                visit(value, depth + 1)
+        elif isinstance(node, (list, tuple)):
+            for value in list(node)[:64]:
+                visit(value, depth + 1)
+
+    visit(obj, 0)
+
+
+@contextlib.contextmanager
+def _torch_portable_load():
+    """反序列化期间把 torch 的 storage 加载器改为“可迁移”的 map_location。
+
+    问题
+    ----
+    模型若在 ``cuda:1`` 上训练并保存，artifact 里 pickle 了绑定该设备的
+    tensor。在只有 1 块 GPU（或纯 CPU）的机器上反序列化时，PyTorch 的
+    ``torch.storage._load_from_bytes`` 内部调用
+    ``torch.load(io.BytesIO(b), weights_only=False)``，**未传 map_location**，
+    于是尝试在 cuda:1 上重建 storage 并报错：
+
+        Attempting to deserialize object on CUDA device 1 but
+        torch.cuda.device_count() is 1. Please use torch.load with
+        map_location to map your storages to an existing device.
+
+    为什么必须打补丁
+    ----------------
+    ``joblib.load`` 不接受 ``map_location`` 参数，而错误发生在它内部调用的
+    torch 反序列化钩子上，调用方无法直接传递。因此只能在反序列化期间把该钩子
+    替换为带 ``map_location`` 的实现。
+
+    ⚠️ 不能“一律映射到 CPU”（历史教训）
+    ----------------------------------
+    早期实现把所有 CUDA tensor 强制映射到 CPU，结果在**有 GPU 的机器**上引入了
+    新回归：模型 pickle 里的 ``self.device = 'cuda:0'`` 是普通字符串属性，
+    不会被映射；权重被改到 CPU 后，forward 里 ``x.to(self.device)`` 仍把输入
+    搬到 ``cuda:0``，报
+    ``Expected all tensors to be on the same device, but found at least two
+    devices, cpu and cuda:0!``。
+
+    因此现在用 :func:`_portable_map_location`（可调用版 map_location）：
+    **设备存在则原地恢复（行为与未修复时一致），设备不存在才落 CPU**。
+
+    影响面
+    ------
+    - 现有 GPU 上保存的模型：行为与修复前完全一致。
+    - 保存自不可用设备的模型：能加载，且 ``device`` 属性会被
+      :func:`_repair_loaded_object_devices` 同步修正为 cpu，避免 forward 报错。
+    - 纯 CPU artifact 行为完全不变。
+    - 补丁在 with 块结束时恢复，不污染全局 torch 状态。
+    - torch 未安装或钩子不存在时静默跳过（不影响非 torch 模型的加载）。
+    """
+    try:
+        import torch
+        import torch.storage as torch_storage
+    except Exception:  # pragma: no cover - torch 为可选依赖
+        yield
+        return
+
+    original = getattr(torch_storage, "_load_from_bytes", None)
+    if original is None:  # pragma: no cover - 旧版 torch 无此钩子
+        yield
+        return
+
+    def _load_from_bytes_portable(b):
+        return torch.load(
+            io.BytesIO(b), map_location=_portable_map_location, weights_only=False
+        )
+
+    torch_storage._load_from_bytes = _load_from_bytes_portable
+    try:
+        yield
+    finally:
+        torch_storage._load_from_bytes = original
+
+
 def loads_artifact(data: bytes) -> Dict[str, Any]:
-    """Load artifact dict from bytes."""
+    """Load artifact dict from bytes.
+
+    反序列化时可迁移处理 CUDA tensor：设备存在则原地恢复（与训练时一致），
+    设备不存在才落回 CPU，并同步修复指向不可用设备的 ``device`` 属性，
+    使在别的 GPU 拓扑（如 ``cuda:1``）上保存的模型也能在当前机器正常预测
+    （见 :func:`_torch_portable_load`）。
+    """
     if joblib is None:
         raise ImportError("joblib not available. Please install joblib (or scikit-learn).")
 
     buf = io.BytesIO(data)
-    obj = joblib.load(buf)
+    with _torch_portable_load():
+        obj = joblib.load(buf)
+    _repair_loaded_object_devices(obj)
 
     # Backward compatibility:
     # - if user uploads a raw pipeline/model pickled by joblib, wrap it

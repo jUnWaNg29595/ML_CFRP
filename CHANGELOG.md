@@ -8,6 +8,43 @@
 ## [Unreleased]
 
 ### 新增
+- 【材料预测平台：配方优先输入、内置条件默认值与模型上传门禁修复】（设计规范 `docs/superpowers/specs/2026-09-22-portal-formulation-first-input-design.md`）
+  - **痛点**：① 从训练平台下载的 `.joblib` 模型导入后**永远无法启用**；② 输入端要求手填 36 个字段，其中「测试标准/反应条件/测试条件」等**对应关系很难找**；③ AI 输入助手无缓存、不能多轮交流
+  - **门禁修复（`core/prediction_portal.py`）**：`workflow.final_feature_names` 由「必须与 `prediction_contract.feature_cols` **完全一致**」改为**基于 `contract ∪ removed` 的子集校验**。实测根因：真实 artifact 的 workflow 产出 253 个分子特征，contract 有 284 列（253 + 31 配方/工艺/测试），且 workflow 中有 **5 个特征已被训练侧 `feature_mask` 删除**（在 `feature_audit.removed_feature_cols` 中）→ 旧规则下双向不等，必然失败。已实测恒等式：`contract.feature_cols ∪ removed == canonical_feature_cols`（289 == 289）；契约声明 `workflow_feature_cols` 时额外校验分区归属
+  - **第二道门禁（`UserPrediction.py`）**：`_is_publishable_ui_model` 原先无条件要求 `schema_version == 2` + `registry_snapshot` + `approved` profile，导致 legacy(schema-1) 导入模型即使发布成功也**不会出现在预测页**。改为：v2 契约仍保持严格语义，legacy 模型跳过注册表快照校验，但 `gate_report.ok` / `publication_status=published` / `enabled=True` 三道硬条件**不放宽**
+  - **内置默认值**：新增 `scripts/build_portal_input_defaults.py`（离线统计）+ `prediction_portal/portal_input_defaults.json`（版本化审计产物）+ `core/portal_input_defaults.py`（读取层）。每条默认值带 `share`（占比）+ `support`（样本数）+ `source_table` 可审计依据；占比 < 0.30 不生成；哨兵值 `other`/`unknown` 计入分母但不得作为默认值。实测产出 31 个目标列 / 78 条测试条件默认值（`storage_modulus_25c_gpa` → DMA 0.856、1.0 Hz 0.826；`td5_c` → TGA 0.991 / N2 0.723）
+  - **硬约束**：默认值**只作用于 `manual_input` 分区**，`derived_workflow` / `molecular_workflow` 字段一律返回 `None`（它们必须由 workflow 真实计算，给默认值等同于伪造数据）
+  - **配方自动推导（`core/portal_formulation_inputs.py`）**：从 SMILES + phr 推出 EEW / AHEW / r / 组分计数 / 官能团汇总，让用户只需输入配方。核心公式 `r = (固化剂phr/AHEW)/(树脂phr/EEW)` —— 全表实测（n=3237）与 `formulation_r_value` 相关系数 **0.9749**、中位绝对误差 **0.00017**
+  - **输入端重构（`UserPrediction.py`）**：分区由「必填/可选/分子/计算」改为按用户心智模型的 5 区 —— ① 配方（必填）② 固化制度（默认预填）③ 高级测试条件（折叠、默认预填）④ 自动推导（只读）⑤ 系统计算（只读）；新增「已自动填充 N 项」明细条，逐字段展示取值与依据（全表占比/样本数/推导公式），避免黑箱填充
+  - **AI 优化**：新增 `core/portal_ai_cache.py`（文件型 LRU 缓存，键 = `sha256(service|model|prompt_kind|规范化输入)`，上限 500，不落 API key）+ `st.chat_message`/`st.chat_input` 多轮对话，每轮把**已确认字段**作为上下文传给 AI 以理解「温度改成 200 度」这类增量修正。约束未放松：AI 仍只能提取/整理，不得生成 EEW/AHEW/PHR/分子特征/工艺参数；结果仍须用户确认
+
+### 修复
+- 【模型启用失败：feature_mask 场景下 mask 前/后列数不一致】上传 TabPFN 模型时报
+  `导入模型缺少 prediction_contract 且自动构建契约失败：无法解析精确模型特征契约：模型公开了 1408 个特征名，但 n_features_in_ 为 2070。；模型要求 2070 个特征，但当前只能解析到 1408 个。`
+  - **根因**：该模型的 pipeline 为 `SimpleImputer(2070) → InfCleaner → FeatureMaskTransformer(2070→1408) → StandardScaler(1408) → TabPFNRegressor(1408)`。即 **pipeline 的输入契约是 mask 前的 2070 列**（mask 在 pipeline 内部执行），而 `model.feature_names_in_` 是 mask **之后**的 1408 个列名。`core/prediction_contract.py` 的解析器把两个不同口径直接对比，必然矛盾
+  - **附带发现**：解析器一旦发现 model 提供 `feature_names_in_`，就**完全跳过** `feature_mask` 分支；且候选列来源中**缺少 `feature_audit.canonical_feature_cols`**（mask 前的完整列清单）
+  - **修复（`core/prediction_contract.py`）**：① 新增 `_widen_columns_to_expected()`——当 pipeline 期望列数 > 模型公开列数且 artifact 带 `feature_mask` 时，用 mask 从更宽候选列还原出 mask 前的列清单（要求 mask 长度匹配、True 数匹配、且过滤后**逐列相等**，避免巧合匹配）；② `_source_candidates` 新增 `canonical_feature_cols` 作为最高优先候选；③ 新增 `_repair_columns_to_length()` 处理 canonical 多记录 1 列的场景（实测：canonical 为 2071 而 pipeline 期望 2070，冗余列为 `resin_3_molecular_weight_g_mol`，与 `core/external_feature_augmenter` 同思路）；④ 报告新增 `removed_features` 字段记录被 mask 剔除的列（不静默丢弃）
+  - **门禁同步（`core/prediction_portal.py`）**：① `build_prediction_contract` 不再因「解析结果 ≠ artifact.feature_cols」直接报「特征列顺序不一致」，而是识别 mask 还原场景；② 新增 `_widen_artifact_features_by_mask()`，发布门禁不再把 `artifact.feature_cols`（mask 后）与 `contract.feature_cols`（mask 前）判为不一致；③ workflow 多产出契约未声明的特征**不再阻断发布**——因为 `core/portal_prediction` 会执行 `features.reindex(columns=contract['feature_cols'])` 安全丢弃多余列（实测 TabPFN 的 workflow 有 2131 个特征名而 contract 只有 2070 个）。安全性仍由运行时保证：契约要求的非 workflow 特征由 `_merge_explicit_model_features` 强制补齐，缺一即抛错
+  - 新增 `tests/test_prediction_contract_feature_mask.py`（6 个测试）
+- 【模型预测失败：cpu 与 cuda:0 设备不一致（下一条修复的回归）】模型补齐数据页报
+  `【Tg.joblib】预测失败: Expected all tensors to be on the same device, but found at least two devices, cpu and cuda:0! (when checking argument for argument mat1 in method wrapper_CUDA_addmm)`
+  - **承认根因是下一条修复引入的回归**：下一条把**所有** CUDA tensor 一律映射到 CPU，但模型 pickle 里的 `self.device = 'cuda:0'` 是普通字符串属性（map_location 改不了它）。权重被改到 CPU 后，forward 里 `x.to(self.device)` 仍把输入搬到 `cuda:0` → 设备不一致。最小复现实验证实：同一模型修复前 forward 成功、修复后报错（与用户报错逐字吻合）
+  - **正确修法（`core/model_io.py`）**：改用**可调用版 `map_location`**（`_portable_map_location`）——目标设备在当前机器**可用**则 `storage.cuda(index)` 原地恢复（与训练时完全一致），**不可用**才留在 CPU。同时解决两个报错：cuda:0 模型不再被错误改设备；cuda:1 模型在单卡机仍可加载。注意可调用版必须返回 **storage 对象**而非设备字符串（torch legacy/zip 两条路径均如此）
+  - **配套修复**：新增 `_repair_loaded_object_devices()` —— 对指向**不可用** CUDA 设备的 `device` 字符串属性（常见自建 NN 写法 `self.device = 'cuda:N'`）同步修正为 `cpu`，条件保守（仅当对象是 nn.Module、属性名为 `device`、设备确实不存在、全部参数/buffer 已在 CPU），使降级模型 forward 不会设备不一致
+  - **实施中发现并修正的额外缺陷**：大编辑替换起点未含装饰器行，导致原本属于旧函数的 `@contextlib.contextmanager` 错误地装饰在 `_cuda_device_usable` 上，使其返回恒真的 GeneratorContextManager、"设备可用"判断永远为真——已删除并加测试锁定
+  - **重写 `tests/test_model_io_cuda_portability.py`（12 个测试）**：新增报错 2 的核心回归（cuda:0 模型保持原位且 forward 数值一致）、按设备逐一判断（cuda:0 不被 cuda:1 缺失牵连）、降级后 device 属性同步修复与端到端 forward、模型补齐路径（external_feature_augmenter → loads_artifact）验证
+- 【模型预览失败：CUDA 设备拓扑不兼容】上传在别的 GPU 拓扑上训练的模型时，UI 报
+  `Attempting to deserialize object on CUDA device 1 but torch.cuda.device_count() is 1. Please use torch.load with map_location...`
+  - **根因**：模型在 `cuda:1` 上训练并保存，artifact 里 pickle 了绑定该设备的 tensor。在只有 1 块 GPU（或纯 CPU）的机器上反序列化时，PyTorch 的 `torch.storage._load_from_bytes` 内部调用 `torch.load(io.BytesIO(b), weights_only=False)`，**未传 `map_location`**，于是尝试在 cuda:1 上重建 storage 并报错
+  - **为何不能简单传参**：`joblib.load` 不接受 `map_location`，而错误发生在它内部调用的 torch 反序列化钩子上，调用方无法直接传递
+  - **修复（`core/model_io.py`）**：新增 `_torch_cpu_map_location()` 上下文管理器，在反序列化期间把 `torch.storage._load_from_bytes` 临时替换为带 `map_location="cpu"` 的实现，让 CUDA tensor 落回 CPU（数值不变；预测时模型/管线自行决定设备）。补丁在 with 块结束时恢复，**不污染全局 torch 状态**；torch 未安装或钩子不存在时静默跳过
+  - 覆盖范围：所有 artifact 加载路径（`preview_artifact` / `portal_prediction` / `prediction_portal` / `training_runs` / `data_imputer` / `external_feature_augmenter`）均经 `load_model_artifact_bytes` → `loads_artifact`，一并修复
+  - 新增 `tests/test_model_io_cuda_portability.py`（7 个测试）：模拟单卡环境加载 cuda:1 保存的模型、数值一致性、CPU artifact 行为不变、补丁不泄漏
+- 【配方库固化制度静默丢阶段】`core/process_features.py::_schedule_pairs` 的正则要求温度是数字，**非数字温度被静默丢弃且不报错**：`'室温/24 h + 80 °C/2 h'` 只解析出 `[(80.0, 2.0)]`（26 h 误算为 2 h）。配方库第 5 条（DGEBF/IPDA）原含此表述 → 已改写为 `'25 °C/24 h + 80 °C/2 h'`；新增 `validate_recipe_schedule()` 与模块级 `_self_check_preset_recipe_schedules()` 自检，导入时即断言全部 8 条配方的阶段数与声明一致
+- 【`cp_r_value` 语义误用风险】`cp_r_value` 的兜底计算是 `ahew / eew`（**当量重比**），而 `formulation_r_value` 是**化学计量比 r**。实测两者与全表 `formulation_r_value` 的相关系数分别为 **-0.0886** 与 **0.9749**（DGEBA/DDS 100:33 时 cp_r_value≈0.365 vs 正确 r≈0.905）→ 在 `core/component_physics.py` 补充 docstring 语义警示（**仅注释，不改计算逻辑**），并在门户侧改用 `core/portal_formulation_inputs.py::derive_r_value()`
+- 【化学引擎对非法 SMILES 静默兜底】实测 `EpoxyMechanismEngine.calc_single_molecule_properties` 对非法 SMILES（如 `'this_is_not_a_smiles(((('`）**不抛错**，而返回伪造值（mw=360 / ew=180 / functionality=2）→ `core/portal_formulation_inputs.py` 先用 RDKit 校验语法，非法即抛 `FormulationInputError`
+
+### 新增
 - 【虚拟筛选：模型外部特征统一输入】高通量筛选页新增「🧩 自动取值 + 批量确认」填充策略（默认）：
   - **痛点**：筛选会消费模型的**全部**输入特征。分子特征能从候选 SMILES 算出，但**工艺/测试/配方特征**（`cure_*`/`post_cure_*`/`curing_pressure_mpa`/`tg_heating_rate_c_min` 等）无法从结构推导，必须在筛选前给定统一值——它们是**筛选的设计变量**。旧实现只有「训练集中位数 / 0 / 模板行」三种填充，等于**伪造工艺条件**（如 `Tg-XGBoost` 的 27 个工艺列在工作区里全部缺失）
   - **新面板 `_render_screening_uniform_inputs`**：① 自动从工作区取代表值（数值→中位数，类别→众数）② 用**一张 `st.data_editor` 表**让用户逐项确认/修改（三列：模型特征 / 值 / 来源，前两列只读）③ 留空 = 交给模型内置 imputer
@@ -15,6 +52,12 @@
   - 实测：`储能模量.joblib` 的 36 个非分子特征 → **29 个自动取值**（`process_max_temperature_c=140`、`formulation_resin_total_eew_g_eq=187.27` …）、7 个需手工；`Tg-XGBoost` 的 27 个工艺列工作区全无 → 全部列在表里等用户填
 
 ### 修复
+- 【模型补齐页对配方物理量特征误启动全提取引擎】「模型补齐数据」页第二次导入模型后，特征补齐不按工作流干活、全引擎空转数分钟：
+  - **根因**：dsc 系列模型的 44 个特征（`cp_*` / `*_mw_resolved` / `*_ew_resolved` / `*_f_network` / `*_epoxy_group_count` / `formulation_*` 等）训练时来自 `component_physics.enrich_narrow_table`，**不在 workflow 产物里**。workflow 回放后它们落到 `AutoFeatureResolver`，被 `looks_molecular` 误判为分子特征 → 步骤 D 启动全提取引擎按方法序逐个试探（RDKit→MACCS→Morgan→FGD→环氧→Mordred→3D，实测一轮 >2 分钟），而提取引擎永远产不出这些列名，全部落空
+  - **修复（`core/auto_feature_resolver.py`）**：① 新增 `is_physics_feature` / `_physics_alias`，`looks_molecular` 对物理量特征返回 False；② `resolve()` 主循环新增 **A0 配方物理量步骤**——用平台自己的物理量引擎（`compute_component_physics` + `compute_formulation_summary`，与训练侧 `enrich_narrow_table` 同口径：L1 文献值 → L2 当量×官能度 → L3 结构直算）补齐，别名映射 `formulation_resin_total_eew_g_eq→cp_eew`、`{side}_{i}_molecular_weight_g_mol→{side}_{i}_mw_resolved`、`resin_{i}_epoxy_group_count→f_stoich` 等；③ 步骤 D（重后端）显式拦截物理量特征（双保险）；④ `diagnose()` 重后端探测同步拦截并支持物理量可用性探测
+  - **踩坑**：`cp_W_g_per_epoxy` 的 W 是大写，初版正则 `cp_[a-z0-9_]+` 漏识别 → 该列被轻量路径错算成环氧数 2.0（应为 ~184.6）；已改为 `cp_[A-Za-z0-9_]+` 并加回归断言
+  - **实测**（dsc放热峰，515 个特征）：workflow 回放 0.4s → resolver 0.1s，**重后端零调用**（修复前 >2 分钟全引擎扫描）；35 个物理量特征全部由「配方物理量」路径填充且数值正确（DGEBA EEW=170.21、MW=340.42、DDM f=4）
+  - 新增回归测试 `tests/test_physics_feature_resolution.py`（6 项：特征识别/分类/别名映射/端到端补齐零重后端/无结构列优雅降级）
 - 【workflow 回放裁剪失效】`_prune_workflow_to_needed_steps` 不再按模型真实需求裁剪，导致全量执行无用步骤：
   - **根因**：旧逻辑只认 `step.feature_names`，但平台导出的 workflow **步骤里没有这个字段**（只有 `prefix`/`source_columns`/`params`）→ `names` 恒为空 → `not names` 为真 → **全部保留**
   - **改用 `workflow.feature_source_map`**（`{特征名: step_id}`，导出时生成，最权威）：直接知道每个特征是哪步算的

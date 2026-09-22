@@ -24,7 +24,7 @@ from collections import Counter, defaultdict
 from joblib import Parallel, delayed
 import multiprocessing
 from .model_interpreter import (
-    compute_xgboost_native_shap,
+    EnhancedModelInterpreter,
     resolve_feature_names_for_matrix,
     _is_placeholder_feature_name,
 )
@@ -3065,7 +3065,7 @@ def render_feature_selector():
                             max_value=512,
                             value=min(64, 512),
                             step=8,
-                            help="512核服务器建议使用64-128核进行并行计算"
+                            help="控制模型预测（BLAS/OpenMP）使用的 CPU 线程数。SHAP 本身单线程持有解释器以避免状态竞争"
                         )
 
                     if st.button("🚀 计算SHAP重要性", key="btn_compute_shap"):
@@ -3107,13 +3107,21 @@ def render_feature_selector():
                                     # 禁用transformers检查
                                     shap.utils.transformers.is_transformers_lm = lambda x: False
 
-                                from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-                                import multiprocessing as mp
-
-                                # [修复] X_test 可能是 ndarray（如 GNN/PINN/导入模型路径），
-                                # 旧代码直接调用 X_test.sample(...)/X_sample.iloc[...] 会抛
-                                # AttributeError: 'numpy.ndarray' object has no attribute 'iloc'。
-                                # 这里统一规范为 DataFrame，并对齐真实特征名与训练期特征掩码。
+                                # [修复] 不再手写「多线程分批 + 共享 KernelExplainer」：
+                                # shap 的 KernelExplainer 把 nsamplesAdded / maskMatrix / synth_data
+                                # 全部放在实例上，explain() 每次调用都会重置它们。多线程共享同一
+                                # 实例会互相覆盖计数器，导致
+                                #   IndexError: index N is out of bounds for axis 0 with size N
+                                # （N = 2*特征数 + 2048，即 shap 的 nsamples='auto'）。
+                                # 另外 M 较大时单个 explainer 的 synth_data ≈ nsamples×背景数×M，
+                                # 多线程各持一份会直接吃光内存。
+                                #
+                                # 统一改用 EnhancedModelInterpreter，它内部按模型类型分派：
+                                #   - 树模型   → TreeExplainer / XGBoost 原生 pred_contribs
+                                #   - 线性模型 → LinearExplainer
+                                #   - 黑盒模型 → 跨样本批量置换 SHAP（比 KernelExplainer 快 1-2 个数量级）
+                                #   - 其余     → KernelExplainer（显式有界 nsamples + l1_reg='aic'）
+                                # 全程单线程持有 explainer，天然无竞争，内存可控。
                                 train_result = st.session_state.get('train_result') or {}
                                 if not isinstance(train_result, dict):
                                     train_result = {}
@@ -3124,100 +3132,73 @@ def render_feature_selector():
                                     train_result.get('feature_names'),
                                     st.session_state.get('feature_cols'),
                                 ]
+                                pipeline = st.session_state.get('pipeline')
                                 X_test_frame, resolved_names = _prepare_shap_feature_frame(
                                     X_test,
                                     model=model,
-                                    pipeline=st.session_state.get('pipeline'),
+                                    pipeline=pipeline,
                                     name_candidates=name_candidates,
                                     feature_mask=feature_mask,
                                 )
                                 X_train_frame, _ = _prepare_shap_feature_frame(
                                     X_train,
                                     model=model,
-                                    pipeline=st.session_state.get('pipeline'),
+                                    pipeline=pipeline,
                                     name_candidates=name_candidates,
                                     feature_mask=feature_mask,
                                     fallback_names=resolved_names,
                                 )
 
-                                # 采样数据（此时一定是 DataFrame）
-                                if len(X_test_frame) > max_samples:
-                                    X_sample = X_test_frame.sample(n=int(max_samples), random_state=42)
-                                else:
-                                    X_sample = X_test_frame.copy()
+                                if X_train_frame.shape[1] != X_test_frame.shape[1]:
+                                    raise ValueError(
+                                        f"训练/测试特征数不一致（{X_train_frame.shape[1]} vs "
+                                        f"{X_test_frame.shape[1]}），请重新训练模型后再计算 SHAP"
+                                    )
+
+                                y_train = st.session_state.get('y_train')
+                                y_test = st.session_state.get('y_test')
+                                if y_train is None:
+                                    y_train = np.zeros(len(X_train_frame), dtype=np.float64)
+                                if y_test is None:
+                                    y_test = np.zeros(len(X_test_frame), dtype=np.float64)
+
+                                n_features_total = int(X_test_frame.shape[1])
+                                # 解释预算：同时作为 KernelExplainer 的 nsamples 和
+                                # 批量置换的评估行数预算，随特征数增长但有硬上限。
+                                kernel_nsamples = int(min(2000, max(4 * n_features_total + 1, 400)))
+
+                                st.info(
+                                    f"🚀 解释器：{model_name} | 特征 {n_features_total} 个 | "
+                                    f"样本 {min(int(max_samples), len(X_test_frame))} 条 | "
+                                    f"CPU 线程 {int(n_jobs)}"
+                                )
+
+                                interpreter = EnhancedModelInterpreter(
+                                    model,
+                                    X_train_frame,
+                                    y_train,
+                                    X_test_frame,
+                                    y_test,
+                                    model_name,
+                                    feature_names=resolved_names,
+                                    max_samples=int(max_samples),
+                                    kernel_background=int(background_samples),
+                                    kernel_nsamples=kernel_nsamples,
+                                    scaler=st.session_state.get('scaler'),
+                                    pipeline=pipeline,
+                                    fallback_feature_names=train_result.get('feature_names'),
+                                )
+                                shap_values = interpreter.compute_shap_values()
+                                if shap_values is None:
+                                    raise RuntimeError(
+                                        f"解释器未能为 {model_name} 计算出 SHAP 值，"
+                                        f"请查看服务端日志中的详细报错"
+                                    )
+
+                                X_sample = interpreter._X_sample
+                                if X_sample is None:
+                                    raise RuntimeError("SHAP 计算未产生有效样本矩阵")
                                 X_sample = X_sample.reset_index(drop=True)
-
-                                st.info(f"🚀 使用 {int(n_jobs)} 个核心进行并行计算，样本数: {len(X_sample)}")
-
-                                # 根据模型类型选择Explainer
-                                tree_models = ['XGBoost', 'LightGBM', 'CatBoost', '随机森林', 'Extra Trees', '梯度提升树']
-
-                                if model_name in tree_models or hasattr(model, 'feature_importances_'):
-                                    st.info(f"✓ 检测到树模型，使用TreeExplainer（快速）")
-                                    try:
-                                        # 对于XGBoost，尝试多种方式
-                                        if model_name == 'XGBoost':
-                                            shap_values, X_sample, _ = compute_xgboost_native_shap(
-                                                model,
-                                                X_sample,
-                                                feature_names=list(X_sample.columns),
-                                            )
-                                            st.info("⚡ 使用 XGBoost 原生 pred_contribs 计算 SHAP...")
-                                        else:
-                                            explainer = shap.TreeExplainer(model, feature_names=list(X_sample.columns))
-
-                                            # TreeExplainer支持批量计算，直接计算所有样本
-                                            st.info("⚡ TreeExplainer支持高效批量计算...")
-                                            # 禁用SHAP内部进度条，避免与Streamlit冲突
-                                            shap_values = explainer.shap_values(X_sample, check_additivity=False)
-
-                                    except Exception as tree_err:
-                                        st.warning(f"TreeExplainer失败: {str(tree_err)[:100]}")
-                                        st.info("尝试使用KernelExplainer作为备选...")
-                                        background = shap.sample(X_train_frame, min(100, len(X_train_frame)))
-                                        explainer = shap.KernelExplainer(model.predict, background)
-
-                                        # KernelExplainer使用并行计算
-                                        st.info(f"⚡ 使用 {int(n_jobs)} 核并行计算KernelExplainer...")
-
-                                        # 分批并行计算
-                                        batch_size = max(1, len(X_sample) // int(n_jobs))
-                                        batches = [X_sample.iloc[i:i+batch_size] for i in range(0, len(X_sample), batch_size)]
-
-                                        def compute_batch_shap(batch):
-                                            # 禁用SHAP内部进度条，避免与Streamlit冲突
-                                            return explainer.shap_values(batch, silent=True)
-
-                                        with ThreadPoolExecutor(max_workers=int(n_jobs)) as executor:
-                                            batch_results = list(executor.map(compute_batch_shap, batches))
-
-                                        shap_values = np.vstack([_normalize_shap_values(r) for r in batch_results])
-
-                                elif model_name in ['线性回归', 'Ridge回归', 'Lasso回归', 'ElasticNet']:
-                                    st.info(f"✓ 检测到线性模型，使用LinearExplainer")
-                                    background = shap.sample(X_train_frame, min(200, len(X_train_frame)))
-                                    explainer = shap.LinearExplainer(model, background)
-                                    # 禁用SHAP内部进度条，避免与Streamlit冲突
-                                    shap_values = explainer.shap_values(X_sample)
-
-                                else:
-                                    st.info(f"✓ 使用KernelExplainer（较慢，适用于任意模型）")
-                                    background = shap.sample(X_train_frame, int(background_samples))
-                                    explainer = shap.KernelExplainer(model.predict, background)
-
-                                    # KernelExplainer并行计算
-                                    st.info(f"⚡ 使用 {int(n_jobs)} 核并行计算...")
-                                    batch_size = max(1, len(X_sample) // int(n_jobs))
-                                    batches = [X_sample.iloc[i:i+batch_size] for i in range(0, len(X_sample), batch_size)]
-
-                                    def compute_batch_shap(batch):
-                                        # 禁用SHAP内部进度条，避免与Streamlit冲突
-                                        return explainer.shap_values(batch, silent=True)
-
-                                    with ThreadPoolExecutor(max_workers=int(n_jobs)) as executor:
-                                        batch_results = list(executor.map(compute_batch_shap, batches))
-
-                                    shap_values = np.vstack([_normalize_shap_values(r) for r in batch_results])
 
                                 # 统一 SHAP 输出形状（兼容 shap.Explanation / 多输出 / 3D）
                                 shap_values = _normalize_shap_values(shap_values)
@@ -3225,12 +3206,10 @@ def render_feature_selector():
                                 # 计算平均绝对SHAP值作为重要性
                                 mean_abs_shap = np.abs(shap_values).mean(axis=0)
 
-                                # 获取特征名（优先已解析出的真实名，避免错误长度列表）
-                                feature_names = list(X_sample.columns)
+                                # 特征名与 SHAP 列数对齐（解释器已解析出真实名）
+                                feature_names = list(interpreter.feature_names)
                                 if len(feature_names) != len(mean_abs_shap):
-                                    feature_names = resolved_names if resolved_names else None
-                                    if feature_names is None or len(feature_names) != len(mean_abs_shap):
-                                        feature_names = [f"Feature_{i}" for i in range(len(mean_abs_shap))]
+                                    feature_names = [f"Feature_{i}" for i in range(len(mean_abs_shap))]
 
                                 # 创建重要性DataFrame
                                 shap_imp_df = pd.DataFrame({

@@ -695,6 +695,21 @@ def compute_formulation_summary(
             v = v.where(np.isfinite(v) & (v > 0))
             r_val = r_val.fillna(v)
     # 当量比推算兜底
+    #
+    # ⚠️⚠️ 语义警示（请勿在别处复用本兜底口径）⚠️⚠️
+    # 下面的 derived = ahew / eew 是**当量重比**，不是环氧/固化剂**化学计量比 r**。
+    # 两者数值与含义均不同，**不可互换**：
+    #   - 正确 r = (固化剂phr / AHEW) / (树脂phr / EEW)
+    #   - 本兜底  = AHEW / EEW
+    # 实测（ml_qspr_selected.csv, n=3237）：
+    #   - 正确公式与全表 formulation_r_value 相关系数 0.9749，中位绝对误差 0.00017
+    #   - 本兜底口径与全表 formulation_r_value 相关系数仅 -0.0886
+    # 具体例：DGEBA/DDS 100:33 时正确 r≈0.905，而本兜底≈0.365。
+    #
+    # 因此：**禁止**用 cp_r_value 填充 formulation_r_value。
+    # 门户侧请用 core/portal_formulation_inputs.py 的 derive_r_value()。
+    # 本兜底仅在原表 r 列全缺失时作为内部临时估值使用（受下方 clip 约束），
+    # 且已有 cp_r_value 与 formulation_r_value 去重逻辑（见本文件末尾）。
     derived = ahew / eew
     derived = derived.where(np.isfinite(derived) & (derived > 0))
     r_val = r_val.fillna(derived).clip(0.05, 20.0)
