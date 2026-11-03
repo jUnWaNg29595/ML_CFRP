@@ -11,8 +11,11 @@ import numpy as np
 import streamlit as st
 from typing import Optional, Tuple, List, Dict, Any
 
-from core.formulation_fusion import FormulationFusionEngine
-
+from core.formulation_fusion import (
+    FormulationFusionEngine,
+    get_candidate_dataset_dirs,
+    get_default_dataset_dir,
+)
 
 def _file_signature(path: str) -> tuple:
     """文件指纹（路径 + mtime + 大小）。文件被改写后指纹变化，缓存自动失效。"""
@@ -43,7 +46,7 @@ def read_csv_cached(path: str) -> pd.DataFrame:
 @st.fragment
 def render_formulation_fusion_ui(
     standalone: bool = True,
-    default_dir: str = r"C:\Users\wangj\Desktop\ml_dataset"
+    default_dir: Optional[str] = None
 ):
     """
     渲染跨表配方数据融合引擎 UI (已片段化 @st.fragment，交互与按钮不触发整页刷新)
@@ -62,28 +65,68 @@ def render_formulation_fusion_ui(
         st.markdown("### 🔗 跨表配方数据融合 (One-Click Fusion)")
         st.caption("自动关联母配方宽表 `ml_wide_samples.csv`，补充各组分精确配比、物理机理参数及固化工艺温度。")
 
+    if not default_dir:
+        default_dir = get_default_dataset_dir()
+
+    with st.expander("⚙️ 数据集路径配置（支持 WSL 与 Windows 共享路径）", expanded=False):
+        c_dir_in = st.text_input(
+            "数据集扫描根目录",
+            value=st.session_state.get("fusion_user_dataset_dir", default_dir or ""),
+            key="fusion_user_dataset_dir_input",
+            help="输入或修改数据集路径（例如 /home/wangj/project、/home/wangj/project/ml_dataset 或 \\\\wsl.localhost\\Ubuntu-24.04\\home\\wangj\\project）。系统会自动向下探测子文件夹中的 CSV 文件。"
+        )
+        if c_dir_in and c_dir_in.strip():
+            from core.formulation_fusion import normalize_cross_platform_path
+            norm_c = normalize_cross_platform_path(c_dir_in.strip())
+            default_dir = norm_c if (norm_c and os.path.exists(norm_c)) else c_dir_in.strip()
+            st.session_state["fusion_user_dataset_dir"] = default_dir
+
     engine = FormulationFusionEngine()
 
-    # 1. 扫描可用文件
-    scan_dirs = [default_dir, os.getcwd()]
-    candidate_narrow_files = []
-    candidate_wide_files = []
+    # 1. 扫描可用文件（多路径与跨平台探测）
+    scan_dirs = get_candidate_dataset_dirs(default_dir)
+    if default_dir and default_dir not in scan_dirs and os.path.exists(default_dir):
+        scan_dirs.insert(0, default_dir)
+    if os.getcwd() not in scan_dirs:
+        scan_dirs.append(os.getcwd())
+
+    # 扩展扫描：若候选目录下有 ml_dataset 子文件夹，也一并纳入扫描
+    extra_subdirs = []
+    for d in list(scan_dirs):
+        sub_mlds = os.path.join(d, "ml_dataset")
+        if os.path.exists(sub_mlds) and os.path.isdir(sub_mlds) and sub_mlds not in scan_dirs:
+            extra_subdirs.append(sub_mlds)
+    scan_dirs.extend(extra_subdirs)
+
+    candidate_narrow_files: List[str] = []
+    candidate_wide_files: List[str] = []
+    seen_narrow_basenames = set()
+    seen_wide_basenames = set()
 
     for s_dir in scan_dirs:
-        if os.path.exists(s_dir):
-            try:
-                for fname in os.listdir(s_dir):
-                    if fname.endswith(".csv"):
-                        fpath = os.path.join(s_dir, fname)
-                        if "wide" in fname.lower():
-                            if fpath not in candidate_wide_files:
-                                candidate_wide_files.append(fpath)
-                        elif "qspr_model" in fname.lower() or "performance" in fname.lower():
-                            # 过滤掉衍生生成的文件如 fused_*，保证输入窄表干净规范
-                            if fpath not in candidate_narrow_files and not fname.startswith("fused_"):
-                                candidate_narrow_files.append(fpath)
-            except Exception:
-                pass
+        if not os.path.exists(s_dir):
+            continue
+        try:
+            for fname in os.listdir(s_dir):
+                if not fname.lower().endswith(".csv"):
+                    continue
+                fpath = os.path.join(s_dir, fname)
+                fn_lower = fname.lower()
+                if "wide" in fn_lower:
+                    if fn_lower not in seen_wide_basenames:
+                        seen_wide_basenames.add(fn_lower)
+                        candidate_wide_files.append(fpath)
+                elif "qspr_model" in fn_lower or "performance" in fn_lower:
+                    # 过滤掉衍生文件与纯标准表（标准表由关联引擎专门读取）
+                    if (
+                        fn_lower not in seen_narrow_basenames
+                        and not fn_lower.startswith("fused_")
+                        and "standards" not in fn_lower
+                    ):
+                        seen_narrow_basenames.add(fn_lower)
+                        candidate_narrow_files.append(fpath)
+        except Exception:
+            pass
 
     # 智能排序：优先将核心 QSPR 模型文件置顶，首选 ml_qspr_model_tg_c.csv
     def sort_narrow_key(path_str):
@@ -98,7 +141,21 @@ def render_formulation_fusion_ui(
 
     candidate_narrow_files.sort(key=sort_narrow_key)
 
-    # 2. 表格选择区
+    # 格式化选项显示，当文件分布在多个目录时，附加目录名标识
+    def format_file_label(p: str) -> str:
+        bn = os.path.basename(p)
+        par = os.path.basename(os.path.dirname(os.path.abspath(p)))
+        if len(scan_dirs) > 1 and par:
+            return f"{bn}  [📁 {par}]"
+        return bn
+
+    # 状态提示条：展示已识别的目录和文件数
+    active_dirs_display = [d for d in scan_dirs if any(f.startswith(d) for f in candidate_narrow_files + candidate_wide_files)]
+    if active_dirs_display:
+        st.caption(
+            f"🔍 **已扫描数据集路径**: `{active_dirs_display[0]}` "
+            f"(检测到 **{len(candidate_narrow_files)}** 个性能窄表, **{len(candidate_wide_files)}** 个母宽表)"
+        )
     st.markdown("#### 📂 1. 选择待融合的数据表格")
     col_left, col_right = st.columns(2)
 
@@ -106,7 +163,7 @@ def render_formulation_fusion_ui(
         st.markdown("**🎯 目标性能窄表 (Narrow Table)**")
         narrow_source = st.radio(
             "数据来源",
-            ["从 ml_dataset 目录选择", "当前工作区数据", "手动上传 CSV"],
+            ["从数据集目录选择", "当前工作区数据", "手动上传 CSV"],
             horizontal=True,
             key="fusion_narrow_source_radio"
         )
@@ -114,7 +171,7 @@ def render_formulation_fusion_ui(
         df_narrow: Optional[pd.DataFrame] = None
         narrow_label = ""
 
-        if narrow_source == "从 ml_dataset 目录选择":
+        if narrow_source == "从数据集目录选择":
             if candidate_narrow_files:
                 # 默认优先选中 tg_c
                 default_idx = 0
@@ -126,7 +183,7 @@ def render_formulation_fusion_ui(
                     "选择目标性能文件",
                     candidate_narrow_files,
                     index=default_idx,
-                    format_func=lambda p: os.path.basename(p),
+                    format_func=format_file_label,
                     key="fusion_narrow_file_select"
                 )
                 if selected_narrow_path and os.path.exists(selected_narrow_path):
@@ -171,17 +228,29 @@ def render_formulation_fusion_ui(
         wide_label = ""
 
         if wide_source == "自动检测 / 推荐宽表":
-            default_wide = os.path.join(default_dir, "ml_wide_samples.csv")
-            if os.path.exists(default_wide):
-                if default_wide not in candidate_wide_files:
-                    candidate_wide_files.insert(0, default_wide)
+            # 优先查找已选窄表同级目录下的 ml_wide_samples.csv
+            pref_wide = None
+            if 'selected_narrow_path' in locals() and selected_narrow_path:
+                narrow_dir = os.path.dirname(os.path.abspath(selected_narrow_path))
+                w_candidate = os.path.join(narrow_dir, "ml_wide_samples.csv")
+                if os.path.exists(w_candidate):
+                    pref_wide = w_candidate
+            if not pref_wide and default_dir:
+                w_candidate = os.path.join(default_dir, "ml_wide_samples.csv")
+                if os.path.exists(w_candidate):
+                    pref_wide = w_candidate
 
+            if pref_wide and pref_wide not in candidate_wide_files:
+                candidate_wide_files.insert(0, pref_wide)
+            elif pref_wide and pref_wide in candidate_wide_files:
+                candidate_wide_files.remove(pref_wide)
+                candidate_wide_files.insert(0, pref_wide)
             if candidate_wide_files:
                 selected_wide_path = st.selectbox(
                     "选择配方母宽表",
                     candidate_wide_files,
                     index=0,
-                    format_func=lambda p: os.path.basename(p),
+                    format_func=format_file_label,
                     key="fusion_wide_file_select"
                 )
                 if selected_wide_path and os.path.exists(selected_wide_path):
@@ -223,16 +292,24 @@ def render_formulation_fusion_ui(
         col_c1, col_c2 = st.columns(2)
         with col_c1:
             curing_filter_choice = st.selectbox(
-                "固化体系筛选 (Curing Type Filter)",
+                "🎯 配方体系与固化剂分类提取 (Formulation System Filter)",
                 [
-                    "仅保留外加固化剂 (external_hardener) [推荐，约 6,474 样本]",
-                    "保留全部固化体系 (包含双固化、催化等全部样本)"
+                    "⭐ 仅提取【环氧+胺体系 (Epoxy-Amine)】[推荐，纯亲核开环，约 60-63% 样本]",
+                    "仅提取【环氧+酸酐体系 (Epoxy-Anhydride)】[酯化交联，约 15% 样本]",
+                    "保留常规外加固化剂 (external_hardener: 胺类 + 酸酐等，约 87% 样本)",
+                    "保留全部固化体系 (包含双固化、催化、自聚等全部样本)"
                 ],
                 index=0,
-                help="筛选常规外加固化剂（胺类、酸酐等），避免自固化或催化体系干扰；筛选后自动剔除单值冗余的 curing_type_standard 列。"
+                help="精准分类提取特定反应机理的配方体系。胺固化（活泼氢加成）与酸酐固化（酯化交联）机理及当量完全不同，分开提取建模可极大提升模型物理自洽性与预测精度。"
             )
-            curing_type_val = "external_hardener" if "external_hardener" in curing_filter_choice else None
-
+            if "环氧+胺" in curing_filter_choice or "Epoxy-Amine" in curing_filter_choice:
+                curing_type_val = "epoxy_amine"
+            elif "酸酐" in curing_filter_choice or "Anhydride" in curing_filter_choice:
+                curing_type_val = "epoxy_anhydride"
+            elif "external_hardener" in curing_filter_choice:
+                curing_type_val = "external_hardener"
+            else:
+                curing_type_val = None
         with col_c2:
             clean_mode_choice = st.selectbox(
                 "特征纯化清洗模式 (Feature Cleaning Mode)",
@@ -284,6 +361,30 @@ def render_formulation_fusion_ui(
                 help="若勾选，融合清洗后的 DataFrame 将直接同步至全局状态，可直接进入特征工程或模型训练。"
             )
 
+        # 配方体系分布速查
+        with st.expander("📊 查看母宽表现有配方体系类型分布 (System Distribution)", expanded=False):
+            try:
+                sys_dist = engine.get_formulation_system_distribution(df_wide)
+                col_d1, col_d2 = st.columns([1.2, 1.0])
+                with col_d1:
+                    st.dataframe(
+                        pd.DataFrame([
+                            {"配方体系类别": k, "样本数": v, "占比": f"{v/len(df_wide)*100:.1f}%"}
+                            for k, v in sys_dist.items()
+                        ]),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                with col_d2:
+                    st.caption(
+                        "💡 **数据分布解读**：\\n\\n"
+                        "• **环氧+胺体系**：占比最高（约 62%），涵盖 DDM、DDS、DETDA、TETA、Jeffamine 等核心芳香胺与脂肪胺/聚醚胺，亲核加成开环；\\n"
+                        "• **环氧+酸酐体系**：占比约 15%（MHHPA、NMA 等），酯化交联；\\n"
+                        "• **其他体系**：含自聚开环、咪唑催化、酚醛、硫醇等小众体系。\\n\\n"
+                        "👉 **建议**：当前若仅训练环氧+胺体系，选择第一项提取即可自动剥离酸酐及非胺类杂质体系！"
+                    )
+            except Exception as _dist_err:
+                st.caption(f"暂未统计分布: {_dist_err}")
         # 4. 执行按钮
         st.markdown("---")
         exec_clicked = st.button("🚀 执行一键跨表配方融合与特征纯化 (One-Click Fusion & Curation)", type="primary", use_container_width=True)
@@ -300,7 +401,19 @@ def render_formulation_fusion_ui(
 
                     # 可选：关联测试标准 (ASTM / ISO / GB / DIN / JIS)
                     if augment_standards:
-                        fused_df, std_meta = engine.augment_with_test_standards(fused_df)
+                        active_mlds_dir = (
+                            os.path.dirname(os.path.abspath(selected_narrow_path))
+                            if ('selected_narrow_path' in locals() and selected_narrow_path)
+                            else default_dir
+                        )
+                        engine.last_dataset_dir = active_mlds_dir
+                        std_path = engine._locate_dataset_file("ml_performance_standards.csv", custom_dir=active_mlds_dir)
+                        brg_path = engine._locate_dataset_file("ml_performance_all.csv", custom_dir=active_mlds_dir)
+                        fused_df, std_meta = engine.augment_with_test_standards(
+                            fused_df,
+                            standards_path=std_path,
+                            bridge_path=brg_path
+                        )
                         meta.update(std_meta)
 
                     # 执行特征纯化清洗
@@ -324,7 +437,8 @@ def render_formulation_fusion_ui(
                         st.session_state["processed_data"] = fused_clean_df
                         st.session_state["target_col"] = target_name
 
-                    curing_info = f"固化体系筛选: `{curing_type_val}` ({clean_stats.get('filtered_rows', len(fused_clean_df))} 样本)" if curing_type_val else "保留全部固化体系"
+                    curing_label = clean_stats.get("system_selected") or curing_type_val or "全部固化体系"
+                    curing_info = f"固化体系分类提取: `{curing_label}` ({clean_stats.get('filtered_rows', len(fused_clean_df))} 样本)" if curing_type_val else "保留全部固化体系"
                     r3_info = "已规范保留 resin_3 物理特征" if clean_stats.get("resin_3_included") else ""
 
                     if single_component_only:
@@ -415,15 +529,16 @@ def render_formulation_fusion_ui(
             )
 
         with col_b3:
-            # 快捷保存至 ml_dataset 目录
-            save_path_default = os.path.join(default_dir, clean_out_name)
-            if st.button("📁 直接保存至 ml_dataset 目录", use_container_width=True):
+            # 快捷保存至数据集目录
+            target_save_dir = default_dir if (default_dir and os.path.exists(default_dir)) else (scan_dirs[0] if scan_dirs else os.getcwd())
+            save_path_default = os.path.join(target_save_dir, clean_out_name)
+            save_btn_label = f"📁 直接保存至 {os.path.basename(target_save_dir) or '数据集'} 目录"
+            if st.button(save_btn_label, use_container_width=True):
                 try:
                     res_df.to_csv(save_path_default, index=False, encoding='utf-8-sig')
                     st.success(f"✅ 已保存至: `{save_path_default}`")
                 except Exception as e_save:
                     st.error(f"保存失败: {e_save}")
-
     # ν 嵌入模型训练区（两阶段 PINN · 阶段1）
     try:
         render_nu_encoder_ui(default_dir=default_dir)
@@ -432,7 +547,7 @@ def render_formulation_fusion_ui(
 
 
 @st.fragment
-def render_nu_encoder_ui(default_dir: str = r"C:\Users\wangj\Desktop\ml_dataset"):
+def render_nu_encoder_ui(default_dir: Optional[str] = None):
     """
     渲染交联密度 (ν) 嵌入模型训练 UI（两阶段 PINN · 阶段1）
     - 用实测 ν 数据一键训练专用编码器（含脏数据清理、留出评估）
@@ -445,6 +560,8 @@ def render_nu_encoder_ui(default_dir: str = r"C:\Users\wangj\Desktop\ml_dataset"
         "用实测交联密度训练专用编码器（自动清理脏数据），冻结后自动嵌入 PINN 作为物理基线——"
         "**训练与预测均无需手工输入 ν**。编码器激活后建议将 PINN 的 Physics Weight 调至 0.2~0.3。"
     )
+    if not default_dir:
+        default_dir = get_default_dataset_dir()
 
     from core.crosslink_nu_model import CrosslinkNuEncoder, default_encoder_path
 
@@ -464,12 +581,19 @@ def render_nu_encoder_ui(default_dir: str = r"C:\Users\wangj\Desktop\ml_dataset"
 
     # 数据源扫描（与融合引擎同目录逻辑）
     nu_files: list = []
-    for s_dir in dict.fromkeys([default_dir, os.getcwd()]):
+    nu_scan_dirs = get_candidate_dataset_dirs(default_dir)
+    if default_dir and default_dir not in nu_scan_dirs and os.path.exists(default_dir):
+        nu_scan_dirs.insert(0, default_dir)
+    if os.getcwd() not in nu_scan_dirs:
+        nu_scan_dirs.append(os.getcwd())
+    for s_dir in nu_scan_dirs:
         if os.path.exists(s_dir):
             try:
                 for fname in os.listdir(s_dir):
                     if fname.lower().endswith(".csv") and "crosslink_density" in fname.lower():
-                        nu_files.append(os.path.join(s_dir, fname))
+                        fpath = os.path.join(s_dir, fname)
+                        if fpath not in nu_files:
+                            nu_files.append(fpath)
             except Exception:
                 pass
     if not nu_files:

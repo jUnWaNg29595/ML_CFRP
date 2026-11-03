@@ -126,10 +126,47 @@ def create_model_artifact(
     return artifact
 
 
+def _sanitize_artifact_for_pickling(artifact: Any) -> Any:
+    """深度清洗待序列化字典中的不可 pickle 属性（如局部闭包函数 epoch_callback 等）。"""
+    if not isinstance(artifact, dict):
+        return artifact
+
+    model = artifact.get("model")
+    if model is not None and hasattr(model, "epoch_callback"):
+        try:
+            model.epoch_callback = None
+        except Exception:
+            pass
+
+    pipe = artifact.get("pipeline")
+    if pipe is not None and hasattr(pipe, "named_steps"):
+        for step_name, step_obj in pipe.named_steps.items():
+            if hasattr(step_obj, "epoch_callback"):
+                try:
+                    step_obj.epoch_callback = None
+                except Exception:
+                    pass
+
+    extra = artifact.get("extra")
+    if isinstance(extra, dict):
+        extra.pop("epoch_callback", None)
+
+    metadata = artifact.get("metadata")
+    if isinstance(metadata, dict):
+        params = metadata.get("params")
+        if isinstance(params, dict):
+            params.pop("epoch_callback", None)
+
+    return artifact
+
+
 def dumps_artifact(artifact: Dict[str, Any], *, compress: int = 3) -> bytes:
     """Serialize an artifact dict to bytes using joblib."""
     if joblib is None:
         raise ImportError("joblib not available. Please install joblib (or scikit-learn).")
+
+    # 全局安全清洗：清除模型或元数据中残留的局部闭包函数
+    _sanitize_artifact_for_pickling(artifact)
 
     buf = io.BytesIO()
     joblib.dump(artifact, buf, compress=compress)

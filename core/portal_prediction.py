@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import hashlib
+import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Mapping, Sequence
@@ -13,14 +15,23 @@ import numpy as np
 import pandas as pd
 
 from .model_io import load_model_artifact_bytes
-from .molecular_feature_workflow import execute_molecular_feature_workflow
+from .molecular_feature_workflow import (
+    execute_molecular_feature_workflow,
+    is_auxiliary_component_column,
+    materialize_workflow_source_columns,
+)
 from .prediction_contract import resolve_prediction_feature_contract
 from .prediction_molecular_baseline import (
     collect_workflow_source_columns,
     validate_single_row_source_values,
 )
-from .molecular_feature_workflow import materialize_workflow_source_columns
 from .prediction_portal import validate_publication_artifact
+
+#: 已发布 artifact 的进程内缓存（键 = 路径|artifact_hash|文件大小）。
+#: 上限故意很小：门户只服务当前启用的少量发布版本。
+_ARTIFACT_CACHE_LIMIT = 4
+_ARTIFACT_CACHE: dict[str, dict[str, Any]] = {}
+_ARTIFACT_CACHE_LOCK = threading.Lock()
 
 _CONFIRMATION_KEYS = ('confirmed_by_user', 'user_confirmed', 'confirmed')
 _REQUEST_KEYS = {
@@ -102,6 +113,21 @@ def _artifact_path(entry: Mapping[str, Any], config: Mapping[str, Any]) -> Path:
     return (roots[0] / path).resolve()
 
 
+def _artifact_cache_key(entry: Mapping[str, Any], path: Path) -> str | None:
+    """Return a stable identity for a published artifact file, or None.
+
+    用于进程内 artifact 缓存：只有 (路径, 内容哈希, 文件大小) 三者齐备时才
+    允许复用，任一缺失即放弃缓存并走完整加载 + 校验路径。
+    """
+    digest = _text(entry.get('artifact_hash')).lower()
+    if not digest:
+        return None
+    try:
+        return f'{path}|{digest}|{path.stat().st_size}'
+    except OSError:
+        return None
+
+
 def _load_artifact(entry: Mapping[str, Any], config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     config = _mapping(config or entry.get('_portal_config'))
     embedded = entry.get('_artifact')
@@ -110,10 +136,25 @@ def _load_artifact(entry: Mapping[str, Any], config: Mapping[str, Any] | None = 
     path = _artifact_path(entry, config)
     if not path.is_file():
         raise FileNotFoundError(f'已发布模型文件不存在：{path}')
+    # 发布 artifact 可达数百 MB（反序列化数十秒），而单次预测会多次取用同一
+    # 文件（契约解析、门禁复核、workflow 回放）。缓存只以 (路径, artifact_hash,
+    # 文件大小) 为键：文件被替换则 artifact_hash 校验先失败，不会命中陈旧对象。
+    cache_key = _artifact_cache_key(entry, path)
+    if cache_key is not None:
+        with _ARTIFACT_CACHE_LOCK:
+            cached = _ARTIFACT_CACHE.get(cache_key)
+        if isinstance(cached, Mapping):
+            return dict(cached)
     artifact = load_model_artifact_bytes(path.read_bytes())
     if not isinstance(artifact, Mapping):
         raise ValueError('模型 artifact 必须是映射对象。')
-    return dict(artifact)
+    result = dict(artifact)
+    if cache_key is not None:
+        with _ARTIFACT_CACHE_LOCK:
+            if len(_ARTIFACT_CACHE) >= _ARTIFACT_CACHE_LIMIT:
+                _ARTIFACT_CACHE.clear()
+            _ARTIFACT_CACHE[cache_key] = result
+    return dict(result)
 
 
 def _verify_artifact_file_hash(entry: Mapping[str, Any], config: Mapping[str, Any]) -> Path | None:
@@ -146,6 +187,59 @@ def _validate_contract_shape(contract: Mapping[str, Any], artifact: Mapping[str,
     if ranges is not None and not isinstance(ranges, Mapping):
         errors.append('发布契约 numeric_ranges 必须是映射。')
     return errors
+
+
+def publication_blocking_errors(
+    report: Mapping[str, Any], contract: Mapping[str, Any]
+) -> list[str]:
+    """Filter publication-gate errors down to genuinely blocking ones.
+
+    与 ``core.prediction_portal.publish_imported_entry`` 的发布时口径完全一致：
+    只要没有特征不匹配、缺 workflow 等严重错误，legacy(schema-1) 的审计提示
+    （「只能审计，必须重新验证后才能发布」）不阻断预测。
+
+    两处共用本函数，避免「发布时放行、预测时拒绝」的判定漂移。
+    """
+    ignored = ('schema-1/legacy', '缺少可复现 molecular workflow', '缺少可用 pipeline')
+    errors = [str(item) for item in report.get('errors') or []]
+    blocking = [item for item in errors if not any(token in item for token in ignored)]
+    if contract.get('schema_version') not in {None, 1} and _text(report.get('status')).lower() != 'valid':
+        blocking.append(f"发布门禁状态不是 valid：{_text(report.get('status')) or 'unknown'}")
+    return blocking
+
+
+def _derive_contract_from_artifact(
+    artifact: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    target_key: str,
+) -> Mapping[str, Any]:
+    """Rebuild the prediction contract from a published artifact.
+
+    与 ``core.prediction_portal.publish_imported_entry`` 发布时使用的推导口径
+    保持一致（feature_cols / target_col / workflow 来源相同），因此推导结果
+    仍会经过 ``validate_publication_artifact`` 复核，不存在放宽门禁的风险。
+
+    任何推导失败都返回 ``{}``，让调用方以原有的「契约无效」错误退出。
+    """
+    from .prediction_portal import build_prediction_contract
+
+    extra = _mapping(artifact.get('extra'))
+    feature_cols = entry.get('feature_cols') or artifact.get('feature_cols') or []
+    target_col = _text(entry.get('target_col') or artifact.get('target_col') or target_key)
+    workflow = (
+        extra.get('molecular_feature_workflow')
+        or extra.get('molecular_feature_config')
+        or extra.get('feature_process')
+    )
+    try:
+        return build_prediction_contract(
+            artifact=artifact,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            workflow=workflow,
+        )
+    except Exception:
+        return {}
 
 
 def load_published_portal_model(config: Mapping[str, Any], material_type: str, target: str) -> dict[str, Any]:
@@ -183,14 +277,29 @@ def load_published_portal_model(config: Mapping[str, Any], material_type: str, t
             raise
         artifact = _load_artifact(load_entry, config)
     contract = _contract(entry, artifact)
+    contract_source = 'entry'
+    if not contract:
+        # 训练平台导入的 artifact 自身不带 extra.prediction_contract，而
+        # publish_imported_entry 只在发布时把推导出的契约写入 gate_report，
+        # 并不回写 entry.contract → 发布成功的模型在配置里仍是 contract=null。
+        # 若此处不现场推导，预测会在「发布契约缺少精确 feature_cols」处失败，
+        # 与 UI 的「未声明任何输入字段」是同一个根因。
+        contract = _derive_contract_from_artifact(artifact, entry, target_key)
+        contract_source = 'derived'
     errors = _validate_contract_shape(contract, artifact, entry)
     if errors:
         raise ValueError('发布模型契约无效：' + '；'.join(errors))
     report = validate_publication_artifact(artifact, contract)
-    if not report.get('ok') or report.get('status') in {'needs_validation', 'invalid'}:
-        details = '；'.join(str(item) for item in report.get('errors') or [])
-        raise ValueError('发布模型未通过验证' + (f'：{details}' if details else '。'))
-    return {'entry': dict(entry), 'artifact': artifact, 'contract': dict(contract)}
+    blocking = publication_blocking_errors(report, contract)
+    if blocking:
+        details = '；'.join(blocking[:5])
+        raise ValueError('发布模型未通过验证：' + details)
+    return {
+        'entry': dict(entry),
+        'artifact': artifact,
+        'contract': dict(contract),
+        'contract_source': contract_source,
+    }
 
 
 def _contains_forbidden_value(value: Any, *, key: str = '') -> bool:
@@ -270,7 +379,26 @@ def _is_missing_scalar(value: Any) -> bool:
     return isinstance(missing, (bool, np.bool_)) and bool(missing)
 
 
+def is_auxiliary_phr_column(column: Any) -> bool:
+    """Return whether a manual input column represents an auxiliary component phr/amount."""
+    text = str(column or "").strip().lower()
+    if not text:
+        return False
+    if re.search(r"(?:resin|hardener|curing_agent|curing|curer)[_ ]*([2-9]|\d{2,})[_ ]*amount[_ ]*phr", text):
+        return True
+    if re.search(r"(?:resin|hardener|curing_agent|curing|curer)[_ ]*amount[_ ]*phr[_ ]*([2-9]|\d{2,})", text):
+        return True
+    if re.search(r"(?:small_additive|additive|accelerator|catalyst|initiator|reactive_diluent|reactive_toughener|filler|other)[_ ]*(?:total[_ ]*)?(?:\d+[_ ]*)?(?:amount[_ ]*)?phr", text):
+        return True
+    return False
+
+
 def _source_is_required(item: Mapping[str, Any]) -> bool:
+    column = str(item.get("column") or item.get("name") or "")
+    if is_auxiliary_component_column(column):
+        if "required" in item:
+            return bool(item["required"]) and not bool(item.get("nullable", False))
+        return False
     return bool(item.get("required", not bool(item.get("nullable", False)))) and not bool(item.get("nullable", False))
 
 
@@ -304,6 +432,10 @@ def _unknown_input_columns(frame: pd.DataFrame, contract: Mapping[str, Any], wor
             aliases = [aliases]
         if isinstance(aliases, Sequence):
             allowed.update(str(alias).strip() for alias in aliases if _text(alias))
+    allowed.update((
+        'resin_smiles', 'hardener_smiles', 'curing_agent_smiles', 'smiles',
+        'phr', 'cure_schedule', 'post_cure_schedule',
+    ))
     return [str(column) for column in frame.columns if str(column) not in allowed]
 
 
@@ -390,6 +522,42 @@ def _manual_feature_definitions(contract: Mapping[str, Any]) -> dict[str, Mappin
     return definitions
 
 
+def _normalize_portal_frame(
+    frame: pd.DataFrame,
+    contract: Mapping[str, Any],
+    workflow: Mapping[str, Any] | None,
+) -> pd.DataFrame:
+    """Normalize input frame for workflow sources and absent auxiliary phr slots."""
+    out = frame.copy()
+    sources = _source_columns(contract, workflow)
+    if sources:
+        source_names = [str(item.get('column')) for item in sources if _text(item.get('column'))]
+        resin_columns = [
+            column for column in source_names
+            if any(tok in column.lower() for tok in ('resin', 'epoxy', '树脂', '基体'))
+        ]
+        hardener_columns = [
+            column for column in source_names
+            if any(tok in column.lower() for tok in ('curing', 'hardener', 'curer', '固化剂', '交联剂'))
+        ]
+        out = materialize_workflow_source_columns(
+            out,
+            resin_columns=resin_columns,
+            hardener_columns=hardener_columns,
+            auxiliary_columns=[c for c in source_names if is_auxiliary_component_column(c)],
+        )
+    manual_names = [str(name) for name in contract.get('manual_input_feature_cols') or [] if _text(name)]
+    if not manual_names:
+        manual_names = [str(name) for name in contract.get('feature_cols') or [] if _text(name)]
+    for col in manual_names:
+        if is_auxiliary_phr_column(col):
+            if col not in out.columns:
+                out[col] = 0.0
+            else:
+                out[col] = pd.to_numeric(out[col], errors='coerce').fillna(0.0)
+    return out
+
+
 def _validate_manual_inputs(frame: pd.DataFrame, contract: Mapping[str, Any]) -> list[str]:
     """Validate only user-editable contract fields; never manufacture defaults."""
     names = [str(name) for name in contract.get('manual_input_feature_cols') or [] if _text(name)]
@@ -409,6 +577,9 @@ def _validate_manual_inputs(frame: pd.DataFrame, contract: Mapping[str, Any]) ->
             errors.append(f'手工特征 {name} 的 default_policy 必须是 explicit_only。')
         required = bool(definition.get('required_for_prediction', True))
         nullable = bool(definition.get('nullable', False))
+        if is_auxiliary_phr_column(name):
+            required = False
+            nullable = True
         if name not in frame.columns:
             if required and not nullable:
                 errors.append(f'缺少必填手工特征：{name}')
@@ -485,14 +656,8 @@ def validate_prediction_request(request: Mapping[str, Any], config: Mapping[str,
         errors.append('inputs 包含未知列：' + ', '.join(unknown_columns))
     sources = _source_columns(contract, workflow)
     if sources:
+        frame = _normalize_portal_frame(frame, contract, workflow)
         source_names = [str(item.get('column')) for item in sources if _text(item.get('column'))]
-        resin_columns = [column for column in source_names if column.lower().startswith(('resin_smiles_', 'resin_smiles'))]
-        hardener_columns = [column for column in source_names if column.lower().startswith(('curing_agent_smiles_', 'curing_agent_smiles', 'hardener_smiles_'))]
-        frame = materialize_workflow_source_columns(
-            frame,
-            resin_columns=resin_columns,
-            hardener_columns=hardener_columns,
-        )
         missing_columns = [column for column in source_names if column not in frame.columns]
         required_missing = [column for column in missing_columns
                             if next((_source_is_required(item) for item in sources if str(item.get('column')) == column), True)]
@@ -572,14 +737,7 @@ def run_confirmed_prediction(
     frame = _as_frame(_input_payload(request))
     sources = _source_columns(contract, workflow)
     if sources:
-        source_names = [str(item.get('column')) for item in sources if _text(item.get('column'))]
-        resin_columns = [column for column in source_names if column.lower().startswith(('resin_smiles_', 'resin_smiles'))]
-        hardener_columns = [column for column in source_names if column.lower().startswith(('curing_agent_smiles_', 'curing_agent_smiles', 'hardener_smiles_'))]
-        frame = materialize_workflow_source_columns(
-            frame,
-            resin_columns=resin_columns,
-            hardener_columns=hardener_columns,
-            )
+        frame = _normalize_portal_frame(frame, contract, workflow)
     warnings: list[str] = []
     manual_errors = _validate_manual_inputs(frame, contract)
     if manual_errors:

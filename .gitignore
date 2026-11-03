@@ -102,3 +102,14 @@ bigsmiles_ui/bigsmiles_ui/generated/
 
 # 门户模型管理审计日志：运行时产物，随本地操作不断追加，不纳入版本控制
 prediction_portal/model_management_audit.jsonl
+# 备份与补丁工作区缓存
+.cache_patch_backups/
+*.bak*
+
+# 扩展模块中的大体积二进制计算中间产物与临时文件
+extensions/network_md_features/artifacts/
+extensions/network_md_features/ANTECHAMBER*
+extensions/network_md_features/ATOMTYPE.INF
+extensions/ml_generalization_v2/artifacts/
+figures/
+epoxy_formulations_catalog.html

@@ -502,6 +502,23 @@ EPOXY_PINN_DEFAULTS = {
     **MISSING_VALUE_DEFAULTS,
 }
 
+EPOXY_PINM_DEFAULTS = {
+    "mode": "auto",
+    "base_estimator": "xgboost",
+    "lambda_param": 0.45,
+    "physics_weight": 0.35,
+    "use_polymer_physics": True,
+    "monotone_constraints": True,
+    "clip_physical_bounds": True,
+    "n_estimators": 200,
+    "max_depth": 6,
+    "learning_rate": 0.05,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "random_state": 42,
+    "target_name": "",
+}
+
 TRANSFORMER_PINN_DEFAULTS = {
     "mode": "tg",
     "d_token": 128,
@@ -639,6 +656,7 @@ MODEL_PARAMETERS = {
     "FT-Transformer": dict(FT_TRANSFORMER_DEFAULTS),
     "Transformer + BNN": dict(TRANSFORMER_BNN_DEFAULTS),
     "Epoxy PINN (Physics-Informed)": dict(EPOXY_PINN_DEFAULTS),
+    "Epoxy PINM (Physics-Informed ML)": dict(EPOXY_PINM_DEFAULTS),
     "Transformer + PINN": dict(TRANSFORMER_PINN_DEFAULTS),
     "GNN + Transformer Fusion": dict(GNN_TRANSFORMER_FUSION_DEFAULTS),
     "TabNet": dict(TABNET_DEFAULTS),
@@ -679,6 +697,7 @@ MODEL_SCOPE_GUIDE = {
     "FT-Transformer": "Tabular Transformer with feature sub-attention for higher-order feature interactions.",
     "Transformer + BNN": "FT-Transformer encoder with Bayesian regression head for both interaction modeling and uncertainty estimation.",
     "Epoxy PINN (Physics-Informed)": "Physics-informed regression for Tg or mechanics tasks that benefit from domain equations and process priors.",
+    "Epoxy PINM (Physics-Informed ML)": "Physics-Informed Machine Learning (PINM): combination of analytic physics baseline (DiBenedetto/Halpin-Tsai) and tree-based residual correction.",
     "Transformer + PINN": "FT-Transformer encoder combined with physics-informed loss for data-driven learning under material constraints.",
     "GNN + Transformer Fusion": "Joint learning from SMILES graph structure and numeric process/formulation features.",
     "TabNet": "Sparse attentive tabular network suitable for medium-scale structured data.",
@@ -1260,6 +1279,22 @@ MANUAL_TUNING_PARAMS = {
         _check("verbose", "Verbose Logging", EPOXY_PINN_DEFAULTS["verbose"]),
         _number("seed", "Random Seed", EPOXY_PINN_DEFAULTS["seed"], 0, 9999, 1),
         _text("target_name", "Target Name", EPOXY_PINN_DEFAULTS["target_name"], "Used when mode=auto to infer the physics branch."),
+    ],
+    "Epoxy PINM (Physics-Informed ML)": [
+        _select("mode", "PINM 物理机理模式", EPOXY_PINM_DEFAULTS["mode"], ["auto", "tg", "mechanics", "generic"], "选择物理公式核：tg(DiBenedetto耐热性), mechanics(Halpin-Tsai复材刚度模量), auto(自动推断)"),
+        _select("base_estimator", "残差传统学习器", EPOXY_PINM_DEFAULTS["base_estimator"], ["xgboost", "lightgbm", "catboost", "rf", "et", "gbr", "ridge"], "负责拟合物理公式先验未捕获的残差部分，强推荐 XGBoost 或 LightGBM"),
+        _number("physics_weight", "物理公式先验权重", EPOXY_PINM_DEFAULTS["physics_weight"], 0.0, 0.9, 0.05, "%.2f"),
+        _number("lambda_param", "DiBenedetto λ 参数", EPOXY_PINM_DEFAULTS["lambda_param"], 0.15, 0.85, 0.05, "%.2f"),
+        _check("use_polymer_physics", "注入高分子物理指数", EPOXY_PINM_DEFAULTS["use_polymer_physics"], "自动从结构 SMILES 计算芳香度/sp3/柔性/键能等高分子物理特征作为树模型输入"),
+        _check("monotone_constraints", "单调性物理约束", EPOXY_PINM_DEFAULTS["monotone_constraints"], "启用物理常识单调递增约束（如固化转化率/纤维含量与性能的正向增益，仅限 XGBoost/LightGBM）"),
+        _check("clip_physical_bounds", "物理合理边界保护", EPOXY_PINM_DEFAULTS["clip_physical_bounds"], "对最终预测结果做材料物理学截断，杜绝出现负模量或荒谬温度"),
+        _slider("n_estimators", "树模型基学习器数量", EPOXY_PINM_DEFAULTS["n_estimators"], 50, 1000, 50),
+        _slider("max_depth", "树模型最大深度", EPOXY_PINM_DEFAULTS["max_depth"], 3, 12, 1),
+        _number("learning_rate", "学习率 (Learning Rate)", EPOXY_PINM_DEFAULTS["learning_rate"], 0.005, 0.3, 0.005, "%.3f"),
+        _slider("subsample", "样本采样率 (Subsample)", EPOXY_PINM_DEFAULTS["subsample"], 0.5, 1.0, 0.05),
+        _slider("colsample_bytree", "特征采样率 (Colsample)", EPOXY_PINM_DEFAULTS["colsample_bytree"], 0.5, 1.0, 0.05),
+        _number("random_state", "随机种子", EPOXY_PINM_DEFAULTS["random_state"], 0, 9999, 1),
+        _text("target_name", "目标属性名称 (Target Name)", EPOXY_PINM_DEFAULTS["target_name"], "辅助 auto 模式精确锁定物理机理支路（如 Tg / Modulus）"),
     ],
     "Transformer + PINN": [
         _select("mode", "PINN Mode", TRANSFORMER_PINN_DEFAULTS["mode"], ["auto", "tg", "mechanics", "thermal", "generic"]),

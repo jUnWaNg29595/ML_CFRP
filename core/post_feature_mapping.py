@@ -392,6 +392,131 @@ def validate_mapping_for_prediction(*args, **kwargs) -> dict[str, Any]:
     return validate_mapping(*args, **kwargs)
 
 
+def build_auto_mapping(
+    *,
+    model_feature_cols: list[str],
+    candidate_df: pd.DataFrame,
+    molecular_feature_cols: list[str] | None = None,
+    constant_values: dict[str, Any] | None = None,
+    model_fingerprint: str | None = None,
+    workflow_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """**自动**为每个模型特征选定来源，无需用户手工确认。
+
+    这是「我不想手动确认映射关系」的实现：系统按证据自动决策，
+    **永不产生 pending**，因此不会再出现「请先确认映射」的阻断。
+
+    优先级
+    ------
+    1. 分子特征 workflow 输出 → ``keep``（mol_features 已写入特征矩阵）
+    2. 候选表已有该列且整列有限数值 → ``candidate``（真实候选值）
+    3. 用户显式给定的统一输入 → ``constant``
+    4. 兜底 → ``keep``（继承 base_row：高性能训练样本 / 中位数 / 模板行）
+
+    为什么第 2 条必须高于 keep：``post_feature_model_cols`` 只由 ``apply_mapping``
+    写入矩阵，``keep`` 会保留 base_row 的值。若把系统算出的配方物理量映射成
+    keep，screening_feature_derivation 的计算结果就进不了矩阵，等于白算、
+    仍用模板值打分。
+
+    为什么 candidate 要求整列有限：``validate_mapping`` 对 candidate 源要求
+    该列无任何 NaN，否则报错阻断。故此处先检查，不满足则退回 keep。
+
+    返回
+    ----
+    已 ``confirmed`` 的 mapping dict，可直接交给 ``validate_mapping`` /
+    ``apply_mapping``。
+    """
+    columns = _feature_cols(model_feature_cols)
+    candidate = candidate_df if isinstance(candidate_df, pd.DataFrame) else pd.DataFrame()
+    molecular = {str(c) for c in _feature_cols(molecular_feature_cols or [])}
+    constants = constant_values if isinstance(constant_values, dict) else {}
+
+    # 预计算：哪些候选列可安全用作 candidate 源（整列有限数值）
+    usable_candidate_cols: set[str] = set()
+    for column in candidate.columns:
+        if not isinstance(column, str) or column not in set(columns):
+            continue
+        values = pd.to_numeric(candidate[column], errors="coerce")
+        if values.isna().any():
+            continue
+        arr = values.to_numpy(dtype=float)
+        if arr.size and np.isfinite(arr).all():
+            usable_candidate_cols.add(column)
+
+    rules: dict[str, dict[str, Any]] = {}
+    for feature in columns:
+        # 1) 分子特征：由 workflow 产出，mol_features 已写入矩阵 → keep
+        if feature in molecular:
+            rules[feature] = {
+                "source_type": "keep",
+                "source_column": None,
+                "constant_value": None,
+                "unit": None,
+                "definition": "分子特征 workflow 输出",
+                "confirmed": True,
+            }
+            continue
+
+        # 2) 候选表已有该列且整列有限 → 用真实候选值
+        if feature in usable_candidate_cols:
+            rules[feature] = {
+                "source_type": "candidate",
+                "source_column": feature,
+                "constant_value": None,
+                "unit": None,
+                "definition": "候选表真实列（含系统自动计算值）",
+                "confirmed": True,
+            }
+            continue
+
+        # 3) 用户显式给定的统一输入 → 常量
+        if feature in constants:
+            value = _finite_numeric(constants[feature])
+            if value is not None:
+                rules[feature] = {
+                    "source_type": "constant",
+                    "source_column": None,
+                    "constant_value": value,
+                    "unit": None,
+                    "definition": "用户给定的统一输入",
+                    "confirmed": True,
+                }
+                continue
+
+        # 4) 兜底：继承 base_row（不伪造，也不阻塞）
+        rules[feature] = {
+            "source_type": "keep",
+            "source_column": None,
+            "constant_value": None,
+            "unit": None,
+            "definition": "继承基准行（高性能样本 / 中位数 / 模板行）",
+            "confirmed": True,
+        }
+
+    return {
+        "schema_version": POST_FEATURE_MAPPING_SCHEMA_VERSION,
+        "model_feature_cols": columns,
+        "rules": rules,
+        "confirmed": True,
+        "status": "confirmed",
+        "model_fingerprint": model_fingerprint,
+        "workflow_fingerprint": workflow_fingerprint,
+        # 不写 catalog_fingerprint：validate_mapping 会与「带 computed_definitions
+        # 构建的目录」指纹比对，此处口径不同必然不等 → 误报 catalog changed。
+        "catalog_fingerprint": None,
+    }
+
+
+def auto_mapping_summary(mapping: dict[str, Any]) -> dict[str, int]:
+    """统计各来源数量，供 UI 一行摘要（让用户知道系统替他做了什么决定）。"""
+    counts: dict[str, int] = {}
+    rules = (mapping or {}).get("rules") or {}
+    for rule in rules.values():
+        key = str((rule or {}).get("source_type") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def apply_mapping(
     base_matrix: pd.DataFrame,
     candidate_df: pd.DataFrame,
@@ -414,7 +539,8 @@ def apply_mapping(
             values = pd.to_numeric(candidate_df[source_column], errors="coerce")
             if values.isna().any() or not np.isfinite(values.to_numpy(dtype=float)).all():
                 raise ValueError(f"{feature}: source column {source_column!r} is not finite numeric")
-            result[feature] = values
+            # 必须用 .to_numpy(dtype=float) 赋值，避免两表 Index 不对齐时注入 NaN
+            result[feature] = values.to_numpy(dtype=float)
         elif source_type == "constant":
             constant = _finite_numeric(rule["constant_value"])
             if constant is None:

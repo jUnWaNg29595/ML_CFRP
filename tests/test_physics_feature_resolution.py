@@ -93,7 +93,9 @@ def test_physics_alias_mapping():
 def _workspace_df(n=3):
     return pd.DataFrame({
         "resin_1_structure": [DGEBA] * n,
+        "resin_1_amount_phr": [100.0] * n,
         "curing_agent_1_structure": [DDM] * n,
+        "curing_agent_1_amount_phr": [29.12] * n,
     })
 
 

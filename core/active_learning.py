@@ -24,6 +24,12 @@ from dataclasses import dataclass
 from typing import Dict, Literal, Optional, Tuple
 
 import numpy as np
+
+if not hasattr(np, "long"):
+    np.long = int
+if not hasattr(np, "ulong"):
+    np.ulong = int
+
 import pandas as pd
 
 from sklearn.impute import SimpleImputer
@@ -36,7 +42,7 @@ from scipy.stats import norm
 
 
 AcqKind = Literal["uncertainty", "ucb", "ei"]
-ModelKind = Literal["gpr", "rf", "etr"]
+ModelKind = Literal["gpr", "rf", "etr", "committee"]
 
 
 def _to_numpy(x) -> np.ndarray:
@@ -81,6 +87,72 @@ def _rf_predict_mu_sigma(model, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     mu = P.mean(axis=0)
     sigma = P.std(axis=0)
     return mu, sigma
+
+
+def select_diverse_batch(
+    X_pool_transformed: np.ndarray,
+    acq_scores: np.ndarray,
+    batch_size: int,
+    diversity_weight: float = 0.5,
+    candidate_pool_ratio: int = 5,
+) -> np.ndarray:
+    """结合采集分数（Exploitation/Exploration）与特征空间样本间距离（Diversity）进行批次多样性推荐。
+
+    原理：
+        在批量主动学习（Batch Active Learning）中，纯贪心取 Top-K 容易选出在特征空间高度聚集、
+        信息极度冗余的样本点。
+        本算法采用贪心最大最小距离（MaxMin / K-Center-Greedy with acquisition weight）策略：
+        1. 先根据采集分数选出前 candidate_pool_ratio * batch_size 个候选样本。
+        2. 第 1 个样本选择采集分数最高者。
+        3. 后续样本每次综合考虑：该样本本身的采集分数，以及它到当前已选择样本集的最小欧式距离。
+           让高潜力和高互补性兼得，有效打破模型性能瓶颈。
+    """
+    n_samples = len(acq_scores)
+    batch_size = int(max(1, min(batch_size, n_samples)))
+    if batch_size == 1:
+        return np.array([int(np.argmax(acq_scores))])
+
+    # 1. 筛选候选集合
+    candidate_size = min(n_samples, int(max(batch_size * candidate_pool_ratio, batch_size)))
+    sorted_candidates = np.argsort(-acq_scores)[:candidate_size]
+
+    if candidate_size <= batch_size:
+        return sorted_candidates[:batch_size]
+
+    # 归一化采集分数到 [0, 1]
+    sub_acqs = acq_scores[sorted_candidates].astype(float)
+    acq_min, acq_max = float(np.min(sub_acqs)), float(np.max(sub_acqs))
+    if acq_max > acq_min:
+        norm_acqs = (sub_acqs - acq_min) / (acq_max - acq_min + 1e-12)
+    else:
+        norm_acqs = np.ones_like(sub_acqs)
+
+    sub_X = X_pool_transformed[sorted_candidates]
+
+    # 计算候选集两两距离矩阵
+    from scipy.spatial.distance import cdist
+    dist_matrix = cdist(sub_X, sub_X, metric="euclidean")
+    max_dist = float(np.max(dist_matrix))
+    if max_dist > 1e-12:
+        norm_dist_matrix = dist_matrix / max_dist
+    else:
+        norm_dist_matrix = np.zeros_like(dist_matrix)
+
+    # 2. 贪心迭代选点
+    selected_sub_idx = [0]  # 第一个必定是采集分数最高者
+    min_dist_to_selected = norm_dist_matrix[:, 0].copy()
+
+    for _ in range(1, batch_size):
+        # 综合分数 = (1 - diversity_weight) * 采集分数 + diversity_weight * 到已选集合的最小距离
+        combined_scores = (1.0 - diversity_weight) * norm_acqs + diversity_weight * min_dist_to_selected
+        # 将已选过的置为负无穷
+        combined_scores[selected_sub_idx] = -np.inf
+        next_pick = int(np.argmax(combined_scores))
+        selected_sub_idx.append(next_pick)
+        # 更新剩余点到已选集合的最近距离
+        min_dist_to_selected = np.minimum(min_dist_to_selected, norm_dist_matrix[:, next_pick])
+
+    return sorted_candidates[selected_sub_idx]
 
 
 def acquisition(
@@ -153,17 +225,23 @@ class ActiveLearningEngine:
         self.imputer = SimpleImputer(strategy=imputer_strategy)
         self.scaler = StandardScaler() if use_scaler else None
         self.model = None
+        self._n_features_in = None
 
-    def _build_model(self):
+    def _build_model(self, n_features: int = 1):
         if self.model_kind == "gpr":
-            # 对小样本较稳：常数核*RBF + WhiteKernel
-            kernel = ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2))
+            # ARD 各向异性核 + 多起点优化，彻底避免高维空间下的核塌陷与局部极值
+            length_scale = np.ones(n_features, dtype=float)
+            kernel = ConstantKernel(1.0, (1e-3, 1e3)) * RBF(
+                length_scale=length_scale,
+                length_scale_bounds=(1e-2, 1e2),
+            )
             kernel += WhiteKernel(noise_level=1e-5, noise_level_bounds=(1e-8, 1e-1))
 
             params = {
                 "kernel": kernel,
-                "alpha": 0.0,
+                "alpha": 1e-6,
                 "normalize_y": True,
+                "n_restarts_optimizer": 5,
                 "random_state": self.random_state,
             }
             params.update(self.model_params)
@@ -186,6 +264,18 @@ class ActiveLearningEngine:
             }
             params.update(self.model_params)
             return ExtraTreesRegressor(**params)
+
+        if self.model_kind == "committee":
+            # 异质模型委员会机制 (Query-by-Committee)：融合 GPR, RF, ETR，
+            # 解决单树模型外推不确定性坍缩和单 GPR 高维尺度失真问题
+            ard_kernel = ConstantKernel(1.0, (1e-3, 1e3)) * RBF(
+                length_scale=np.ones(n_features, dtype=float),
+                length_scale_bounds=(1e-2, 1e2),
+            ) + WhiteKernel(noise_level=1e-5, noise_level_bounds=(1e-8, 1e-1))
+            m1 = GaussianProcessRegressor(kernel=ard_kernel, alpha=1e-6, normalize_y=True, random_state=self.random_state)
+            m2 = RandomForestRegressor(n_estimators=200, random_state=self.random_state, n_jobs=-1)
+            m3 = ExtraTreesRegressor(n_estimators=200, random_state=self.random_state, n_jobs=-1)
+            return [m1, m2, m3]
 
         raise ValueError(f"未知 model_kind: {self.model_kind}")
 
@@ -215,8 +305,13 @@ class ActiveLearningEngine:
             raise ValueError("主动学习至少需要 3 个已标注样本")
 
         Xp = self._preprocess_fit(X)
-        self.model = self._build_model()
-        self.model.fit(Xp, y)
+        self._n_features_in = Xp.shape[1]
+        self.model = self._build_model(n_features=self._n_features_in)
+        if isinstance(self.model, list):
+            for m in self.model:
+                m.fit(Xp, y)
+        else:
+            self.model.fit(Xp, y)
         return self
 
     def predict(self, X) -> Tuple[np.ndarray, np.ndarray]:
@@ -228,6 +323,29 @@ class ActiveLearningEngine:
         if self.model_kind == "gpr":
             mu, sigma = self.model.predict(Xp, return_std=True)
             return np.asarray(mu, dtype=float), np.asarray(sigma, dtype=float)
+
+        if self.model_kind == "committee":
+            # 委员会预测：综合模型平均预测值，以及模型间的预测分歧度 + 模型自身内部方差
+            mus = []
+            sigmas = []
+            for m in self.model:
+                if isinstance(m, GaussianProcessRegressor):
+                    m_mu, m_sig = m.predict(Xp, return_std=True)
+                else:
+                    m_mu, m_sig = _rf_predict_mu_sigma(m, Xp)
+                mus.append(m_mu)
+                sigmas.append(m_sig)
+
+            mus_stack = np.stack(mus, axis=0)
+            sigmas_stack = np.stack(sigmas, axis=0)
+
+            # 总预测均值
+            mu = np.mean(mus_stack, axis=0)
+            # 认知不确定性（模型间分歧，Epistemic）+ 偶然不确定性（各模型内部方差，Aleatoric）
+            disagreement_var = np.var(mus_stack, axis=0)
+            internal_var = np.mean(sigmas_stack ** 2, axis=0)
+            total_sigma = np.sqrt(disagreement_var + internal_var)
+            return np.asarray(mu, dtype=float), np.asarray(total_sigma, dtype=float)
 
         # 树模型：用树集合 std 估计
         mu, sigma = _rf_predict_mu_sigma(self.model, Xp)
@@ -243,13 +361,26 @@ class ActiveLearningEngine:
         minimize: bool = False,
         xi: float = 0.01,
         kappa: float = 2.0,
+        diversity_weight: float = 0.5,
     ) -> ActiveLearningResult:
         Xp = _ensure_2d(X_pool)
         mu, sigma = self.predict(Xp)
         acq = acquisition(mu, sigma, kind=kind, y_best=y_best, minimize=minimize, xi=xi, kappa=kappa)
 
         batch_size = int(max(1, batch_size))
-        idx = np.argsort(-acq)[:batch_size]
+        # 预处理候选池用于多样性距离计算
+        X_pool_trans = self._preprocess(Xp)
+
+        if diversity_weight > 0.0 and len(acq) > batch_size and batch_size > 1:
+            idx = select_diverse_batch(
+                X_pool_transformed=X_pool_trans,
+                acq_scores=acq,
+                batch_size=batch_size,
+                diversity_weight=diversity_weight,
+            )
+        else:
+            idx = np.argsort(-acq)[:batch_size]
+
         return ActiveLearningResult(
             recommended_indices=idx,
             mu=mu,
@@ -271,6 +402,7 @@ def recommend_from_dataframes(
     minimize: bool = False,
     xi: float = 0.01,
     kappa: float = 2.0,
+    diversity_weight: float = 0.5,
     random_state: int = 42,
 ) -> pd.DataFrame:
     """基于 DataFrame 的便捷接口。
@@ -313,6 +445,7 @@ def recommend_from_dataframes(
         minimize=minimize,
         xi=xi,
         kappa=kappa,
+        diversity_weight=diversity_weight,
     )
 
     out = df_pool.iloc[res.recommended_indices].copy()

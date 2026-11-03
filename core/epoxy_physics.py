@@ -141,6 +141,84 @@ def dibenedetto_tg_torch(
     return tg0 + (tginf - tg0) * frac
 
 
+def generalized_multimechanism_dibenedetto_tg_torch(
+    tg0_c: "torch.Tensor",
+    nu_mmol_g: "torch.Tensor",
+    rigid_carbon_ratio: "torch.Tensor",
+    alpha: "torch.Tensor",
+    lam: "torch.Tensor",
+    t_cure_max_c: "torch.Tensor",
+    prob_alkyne: "torch.Tensor",
+    delta_e_fwd: "torch.Tensor",
+    kappa_nu: "torch.Tensor",
+    kappa_rigid: "torch.Tensor",
+    gamma_cure: "torch.Tensor",
+    t0_base: float = 80.0,
+) -> "torch.Tensor":
+    """广义多机理自适应 DiBenedetto (GMM-DiBenedetto) 方程（可微）。
+
+    物理扩展特性：
+    1. Tginf 物理展开：Tginf = T0_base + kappa_nu * nu + kappa_rigid * rigid_carbon_ratio
+       彻底将理论耐热极限从常数拟合解放为真实高分子交联密度与主链杂化刚度驱动；
+    2. 主交联开环项：遵循自适应 DiBenedetto 网链热力学；
+    3. 次级高温自聚项：当固化温度 > 180°C 时，激活烯丙基/炔基自由基热加成引起的耐热激增项，
+       完美覆盖超高温高 Tg (>300°C) 异构网络体系。
+    """
+    # 1. 自适应理论极限耐热温度 Tginf(x)
+    # nu_mmol_g 通常在 [1.0, 10.0]，rigid_carbon_ratio 在 [0.3, 1.0]
+    tginf_primary = t0_base + kappa_nu * torch.clamp(nu_mmol_g, min=0.0) * 15.0 + kappa_rigid * torch.clamp(rigid_carbon_ratio, 0.0, 1.0) * 120.0
+    tginf_primary = torch.maximum(tginf_primary, tg0_c + 15.0)
+
+    # 2. 主通道开环交联项 (DiBenedetto)
+    lam_safe = torch.clamp(lam, 0.15, 0.85)
+    alpha_safe = torch.clamp(alpha, 0.0, 0.999)
+    denom = 1.0 - (1.0 - lam_safe) * alpha_safe
+    denom = torch.where(torch.abs(denom) < 1e-6, torch.full_like(denom, 1e-6), denom)
+    frac_crosslink = (lam_safe * alpha_safe) / denom
+    delta_tg_primary = (tginf_primary - tg0_c) * frac_crosslink
+
+    # 3. 次级高温热自聚激增项 (针对 T_cure > 180°C 且含双键/炔基/共轭位点)
+    # 热活化温度驱动门: ReLU(T_max - 180°C)
+    t_therm_excess = torch.relu(t_cure_max_c - 180.0) / 50.0  # 归一化缩放
+    kinetic_gate = 1.0 / (1.0 + torch.exp(torch.clamp((delta_e_fwd - 7.5) / 1.2, -15.0, 15.0)))
+    delta_tg_secondary = gamma_cure * (prob_alkyne * 1.5 + 0.2) * t_therm_excess * kinetic_gate * 80.0
+
+    return tg0_c + delta_tg_primary + delta_tg_secondary
+
+
+def fox_tg_torch(
+    tg0_c: "torch.Tensor",
+    tginf_c: "torch.Tensor",
+    alpha: "torch.Tensor",
+) -> "torch.Tensor":
+    """热力学绝对温标 (Kelvin) 计算的 Fox 方程（可微）。
+    
+    输入输出均为摄氏度 (°C)。严格防止摄氏度除法在低温/负温时数值崩塌。
+    1 / T_g(K) = (1 - alpha) / T_g0(K) + alpha / T_ginf(K)
+    """
+    tg0_k = torch.clamp(tg0_c + 273.15, min=150.0)
+    tginf_k = torch.clamp(tginf_c + 273.15, min=tg0_k + 5.0)
+    alpha_clip = torch.clamp(alpha, 0.0, 0.999)
+    inv_tg = (1.0 - alpha_clip) / tg0_k + alpha_clip / tginf_k
+    tg_k = 1.0 / torch.clamp(inv_tg, min=1e-6)
+    return tg_k - 273.15
+
+
+def fox_loshaek_tg_torch(
+    tg0_c: "torch.Tensor",
+    nu_mol_m3: "torch.Tensor",
+    k_nu: "torch.Tensor",
+) -> "torch.Tensor":
+    """Fox–Loshaek 交联密度关系（可微）。
+    
+    Tg = Tg0 + k_nu * (nu / 1000)
+    交联密度越高 (nu 越大)，Tg 单调递增。
+    输入输出均为摄氏度 (°C)。
+    """
+    nu_scaled = torch.clamp(nu_mol_m3 / 1000.0, min=0.0)
+    return tg0_c + k_nu * nu_scaled
+
+
 def halpin_tsai_np(E_m: np.ndarray, E_f: np.ndarray, xi: np.ndarray, vf: np.ndarray) -> np.ndarray:
     """Halpin–Tsai 复合材料弹性模量（工程近似，numpy）。
 

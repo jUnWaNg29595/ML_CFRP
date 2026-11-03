@@ -3467,27 +3467,59 @@ class MLForceFieldExtractor:
         return df, final_indices
 
 
-def _quick_ff_embed_mol(mol):
-    # [提速] 先嵌重原子骨架，再 AddHs(addCoords=True) 补氢（同 ANI worker：加氢后嵌入成本膨胀 4-8 倍）
+def _quick_ff_embed_mol(mol, num_confs: int = 5, random_seed: int = 42):
+    """生成 3D 构象并用 MMFF 优选最低能量构象（多构象初筛）"""
     params = _get_etkdg_params()
-    for _attr, _val in [("useRandomCoords", True), ("numThreads", 1)]:
+    for _attr, _val in [("useRandomCoords", True), ("numThreads", 1), ("randomSeed", int(random_seed))]:
         try:
             setattr(params, _attr, _val)
         except Exception:
             pass
-    res, _err = _embed_molecule_compat(mol, params)
-    res = int(res) if res is not None else -1
-    if res != 0:
+    num_confs = max(1, int(num_confs))
+    cids = []
+    try:
+        cids = list(AllChem.EmbedMultipleConfs(mol, numConfs=num_confs, params=params))
+    except Exception:
+        cids = []
+    if not cids:
         try:
-            res = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=25)
+            cids = list(AllChem.EmbedMultipleConfs(mol, numConfs=num_confs, useRandomCoords=True, maxAttempts=30, randomSeed=int(random_seed)))
         except Exception:
-            res = -1
-    if res != 0:
+            cids = []
+    if not cids:
+        try:
+            res = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=30, randomSeed=int(random_seed))
+            if res == 0:
+                cids = [0]
+        except Exception:
+            cids = []
+    if not cids:
         return None
-    return Chem.AddHs(mol, addCoords=True)
+
+    mol = Chem.AddHs(mol, addCoords=True)
+
+    if len(cids) > 1 and AllChem.MMFFHasAllMoleculeParams(mol):
+        try:
+            opt_res = AllChem.MMFFOptimizeMoleculeConfs(mol, maxIters=30, mmffVariant="MMFF94s")
+            best_cid = -1
+            min_e = float("inf")
+            for cid, (converged, energy) in enumerate(opt_res):
+                if energy < min_e:
+                    min_e = energy
+                    best_cid = cid
+            if best_cid >= 0:
+                conf = mol.GetConformer(best_cid)
+                new_mol = Chem.Mol(mol)
+                new_mol.RemoveAllConformers()
+                new_mol.AddConformer(Chem.Conformer(conf), assignId=True)
+                return new_mol
+        except Exception:
+            pass
+    return mol
 
 
-def _quick_ff_mmff_energy(mol, max_iters: int, do_minimize: bool):
+def _quick_ff_mmff_energy_decomp(mol, max_iters: int, do_minimize: bool):
+    """计算 MMFF94s 总能量及各项分解（Bond, Angle, StretchBend, Oop, Torsion, VdW, Ele）"""
     try:
         if not AllChem.MMFFHasAllMoleculeParams(mol):
             return None
@@ -3497,9 +3529,24 @@ def _quick_ff_mmff_energy(mol, max_iters: int, do_minimize: bool):
             return None
         if do_minimize:
             ff.Minimize(maxIts=int(max_iters))
-        return float(ff.CalcEnergy())
+        total_energy = float(ff.CalcEnergy())
+
+        terms = ["Bond", "Angle", "StretchBend", "Oop", "Torsion", "VdW", "Ele"]
+        decomp = {"total": total_energy}
+        for t in terms:
+            p_sub = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s")
+            for other in terms:
+                getattr(p_sub, f"SetMMFF{other}Term")(other == t)
+            ff_sub = AllChem.MMFFGetMoleculeForceField(mol, p_sub)
+            decomp[t.lower()] = float(ff_sub.CalcEnergy()) if ff_sub is not None else 0.0
+        return decomp
     except Exception:
         return None
+
+
+def _quick_ff_mmff_energy(mol, max_iters: int, do_minimize: bool):
+    decomp = _quick_ff_mmff_energy_decomp(mol, max_iters=max_iters, do_minimize=do_minimize)
+    return decomp.get("total") if decomp else None
 
 
 def _quick_ff_uff_energy(mol, max_iters: int, do_minimize: bool):
@@ -3584,6 +3631,17 @@ def _quick_ff_calc_features(
         use_mmff = False
 
     energies = []
+    decomp_sums = {
+        "bond": 0.0,
+        "angle": 0.0,
+        "stretchbend": 0.0,
+        "oop": 0.0,
+        "torsion": 0.0,
+        "vdw": 0.0,
+        "ele": 0.0,
+    }
+    has_decomp = False
+
     for mol in mols:
         n_atoms = int(mol.GetNumAtoms())
         do_minimize = bool(minimize)
@@ -3591,7 +3649,13 @@ def _quick_ff_calc_features(
             if n_atoms > int(skip_optimize_above_atoms):
                 do_minimize = False
         if use_mmff:
-            e = _quick_ff_mmff_energy(mol, max_iters=int(max_iters), do_minimize=do_minimize)
+            decomp = _quick_ff_mmff_energy_decomp(mol, max_iters=int(max_iters), do_minimize=do_minimize)
+            if decomp is None:
+                return None
+            e = decomp.get("total")
+            for k in decomp_sums:
+                decomp_sums[k] += decomp.get(k, 0.0)
+            has_decomp = True
         else:
             e = _quick_ff_uff_energy(mol, max_iters=int(max_iters), do_minimize=do_minimize)
         if e is None:
@@ -3602,7 +3666,7 @@ def _quick_ff_calc_features(
     total_energy = float(np.sum(energies)) if energies else np.nan
     per_atom = total_energy / total_atoms if total_atoms > 0 else np.nan
 
-    return {
+    res = {
         "ff_energy": total_energy,
         "ff_energy_per_atom": per_atom,
         "ff_used_mmff": 1 if use_mmff else 0,
@@ -3611,6 +3675,18 @@ def _quick_ff_calc_features(
         "ff_n_fragments": int(len(mols)),
         "ff_success": 1,
     }
+
+    # 能量分项贡献
+    if has_decomp:
+        for k, v in decomp_sums.items():
+            res[f"ff_energy_{k}"] = float(v)
+            res[f"ff_energy_{k}_per_atom"] = float(v) / total_atoms if total_atoms > 0 else np.nan
+    else:
+        for k in decomp_sums:
+            res[f"ff_energy_{k}"] = np.nan
+            res[f"ff_energy_{k}_per_atom"] = np.nan
+
+    return res
 
 
 def _quick_ff_worker(
@@ -3674,6 +3750,21 @@ class QuickForceFieldFeatureExtractor:
             "ff_n_atoms",
             "ff_n_fragments",
             "ff_success",
+            # 新增 MMFF 能量分项与归一化分项
+            "ff_energy_bond",
+            "ff_energy_bond_per_atom",
+            "ff_energy_angle",
+            "ff_energy_angle_per_atom",
+            "ff_energy_stretchbend",
+            "ff_energy_stretchbend_per_atom",
+            "ff_energy_oop",
+            "ff_energy_oop_per_atom",
+            "ff_energy_torsion",
+            "ff_energy_torsion_per_atom",
+            "ff_energy_vdw",
+            "ff_energy_vdw_per_atom",
+            "ff_energy_ele",
+            "ff_energy_ele_per_atom",
         ]
 
     def _embed_mol(self, mol):
@@ -3822,6 +3913,12 @@ class XTBFeatureExtractor:
                 os.path.join(sys.prefix, "Library", "bin", executable_name),
                 os.path.join(sys.prefix, "bin", executable_name),
                 os.path.join(sys.prefix, "Scripts", executable_name),
+                os.path.expanduser(f"~/software/xtb-6.7.1/bin/{executable_name}"),
+                f"/home/wangj/software/xtb-6.7.1/bin/{executable_name}",
+                f"/home/wangj/miniconda3/envs/CFRP_env/bin/{executable_name}",
+                os.path.expanduser(f"~/.local/bin/{executable_name}"),
+                f"/usr/local/bin/{executable_name}",
+                f"/usr/bin/{executable_name}",
             ]
             resolved_xtb_path = next((p for p in env_candidates if os.path.isfile(p)), None)
         self.xtb_path = resolved_xtb_path or requested_xtb_path
@@ -3852,9 +3949,33 @@ class XTBFeatureExtractor:
             "xtb_n_atoms",
             "xtb_n_fragments",
             "xtb_success",
+            # 新增 CDFT 反应活性与物理化学衍生特征
+            "xtb_chemical_hardness",       # 化学硬度 eta = (LUMO - HOMO)/2
+            "xtb_chemical_softness",       # 化学软度 S = 1 / (2*eta)
+            "xtb_electronegativity",       # 电负性 chi = -(HOMO + LUMO)/2
+            "xtb_chemical_potential",      # 化学势 mu = -chi
+            "xtb_electrophilicity_index",  # 亲电性指数 omega = mu^2 / (2*eta)
         ]
         self._cache = OrderedDict()
         self._cache_lock = threading.RLock()
+        self._db_cache_path = os.path.join(tempfile.gettempdir(), "cfrp_xtb_feature_cache.db")
+        self._init_db_cache()
+
+    def _init_db_cache(self):
+        try:
+            with sqlite3.connect(self._db_cache_path, timeout=10.0) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS xtb_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        data_json TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.commit()
+        except Exception:
+            pass
 
     def _cache_get(self, key: str | None):
         if not key or self.cache_size <= 0:
@@ -3866,7 +3987,22 @@ class XTBFeatureExtractor:
                     self._cache.move_to_end(key)
                 except Exception:
                     pass
-        return val
+                return val
+        # 尝试从持久化 SQLite 缓存读取
+        try:
+            with sqlite3.connect(self._db_cache_path, timeout=5.0) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT data_json FROM xtb_cache WHERE cache_key = ?", (key,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    val = json.loads(row[0])
+                    # 回填到内存 LRU
+                    with self._cache_lock:
+                        self._cache[key] = val
+                    return val
+        except Exception:
+            pass
+        return None
 
     def _cache_set(self, key: str | None, val):
         if not key or self.cache_size <= 0 or val is None:
@@ -3879,6 +4015,16 @@ class XTBFeatureExtractor:
                     self._cache.popitem(last=False)
             except Exception:
                 pass
+        # 同步写入持久化 SQLite 缓存
+        try:
+            with sqlite3.connect(self._db_cache_path, timeout=5.0) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO xtb_cache (cache_key, data_json, created_at) VALUES (?, ?, ?)",
+                    (key, json.dumps(val), time.time()),
+                )
+                conn.commit()
+        except Exception:
+            pass
 
     def _dedup_key(self, raw):
         if raw is None:
@@ -4061,12 +4207,44 @@ class XTBFeatureExtractor:
                 mode_flag,
             ]
             out, err = None, None  # [修复] 初始化变量
+            # [多核性能修复] 必须给 xTB 子进程显式限定线程数。
+            #
+            # 原先 Popen 未传 env → 子进程继承父进程 OMP_NUM_THREADS。
+            # 而 core/thread_config 在 512 核机器上把它设为 512，于是
+            # 「n_jobs 个 xTB 进程 × 各自 512 线程」严重超订：
+            # 实测单次 xtb --sp 从 0.11s（1 线程）恶化到 0.31s（512 线程）。
+            #
+            # xTB 半经验计算单分子内并行度很低，最优是「1 线程 × 多进程」，
+            # 并行度交给上层 n_jobs（ThreadPoolExecutor）控制。
+            _xtb_env = os.environ.copy()
+            # 自动注入 XTBPATH，确保参数文件能被准确找到
+            if "XTBPATH" not in _xtb_env:
+                _xtb_candidates = [
+                    os.path.join(sys.prefix, "share", "xtb"),
+                    "/home/wangj/software/xtb-6.7.1/share/xtb",
+                    "/home/wangj/miniconda3/envs/CFRP_env/share/xtb",
+                    os.path.expanduser("~/software/xtb-6.7.1/share/xtb"),
+                ]
+                for _c in _xtb_candidates:
+                    if os.path.isdir(_c):
+                        _xtb_env["XTBPATH"] = _c
+                        break
+            _xtb_threads = os.environ.get("ML_XTB_THREADS", "1")
+            for _k in (
+                "OMP_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ):
+                _xtb_env[_k] = str(_xtb_threads)
             try:
                 if os.name == "nt":
                     # [修复] Windows 下使用 utf-8 编码，避免 gbk 解码错误
                     proc = subprocess.Popen(
                         cmd,
                         cwd=td,
+                        env=_xtb_env,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
@@ -4077,6 +4255,7 @@ class XTBFeatureExtractor:
                     proc = subprocess.Popen(
                         cmd,
                         cwd=td,
+                        env=_xtb_env,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
@@ -4224,16 +4403,47 @@ class XTBFeatureExtractor:
                 return np.nan
             return weighted[k] / weight_sum[k]
 
+        homo_val = _avg("homo")
+        lumo_val = _avg("lumo")
+        gap_val = _avg("gap")
+
+        # 计算概念密度泛函理论 (CDFT) 反应活性指数
+        # 硬度 eta = (LUMO - HOMO)/2
+        # 软度 S = 1 / (2*eta)
+        # 电负性 chi = -(HOMO + LUMO)/2
+        # 化学势 mu = -chi = (HOMO + LUMO)/2
+        # 亲电指数 omega = mu^2 / (2*eta)
+        eta = np.nan
+        softness = np.nan
+        chi = np.nan
+        mu = np.nan
+        omega = np.nan
+
+        if not np.isnan(homo_val) and not np.isnan(lumo_val):
+            diff = lumo_val - homo_val
+            if abs(diff) > 1e-6:
+                eta = diff / 2.0
+                softness = 1.0 / (2.0 * eta) if eta != 0 else np.nan
+                chi = -(homo_val + lumo_val) / 2.0
+                mu = -chi
+                omega = (mu ** 2) / (2.0 * eta) if eta != 0 else np.nan
+
         return {
             "xtb_total_energy": float(energy_sum),
             "xtb_energy_per_atom": float(energy_sum) / float(total_atoms) if total_atoms > 0 else np.nan,
-            "xtb_homo": _avg("homo"),
-            "xtb_lumo": _avg("lumo"),
-            "xtb_gap": _avg("gap"),
+            "xtb_homo": homo_val,
+            "xtb_lumo": lumo_val,
+            "xtb_gap": gap_val,
             "xtb_dipole": _avg("dipole"),
             "xtb_n_atoms": int(total_atoms),
             "xtb_n_fragments": int(n_frags),
             "xtb_success": 1,
+            # CDFT 指数
+            "xtb_chemical_hardness": float(eta) if not np.isnan(eta) else np.nan,
+            "xtb_chemical_softness": float(softness) if not np.isnan(softness) else np.nan,
+            "xtb_electronegativity": float(chi) if not np.isnan(chi) else np.nan,
+            "xtb_chemical_potential": float(mu) if not np.isnan(mu) else np.nan,
+            "xtb_electrophilicity_index": float(omega) if not np.isnan(omega) else np.nan,
         }
 
     def featurize(self, smiles_list, n_jobs=1, progress_callback=None):

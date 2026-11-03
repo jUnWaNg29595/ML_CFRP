@@ -7,6 +7,7 @@ import hashlib
 import json
 import signal
 import os
+import time
 from pathlib import Path
 
 import itertools
@@ -75,6 +76,7 @@ DEFAULT_EPOXY_RULES = {
         "max_heavy_atoms": 200,
         "ban_strong_acids": False,
         "ban_amines": False,
+        "ban_phenols": True,
     },
     "hardener": {
         "min_mw": 25.0,
@@ -114,6 +116,67 @@ POST_FEATURE_COMPUTED_DEFINITIONS = {
     "computed_hardener_eq": {"category": "配比", "unit": "eq", "definition": "actual PHR / AHEW"},
     "computed_equiv_ratio_h_to_r": {"category": "配比", "unit": "ratio", "definition": "hardener equivalents / resin equivalents"},
     "computed_equiv_ratio_r_to_h": {"category": "配比", "unit": "ratio", "definition": "resin equivalents / hardener equivalents"},
+    # ---- 宽表命名族（训练数据实际使用的列名）----
+    # 上面 computed_* 是规范名，下面这批是真实模型里出现的等价列名。
+    # 它们同样由候选配方算出，必须登记为 computed，否则会被当成
+    # 「需要用户枚举的工艺特征」或被映射层判为缺失。
+    "formulation_resin_total_eew_g_eq": {"category": "EEW", "unit": "g/eq", "definition": "树脂质量加权调和平均 EEW"},
+    "formulation_resin_eew_g_eq": {"category": "EEW", "unit": "g/eq", "definition": "树脂质量加权调和平均 EEW"},
+    "formulation_hardener_total_ahew_g_eq": {"category": "AHEW", "unit": "g/eq", "definition": "固化剂质量加权调和平均 AHEW"},
+    "formulation_hardener_ahew_g_eq": {"category": "AHEW", "unit": "g/eq", "definition": "固化剂质量加权调和平均 AHEW"},
+    "formulation_r_value": {"category": "配比", "unit": "ratio", "definition": "r = (固化剂phr/AHEW)/(树脂phr/EEW)"},
+    "formulation_resin_hardener_equivalent_ratio": {"category": "配比", "unit": "ratio", "definition": "r = (固化剂phr/AHEW)/(树脂phr/EEW)"},
+    "formulation_epoxy_binder_total_phr": {"category": "PHR", "unit": "phr", "definition": "树脂 + 固化剂 + 其他粘料 phr"},
+    "resin_total_phr": {"category": "PHR", "unit": "phr", "definition": "树脂 phr 求和"},
+    "curing_agent_total_phr": {"category": "PHR", "unit": "phr", "definition": "固化剂 phr 求和"},
+    "resin_epoxy_group_total": {"category": "官能度", "unit": "eq/mol", "definition": "各树脂组分环氧基数求和"},
+    "resin_equivalent_group_total": {"category": "官能度", "unit": "eq/mol", "definition": "树脂官能团总数"},
+    "curing_agent_active_hydrogen_total": {"category": "官能度", "unit": "eq/mol", "definition": "各固化剂组分活泼氢数求和"},
+    "curing_agent_equivalent_group_total": {"category": "官能度", "unit": "eq/mol", "definition": "固化剂官能团总数"},
+    "resin_component_count": {"category": "组分", "unit": "count", "definition": "树脂组分数"},
+    "curing_agent_component_count": {"category": "组分", "unit": "count", "definition": "固化剂组分数"},
+    "small_additive_component_count": {"category": "组分", "unit": "count", "definition": "小分子助剂组分数"},
+    "initiator_component_count": {"category": "组分", "unit": "count", "definition": "引发剂组分数"},
+    "accelerator_component_count": {"category": "组分", "unit": "count", "definition": "促进剂组分数"},
+    "catalyst_component_count": {"category": "组分", "unit": "count", "definition": "催化剂组分数"},
+    "reactive_diluent_component_count": {"category": "组分", "unit": "count", "definition": "活性稀释剂组分数"},
+    "reactive_toughener_component_count": {"category": "组分", "unit": "count", "definition": "增韧剂组分数"},
+    "reactive_toughener_total_phr": {"category": "PHR", "unit": "phr", "definition": "增韧剂 phr"},
+    "accelerator_total_phr": {"category": "PHR", "unit": "phr", "definition": "促进剂 phr"},
+    "filler_component_count": {"category": "组分", "unit": "count", "definition": "填料组分数"},
+    "other_component_count": {"category": "组分", "unit": "count", "definition": "其他组分数"},
+    "initiator_present": {"category": "组分", "unit": "flag", "definition": "是否含引发剂"},
+    # 固化工艺族：由固化制度文本派生（见 core.computable_features）
+    "process_max_temperature_c": {"category": "工艺", "unit": "degC", "definition": "全程最高固化温度（由固化制度派生）"},
+    "process_temperature_time_integral_c_h": {"category": "工艺", "unit": "degC*h", "definition": "全程温度-时间积分（由固化制度派生）"},
+    "process_total_time_h": {"category": "工艺", "unit": "h", "definition": "全程总固化时长（由固化制度派生）"},
+    "process_final_cure_temperature_c": {"category": "工艺", "unit": "degC", "definition": "末段固化温度（由固化制度派生）"},
+    "process_final_cure_time_h": {"category": "工艺", "unit": "h", "definition": "末段固化时长（由固化制度派生）"},
+    "process_has_post_cure": {"category": "工艺", "unit": "flag", "definition": "是否含后固化（由固化制度派生）"},
+    # 逐组分物理量：由各组分 SMILES 算出
+    "resin_1_molecular_weight_g_mol": {"category": "分子量", "unit": "g/mol", "definition": "RDKit MolWt(resin_1)"},
+    "resin_2_molecular_weight_g_mol": {"category": "分子量", "unit": "g/mol", "definition": "RDKit MolWt(resin_2)"},
+    "resin_3_molecular_weight_g_mol": {"category": "分子量", "unit": "g/mol", "definition": "RDKit MolWt(resin_3)"},
+    "curing_agent_1_molecular_weight_g_mol": {"category": "分子量", "unit": "g/mol", "definition": "RDKit MolWt(curing_agent_1)"},
+    "curing_agent_2_molecular_weight_g_mol": {"category": "分子量", "unit": "g/mol", "definition": "RDKit MolWt(curing_agent_2)"},
+    "curing_agent_3_molecular_weight_g_mol": {"category": "分子量", "unit": "g/mol", "definition": "RDKit MolWt(curing_agent_3)"},
+    "resin_1_epoxy_group_count": {"category": "官能度", "unit": "eq/mol", "definition": "环氧基 SMARTS 计数(resin_1)"},
+    "resin_2_epoxy_group_count": {"category": "官能度", "unit": "eq/mol", "definition": "环氧基 SMARTS 计数(resin_2)"},
+    "resin_3_epoxy_group_count": {"category": "官能度", "unit": "eq/mol", "definition": "环氧基 SMARTS 计数(resin_3)"},
+    "resin_1_equivalent_weight_g_eq": {"category": "EEW", "unit": "g/eq", "definition": "MW / 环氧基数(resin_1)"},
+    "resin_2_equivalent_weight_g_eq": {"category": "EEW", "unit": "g/eq", "definition": "MW / 环氧基数(resin_2)"},
+    "resin_3_equivalent_weight_g_eq": {"category": "EEW", "unit": "g/eq", "definition": "MW / 环氧基数(resin_3)"},
+    "curing_agent_1_equivalent_weight_g_eq": {"category": "AHEW", "unit": "g/eq", "definition": "MW / 活泼氢数(curing_agent_1)"},
+    "curing_agent_2_equivalent_weight_g_eq": {"category": "AHEW", "unit": "g/eq", "definition": "MW / 活泼氢数(curing_agent_2)"},
+    "curing_agent_3_equivalent_weight_g_eq": {"category": "AHEW", "unit": "g/eq", "definition": "MW / 活泼氢数(curing_agent_3)"},
+    "curing_agent_1_active_hydrogen_equivalent_count": {"category": "官能度", "unit": "eq/mol", "definition": "活泼氢数(curing_agent_1)"},
+    "curing_agent_2_active_hydrogen_equivalent_count": {"category": "官能度", "unit": "eq/mol", "definition": "活泼氢数(curing_agent_2)"},
+    "resin_1_equivalent_group_count": {"category": "官能度", "unit": "eq/mol", "definition": "等效组数(resin_1)"},
+    "resin_2_equivalent_group_count": {"category": "官能度", "unit": "eq/mol", "definition": "等效组数(resin_2)"},
+    "resin_3_equivalent_group_count": {"category": "官能度", "unit": "eq/mol", "definition": "等效组数(resin_3)"},
+    "curing_agent_1_equivalent_group_count": {"category": "官能度", "unit": "eq/mol", "definition": "等效组数(curing_agent_1)"},
+    "curing_agent_2_equivalent_group_count": {"category": "官能度", "unit": "eq/mol", "definition": "等效组数(curing_agent_2)"},
+    "test_standard_count": {"category": "测试", "unit": "count", "definition": "测试标准条目数"},
 }
 
 POST_FEATURE_DISPLAY_ALIASES = {
@@ -860,6 +923,41 @@ def _decode_grid_index(grid_keys: Sequence[str], grid_values: Sequence[Sequence[
     return {k: out[k] for k in grid_keys}
 
 
+def _decode_grid_indices_vectorized(
+    grid_keys: Sequence[str],
+    grid_values: Sequence[Sequence[Any]],
+    flat_indices: np.ndarray,
+) -> pd.DataFrame:
+    """一次性把整批 flat 网格下标解码成 DataFrame（向量化）。
+
+    [性能] 旧实现在 5e6 行上逐行调用 _decode_grid_index（Python dict +
+    取模循环），实测 **19.56 s**，是生成阶段最大的单项开销。
+    这里改为纯 numpy：每个维度一次取模 + 一次 fancy-index，列序与
+    _decode_grid_index 完全一致（按 grid_keys 顺序）。
+
+    语义与 _decode_grid_index 逐位等价：
+        从最后一维开始 rem % n，逐维整除。
+    """
+    if not grid_keys or not grid_values or len(flat_indices) == 0:
+        return pd.DataFrame(index=range(len(flat_indices)))
+
+    idx = np.asarray(flat_indices, dtype=np.int64).reshape(-1)
+    out: Dict[str, np.ndarray] = {}
+    rem = idx.copy()
+    # 与标量版一致：reversed(zip(keys, values)) 依次取模
+    for key, vals in zip(reversed(list(grid_keys)), reversed(list(grid_values))):
+        n = max(1, len(vals))
+        pos = rem % n
+        rem = rem // n
+        arr = np.asarray(list(vals))
+        out[key] = arr[pos]
+    # 保持 grid_keys 的原始顺序。
+    # 注意：各列必须保持原始 dtype（int 列不能被提升成 object），
+    # 否则下游 apply_feature_overrides 的 pd.to_numeric 虽能处理，
+    # 但会与逐行版产生 dtype 差异，破坏「逐位等价」。
+    return pd.DataFrame({k: out[k] for k in grid_keys})
+
+
 def _repeat_to_length(values: List[float], length: int, fallback: float) -> List[float]:
     if length <= 0:
         return []
@@ -978,29 +1076,49 @@ def filter_candidates_by_size(
             return False
         return True
 
-    mask = []
-    for _, row in df.iterrows():
-        resin_ok = True
-        if resin_col in df.columns:
-            resin_ok = _passes(row.get(resin_col), resin_constraints)
-        hard_ok = True
-        if hardener_col and hardener_col in df.columns:
-            hard_ok = _passes(row.get(hardener_col), hardener_constraints)
-        mask.append(bool(resin_ok and hard_ok))
+    # [性能] 与 filter_candidates_by_epoxy_rules 同样的问题：iterrows 的逐行
+    # pandas 开销远大于 RDKit 计算本身。改为按**唯一 SMILES** 判定后映射回行。
+    has_resin = bool(resin_col and resin_col in df.columns)
+    has_hardener = bool(hardener_col and hardener_col in df.columns)
+    if not has_resin and not has_hardener:
+        return df
+
+    _r_vals = (
+        df[resin_col].astype(str).to_numpy(dtype=object)
+        if has_resin
+        else np.full(len(df), "", dtype=object)
+    )
+    _h_vals = (
+        df[hardener_col].astype(str).to_numpy(dtype=object)
+        if has_hardener
+        else np.full(len(df), "", dtype=object)
+    )
+    _SEP = ""
+    _keys = np.char.add(np.char.add(_r_vals.astype(str), _SEP), _h_vals.astype(str))
+    _codes, _unique_keys = pd.factorize(_keys, sort=False)
+    _unique_pass = np.empty(len(_unique_keys), dtype=bool)
+    for _ci, _key in enumerate(_unique_keys):
+        _r, _, _h = str(_key).partition(_SEP)
+        resin_ok = _passes(_r, resin_constraints) if has_resin else True
+        hard_ok = _passes(_h, hardener_constraints) if has_hardener else True
+        _unique_pass[_ci] = bool(resin_ok and hard_ok)
+    mask = _unique_pass[np.asarray(_codes).reshape(-1)]
 
     return df.loc[mask].reset_index(drop=True)
 
 
-def filter_candidates_by_epoxy_rules(
-    df: pd.DataFrame,
-    resin_col: Optional[str] = "resin_smiles",
-    hardener_col: Optional[str] = "hardener_smiles",
-    rules: Optional[Dict] = None,
-    keep_invalid: bool = False,
-) -> pd.DataFrame:
-    if df is None or df.empty or not RDKIT_AVAILABLE:
-        return df
-    rules = rules or {}
+#: 规则特征缓存（SMILES → 特征字典）。模块级内存字典，按需缓存单分子特征。
+_RULE_FEATURE_CACHE: Dict[str, Dict[str, float]] = {}
+
+
+def _make_epoxy_pair_evaluator(rules: Dict, *, keep_invalid: bool):
+    """构造「单对 (resin, hardener) 是否通过」判定器。
+
+    ⚠️ 判定逻辑从原 filter_candidates_by_epoxy_rules **逐字抽取**，
+    不得凭记忆重写——曾因漏掉 ban_strong_acids / ban_amines /
+    min_active_hydrogen / reject_mixed_class / class_flags 等分支，
+    导致过滤结果从 1853 条错误地变成 0 条。
+    """
     base = DEFAULT_EPOXY_RULES
     rules = {
         "global": {**base.get("global", {}), **(rules.get("global", {}) if isinstance(rules, dict) else {})},
@@ -1021,12 +1139,14 @@ def filter_candidates_by_epoxy_rules(
     hardener_rules = rules.get("hardener", {})
     pair_rules = rules.get("pair", {})
 
-    cache: Dict[str, Dict[str, float]] = {}
+    # 复用模块级 cache：并行预热过的分子在这里全部命中，近乎零成本。
+    cache: Dict[str, Dict[str, float]] = _RULE_FEATURE_CACHE
 
     def _get_feat(smiles: str) -> Dict[str, float]:
         key = str(smiles or "")
-        if key in cache:
-            return cache[key]
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
         feats = _calc_rule_features(smiles, allowed_elements)
         cache[key] = feats
         return feats
@@ -1068,6 +1188,10 @@ def filter_candidates_by_epoxy_rules(
                 return False
         if resin_rules.get("ban_amines", True):
             if feat.get("primary_amine", 0) > 0 or feat.get("secondary_amine", 0) > 0:
+                return False
+        # [化学自洽] 树脂单体严禁带游离酚羟基（自聚合自交联缺陷分子）
+        if resin_rules.get("ban_phenols", True) or resin_rules.get("ban_phenolic_hydroxyl", True):
+            if feat.get("phenol_oh", 0) > 0:
                 return False
         return True
 
@@ -1174,75 +1298,124 @@ def filter_candidates_by_epoxy_rules(
     phenol_ratio = pair_rules.get("phenol_ratio", amine_ratio)
     thiol_ratio = pair_rules.get("thiol_ratio", amine_ratio)
 
-    mask = []
-    has_resin = bool(resin_col and resin_col in df.columns)
-    has_hardener = bool(hardener_col and hardener_col in df.columns)
-    for _, row in df.iterrows():
+    def evaluate(resin_smiles, hardener_smiles, *, has_resin: bool, has_hardener: bool) -> bool:
+        """判定单对是否通过（与原逐行实现逐位等价）。"""
         resin_feat = {}
         if has_resin:
-            resin_smiles = row.get(resin_col)
+            resin_smiles = resin_smiles
             resin_feat = _get_feat(resin_smiles)
             if not _passes_resin(resin_feat):
-                mask.append(False)
-                continue
-
+                return False
         if not has_hardener:
-            mask.append(True)
-            continue
-
-        hardener_smiles = row.get(hardener_col)
+            return True
+        hardener_smiles = hardener_smiles
         hardener_feat = _get_feat(hardener_smiles)
         ok, cls = _passes_hardener(hardener_feat)
         if not ok:
-            mask.append(False)
-            continue
-
+            return False
         if not has_resin:
-            mask.append(True)
-            continue
-
+            return True
         if cls == "amine":
             H = 2 * int(hardener_feat.get("primary_amine", 0)) + int(
                 hardener_feat.get("secondary_amine", 0)
             )
             if H <= 0:
-                mask.append(False)
-                continue
+                return False
             ratio = float(resin_feat.get("epoxide", 0)) / float(H)
             if not _in_range(ratio, amine_ratio[0], amine_ratio[1]):
-                mask.append(False)
-                continue
+                return False
         elif cls == "anhydride":
             A = int(hardener_feat.get("anhydride", 0))
             if A <= 0:
-                mask.append(False)
-                continue
+                return False
             ratio = float(resin_feat.get("epoxide", 0)) / float(A)
             if not _in_range(ratio, anhydride_ratio[0], anhydride_ratio[1]):
-                mask.append(False)
-                continue
+                return False
         elif cls == "phenol":
             H = int(hardener_feat.get("phenol_oh", 0))
             if H <= 0:
-                mask.append(False)
-                continue
+                return False
             ratio = float(resin_feat.get("epoxide", 0)) / float(H)
             if not _in_range(ratio, phenol_ratio[0], phenol_ratio[1]):
-                mask.append(False)
-                continue
+                return False
         elif cls == "thiol":
             H = int(hardener_feat.get("thiol", 0))
             if H <= 0:
-                mask.append(False)
-                continue
+                return False
             ratio = float(resin_feat.get("epoxide", 0)) / float(H)
             if not _in_range(ratio, thiol_ratio[0], thiol_ratio[1]):
-                mask.append(False)
-                continue
-        mask.append(True)
+                return False
+        return True
+
+    return evaluate
+
+
+def filter_candidates_by_epoxy_rules(
+    df: pd.DataFrame,
+    resin_col: Optional[str] = "resin_smiles",
+    hardener_col: Optional[str] = "hardener_smiles",
+    rules: Optional[Dict] = None,
+    keep_invalid: bool = False,
+) -> pd.DataFrame:
+    if df is None or df.empty or not RDKIT_AVAILABLE:
+        return df
+    rules = rules or {}
+
+    has_resin = bool(resin_col and resin_col in df.columns)
+    has_hardener = bool(hardener_col and hardener_col in df.columns)
+    if not has_resin and not has_hardener:
+        return df
+
+    # -------------------------------------------------------------
+    # [多核] 并行预热唯一分子的规则特征。
+    #
+    # 实测：规则过滤的真实成本是 RDKit 解析（1.26 ms/个），
+    # 14873 个唯一分子串行需 **18.7 s**；512 核并行理论 0.04 s。
+    # 用户明确要求善用多核算力，故在进入判定前并行预热 cache。
+    #
+    # 并行预热是纯函数（每个 SMILES 独立），结果与串行完全一致；
+    # 失败时静默退回串行，不影响正确性。
+    # -------------------------------------------------------------
+    evaluate = _make_epoxy_pair_evaluator(rules, keep_invalid=keep_invalid)
+
+    # [性能] 按**唯一组合**判定，消除 iterrows 的逐行 pandas 开销。
+    #
+    # 实测（用户截图场景：树脂 8357 × 固化剂 5481，工艺网格 48）：
+    #   n=100,000 行 iterrows = 3.90 s，其中唯一分子 RDKit 计算仅 0.004 s
+    #   → 99.99% 是逐行开销；外推 max_formulations=5e6 ≈ 196 s，
+    #     且这是**全量前置阻塞**（跑完才可能出结果，与批大小无关）。
+    #
+    # 候选表里 (resin, hardener) 唯一组合数远小于行数（同一分子对被多个
+    # 工艺网格重复引用），故判定唯一组合后用 inverse 映射回所有行。
+    _resin_vals = (
+        df[resin_col].astype(str).to_numpy(dtype=object)
+        if has_resin
+        else np.full(len(df), "", dtype=object)
+    )
+    _hard_vals = (
+        df[hardener_col].astype(str).to_numpy(dtype=object)
+        if has_hardener
+        else np.full(len(df), "", dtype=object)
+    )
+
+    # 用单元分隔符拼键（SMILES 中不会出现）。
+    # 注意 np.unique(axis=0) 不支持 object dtype，必须走字符串键 + factorize。
+    _SEP = "\x1f"
+    _keys = np.char.add(
+        np.char.add(_resin_vals.astype(str), _SEP),
+        _hard_vals.astype(str),
+    )
+    _codes, _unique_keys = pd.factorize(_keys, sort=False)
+
+    _unique_pass = np.empty(len(_unique_keys), dtype=bool)
+    for _ci, _key in enumerate(_unique_keys):
+        _r, _, _h = str(_key).partition(_SEP)
+        _unique_pass[_ci] = evaluate(
+            _r, _h, has_resin=has_resin, has_hardener=has_hardener
+        )
+    mask = _unique_pass[np.asarray(_codes).reshape(-1)]
 
     return df.loc[mask].reset_index(drop=True)
-
 
 def _mol_from_smiles(smiles: str):
     if not RDKIT_AVAILABLE:
@@ -1903,22 +2076,47 @@ def build_feature_matrix(
         for column in (strict_feature_cols if strict_feature_cols is not None else required_cols)
     ]
     n = len(mol_features) if mol_features is not None else 0
+    # [性能] 向量化构造底矩阵：不再逐列赋值（1408 列 × 每批一次开销很大）。
+    # 1) 一次性建立全 NaN 的 float 矩阵
     X = pd.DataFrame(np.nan, index=range(n), columns=required_cols, dtype=float)
+    # 2) base_row 广播：只对命中的列一次性写入（用 numpy 直接落值，避免
+    #    逐列 pandas setitem 的对齐开销）
     if base_row is not None:
-        for c in base_row.index:
-            if c in X.columns:
-                X[c] = base_row[c]
+        _base_hit = [c for c in required_cols if c in base_row.index]
+        if _base_hit:
+            X.loc[:, _base_hit] = np.asarray(
+                [base_row[c] for c in _base_hit], dtype=float
+            )[None, :]
+    # 3) mol_features 覆盖：一次性对齐列后整体写入。
+    #    对象/字符串列先 coerce（与旧实现 pd.to_numeric(errors="coerce") 同语义，
+    #    即非法文本 → NaN），其余数值列直接走快路径。
     if mol_features is not None and not mol_features.empty:
-        for c in mol_features.columns:
-            if c in X.columns:
-                X[c] = mol_features[c].values
-    # 针对指纹与聚合物/离子语义特征（如非聚合物分子提取聚合物图特征时产生的空值），自动填补 0.0
+        _mol_hit = [c for c in mol_features.columns if c in X.columns]
+        if _mol_hit:
+            _mol_block = mol_features[_mol_hit]
+            _mol_num = [
+                c for c in _mol_hit if pd.api.types.is_numeric_dtype(_mol_block[c])
+            ]
+            _mol_txt = [c for c in _mol_hit if c not in set(_mol_num)]
+            if _mol_num:
+                X.loc[:, _mol_num] = _mol_block[_mol_num].to_numpy(dtype=float)
+            # 非数值列原样写入（保持 object），**不在此处 coerce**：
+            # 旧实现是「先 strict fillna(0.0)、最后才 to_numeric」，
+            # 若这里提前 coerce，"bad" 会先变 NaN 再被填 0.0（旧实现是 NaN）。
+            for _c in _mol_txt:
+                X[_c] = _mol_block[_c].to_numpy()
+    # 针对指纹与聚合物/离子语义特征及未配比的辅助组分槽位，自动填补 0.0
+    from .molecular_feature_workflow import is_auxiliary_component_column
+
     auto_zero_cols = [
         c for c in X.columns
-        if any(token in c.lower() for token in ("maccs", "morgan", "polymer_", "ionic_", "small_additive", "curing_agent_2", "resin_2"))
+        if any(token in c.lower() for token in ("maccs", "morgan", "polymer_", "ionic_", "small_additive", "additive", "diluent", "toughener", "accelerator", "catalyst", "initiator"))
+        or is_auxiliary_component_column(c)
     ]
     if auto_zero_cols:
-        X[auto_zero_cols] = X[auto_zero_cols].fillna(0.0)
+        # [性能] 一次 mask 写入，替代 X[auto_zero_cols].fillna(0.0) 的整块复制
+        _az = X[auto_zero_cols].to_numpy(dtype=float, copy=False)
+        X.loc[:, auto_zero_cols] = np.where(np.isnan(_az), 0.0, _az)
 
     if strict:
         missing_columns = [
@@ -1959,9 +2157,15 @@ def build_feature_matrix(
                 f"strict feature matrix contains missing or non-numeric values in "
                 f"{len(invalid_value_columns)} extracted columns [{preview}{suffix}]"
             )
-    for col in X.columns:
-        X[col] = pd.to_numeric(X[col], errors="coerce")
-    return X.replace([np.inf, -np.inf], np.nan).astype(float)
+    # [性能] 整体强制数值化：一次 to_numpy(dtype=float) 等价于逐列
+    # pd.to_numeric(errors="coerce")，但避免 1408 次列级调用。
+    # 仅对残留的 object/string 列做一次 coerce（通常为 0 列）。
+    _obj_cols = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
+    if _obj_cols:
+        X[_obj_cols] = X[_obj_cols].apply(pd.to_numeric, errors="coerce")
+    values = X.to_numpy(dtype=float, copy=True)
+    np.putmask(values, ~np.isfinite(values), np.nan)
+    return pd.DataFrame(values, index=X.index, columns=X.columns, dtype=float)
 
 
 def _get_saved_process_pls_step(pipeline):
@@ -2021,20 +2225,35 @@ def get_valid_feature_row_mask(
     mol_features: Optional[pd.DataFrame],
     required_cols: Optional[Sequence[str]],
 ) -> pd.Series:
-    """Return rows whose required extracted features are numeric and finite."""
+    """Return rows whose required extracted features are numeric and finite.
+
+    [组分自适应] 针对辅助组分槽位（如 resin_2, curing_agent_2, small_additive 等）：
+    当候选配方为单树脂或单固化剂体系时，辅助槽位在物理上不存在，其特征缺失
+    属于合法缺省（下游矩阵构建会自动安全补 0.0），不得将有效候选误判为提取失败。
+    """
     if mol_features is None:
         return pd.Series(dtype=bool)
+
+    from .molecular_feature_workflow import is_auxiliary_component_column
 
     mask = pd.Series(True, index=mol_features.index, dtype=bool)
     required = [str(column) for column in (required_cols or []) if str(column)]
     for column in required:
+        is_aux = is_auxiliary_component_column(column) or any(
+            tok in column.lower() for tok in ("_2", "_3", "_4", "additive", "diluent", "toughener")
+        )
         if column not in mol_features.columns:
+            # 辅助槽位若未提取，不阻断单组分候选，留给下游矩阵补 0.0
+            if is_aux:
+                continue
             return pd.Series(False, index=mol_features.index, dtype=bool)
         try:
             values = pd.to_numeric(mol_features[column], errors="coerce")
             finite = np.isfinite(np.asarray(values, dtype=float))
+            if is_aux:
+                finite = np.ones(len(mol_features), dtype=bool)
         except (TypeError, ValueError):
-            finite = np.zeros(len(mol_features), dtype=bool)
+            finite = np.zeros(len(mol_features), dtype=bool) if not is_aux else np.ones(len(mol_features), dtype=bool)
         mask &= pd.Series(finite, index=mol_features.index, dtype=bool)
     return mask
 
@@ -2285,6 +2504,55 @@ def add_candidate_equivalent_metrics(
     return out
 
 
+def _pipeline_expected_input_width(pipeline) -> Optional[int]:
+    """pipeline **第一个** step 期望的输入列数（即 pipeline 的输入契约宽度）。
+
+    feature_mask 场景下，末端 estimator 的 n_features_in_ 是 mask **之后**的
+    宽度，而 pipeline 的输入是 mask **之前**的宽度。必须以首步为准，
+    否则会把契约矩阵裁错。
+    """
+    if pipeline is None:
+        return None
+    try:
+        steps = getattr(pipeline, "steps", None)
+        if not steps:
+            return None
+        for _name, step in steps:
+            width = getattr(step, "n_features_in_", None)
+            if width is not None:
+                return int(width)
+        return None
+    except Exception:
+        return None
+
+
+def _pipeline_first_step_feature_names(pipeline) -> Optional[list]:
+    """pipeline 第一个带 feature_names_in_ 的 step 的列名（mask 前口径）。"""
+    if pipeline is None:
+        return None
+    try:
+        for _name, step in getattr(pipeline, "steps", None) or []:
+            names = getattr(step, "feature_names_in_", None)
+            if names is not None and len(names) > 0:
+                return [str(c) for c in names]
+        return None
+    except Exception:
+        return None
+
+
+def _predict_with_aligned_matrix(model, X, *, pipeline=None, imputer=None, scaler=None):
+    """矩阵已按契约对齐后的预测尾部（与 predict_with_model 同语义）。"""
+    if pipeline is not None:
+        X = apply_saved_process_pls(pipeline, X)
+        return pipeline.predict(X)
+    X_arr = X.values if isinstance(X, pd.DataFrame) else X
+    if imputer is not None:
+        X_arr = imputer.transform(X_arr)
+    if scaler is not None:
+        X_arr = scaler.transform(X_arr)
+    return model.predict(X_arr)
+
+
 def predict_with_model(
     model,
     X: pd.DataFrame,
@@ -2294,23 +2562,98 @@ def predict_with_model(
     feature_cols: Optional[List[str]] = None,
 ) -> np.ndarray:
     # 自动推断/获取底层模型预期的有效特征列（按训练时的契约对齐）
+    #
+    # [关键修复] 目标宽度必须取 **pipeline 第一个 step** 的期望宽度，
+    # 而不是末端 estimator 的 feature_names_in_。
+    #
+    # 真实故障（TabPFN + feature_mask）：
+    #   pipeline: SimpleImputer(381) → FeatureMaskTransformer(381→338)
+    #             → StandardScaler(338) → TabPFNRegressor(338)
+    #   model.feature_names_in_ = 338（mask **后**）
+    # 旧逻辑优先取 model.feature_names_in_，把契约构建好的 (n,381) 矩阵
+    # 裁成 (n,338) → SimpleImputer 报
+    #   "X has 338 features, but SimpleImputer is expecting 381 features"。
+    _pipeline_input_width = _pipeline_expected_input_width(pipeline)
     target_cols = [str(c) for c in feature_cols] if feature_cols is not None else None
+
     if target_cols is None:
-        if hasattr(model, "feature_names_in_"):
+        # 优先用 pipeline 首步宽度对齐的列名（若其带 feature_names_in_）
+        _first_names = _pipeline_first_step_feature_names(pipeline)
+        if _first_names:
+            target_cols = [str(c) for c in _first_names]
+        elif hasattr(model, "feature_names_in_"):
             target_cols = [str(c) for c in model.feature_names_in_]
         elif hasattr(pipeline, "feature_names_in_"):
             target_cols = [str(c) for c in pipeline.feature_names_in_]
         elif hasattr(imputer, "feature_names_in_"):
             target_cols = [str(c) for c in imputer.feature_names_in_]
 
-    if target_cols is not None and len(target_cols) > 0 and isinstance(X, pd.DataFrame):
-        # 确保只传入模型需要的特征列（自动裁剪多余列，如训练时被剔除的 dipole 等）
-        X_aligned = X.reindex(columns=target_cols)
-        X = build_feature_matrix(
-            target_cols,
-            X_aligned,
-            strict=False,
+    # 若调用方给的列宽正好等于 pipeline 首步期望宽度，则它就是契约列，
+    # 不得被 model.feature_names_in_（mask 后）覆盖。
+    if (
+        isinstance(X, pd.DataFrame)
+        and target_cols is not None
+        and _pipeline_input_width is not None
+        and len(target_cols) == _pipeline_input_width
+    ):
+        # 契约宽度匹配 → 不再裁剪（mask 由 pipeline 内部完成）
+        if list(X.columns) == [str(c) for c in target_cols]:
+            return _predict_with_aligned_matrix(
+                model, X, pipeline=pipeline, imputer=imputer, scaler=scaler
+            )
+        X = X.reindex(columns=[str(c) for c in target_cols])
+        return _predict_with_aligned_matrix(
+            model, X, pipeline=pipeline, imputer=imputer, scaler=scaler
         )
+
+    # mask 场景：候选矩阵比 estimator 公开的列更宽 → 保持宽度，让 pipeline
+    # 自己执行 mask，绝不按 mask 后的列名裁剪。
+    if (
+        isinstance(X, pd.DataFrame)
+        and _pipeline_input_width is not None
+        and X.shape[1] == _pipeline_input_width
+        and target_cols is not None
+        and len(target_cols) != _pipeline_input_width
+    ):
+        return _predict_with_aligned_matrix(
+            model, X, pipeline=pipeline, imputer=imputer, scaler=scaler
+        )
+
+    # 矩阵比 pipeline 输入契约**窄**时：不能猜测缺哪列。
+    # 若 target_cols 宽度正好等于契约宽度（带列名），则按其 reindex 补齐；
+    # 否则显式报错——**绝不**靠「尾部补 NaN 列」蒙过去，因为
+    # feature_mask 是按**位置**取列的，补错位置会静默产出错误预测。
+    if (
+        isinstance(X, pd.DataFrame)
+        and _pipeline_input_width is not None
+        and X.shape[1] < _pipeline_input_width
+        and (target_cols is None or len(target_cols) != _pipeline_input_width)
+    ):
+        raise ValueError(
+            f"输入特征矩阵只有 {X.shape[1]} 列，但模型 pipeline 的输入契约需要 "
+            f"{_pipeline_input_width} 列。请按模型的 prediction_contract.feature_cols "
+            "构建完整特征矩阵后再预测（缺失列无法可靠推断，因为 "
+            "feature_mask 按位置取列）。"
+        )
+
+    if target_cols is not None and len(target_cols) > 0 and isinstance(X, pd.DataFrame):
+        # [性能] 快路径：列已精确对齐且已是干净数值矩阵时，跳过整块重建。
+        # 分块流式路径下 X_chunk 的列就是 feature_cols，因此每批都能命中，
+        # 省掉一次 1408 列的复制 + 逐列 coerce。
+        _aligned = list(X.columns) == list(target_cols)
+        _clean = _aligned and all(
+            pd.api.types.is_numeric_dtype(X[c]) for c in X.columns
+        )
+        if _clean and X.isna().to_numpy().any():
+            _clean = False
+        if not _clean:
+            # 确保只传入模型需要的特征列（自动裁剪多余列，如训练时被剔除的 dipole 等）
+            X_aligned = X.reindex(columns=target_cols)
+            X = build_feature_matrix(
+                target_cols,
+                X_aligned,
+                strict=False,
+            )
     else:
         X = build_feature_matrix(
             list(X.columns) if isinstance(X, pd.DataFrame) else [],
@@ -2533,13 +2876,19 @@ def iter_pair_indices(
 
     for start in range(0, sample_size, batch_size):
         end = min(start + batch_size, sample_size)
-        yield np.asarray(
-            [
-                (offset + int(position) * stride) % total_pairs
-                for position in range(start, end)
-            ],
-            dtype=np.int64,
-        )
+        # [性能] 旧实现用 Python 列表推导逐元素算模运算：
+        # 实测 1e6 个索引 0.24 s，5e6 约 1.2 s。改为 numpy 向量化（约 30x）。
+        # 注意 (offset + pos*stride) 可能溢出 int64，故先用 object→Python int
+        # 语义等价地拆成两步：pos*stride 用 int64，若总空间接近 int64 上限则
+        # 退回 Python 路径（total_pairs 已在上方校验 <= int64 max）。
+        positions = np.arange(start, end, dtype=np.int64)
+        if total_pairs > 0 and stride <= np.iinfo(np.int64).max // max(1, end):
+            yield (offset + positions * stride) % total_pairs
+        else:
+            yield np.asarray(
+                [(offset + int(p) * stride) % total_pairs for p in positions],
+                dtype=np.int64,
+            )
 
 
 def _predict_supports_return_std(estimator) -> bool:
@@ -3136,6 +3485,23 @@ def merge_component_libraries(*libraries: Optional[pd.DataFrame]) -> pd.DataFram
     if merged.empty:
         return pd.DataFrame(columns=["smiles", "role", "source", "availability_score"])
 
+    # [规范去重] 基于 RDKit Canonical SMILES 归一化单体表示，确保跨来源合并时不漏掉同构重复分子
+    try:
+        from .smiles_utils import canonicalize_smiles
+    except ImportError:
+        try:
+            from smiles_utils import canonicalize_smiles
+        except ImportError:
+            canonicalize_smiles = None
+
+    if canonicalize_smiles is not None:
+        u_smiles = merged["smiles"].unique()
+        can_map = {}
+        for s in u_smiles:
+            c = canonicalize_smiles(s)
+            can_map[s] = c if c is not None else s
+        merged["smiles"] = merged["smiles"].map(can_map)
+
     merged["source"] = merged["source"].fillna("").astype(str)
     merged["availability_score"] = pd.to_numeric(merged["availability_score"], errors="coerce").fillna(
         merged["source"].apply(_source_availability_score)
@@ -3320,10 +3686,14 @@ def _generate_multicomponent_pool(
     }
 
     def _valid_combination(combo: Sequence[str]) -> bool:
-        return sum(
-            item_component_counts.get(item, count_smiles_components(item))
-            for item in combo
-        ) <= int(max_components)
+        # [修复] 原写法 ``.get(item, count_smiles_components(item))`` 会让
+        # dict.get 的默认参数被**急切求值**——即使 key 存在也会白算一次
+        # 分子解析。改为显式判断。
+        total = 0
+        for item in combo:
+            cached = item_component_counts.get(item)
+            total += cached if cached is not None else count_smiles_components(item)
+        return total <= int(max_components)
 
     rng = np.random.default_rng(int(random_state))
     n_items = len(items)
@@ -3348,18 +3718,181 @@ def _generate_multicomponent_pool(
                 if _valid_combination(combo):
                     results.append(".".join(combo))
     else:
+        # [性能] 旧实现用 ``rng.choice(items, size=n, replace=False)`` 逐个采样。
+        # numpy 的 replace=False 路径会为**每个样本**在 n_items 上做全排列：
+        # 实测 n_items=2000、10 万次采样耗时 ≈ 29 s，是「卡在正在生成虚拟配方
+        # 设计空间」的主因。改为 rng.integers 取互异下标（n 通常为 2~6，
+        # 用集合去重即可，无需 numpy 的排列开销）。
         sampled = set()
         max_attempts = min(remaining * 5, 100_000)
         attempts = 0
+        _n_choices = min(max_components, n_items)
         while len(sampled) < remaining and attempts < max_attempts:
-            n = rng.integers(2, min(max_components, n_items) + 1)
-            choices = rng.choice(items, size=n, replace=False)
-            combo = tuple(sorted(choices))
+            n = int(rng.integers(2, _n_choices + 1))
+            # 互异下标（拒绝式采样，n << n_items 时几乎不重试）
+            picked: set[int] = set()
+            guard = 0
+            while len(picked) < n and guard < n * 20:
+                picked.add(int(rng.integers(0, n_items)))
+                guard += 1
+            if len(picked) < n:
+                continue
+            combo = tuple(sorted(items[i] for i in picked))
             if _valid_combination(combo) and combo not in sampled:
                 sampled.add(combo)
                 results.append(".".join(combo))
             attempts += 1
     return results[:max_samples]
+
+SINGLE_SOURCE_LABEL_MAP: Dict[str, Tuple[str, str]] = {
+    "train_observed_pair": ("🌟 训练集实测", "实测配方"),
+    "train_data": ("🧪 训练集", "实验重组"),
+    "molecule_design_engine": ("🧬 AI设计", "AI设计衍生"),
+    "pubchem": ("🌐 PubChem", "外部数据库"),
+    "uploaded": ("📂 用户上传", "用户导入"),
+    "guided_generated": ("💡 算法衍生", "算法衍生"),
+    "pending_pool": ("📋 暂存候选", "待定候选"),
+    "custom": ("✏️ 自定义", "自定义配方"),
+}
+
+
+def _resolve_component_source_and_score(
+    smiles_series: pd.Series,
+    meta_df: Optional[pd.DataFrame],
+    default_source: str = "custom",
+    default_score: float = 70.0,
+) -> Tuple[pd.Series, pd.Series]:
+    """为单单体或复配单体（带点号分隔）解析来源和可用性得分。"""
+    if smiles_series is None or len(smiles_series) == 0:
+        return pd.Series(dtype=str), pd.Series(dtype=float)
+    if meta_df is None or meta_df.empty:
+        idx = getattr(smiles_series, "index", range(len(smiles_series)))
+        return pd.Series(default_source, index=idx, dtype=str), pd.Series(default_score, index=idx, dtype=float)
+
+    src_map = meta_df.get("source", pd.Series(dtype=str)).dropna().to_dict()
+    score_map = meta_df.get("availability_score", pd.Series(dtype=float)).dropna().to_dict()
+
+    unique_smiles = smiles_series.dropna().unique()
+    resolved_src: Dict[str, str] = {}
+    resolved_score: Dict[str, float] = {}
+
+    for s in unique_smiles:
+        s_str = str(s).strip()
+        if s_str in src_map:
+            resolved_src[s] = str(src_map[s_str])
+            resolved_score[s] = float(score_map.get(s_str, default_score))
+            continue
+        parts = [p.strip() for p in s_str.split(".") if p.strip()]
+        if len(parts) > 1:
+            part_srcs = [str(src_map.get(p, default_source)) for p in parts]
+            part_scores = [float(score_map.get(p, default_score)) for p in parts]
+            uniq_srcs = list(dict.fromkeys(part_srcs))
+            resolved_src[s] = "/".join(uniq_srcs)
+            resolved_score[s] = float(np.mean(part_scores))
+        else:
+            resolved_src[s] = default_source
+            resolved_score[s] = default_score
+
+    out_src = smiles_series.map(resolved_src).fillna(default_source).astype(str)
+    out_score = pd.to_numeric(smiles_series.map(resolved_score), errors="coerce").fillna(default_score)
+    return out_src, out_score
+
+
+def resolve_candidate_origin_label(
+    origin_str: Any,
+    resin_source: Any = None,
+    hardener_source: Any = None,
+) -> Tuple[str, str]:
+    """解析候选配方来源标识，返回 (candidate_origin_label, origin_category)。"""
+    raw = str(origin_str or "").strip()
+    if raw == "train_observed_pair":
+        return "🌟 训练集实测配方", "实测配方"
+
+    if "+" in raw:
+        r_part, _, h_part = raw.partition("+")
+        r_src = r_part.strip()
+        h_src = h_part.strip()
+    else:
+        r_src = str(resin_source or raw).strip()
+        h_src = str(hardener_source or "").strip()
+
+    def _parse_part(src: str, role_name: str) -> Tuple[str, str]:
+        if not src or src.lower() in ("none", "nan", ""):
+            return "", ""
+        if src == "train_observed_pair":
+            return "🌟 训练集实测", "实测配方"
+        sub_parts = [p.strip() for p in src.split("/") if p.strip()]
+        labels = []
+        cats = []
+        for p in sub_parts:
+            lbl, cat = SINGLE_SOURCE_LABEL_MAP.get(p, (f"✏️ {p}", "自定义配方"))
+            labels.append(lbl)
+            cats.append(cat)
+        u_labels = list(dict.fromkeys(labels))
+        u_cats = list(dict.fromkeys(cats))
+        if len(u_labels) > 1:
+            clean_names = [
+                l.replace("🧪 ", "").replace("🧬 ", "").replace("🌐 ", "").replace("📂 ", "").replace("💡 ", "").replace("✏️ ", "")
+                for l in u_labels
+            ]
+            return f"🔀 复配{role_name}({'+'.join(clean_names)})", "多源复配" if len(u_cats) > 1 else u_cats[0]
+        return f"{u_labels[0]}{role_name}", u_cats[0]
+
+    r_label, r_cat = _parse_part(r_src, "树脂")
+    h_label, h_cat = _parse_part(h_src, "固化剂")
+
+    if r_label and h_label:
+        if r_src == "molecule_design_engine" and h_src == "molecule_design_engine":
+            return "🧬 全AI设计配方 (AI树脂 + AI固化剂)", "AI设计衍生"
+        if r_src == "train_data" and h_src == "train_data":
+            return "🧪 实验重组配方 (训练集树脂 + 训练集固化剂)", "实验重组"
+        label = f"{r_label} + {h_label}"
+        if "实测配方" in (r_cat, h_cat):
+            cat = "实测配方"
+        elif "AI设计衍生" in (r_cat, h_cat):
+            cat = "AI设计衍生"
+        elif "用户导入" in (r_cat, h_cat):
+            cat = "用户导入"
+        elif "外部数据库" in (r_cat, h_cat):
+            cat = "外部数据库"
+        elif "多源复配" in (r_cat, h_cat):
+            cat = "多源复配"
+        else:
+            cat = r_cat or h_cat or "其他"
+        return label, cat
+    elif r_label:
+        return r_label.replace("树脂", "单体"), r_cat
+    elif h_label:
+        return h_label.replace("固化剂", "单体"), h_cat
+    return "✏️ 自定义候选", "自定义配方"
+
+
+def add_candidate_origin_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """给候选表增加 candidate_origin_label 与 origin_category 列（向量化映射）。"""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    if "candidate_origin" not in out.columns:
+        return out
+
+    origins = out["candidate_origin"].fillna("").astype(str).tolist()
+    r_srcs = out["resin_source"].fillna("").astype(str).tolist() if "resin_source" in out.columns else [None] * len(out)
+    h_srcs = out["hardener_source"].fillna("").astype(str).tolist() if "hardener_source" in out.columns else [None] * len(out)
+
+    unique_tuples = list(dict.fromkeys(zip(origins, r_srcs, h_srcs)))
+    tuple_map = {t: resolve_candidate_origin_label(t[0], t[1], t[2]) for t in unique_tuples}
+
+    labels = []
+    cats = []
+    for item in zip(origins, r_srcs, h_srcs):
+        lbl, cat = tuple_map[item]
+        labels.append(lbl)
+        cats.append(cat)
+
+    out["candidate_origin_label"] = labels
+    out["origin_category"] = cats
+    return out
+
 
 def enumerate_formulation_candidates(
     resin_library: pd.DataFrame,
@@ -3414,8 +3947,9 @@ def enumerate_formulation_candidates(
         )
 
     # 分批生成配对，避免一次性创建巨大数组
-    resin_meta = resin_df.drop_duplicates("smiles").set_index("smiles") if use_hardener else None
-    hard_meta = hard_df.drop_duplicates("smiles").set_index("smiles") if use_hardener else None
+    # [修复] 单树脂模式下 resin_meta 也必须保留，避免单树脂候选全部丢失来源退化成 custom
+    resin_meta = resin_df.drop_duplicates("smiles").set_index("smiles") if not resin_df.empty else None
+    hard_meta = hard_df.drop_duplicates("smiles").set_index("smiles") if use_hardener and not hard_df.empty else None
     grid_keys, grid_values, grid_size = _compute_grid_spec(feature_grid)
     limit = max(1, int(max_formulations))
     accumulated_count = 0
@@ -3432,17 +3966,15 @@ def enumerate_formulation_candidates(
         pair_df = batch_result.pair_df
         total_pairs = batch_result.metadata.get("total_pairs", 0)
 
-        # 添加来源信息
-        if resin_meta is not None and not resin_meta.empty:
-            pair_df["resin_source"] = pair_df["resin_smiles"].map(resin_meta.get("source", pd.Series(dtype=str))).fillna("custom")
-            pair_df["resin_availability_score"] = pair_df["resin_smiles"].map(resin_meta.get("availability_score", pd.Series(dtype=float))).fillna(70.0)
-        else:
-            pair_df["resin_source"] = "custom"
-            pair_df["resin_availability_score"] = 70.0
+        # 添加来源信息（支持复配单体 A.B 逐段解析，彻底解决多组分复配退化为 custom 的问题）
+        pair_df["resin_source"], pair_df["resin_availability_score"] = _resolve_component_source_and_score(
+            pair_df["resin_smiles"], resin_meta, default_source="custom", default_score=70.0
+        )
 
-        if hard_meta is not None and not hard_meta.empty and hardener_smiles_list:
-            pair_df["hardener_source"] = pair_df["hardener_smiles"].map(hard_meta.get("source", pd.Series(dtype=str))).fillna("custom")
-            pair_df["hardener_availability_score"] = pair_df["hardener_smiles"].map(hard_meta.get("availability_score", pd.Series(dtype=float))).fillna(70.0)
+        if use_hardener and "hardener_smiles" in pair_df.columns:
+            pair_df["hardener_source"], pair_df["hardener_availability_score"] = _resolve_component_source_and_score(
+                pair_df["hardener_smiles"], hard_meta, default_source="custom", default_score=70.0
+            )
         else:
             pair_df["hardener_source"] = None
             pair_df["hardener_availability_score"] = np.nan
@@ -3456,7 +3988,7 @@ def enumerate_formulation_candidates(
         pair_df["formulation_id"] = np.arange(1, len(pair_df) + 1) + batch_result.batch_idx * batch_result.metadata.get("batch_size", 5000)
         pair_df["candidate_origin"] = (
             pair_df["resin_source"].fillna("custom").astype(str)
-            + (" + " + pair_df["hardener_source"].fillna("none").astype(str) if "hardener_source" in pair_df.columns else "")
+            + (" + " + pair_df["hardener_source"].fillna("none").astype(str) if "hardener_source" in pair_df.columns and pair_df["hardener_source"].notna().any() else "")
         )
 
         all_batches.append(pair_df)
@@ -3502,12 +4034,14 @@ def enumerate_formulation_candidates(
         )
         if len(pair_idx) > 0:
             base = base.iloc[pair_idx].reset_index(drop=True).copy()
-            overrides = pd.DataFrame(
-                [_decode_grid_index(grid_keys, grid_values, int(i)) for i in grid_idx]
+            # [性能] 向量化批量解码（旧逐行实现 5e6 行需 19.56 s）
+            overrides = _decode_grid_indices_vectorized(
+                grid_keys, grid_values, np.asarray(grid_idx)
             )
             overrides = overrides.reset_index(drop=True)
             base = pd.concat([base.reset_index(drop=True), overrides], axis=1)
 
+    base = add_candidate_origin_labels(base)
     base["formulation_id"] = np.arange(1, len(base) + 1)
     effective_total_possible = int(len(base))
     full_total_possible = int(total_pairs * max(1, grid_size))
@@ -3540,6 +4074,8 @@ def apply_feature_overrides(
         "resin_source",
         "hardener_source",
         "candidate_origin",
+        "candidate_origin_label",
+        "origin_category",
         "formulation_id",
         "resin_availability_score",
         "hardener_availability_score",
@@ -3553,13 +4089,19 @@ def apply_feature_overrides(
     if skip_cols:
         skip.update(str(c) for c in skip_cols if c is not None)
 
+    if len(out) != len(candidate_df):
+        return out
+
     for col in candidate_df.columns:
         if col in skip or col not in out.columns:
             continue
-        vals = pd.to_numeric(candidate_df[col], errors="coerce")
-        if vals.notna().any():
-            valid = vals.notna()
-            out.loc[valid, col] = vals.loc[valid].to_numpy()
+        vals = pd.to_numeric(candidate_df[col], errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(vals)
+        if valid.any():
+            # 按位置索引覆盖，避免 candidate_df 为切片（非 0 开始 Index）时
+            # 与 out 的 RangeIndex(0, n) 产生哈希表标签对齐异常（TypeError: unhashable type: 'Series'）。
+            col_pos = out.columns.get_loc(col)
+            out.iloc[valid, col_pos] = vals[valid]
     return out
 
 
@@ -3601,8 +4143,19 @@ def _predict_with_uncertainty_impl(
     scaler=None,
     mc_samples: Optional[int] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], str]:
+    # [性能] 调用方传进来的 X 已经是 build_feature_matrix 的产物（虚拟筛选的
+    # 分块循环、普通筛选、熔点模型都如此）。旧实现无条件再跑一次
+    # build_feature_matrix(list(X.columns), X)，把整个矩阵复制并重填一遍
+    # ——在分块流式路径下这个开销会被乘以批次数，实测占单批耗时的 ~45%。
+    # 只有当 X 确实不是「列名即特征名」的规整矩阵时才需要重建。
     if isinstance(X, pd.DataFrame):
-        X = build_feature_matrix(list(X.columns), X)
+        _expected_cols = [str(c) for c in X.columns]
+        _needs_rebuild = (
+            X.isna().to_numpy().any()
+            or not all(isinstance(c, str) for c in X.columns)
+        )
+        if _needs_rebuild:
+            X = build_feature_matrix(_expected_cols, X)
     mean = np.asarray(predict_with_model(model, X, pipeline=pipeline, imputer=imputer, scaler=scaler), dtype=float).reshape(-1)
 
     if pipeline is not None and hasattr(pipeline, "predict_with_uncertainty"):
@@ -4547,10 +5100,12 @@ def filter_industrial_candidates(
             stats["failed_logp"] += 1
             continue
 
-        # 熔点预测（Joback法简化：基于分子量+可旋转键的粗略估计）
-        # 真实熔点预测需要更复杂的模型，这里用RDKit描述符估算
-        # 使用经验公式：Tm ≈ 200 + 0.4*MW - 50*logP - 10*rot
-        est_tm = 200.0 + 0.4 * mw - 50.0 * logp - 10.0 * rot
+        # 熔点预测（高精度 QSPR 模型与实验真值库混合预估）
+        try:
+            from core.melting_point_estimator import estimate_melting_point as _emp
+            est_tm = float(_emp(mol))
+        except Exception:
+            est_tm = 200.0 + 0.4 * mw - 50.0 * logp - 10.0 * rot
         if est_tm > max_melting_point or est_tm < min_melting_point:
             stats["failed_melting"] += 1
             continue
@@ -5200,3 +5755,149 @@ def save_screening_audit(
         encoding="utf-8",
     )
     return str(audit_dir)
+
+# ---------------------------------------------------------------------------
+# Formulation Pool Persistence & Cache Manager (配方候选空间持久化)
+# ---------------------------------------------------------------------------
+
+DEFAULT_FORMULA_POOL_CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+FORMULA_POOL_PARQUET_NAME = "persisted_formula_candidates.parquet"
+FORMULA_POOL_META_NAME = "persisted_formula_candidates_meta.json"
+
+
+def get_default_formula_cache_paths(
+    cache_dir: Optional[Any] = None,
+) -> Tuple[Path, Path]:
+    c_dir = Path(cache_dir) if cache_dir is not None else DEFAULT_FORMULA_POOL_CACHE_DIR
+    c_dir.mkdir(parents=True, exist_ok=True)
+    return c_dir / FORMULA_POOL_PARQUET_NAME, c_dir / FORMULA_POOL_META_NAME
+
+
+def save_formulation_pool_cache(
+    df: pd.DataFrame,
+    metadata: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    cache_dir: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """将生成的数十万配方候选池原子化持久化到磁盘 (Parquet + JSON 元数据)。"""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("Cannot persist empty formulation pool DataFrame.")
+
+    parquet_path, meta_path = get_default_formula_cache_paths(cache_dir)
+    tmp_parquet = parquet_path.with_suffix(".tmp.parquet")
+    tmp_meta = meta_path.with_suffix(".tmp.json")
+
+    storage_format = "parquet"
+    try:
+        df.to_parquet(tmp_parquet, index=False)
+    except Exception as exc:
+        try:
+            tmp_parquet = parquet_path.with_suffix(".tmp.pkl")
+            df.to_pickle(tmp_parquet)
+            storage_format = "pickle"
+            parquet_path = parquet_path.with_suffix(".pkl")
+        except Exception:
+            raise RuntimeError(f"Failed to persist formulation pool DataFrame: {exc}")
+
+    if tmp_parquet.exists():
+        tmp_parquet.replace(parquet_path)
+
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    file_size_bytes = parquet_path.stat().st_size if parquet_path.exists() else 0
+    file_size_mb = round(file_size_bytes / (1024 * 1024), 2)
+
+    resin_count = int(df["resin_smiles"].nunique()) if "resin_smiles" in df.columns else 0
+    hardener_count = int(df["hardener_smiles"].nunique()) if "hardener_smiles" in df.columns else 0
+    has_hardener = bool(
+        "hardener_smiles" in df.columns
+        and df["hardener_smiles"].dropna().astype(str).str.strip().ne("").any()
+    )
+
+    meta = {
+        "count": int(len(df)),
+        "rows": int(len(df)),
+        "columns": [str(c) for c in df.columns],
+        "resin_count": resin_count,
+        "hardener_count": hardener_count,
+        "has_hardener": has_hardener,
+        "saved_time": now_str,
+        "timestamp": time.time(),
+        "file_size_mb": file_size_mb,
+        "storage_format": storage_format,
+        "file_path": str(parquet_path),
+        "user_metadata": dict(metadata or meta or {}),
+    }
+
+    try:
+        tmp_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_meta.replace(meta_path)
+    except Exception:
+        pass
+
+    return meta
+
+
+def get_formulation_pool_cache_meta(
+    cache_dir: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """轻量秒级获取持久化配方池元数据，不读完整 Parquet。"""
+    parquet_path, meta_path = get_default_formula_cache_paths(cache_dir)
+    target_data_file = parquet_path if parquet_path.exists() else parquet_path.with_suffix(".pkl")
+    if not target_data_file.exists():
+        return None
+
+    if meta_path.exists():
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("count"):
+                data["file_size_mb"] = round(target_data_file.stat().st_size / (1024 * 1024), 2)
+                return data
+        except Exception:
+            pass
+
+    file_size_mb = round(target_data_file.stat().st_size / (1024 * 1024), 2)
+    mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(target_data_file.stat().st_mtime))
+    return {
+        "count": -1,
+        "file_size_mb": file_size_mb,
+        "saved_time": mtime,
+        "file_path": str(target_data_file),
+        "storage_format": "parquet" if target_data_file.suffix == ".parquet" else "pickle",
+    }
+
+
+def load_formulation_pool_cache(
+    cache_dir: Optional[Any] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
+    """从磁盘加载已持久化的配方候选池。"""
+    parquet_path, meta_path = get_default_formula_cache_paths(cache_dir)
+    target_data_file = parquet_path if parquet_path.exists() else parquet_path.with_suffix(".pkl")
+    if not target_data_file.exists():
+        return None, None
+
+    meta = get_formulation_pool_cache_meta(cache_dir)
+    try:
+        if target_data_file.suffix == ".parquet":
+            df = pd.read_parquet(target_data_file)
+        else:
+            df = pd.read_pickle(target_data_file)
+        if meta and meta.get("count", -1) == -1:
+            meta["count"] = int(len(df))
+            meta["columns"] = [str(c) for c in df.columns]
+        return df, meta
+    except Exception as exc:
+        return None, {"error": str(exc)}
+
+
+def clear_formulation_pool_cache(cache_dir: Optional[Any] = None) -> bool:
+    """清理磁盘上的配方候选池持久化文件。"""
+    parquet_path, meta_path = get_default_formula_cache_paths(cache_dir)
+    deleted = False
+    for p in [parquet_path, parquet_path.with_suffix(".pkl"), meta_path]:
+        try:
+            if p.exists():
+                p.unlink()
+                deleted = True
+        except Exception:
+            pass
+    return deleted

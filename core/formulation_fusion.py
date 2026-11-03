@@ -17,6 +17,205 @@ import pandas as pd
 from rdkit import Chem
 
 
+def normalize_cross_platform_path(p: str) -> str:
+    """
+    跨平台路径规范化：在 Windows 与 WSL/Linux 之间自动转换路径表达。
+    - Linux/WSL 环境下：将 \\\\wsl.localhost\\... 或 C:\\... 转换为 /home/... 或 /mnt/c/...
+    - Windows 环境下：将 /home/... 转换为 \\\\wsl.localhost\\Ubuntu-24.04\\home\\...
+    """
+    if not p:
+        return ""
+    p_str = str(p).strip().strip("'\"")
+    if not p_str:
+        return ""
+    if os.name != 'nt':  # 运行在 Linux / WSL 环境
+        # 1. Windows UNC 格式：\\wsl.localhost\Ubuntu-24.04\home\... 或 //wsl$...
+        m_unc = re.match(r'^[/\\]{2}wsl(?:\.localhost|\$)[/\\]+[^/\\]+([/\\].*)$', p_str, re.IGNORECASE)
+        if m_unc:
+            linux_path = m_unc.group(1).replace('\\', '/')
+            return linux_path
+        # 2. Windows 盘符格式：C:\... 或 C:/...
+        m_drive = re.match(r'^([a-zA-Z]):[/\\](.*)$', p_str)
+        if m_drive:
+            drive = m_drive.group(1).lower()
+            rest = m_drive.group(2).replace('\\', '/')
+            return f"/mnt/{drive}/{rest}"
+    else:  # 运行在 Windows 环境
+        # 1. WSL 路径 /mnt/c/... 还原为 C:\...
+        m_mnt = re.match(r'^/mnt/([a-zA-Z])/(.*)$', p_str)
+        if m_mnt:
+            drive = m_mnt.group(1).upper()
+            rest = m_mnt.group(2).replace('/', '\\')
+            return f"{drive}:\\{rest}"
+        # 2. Linux 原生路径 /home/... 映射为 Windows UNC 共享
+        if p_str.startswith('/home/') or (p_str.startswith('/') and not p_str.startswith('//')):
+            for prefix in ("//wsl.localhost/Ubuntu-24.04", "//wsl$/Ubuntu-24.04"):
+                cand = f"{prefix}{p_str}"
+                if os.path.exists(cand):
+                    return os.path.normpath(cand)
+            return os.path.normpath(f"//wsl.localhost/Ubuntu-24.04{p_str}")
+    return os.path.normpath(p_str)
+
+
+def get_candidate_dataset_dirs(custom_dir: Optional[str] = None) -> List[str]:
+    """
+    智能获取可能存在数据集（ml_wide_samples.csv、ml_qspr_model_*.csv 等）的候选目录列表。
+    
+    跨平台适配：
+    1. 用户显式指定目录 custom_dir（及其深层子目录探测）
+    2. 环境变量 ML_DATASET_DIR
+    3. 相对路径/层级探测（支持 WSL 与 Windows 项目结构）：
+       - 项目同级/上级目录：../ml_dataset, .., ml_dataset
+       - 基于代码文件的上层目录
+    4. WSL / Linux 原生路径（如 /home/wangj/project/ml_dataset, /home/wangj/project）
+    5. Windows UNC 共享路径与本地路径（如 \\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\wangj\\\\project...）
+    6. 当前工作目录
+    
+    返回去重且真实存在的目录列表，且按数据集特征完整度评分排序。
+    """
+    raw_candidates: List[str] = []
+
+    # 1. 显式指定
+    if custom_dir:
+        raw_candidates.append(str(custom_dir))
+
+    # 2. 环境变量
+    env_dir = os.environ.get("ML_DATASET_DIR")
+    if env_dir:
+        raw_candidates.append(env_dir)
+
+    # 3. 相对路径推断（无论在 WSL 还是 Windows，只要在项目目录内运行都能定位上级与周边）
+    cwd = os.getcwd()
+    raw_candidates.extend([
+        os.path.join(cwd, "ml_dataset"),
+        os.path.abspath(os.path.join(cwd, "..", "ml_dataset")),
+        os.path.abspath(os.path.join(cwd, "..")),
+        cwd,
+    ])
+
+    # 基于当前模块文件位置的相对推断
+    try:
+        mod_dir = os.path.dirname(os.path.abspath(__file__))
+        raw_candidates.extend([
+            os.path.abspath(os.path.join(mod_dir, "..", "ml_dataset")),
+            os.path.abspath(os.path.join(mod_dir, "..", "..", "ml_dataset")),
+            os.path.abspath(os.path.join(mod_dir, "..", "..")),
+        ])
+    except Exception:
+        pass
+
+    # 4. Linux / WSL 常见路径（针对 WSL 环境及 Windows UNC 访问）
+    raw_candidates.extend([
+        "/home/wangj/project/ml_dataset",
+        "/home/wangj/project",
+        "/home/wangj/ml_dataset",
+        "/mnt/c/Users/wangj/Desktop/ml_dataset",
+    ])
+
+    # 5. Windows 原生与 UNC 路径（支持从 Windows 端直接访问 WSL 项目与数据）
+    raw_candidates.extend([
+        r"\\wsl.localhost\Ubuntu-24.04\home\wangj\project\ml_dataset",
+        r"//wsl.localhost/Ubuntu-24.04/home/wangj/project/ml_dataset",
+        r"\\wsl.localhost\Ubuntu-24.04\home\wangj\project",
+        r"//wsl.localhost/Ubuntu-24.04/home/wangj/project",
+        r"\\wsl$\Ubuntu-24.04\home\wangj\project\ml_dataset",
+        r"//wsl$/Ubuntu-24.04/home/wangj/project/ml_dataset",
+        r"\\wsl$\Ubuntu-24.04\home\wangj\project",
+        r"//wsl$/Ubuntu-24.04/home/wangj/project",
+        r"C:\Users\wangj\Desktop\ml_dataset",
+        r"C:\Users\wangj\project\ml_dataset",
+        r"C:\Users\wangj\project",
+    ])
+
+    # 跨平台转换扩充
+    expanded_candidates: List[str] = []
+    for p in raw_candidates:
+        if not p:
+            continue
+        if p not in expanded_candidates:
+            expanded_candidates.append(p)
+        norm_p = normalize_cross_platform_path(p)
+        if norm_p and norm_p not in expanded_candidates:
+            expanded_candidates.append(norm_p)
+
+    # 深度子目录探测：对每个存在目录，自动发现包含 .csv 的子目录（如 ml_dataset, dataset, data 等）
+    sub_discovered: List[str] = []
+    for d in expanded_candidates:
+        if not d:
+            continue
+        try:
+            if os.path.exists(d) and os.path.isdir(d):
+                for item in os.listdir(d):
+                    sub_path = os.path.join(d, item)
+                    try:
+                        if os.path.isdir(sub_path):
+                            item_low = item.lower()
+                            if "dataset" in item_low or "data" in item_low or item_low in ("ml", "raw"):
+                                sub_discovered.append(sub_path)
+                            else:
+                                sub_files = os.listdir(sub_path)
+                                if any(f.lower().endswith(".csv") for f in sub_files):
+                                    sub_discovered.append(sub_path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    expanded_candidates.extend(sub_discovered)
+
+    # 规范化与去重过滤（将 \\wsl$ 与 \\wsl.localhost 视为同级归一化去重）
+    seen_keys = set()
+    existing_dirs: List[str] = []
+    for p in expanded_candidates:
+        if not p:
+            continue
+        p_clean = os.path.normpath(p)
+        comp_key = p_clean.lower() if os.name == 'nt' else p_clean
+        comp_key = comp_key.replace('\\\\wsl$\\', '\\\\wsl.localhost\\').replace('//wsl$/', '//wsl.localhost/')
+        if comp_key in seen_keys:
+            continue
+        seen_keys.add(comp_key)
+        try:
+            if os.path.exists(p) and os.path.isdir(p):
+                existing_dirs.append(p)
+        except Exception:
+            pass
+
+    # 智能评分排序：含关键标志性数据集的目录置顶
+    def score_dir(d: str) -> int:
+        score = 0
+        try:
+            files = os.listdir(d)
+            files_lower = [f.lower() for f in files]
+            if "ml_wide_samples.csv" in files_lower:
+                score += 100
+            if "ml_qspr_model_tg_c.csv" in files_lower:
+                score += 50
+            if "ml_performance_all.csv" in files_lower:
+                score += 30
+            qspr_count = sum(1 for f in files_lower if "qspr_model" in f and f.endswith(".csv"))
+            score += min(qspr_count * 2, 40)
+            perf_count = sum(1 for f in files_lower if "performance" in f and f.endswith(".csv"))
+            score += min(perf_count * 2, 30)
+            csv_count = sum(1 for f in files_lower if f.endswith(".csv"))
+            score += min(csv_count, 20)
+        except Exception:
+            pass
+        return score
+
+    existing_dirs.sort(key=score_dir, reverse=True)
+    return existing_dirs
+
+
+def get_default_dataset_dir(custom_dir: Optional[str] = None) -> str:
+    """获取首选的默认数据集目录，若均未找到则回退至安全默认路径"""
+    candidates = get_candidate_dataset_dirs(custom_dir)
+    if candidates:
+        return candidates[0]
+    if custom_dir:
+        norm_c = normalize_cross_platform_path(custom_dir)
+        return norm_c if norm_c else custom_dir
+    return os.path.join(os.getcwd(), "ml_dataset")
+
 class FormulationFusionEngine:
     """配方数据融合与化学语义对齐引擎"""
 
@@ -27,31 +226,36 @@ class FormulationFusionEngine:
         self.pat_amine = Chem.MolFromSmarts("[NX3;H2,H1;!$(NC=O)]")
         self.pat_anhydride = Chem.MolFromSmarts("C(=O)OC(=O)")
         self.pat_thiol = Chem.MolFromSmarts("[SX2H]")
+        self.pat_phenol = Chem.MolFromSmarts("[OX2H]c1ccccc1")
+        self.pat_dicy = Chem.MolFromSmarts("NC(=N)NC#N")
+        self.last_dataset_dir: Optional[str] = None
 
     def find_companion_wide_table(self, main_path: str, custom_dir: Optional[str] = None) -> Optional[str]:
         """
         在主数据表同级目录或指定数据集目录下自动寻找 ml_wide_samples.csv
         """
         candidate_dirs = []
-        if custom_dir and os.path.exists(custom_dir):
-            candidate_dirs.append(custom_dir)
-        if main_path and os.path.exists(main_path):
-            candidate_dirs.append(os.path.dirname(os.path.abspath(main_path)))
-        # 默认常见路径
-        candidate_dirs.extend([
-            r"C:\Users\wangj\Desktop\ml_dataset",
-            os.path.join(os.getcwd(), "ml_dataset"),
-            os.getcwd(),
-        ])
+        if custom_dir:
+            c_norm = normalize_cross_platform_path(custom_dir)
+            if c_norm and os.path.exists(c_norm):
+                candidate_dirs.append(c_norm)
+            elif os.path.exists(custom_dir):
+                candidate_dirs.append(custom_dir)
+        if main_path:
+            m_norm = normalize_cross_platform_path(main_path)
+            p_to_check = m_norm if (m_norm and os.path.exists(m_norm)) else main_path
+            if os.path.exists(p_to_check):
+                candidate_dirs.append(os.path.dirname(os.path.abspath(p_to_check)))
+        candidate_dirs.extend(get_candidate_dataset_dirs(custom_dir))
 
         for c_dir in candidate_dirs:
             if not c_dir or not os.path.exists(c_dir):
                 continue
             wide_file = os.path.join(c_dir, "ml_wide_samples.csv")
             if os.path.exists(wide_file):
+                self.last_dataset_dir = c_dir
                 return wide_file
         return None
-
     def compute_formulation_hash(self, row: pd.Series, ignore_process: bool = False) -> str:
         """
         基于关键化学组分与工艺条件计算配方唯一物理哈希指纹
@@ -343,18 +547,25 @@ class FormulationFusionEngine:
     def _locate_dataset_file(self, filename: str, custom_dir: Optional[str] = None) -> Optional[str]:
         """在常见数据集目录下定位指定文件"""
         candidate_dirs = []
-        if custom_dir and os.path.exists(custom_dir):
-            candidate_dirs.append(custom_dir)
-        candidate_dirs.extend([
-            r"C:\Users\wangj\Desktop\ml_dataset",
-            os.path.join(os.getcwd(), "ml_dataset"),
-            os.getcwd(),
-        ])
+        if custom_dir:
+            c_norm = normalize_cross_platform_path(custom_dir)
+            if c_norm and os.path.exists(c_norm):
+                candidate_dirs.append(c_norm)
+            elif os.path.exists(custom_dir):
+                candidate_dirs.append(custom_dir)
+        if getattr(self, "last_dataset_dir", None):
+            l_norm = normalize_cross_platform_path(self.last_dataset_dir)
+            if l_norm and os.path.exists(l_norm):
+                candidate_dirs.append(l_norm)
+            elif os.path.exists(self.last_dataset_dir):
+                candidate_dirs.append(self.last_dataset_dir)
+        candidate_dirs.extend(get_candidate_dataset_dirs(custom_dir))
         for d in candidate_dirs:
             if not d or not os.path.exists(d):
                 continue
             p = os.path.join(d, filename)
             if os.path.exists(p):
+                self.last_dataset_dir = d
                 return p
         return None
 
@@ -660,6 +871,247 @@ class FormulationFusionEngine:
             else:
                 mask = mask | col.notna()
         return mask
+    def compute_and_fill_molecular_weights(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        基于 SMILES 结构与高分子物理当量关系对各组分分子量进行多级互补计算与填补。
+        推导层级：
+        1. 优先使用已有解析分子量 (*_mw_resolved)；
+        2. 若缺失，使用 RDKit 基于 SMILES (*_structure) 精确计算 MolWt；
+        3. 若仍缺失，根据高分子物理关系推导：
+           - 树脂：MW = EEW * f_network；
+           - 固化剂：MW = AHEW * f_network；
+        4. 统一回填到标准分子量字段 (*_molecular_weight_g_mol)；
+        5. 派生配方级分子量比值 (formulation_mw_ratio_h_r) 与加权平均单体分子量 (formulation_monomer_avg_mw)。
+        """
+        out = df.copy()
+
+        mw_cache = {}
+
+        def _calc_rdkit_mw(smi):
+            if smi is None or pd.isna(smi):
+                return None
+            smi_str = str(smi).strip()
+            if not smi_str or smi_str.lower() in ["none", "nan", ""]:
+                return None
+            if smi_str in mw_cache:
+                return mw_cache[smi_str]
+            val = None
+            try:
+                mol = Chem.MolFromSmiles(smi_str)
+                if mol:
+                    from rdkit.Chem import Descriptors
+                    val = float(Descriptors.MolWt(mol))
+            except Exception:
+                pass
+            mw_cache[smi_str] = val
+            return val
+
+        # 处理主树脂与辅树脂 (resin_1, resin_2)
+        for i in (1, 2):
+            smi_col = f"resin_{i}_structure"
+            std_mw_col = f"resin_{i}_molecular_weight_g_mol"
+            res_mw_col = f"resin_{i}_mw_resolved"
+            ew_col = f"resin_{i}_ew_resolved"
+            f_col = f"resin_{i}_f_network"
+
+            if smi_col not in out.columns and std_mw_col not in out.columns:
+                continue
+
+            current_mw = pd.to_numeric(out[res_mw_col], errors="coerce") if res_mw_col in out.columns else pd.Series(np.nan, index=out.index)
+            if std_mw_col in out.columns:
+                current_mw = current_mw.combine_first(pd.to_numeric(out[std_mw_col], errors="coerce"))
+
+            # RDKit 计算补齐
+            if smi_col in out.columns:
+                calc_mw = out[smi_col].apply(_calc_rdkit_mw)
+                current_mw = current_mw.combine_first(calc_mw)
+
+            # 物理当量与官能度倒推: EEW * f_network
+            if ew_col in out.columns and f_col in out.columns:
+                eew = pd.to_numeric(out[ew_col], errors="coerce")
+                f_net = pd.to_numeric(out[f_col], errors="coerce")
+                physics_mw = eew * f_net
+                physics_mw = physics_mw.where(physics_mw > 0, np.nan)
+                current_mw = current_mw.combine_first(physics_mw)
+
+            out[std_mw_col] = current_mw
+
+        # 处理主固化剂与辅固化剂 (curing_agent_1, curing_agent_2)
+        for i in (1, 2):
+            smi_col = f"curing_agent_{i}_structure"
+            std_mw_col = f"curing_agent_{i}_molecular_weight_g_mol"
+            res_mw_col = f"curing_agent_{i}_mw_resolved"
+            ew_col = f"curing_agent_{i}_ew_resolved"
+            f_col = f"curing_agent_{i}_f_network"
+
+            if smi_col not in out.columns and std_mw_col not in out.columns:
+                continue
+
+            current_mw = pd.to_numeric(out[res_mw_col], errors="coerce") if res_mw_col in out.columns else pd.Series(np.nan, index=out.index)
+            if std_mw_col in out.columns:
+                current_mw = current_mw.combine_first(pd.to_numeric(out[std_mw_col], errors="coerce"))
+
+            # RDKit 计算补齐
+            if smi_col in out.columns:
+                calc_mw = out[smi_col].apply(_calc_rdkit_mw)
+                current_mw = current_mw.combine_first(calc_mw)
+
+            # 物理当量与官能度倒推: AHEW * f_network
+            if ew_col in out.columns and f_col in out.columns:
+                ahew = pd.to_numeric(out[ew_col], errors="coerce")
+                f_net = pd.to_numeric(out[f_col], errors="coerce")
+                physics_mw = ahew * f_net
+                physics_mw = physics_mw.where(physics_mw > 0, np.nan)
+                current_mw = current_mw.combine_first(physics_mw)
+
+            out[std_mw_col] = current_mw
+
+        # 4. 固化剂用量 (PHR) 的物理当量兜底补全:
+        # 当 curing_agent_1_amount_phr 缺失但记录了当量比 r、EEW 与 AHEW 时，
+        # 根据高分子物理严格关系 phr = r * (AHEW / EEW) * 100 自动推导补齐
+        ca_phr = pd.to_numeric(out.get("curing_agent_1_amount_phr"), errors="coerce")
+        r_val = pd.to_numeric(out.get("formulation_r_value"), errors="coerce")
+        eew_val = pd.to_numeric(out.get("formulation_resin_total_eew_g_eq"), errors="coerce")
+        ahew_val = pd.to_numeric(out.get("formulation_hardener_total_ahew_g_eq"), errors="coerce")
+
+        if r_val is not None and eew_val is not None and ahew_val is not None:
+            ca_phr_inferred = (r_val * ahew_val / eew_val * 100.0).where(
+                (r_val > 0) & (eew_val > 0) & (ahew_val > 0), np.nan
+            )
+            out["curing_agent_1_amount_phr"] = ca_phr.combine_first(ca_phr_inferred) if ca_phr is not None else ca_phr_inferred
+
+        # 5. 派生高分子配方级特征
+        r1_mw = pd.to_numeric(out.get("resin_1_molecular_weight_g_mol"), errors="coerce")
+        ca1_mw = pd.to_numeric(out.get("curing_agent_1_molecular_weight_g_mol"), errors="coerce")
+        if r1_mw is not None and ca1_mw is not None:
+            # 固化剂/树脂分子量比值
+            out["formulation_mw_ratio_h_r"] = (ca1_mw / r1_mw).where((r1_mw > 0) & (ca1_mw > 0), np.nan)
+
+            # 按 PHR 加权平均单体分子量 (此时因 PHR 补齐，分子量加权平均值缺失率也降至 3% 左右)
+            r_phr = pd.to_numeric(out.get("resin_1_amount_phr", 100.0), errors="coerce").fillna(100.0)
+            ca_phr_eff = pd.to_numeric(out.get("curing_agent_1_amount_phr"), errors="coerce")
+            tot_phr = r_phr + ca_phr_eff
+            out["formulation_monomer_avg_mw"] = ((r_phr * r1_mw + ca_phr_eff * ca1_mw) / tot_phr).where(tot_phr > 0, np.nan)
+
+        return out
+
+    def classify_formulation_systems(self, df: pd.DataFrame) -> pd.Series:
+        """
+        基于化学语义、反应机理与固化剂官能团对配方进行高精度体系分类。
+        返回分类标签 Series，类别包括：
+        - '环氧-胺体系 (Epoxy-Amine)'
+        - '环氧-酸酐体系 (Epoxy-Anhydride)'
+        - '环氧-酚类体系 (Epoxy-Phenolic)'
+        - '环氧-硫醇体系 (Epoxy-Thiol)'
+        - '催化型/自聚开环体系 (Catalytic / Homopolymerization)'
+        - '其他/未分类体系 (Other / Unclassified)'
+        """
+        if df is None or len(df) == 0:
+            return pd.Series(dtype=object)
+
+        # 预先缓存唯一 SMILES 的官能团分析结果，提升万级样本的分类性能
+        smiles_cache: Dict[str, Optional[str]] = {}
+
+        def check_smiles_category(smi: Any) -> Optional[str]:
+            if smi is None or pd.isna(smi) or str(smi).strip().lower() in ["none", "nan", ""]:
+                return None
+            smi_clean = str(smi).strip()
+            if smi_clean in smiles_cache:
+                return smiles_cache[smi_clean]
+            cat = None
+            try:
+                mol = Chem.MolFromSmiles(smi_clean)
+                if mol:
+                    if mol.HasSubstructMatch(self.pat_anhydride):
+                        cat = "anhydride"
+                    elif mol.HasSubstructMatch(self.pat_amine):
+                        cat = "amine"
+                    elif mol.HasSubstructMatch(self.pat_thiol):
+                        cat = "thiol"
+                    elif hasattr(self, "pat_phenol") and mol.HasSubstructMatch(self.pat_phenol):
+                        cat = "phenolic"
+            except Exception:
+                pass
+            smiles_cache[smi_clean] = cat
+            return cat
+
+        mech_series = df["curing_mechanism"].astype(str).str.lower() if "curing_mechanism" in df.columns else pd.Series("", index=df.index)
+        std_series = df["curing_type_standard"].astype(str).str.lower() if "curing_type_standard" in df.columns else pd.Series("", index=df.index)
+        ca1_smi = df["curing_agent_1_structure"].fillna("") if "curing_agent_1_structure" in df.columns else pd.Series("", index=df.index)
+        ca2_smi = df["curing_agent_2_structure"].fillna("") if "curing_agent_2_structure" in df.columns else pd.Series("", index=df.index)
+
+        name_cols = [c for c in df.columns if "curing_agent" in c.lower() and "name" in c.lower()]
+
+        results = []
+        for idx in range(len(df)):
+            mech = mech_series.iloc[idx]
+            std = std_series.iloc[idx]
+
+            # 1. 优先根据明确的机理标注
+            if "amine" in mech:
+                results.append("环氧-胺体系 (Epoxy-Amine)")
+                continue
+            if "anhydride" in mech:
+                results.append("环氧-酸酐体系 (Epoxy-Anhydride)")
+                continue
+            if "thiol" in mech:
+                results.append("环氧-硫醇体系 (Epoxy-Thiol)")
+                continue
+            if "phenolic" in mech:
+                results.append("环氧-酚类体系 (Epoxy-Phenolic)")
+                continue
+            if any(k in mech for k in ["homopolymerization", "imidazole", "anionic", "cationic"]):
+                results.append("催化型/自聚开环体系 (Catalytic / Homopolymerization)")
+                continue
+
+            # 2. 固化剂 SMILES 官能团精准识别
+            c1 = check_smiles_category(ca1_smi.iloc[idx])
+            c2 = check_smiles_category(ca2_smi.iloc[idx])
+            if c1 == "anhydride" or c2 == "anhydride":
+                results.append("环氧-酸酐体系 (Epoxy-Anhydride)")
+                continue
+            if c1 == "amine" or c2 == "amine":
+                results.append("环氧-胺体系 (Epoxy-Amine)")
+                continue
+            if c1 == "thiol" or c2 == "thiol":
+                results.append("环氧-硫醇体系 (Epoxy-Thiol)")
+                continue
+            if c1 == "phenolic" or c2 == "phenolic":
+                results.append("环氧-酚类体系 (Epoxy-Phenolic)")
+                continue
+
+            # 3. 常见固化剂名称关键词辅助
+            is_amine_name = False
+            for ncol in name_cols:
+                nval = str(df[ncol].iloc[idx] or "").lower()
+                if any(k in nval for k in ["amine", "ddm", "dds", "detda", "teta", "deta", "ipda", "jeffamine", "pacm", "mda", "mxd", "diamin", "triamin"]):
+                    is_amine_name = True
+                    break
+            if is_amine_name:
+                results.append("环氧-胺体系 (Epoxy-Amine)")
+                continue
+
+            # 4. 活性氢当量 AHEW 判定
+            if "curing_agent_1_active_hydrogen_equivalent_count" in df.columns:
+                h_cnt = df["curing_agent_1_active_hydrogen_equivalent_count"].iloc[idx]
+                if pd.notna(h_cnt) and float(h_cnt) > 0:
+                    results.append("环氧-胺体系 (Epoxy-Amine)")
+                    continue
+
+            # 5. 固化类型分类
+            if std in ["catalytic_curing", "self_curing", "initiator_triggered"]:
+                results.append("催化型/自聚开环体系 (Catalytic / Homopolymerization)")
+                continue
+
+            results.append("其他/未分类体系 (Other / Unclassified)")
+
+        return pd.Series(results, index=df.index)
+
+    def get_formulation_system_distribution(self, df: pd.DataFrame) -> Dict[str, int]:
+        """获取数据集的配方体系分布计数字典"""
+        systems = self.classify_formulation_systems(df)
+        return dict(systems.value_counts())
+
 
     def clean_features_for_ml(
         self,
@@ -701,9 +1153,27 @@ class FormulationFusionEngine:
 
         out_df = df.copy()
 
-        # 1. 固化体系筛选 (如用户常用的 external_hardener)
+        # 1. 固化体系筛选与分类提取
         if curing_type_filter and str(curing_type_filter).lower() not in ["all", "全部", "none"]:
-            if "curing_type_standard" in out_df.columns:
+            c_filter_str = str(curing_type_filter).lower()
+            if "胺" in c_filter_str or "amine" in c_filter_str:
+                systems = self.classify_formulation_systems(out_df)
+                mask = systems == "环氧-胺体系 (Epoxy-Amine)"
+                out_df = out_df[mask].copy()
+                stats["filtered_rows"] = len(out_df)
+                stats["system_selected"] = "环氧-胺体系 (Epoxy-Amine)"
+            elif "酸酐" in c_filter_str or "anhydride" in c_filter_str:
+                systems = self.classify_formulation_systems(out_df)
+                mask = systems == "环氧-酸酐体系 (Epoxy-Anhydride)"
+                out_df = out_df[mask].copy()
+                stats["filtered_rows"] = len(out_df)
+                stats["system_selected"] = "环氧-酸酐体系 (Epoxy-Anhydride)"
+            elif "external_hardener" in c_filter_str:
+                if "curing_type_standard" in out_df.columns:
+                    out_df = out_df[out_df["curing_type_standard"] == "external_hardener"].copy()
+                    stats["filtered_rows"] = len(out_df)
+                    stats["system_selected"] = "常规外加固化剂 (external_hardener)"
+            elif "curing_type_standard" in out_df.columns:
                 out_df = out_df[out_df["curing_type_standard"] == curing_type_filter].copy()
                 stats["filtered_rows"] = len(out_df)
 
@@ -774,69 +1244,53 @@ class FormulationFusionEngine:
                 stats["component_physics_enriched"] = False
                 stats["component_physics_error"] = str(_cp_err)
 
-            # 类似 ml_qspr_model_ 结构的标准特征组织
+            # [关键增强] 对树脂与固化剂分子量进行多级计算与精准回填补齐，并派生分子量比值等核心特征
+            out_df = self.compute_and_fill_molecular_weights(out_df)
+
+            # 类似 ml_qspr_model_ 结构的标准精纯特征组织（彻底剥离50+重复冗余/高缺失/常数列）
             valuable_ordered_cols = [
-                # 结构列 (包含三组分)
-                "resin_1_structure", "resin_2_structure", "resin_3_structure",
-                "curing_agent_1_structure", "curing_agent_2_structure", "curing_agent_3_structure",
-                "small_additive_1_structure", "small_additive_2_structure",
-                # 单体精确物理量 (包含 resin_3 与各组分真实 PHR / MW / 官能度)
-                "resin_1_amount_phr", "resin_2_amount_phr", "resin_3_amount_phr",
-                "resin_1_molecular_weight_g_mol", "resin_2_molecular_weight_g_mol", "resin_3_molecular_weight_g_mol",
-                "resin_1_epoxy_group_count", "resin_2_epoxy_group_count", "resin_3_epoxy_group_count",
-                "resin_3_equivalent_group_count", "resin_3_equivalent_weight_g_eq",
-                "curing_agent_1_amount_phr", "curing_agent_2_amount_phr", "curing_agent_3_amount_phr",
-                "curing_agent_1_molecular_weight_g_mol", "curing_agent_2_molecular_weight_g_mol", "curing_agent_3_molecular_weight_g_mol",
-                "curing_agent_1_active_hydrogen_equivalent_count", "curing_agent_2_active_hydrogen_equivalent_count",
-                # [新增] 逐组分当量重（EEW/AHEW）与逐组分等效组
-                "resin_1_equivalent_weight_g_eq", "resin_2_equivalent_weight_g_eq", "resin_3_equivalent_weight_g_eq",
-                "curing_agent_1_equivalent_weight_g_eq", "curing_agent_2_equivalent_weight_g_eq", "curing_agent_3_equivalent_weight_g_eq",
-                "resin_1_equivalent_group_count", "resin_2_equivalent_group_count",
-                "curing_agent_1_equivalent_group_count", "curing_agent_2_equivalent_group_count",
-                # 配方宏观基准当量
-                "initiator_present", "formulation_resin_total_eew_g_eq", "formulation_hardener_total_ahew_g_eq",
-                "formulation_resin_hardener_equivalent_ratio", "formulation_r_value", "formulation_epoxy_binder_total_phr",
-                # 固化工艺参数
-                "process_max_temperature_c", "process_temperature_time_integral_c_h", "process_total_time_h",
-                "process_final_cure_temperature_c", "process_final_cure_time_h", "process_atmosphere", "process_has_post_cure",
-                # 体系组分宏观统计量
-                "resin_component_count", "resin_total_phr", "resin_epoxy_group_total", "resin_equivalent_group_total",
-                "curing_agent_component_count", "curing_agent_total_phr", "curing_agent_active_hydrogen_total", "curing_agent_equivalent_group_total",
-                "small_additive_component_count", "initiator_component_count", "accelerator_component_count", "catalyst_component_count",
-                "reactive_diluent_component_count", "reactive_toughener_component_count", "reactive_toughener_total_phr",
-                "filler_component_count", "other_component_count",
+                # 1. 分子化学结构 (SMILES 供特征工程/指纹提取)
+                "resin_1_structure", "curing_agent_1_structure",
+                "resin_2_structure", "curing_agent_2_structure",
+                "small_additive_1_structure",
+                # 2. 分子量特征 (全面多级计算补齐，缺失率接近 0%)
+                "resin_1_molecular_weight_g_mol",
+                "curing_agent_1_molecular_weight_g_mol",
+                "formulation_mw_ratio_h_r",
+                "formulation_monomer_avg_mw",
+                "resin_2_molecular_weight_g_mol",
+                "curing_agent_2_molecular_weight_g_mol",
+                # 3. 核心配比与基准物理当量 (高覆盖率)
+                "resin_1_amount_phr", "curing_agent_1_amount_phr",
+                "resin_2_amount_phr", "curing_agent_2_amount_phr",
+                "formulation_resin_total_eew_g_eq",
+                "formulation_hardener_total_ahew_g_eq",
+                "formulation_r_value",
+                # 4. 高分子网络物理机理特征 (覆盖率100%且物理自洽)
+                "resin_1_f_network",
+                "curing_agent_1_f_network",
+                "cp_f_avg_network",
+                "cp_W_g_per_epoxy",
+                "cp_epoxy_conc_mol_m3",
+                "cp_f_r", "cp_f_h_network",
+                # 5. 固化热历史工艺参数 (对力学与Tg至关重要)
+                "process_max_temperature_c",
+                "process_temperature_time_integral_c_h",
+                "process_total_time_h",
+                "process_final_cure_temperature_c",
+                "process_final_cure_time_h",
+                "process_atmosphere",
+                "process_has_post_cure",
             ]
 
             if cp_available:
-                # [新增] component_physics 补齐后的逐组分物理量与配方级汇总量。
-                # 单位约定：所有交联密度量均为 mol/m³（SI 体积摩尔浓度）。
-                _cp_extra: List[str] = []
-                for _side in ("resin", "curing_agent"):
-                    for _i in (1, 2, 3):
-                        _p = f"{_side}_{_i}_"
-                        if f"{_p}mw_resolved" not in out_df.columns:
-                            continue
-                        _cp_extra += [
-                            f"{_p}mw_resolved",
-                            f"{_p}ew_resolved",
-                            f"{_p}f_stoich",
-                            f"{_p}f_network",
-                        ]
-                _cp_extra += [
-                    "cp_balance",
-                    "cp_f_r",
-                    "cp_f_h_stoich", "cp_f_h_network", "cp_f_avg_network",
-                    "cp_W_g_per_epoxy",
-                    "cp_epoxy_conc_mol_m3", "cp_dilution",
-                ]
+                # 补充保留有效机理特征，过滤掉已在分子量和当量中规范化的重复列
+                _cp_extra = ["cp_f_r", "cp_f_h_network", "cp_f_avg_network", "cp_W_g_per_epoxy", "cp_epoxy_conc_mol_m3"]
                 for _c in _cp_extra:
                     if _c in out_df.columns and _c not in valuable_ordered_cols:
                         valuable_ordered_cols.append(_c)
-                stats["component_physics_cols"] = len(
-                    [c for c in _cp_extra if c in out_df.columns]
-                )
+                stats["component_physics_cols"] = len([c for c in _cp_extra if c in out_df.columns])
 
-            # 提取与当前目标相关的测试条件列 (如 tg_c_test_method 等)
             target_test_cols = []
             cand_sources = [base_df] if base_df is not None else [out_df]
             for src in cand_sources:

@@ -75,19 +75,23 @@ except Exception:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
-# SMARTS
+# 统一从 reaction_core 导入 SMARTS 与规范物理参数
 # ---------------------------------------------------------------------------
-_EPOXIDE_PAT = "[C]1[O][C]1"
-_PRI_AMINE_PAT = "[NX3;H2]"
-_SEC_AMINE_PAT = "[NX3;H1]"
-# 环状酸酐通用模式（兼容 PMDA/BTDA 型稠环芳酐的芳构化感知）
-_ANHYDRIDE_PAT = "[o,OX2]1~[#6](=[OX1])~[#6]~[#6]~[#6](=[OX1])~1"
-_THIOL_PAT = "[SX2;H1]"
-_ISOCYANATE_PAT = "[NX2]=[CX2]=[OX1]"
-_PHENOL_OH_PAT = "[OX2H]-c"
-_ALCOHOL_OH_PAT = "[OX2H]-[CX4]"
-_CARBOXYL_PAT = "[OX2H]-[CX3]=[OX1]"
-
+from .reaction_core import (
+    EPOXIDE_PAT as _EPOXIDE_PAT,
+    PRI_AMINE_PAT as _PRI_AMINE_PAT,
+    SEC_AMINE_PAT as _SEC_AMINE_PAT,
+    ANHYDRIDE_PAT as _ANHYDRIDE_PAT,
+    THIOL_PAT as _THIOL_PAT,
+    ISOCYANATE_PAT as _ISOCYANATE_PAT,
+    PHENOL_OH_PAT as _PHENOL_OH_PAT,
+    ALCOHOL_OH_PAT as _ALCOHOL_OH_PAT,
+    CARBOXYL_PAT as _CARBOXYL_PAT,
+    inspect_resin_functionality,
+    inspect_curer_functionality,
+    count_substruct_matches as _count,
+    count_unique_center_matches as _count_unique_center,
+)
 #: 官能度物理上限（防御解析异常，如多片段堆叠产生的 f=25）
 F_MAX = 8.0
 
@@ -112,41 +116,14 @@ MECH_CARBOXYL = "carboxyl"
 MECH_ALCOHOL = "polyol"
 MECH_UNKNOWN = "unknown"
 
-
-def _smarts(pattern: str):
-    if not RDKIT_AVAILABLE:
-        return None
-    return Chem.MolFromSmarts(pattern)
-
-
-_PATTERNS: Dict[str, Any] = {}
+#: 当量比来源常量
+R_SRC_LITERATURE = "literature"
+R_SRC_CALCULATED = "calculated_from_mass"
+R_SRC_ASSUMED_STOICH = "assumed_stoichiometric"
+R_SRC_MISSING_STOICH = "missing_stoichiometry"
+R_SRC_INVALID_CHEM = "invalid_chemistry"
 
 
-def _pat(pattern: str):
-    if pattern not in _PATTERNS:
-        _PATTERNS[pattern] = _smarts(pattern)
-    return _PATTERNS[pattern]
-
-
-def _count(mol, pattern: str) -> int:
-    p = _pat(pattern)
-    if mol is None or p is None:
-        return 0
-    try:
-        return len(mol.GetSubstructMatches(p))
-    except Exception:
-        return 0
-
-
-def _count_unique_center(mol, pattern: str) -> int:
-    """以唯一中心原子计数（酸酐等对称环需防双向重复匹配）"""
-    p = _pat(pattern)
-    if mol is None or p is None:
-        return 0
-    try:
-        return len({m[0] for m in mol.GetSubstructMatches(p)})
-    except Exception:
-        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -238,74 +215,17 @@ def _as_mol(text: Any, mol: Optional[Any] = None) -> Optional[Any]:
 
 
 def resin_functionality(text: Any, mol: Optional[Any] = None) -> Functionality:
-    """树脂环氧官能度。环氧基是双官能支化点，两口径一致。"""
-    mol = _as_mol(text, mol)
-    n = _count(mol, _EPOXIDE_PAT)
-    if n <= 0:
-        return Functionality(0.0, 0.0, MECH_UNKNOWN, 0)
-    f = float(min(n, F_MAX))
-    return Functionality(f, f, MECH_AMINE, n)
+    """树脂环氧官能度（统一对接 reaction_core）。"""
+    target = _as_mol(text, mol)
+    info = inspect_resin_functionality(target)
+    return Functionality(info.f_stoich, info.f_network, info.mechanism, info.n_groups)
 
 
 def curer_functionality(text: Any, mol: Optional[Any] = None) -> Functionality:
-    """固化剂官能度（双口径）。
-
-    f_stoich  : 每分子消耗的环氧当量数
-    f_network : 每分子在网络中形成的分支数
-
-    胺     ：伯胺 2 氢 → 消耗 2 环氧，并与 2 条链成键 → 两口径都是 2
-    酸酐   ：1 酸酐消耗 1 环氧(f_stoich=1)，开环酯化后桥接 2 条链(f_network=2)
-    硫醇   ：1:1 消耗，形成 1 个硫醚桥 → 两口径都是 1
-    酚羟基 ：1:1 消耗，形成 1 个醚桥 → 两口径都是 1
-    异氰酸酯：与羟基/胺 1:1 → 两口径都是 1
-    羧基   ：1:1 消耗 → 两口径都是 1
-    醇羟基 ：1:1（与 NCO 或醚化）→ 两口径都是 1
-    """
-    mol = _as_mol(text, mol)
-    if mol is None:
-        return Functionality(0.0, 0.0, MECH_UNKNOWN, 0)
-
-    n_nco = _count(mol, _ISOCYANATE_PAT)
-    if n_nco > 0:
-        f = float(min(n_nco, F_MAX))
-        return Functionality(f, f, MECH_ISOCYANATE, n_nco)
-
-    n_pri = _count(mol, _PRI_AMINE_PAT)
-    n_sec = _count(mol, _SEC_AMINE_PAT)
-    if n_pri + n_sec > 0:
-        # 伯胺贡献 2 个活性氢；仲胺 1 个
-        n_h = n_pri * 2 + n_sec
-        f = float(min(n_h, F_MAX))
-        return Functionality(f, f, MECH_AMINE, n_h)
-
-    n_anh = _count_unique_center(mol, _ANHYDRIDE_PAT)
-    if n_anh > 0:
-        # 关键：两套口径分离
-        f_st = float(min(n_anh, F_MAX))            # 1 酸酐 : 1 环氧
-        f_net = float(min(2.0 * n_anh, F_MAX))     # 开环后桥接 2 条链
-        return Functionality(f_st, f_net, MECH_ANHYDRIDE, n_anh)
-
-    n_sh = _count(mol, _THIOL_PAT)
-    if n_sh > 0:
-        f = float(min(n_sh, F_MAX))
-        return Functionality(f, f, MECH_THIOL, n_sh)
-
-    n_ph = _count(mol, _PHENOL_OH_PAT)
-    if n_ph > 0:
-        f = float(min(n_ph, F_MAX))
-        return Functionality(f, f, MECH_PHENOL, n_ph)
-
-    n_cooh = _count(mol, _CARBOXYL_PAT)
-    if n_cooh > 0:
-        f = float(min(n_cooh, F_MAX))
-        return Functionality(f, f, MECH_CARBOXYL, n_cooh)
-
-    n_oh = _count(mol, _ALCOHOL_OH_PAT)
-    if n_oh > 0:
-        f = float(min(n_oh, F_MAX))
-        return Functionality(f, f, MECH_ALCOHOL, n_oh)
-
-    return Functionality(0.0, 0.0, MECH_UNKNOWN, 0)
+    """固化剂官能度（双口径，统一对接 reaction_core）。"""
+    target = _as_mol(text, mol)
+    info = inspect_curer_functionality(target)
+    return Functionality(info.f_stoich, info.f_network, info.mechanism, info.n_groups)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +243,7 @@ class ComponentPhysics:
     f_source: str = SRC_UNRESOLVED
     bigsmiles_proxy: bool = False          # 结构来自 BigSMILES 采样代理
     multi_fragment: bool = False
+    structure_functionality_conflict: bool = False  # 结构解析活性基团与外部声明官能度冲突 (P0-2)
 
     @property
     def resolved(self) -> bool:
@@ -378,7 +299,10 @@ def resolve_component(
     )
     if func.f_stoich <= 0 and f_literature is not None:
         fl = _num(f_literature)
-        if np.isfinite(fl):
+        if np.isfinite(fl) and fl > 0:
+            if mol is not None and not out.bigsmiles_proxy and not out.multi_fragment:
+                # 结构成功解析但毫无对应环氧/固化位点，而外部声明存在正官能度 (P0-2)
+                out.structure_functionality_conflict = True
             func = Functionality(fl, fl, MECH_UNKNOWN, int(fl))
             out.f_source = SRC_LITERATURE
     out.f_stoich = func.f_stoich
@@ -441,10 +365,18 @@ _EQUIV_F_SUFFIX = "equivalent_group_count"
 
 
 def _pick(df: pd.DataFrame, names: Tuple[str, ...]) -> Optional[pd.Series]:
+    res: Optional[pd.Series] = None
     for n in names:
         if n in df.columns:
-            return df[n]
-    return None
+            s = df[n].copy()
+            if s.dtype == object or pd.api.types.is_string_dtype(s):
+                cleaned = s.astype(str).str.strip().str.lower()
+                s = s.where(~cleaned.isin(["", "nan", "none", "null", "<na>"]), np.nan)
+            if res is None:
+                res = s
+            else:
+                res = res.combine_first(s)
+    return res
 
 
 #: 窄表原有的配方级当量重列（这些是实测/文献值，反映真实低聚物分布，优先级高于结构直算）
@@ -468,9 +400,56 @@ def _existing_series(df: pd.DataFrame, names: Tuple[str, ...]) -> pd.Series:
     return pd.Series(np.nan, index=df.index, dtype=float)
 
 
-def _col(df: pd.DataFrame, side: str, idx: int, suffix: str) -> Optional[pd.Series]:
-    """取逐组分列，兼容 role_1_x / role_x 两种命名。"""
-    return _pick(df, (f"{side}_{idx}_{suffix}", f"{side}_{suffix}_{idx}"))
+def _col(df: pd.DataFrame, side: str, idx: int, suffix: Union[str, Tuple[str, ...], List[str]]) -> Optional[pd.Series]:
+    """取逐组分列，兼容 role_1_x / role_x 两种命名及 curing_agent / hardener 前缀别名。"""
+    prefixes = [side]
+    if side in ("curing_agent", "curingagent"):
+        prefixes.extend(["hardener", "curer"])
+    elif side in ("hardener", "curer"):
+        prefixes.extend(["curing_agent", "curingagent"])
+    elif side == "resin":
+        prefixes.extend(["epoxy"])
+
+    suffixes = [suffix] if isinstance(suffix, str) else list(suffix)
+
+    candidates: List[str] = []
+    for p in prefixes:
+        for s_raw in suffixes:
+            s = s_raw.lstrip("_")
+            candidates.extend([f"{p}_{idx}_{s}", f"{p}_{s}_{idx}"])
+            if idx == 1:
+                candidates.append(f"{p}_{s}")
+            if s in (_PHR_SUFFIX, "phr", "amount"):
+                candidates.extend([
+                    f"{p}_{idx}_phr",
+                    f"{p}_{idx}_weight_phr",
+                    f"{p}_{idx}_amount",
+                    f"{p}_{idx}_mass",
+                    f"{p}_{idx}_mass_g",
+                    f"{p}_{idx}_weight",
+                    f"{p}_{idx}_wt_ratio",
+                ])
+                if idx == 1:
+                    candidates.extend([
+                        f"{p}_phr",
+                        f"{p}_amount",
+                        f"{p}_mass",
+                        f"{p}_weight",
+                    ])
+            elif s in ("structure", "smiles", "name"):
+                candidates.extend([
+                    f"{p}_{idx}_structure",
+                    f"{p}_{idx}_smiles",
+                    f"{p}_{idx}_name",
+                    f"{p}_{idx}_chemical_name",
+                ])
+                if idx == 1:
+                    candidates.extend([
+                        f"{p}_structure",
+                        f"{p}_smiles",
+                        f"{p}_name",
+                    ])
+    return _pick(df, tuple(candidates))
 
 
 def _func_col(df: pd.DataFrame, side: str, idx: int, is_resin: bool) -> Optional[pd.Series]:
@@ -502,6 +481,7 @@ def compute_component_physics(
     max_components: int = 3,
     resin_prefix: str = "resin",
     curer_prefix: str = "curing_agent",
+    assume_stoichiometric_if_missing: bool = True,
 ) -> pd.DataFrame:
     """逐行解析各组分物理量，返回与 df 同索引的明细表。
 
@@ -525,7 +505,20 @@ def compute_component_physics(
 
     for side, is_resin in ((resin_prefix, True), (curer_prefix, False)):
         for i in range(1, max_components + 1):
-            struct_col = _pick(df, (f"{side}_{i}_structure", f"{side}_{i}_smiles"))
+            prefixes = [side]
+            if side in ("curing_agent", "curingagent"):
+                prefixes.extend(["hardener", "curer"])
+            elif side in ("hardener", "curer"):
+                prefixes.extend(["curing_agent", "curingagent"])
+            elif side == "resin":
+                prefixes.extend(["epoxy"])
+
+            cand = []
+            for p in prefixes:
+                cand.extend([f"{p}_{i}_structure", f"{p}_{i}_smiles", f"{p}_structure_{i}", f"{p}_smiles_{i}"])
+                if i == 1:
+                    cand.extend([f"{p}_structure", f"{p}_smiles"])
+            struct_col = _pick(df, tuple(cand))
             if struct_col is None:
                 continue
             mw_col = _col(df, side, i, _MW_SUFFIX)
@@ -560,9 +553,28 @@ def compute_component_physics(
             out[p + "mw_trust"] = np.array([r.trust for r in rows], dtype=object)
             out[p + "bigsmiles_proxy"] = np.array([r.bigsmiles_proxy for r in rows], dtype=bool)
             out[p + "multi_fragment"] = np.array([r.multi_fragment for r in rows], dtype=bool)
+            out[p + "struct_func_conflict"] = np.array([r.structure_functionality_conflict for r in rows], dtype=bool)
             out[p + "has_structure"] = np.array([bool(_clean(s)) for s in structs], dtype=bool)
 
     res = pd.DataFrame(out, index=df.index)
+    try:
+        summary = compute_formulation_summary(
+            df,
+            res,
+            max_components=max_components,
+            assume_stoichiometric_if_missing=assume_stoichiometric_if_missing,
+        )
+        cols_to_add = [c for c in summary.columns if c not in res.columns]
+        if cols_to_add:
+            res = pd.concat([res, summary[cols_to_add]], axis=1)
+    except Exception:
+        pass
+    # 只记录源输入证据；不影响任何物理公式或来源优先级。
+    from .cp_cache_integrity import stamp_cp_cache
+    res = stamp_cp_cache(
+        res, df, max_components=max_components,
+        assume_stoichiometric_if_missing=assume_stoichiometric_if_missing,
+    )
     return res
 
 
@@ -626,6 +638,7 @@ def compute_formulation_summary(
     *,
     max_components: int = 3,
     rho_g_cm3: float = 1.2,
+    assume_stoichiometric_if_missing: bool = True,
 ) -> pd.DataFrame:
     """在逐组分明细之上计算配方级汇总量（供 ν 公式消费）。
 
@@ -656,63 +669,265 @@ def compute_formulation_summary(
     f_h_st, mol_h, cov_h = _mole_weighted(comp, df, "curing_agent", cur_idx, use_network_functionality=False)
     f_h_net, _, _ = _mole_weighted(comp, df, "curing_agent", cur_idx, use_network_functionality=True)
 
-    # ---- 配方有效当量重（质量加权调和平均，等效于 phr 加权） ----
-    def _eff_ew(side: str, idx_list: List[int]) -> pd.Series:
+    # ---- 配方有效当量重与配方总当量数 ----
+    def _eff_ew_and_equivs(side: str, idx_list: List[int]) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+        """返回 (eff_ew, total_phr, total_equivs, has_all_real_mass, total_input_phr, unresolved_count, ignored_phr, unresolved_missing_m)"""
         num = np.zeros(n)
         den = np.zeros(n)
+        active_comps = np.zeros(n, dtype=int)
+        mass_comps = np.zeros(n, dtype=int)
+        total_input_phr = np.zeros(n)
+        unresolved_count = np.zeros(n, dtype=int)
+        ignored_phr = np.zeros(n)
+        unresolved_missing_m = np.zeros(n, dtype=int)
         for i in idx_list:
             p = f"{side}_{i}_"
-            if p + "ew_resolved" not in comp.columns:
-                continue
-            ew = pd.to_numeric(comp[p + "ew_resolved"], errors="coerce").to_numpy(dtype=float)
-            has = comp[p + "has_structure"].to_numpy(dtype=bool)
             phr_col = _col(df, side, i, _PHR_SUFFIX)
             if phr_col is not None:
                 phr = pd.to_numeric(phr_col, errors="coerce").to_numpy(dtype=float)
             else:
                 phr = np.full(n, np.nan)
-            w = np.where(np.isfinite(phr) & (phr > 0), phr, 1.0)
+            valid_m = np.isfinite(phr) & (phr > 0)
+
+            # 检查是否有结构输入 (P0-3)
+            smi_series = _col(df, side, i, ("structure", "smiles", "name"))
+            has_smi_entry = (
+                smi_series.notna()
+                & (smi_series.astype(str).str.strip().ne(""))
+                & (smi_series.astype(str).str.lower().ne("none"))
+                & (smi_series.astype(str).str.lower().ne("nan"))
+            ) if smi_series is not None else np.zeros(n, dtype=bool)
+
+            ew = pd.to_numeric(comp[p + "ew_resolved"], errors="coerce").to_numpy(dtype=float) if (p + "ew_resolved" in comp.columns) else np.full(n, np.nan)
+            has = comp[p + "has_structure"].to_numpy(dtype=bool) if (p + "has_structure" in comp.columns) else np.zeros(n, dtype=bool)
+
             ok = has & np.isfinite(ew) & (ew > 0)
+            active_comps += ok.astype(int)
+            mass_comps += (ok & valid_m).astype(int)
+            w = np.where(valid_m, phr, 1.0)
             num += np.where(ok, w, 0.0)
             den += np.where(ok, w / np.where(ok, ew, 1.0), 0.0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            return pd.Series(np.where(den > 0, num / den, np.nan), index=df.index)
 
-    eew = _eff_ew("resin", res_idx)
-    ahew = _eff_ew("curing_agent", cur_idx)
+            # 统计输入了质量或结构但未能解析成有效化学当量的未识别组分 (P1-3 & P1-1)
+            comp_present = valid_m | has_smi_entry
+            is_unresolved = comp_present & (~ok)
+            unresolved_count += is_unresolved.astype(int)
+            unresolved_missing_m += (is_unresolved & (~valid_m)).astype(int)
+            ignored_phr += np.where(is_unresolved & valid_m, phr, 0.0)
+            total_input_phr += np.where(valid_m, phr, 0.0)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            eff_ew = np.where(den > 0, num / den, np.nan)
+        # 严格要求：该侧所有有效组分必须均具有真实质量，任一缺失都不能标记为 has_all_real_mass (P0-2)
+        has_all_real_mass = (active_comps > 0) & (active_comps == mass_comps)
+        return (
+            pd.Series(eff_ew, index=df.index),
+            pd.Series(num, index=df.index),
+            pd.Series(den, index=df.index),
+            pd.Series(has_all_real_mass, index=df.index),
+            pd.Series(total_input_phr, index=df.index),
+            pd.Series(unresolved_count, index=df.index),
+            pd.Series(ignored_phr, index=df.index),
+            pd.Series(unresolved_missing_m, index=df.index),
+        )
+
+    eew, phr_r, equiv_r, has_mass_r, in_phr_r, unres_r, ign_phr_r, unres_m_r = _eff_ew_and_equivs("resin", res_idx)
+    ahew, phr_h, equiv_h, has_mass_h, in_phr_h, unres_h, ign_phr_h, unres_m_h = _eff_ew_and_equivs("curing_agent", cur_idx)
+
+    # 计算忽略质量占比与组成不完整标记 (P1-1: 未知组分缺质量时必须为 NaN，不可误报为 0)
+    total_unres_missing_m = unres_m_r + unres_m_h
+    total_in_phr = in_phr_r + in_phr_h
+    total_ign_phr = ign_phr_r + ign_phr_h
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ign_ratio = np.where(total_in_phr > 0, total_ign_phr / total_in_phr, 0.0)
+
+    ignored_mass_fraction = np.where(
+        total_unres_missing_m > 0,
+        np.nan,
+        np.where((unres_r + unres_h) > 0, ign_ratio, 0.0)
+    )
+    ignored_mass_fraction = pd.Series(ignored_mass_fraction, index=df.index)
+    comp_incomplete = ((unres_r + unres_h) > 0) | (ignored_mass_fraction.isna()) | (ignored_mass_fraction > 1e-4)
 
     # ---- 化学计量比 r ----
-    r_val = pd.Series(np.nan, index=df.index, dtype=float)
-    for c in (
+    _R_LIT_CANDIDATES = (
         "formulation_r_value",
         "formulation_resin_hardener_equivalent_ratio",
         "crosslink_stoichiometry_r",
         "stoichiometric_ratio_r_cleaned",
         "r_value",
-    ):
+        "r_actual",
+    )
+    _R_DERIVED_CANDIDATES = (
+        "cp_r_value",
+        "rxn_r_actual",
+        "rxn_r_effective",
+        "xl_r_value",
+    )
+    has_lit_col_val = pd.Series(False, index=df.index)
+    has_derived_col_val = pd.Series(False, index=df.index)
+    r_val = pd.Series(np.nan, index=df.index, dtype=float)
+
+    for c in _R_LIT_CANDIDATES:
         if c in df.columns:
             v = pd.to_numeric(df[c], errors="coerce")
-            v = v.where(np.isfinite(v) & (v > 0))
-            r_val = r_val.fillna(v)
-    # 当量比推算兜底
-    #
-    # ⚠️⚠️ 语义警示（请勿在别处复用本兜底口径）⚠️⚠️
-    # 下面的 derived = ahew / eew 是**当量重比**，不是环氧/固化剂**化学计量比 r**。
-    # 两者数值与含义均不同，**不可互换**：
-    #   - 正确 r = (固化剂phr / AHEW) / (树脂phr / EEW)
-    #   - 本兜底  = AHEW / EEW
-    # 实测（ml_qspr_selected.csv, n=3237）：
-    #   - 正确公式与全表 formulation_r_value 相关系数 0.9749，中位绝对误差 0.00017
-    #   - 本兜底口径与全表 formulation_r_value 相关系数仅 -0.0886
-    # 具体例：DGEBA/DDS 100:33 时正确 r≈0.905，而本兜底≈0.365。
-    #
-    # 因此：**禁止**用 cp_r_value 填充 formulation_r_value。
-    # 门户侧请用 core/portal_formulation_inputs.py 的 derive_r_value()。
-    # 本兜底仅在原表 r 列全缺失时作为内部临时估值使用（受下方 clip 约束），
-    # 且已有 cp_r_value 与 formulation_r_value 去重逻辑（见本文件末尾）。
-    derived = ahew / eew
-    derived = derived.where(np.isfinite(derived) & (derived > 0))
-    r_val = r_val.fillna(derived).clip(0.05, 20.0)
+            v_valid = v.where(np.isfinite(v) & (v > 0))
+            has_lit_col_val = has_lit_col_val | v_valid.notna()
+            r_val = r_val.fillna(v_valid)
+
+    for c in _R_DERIVED_CANDIDATES:
+        if c in df.columns:
+            v = pd.to_numeric(df[c], errors="coerce")
+            v_valid = v.where(np.isfinite(v) & (v > 0))
+            has_derived_col_val = has_derived_col_val | v_valid.notna()
+            r_val = r_val.fillna(v_valid)
+
+    # 检测输入数据中是否存在历史来源标记与假定标记 (防来源漂移 P0-2)
+    prior_r_source = pd.Series(None, index=df.index, dtype=object)
+    for sc in ("formulation_r_source", "r_source", "cp_r_source", "rxn_r_source", "xl_r_source"):
+        if sc in df.columns:
+            s_val = df[sc].astype(str)
+            valid_s = s_val.isin([
+                "literature",
+                "calculated_from_mass",
+                "partial_composition_calculated",
+                "assumed_stoichiometric",
+                "missing_stoichiometry",
+                "invalid_chemistry",
+                "unknown_provenance",
+            ])
+            # 若 sc 为 formulation_r_source/r_source 但原始文献列无值，不能为派生列背书 (P0-1 & P0-2)
+            if sc in ("formulation_r_source", "r_source") and (~has_lit_col_val).any():
+                s_val = s_val.where(has_lit_col_val, None)
+            prior_r_source = prior_r_source.where(prior_r_source.notna(), s_val.where(valid_s, None))
+
+    # P1-2: 无来源证据的历史衍生字段，不得自动认定为 literature，标记为 unknown_provenance
+    is_derived_only_without_src = prior_r_source.isna() & has_derived_col_val & (~has_lit_col_val)
+    prior_r_source = prior_r_source.where(~is_derived_only_without_src, "unknown_provenance")
+
+    # 继承布尔来源标志 (P0-2: 解决 keep_metadata=False 下来源血统丢失问题)
+    if "cp_r_unknown" in df.columns:
+        is_unk_flag = df["cp_r_unknown"].astype(bool)
+        prior_r_source = prior_r_source.where(~is_unk_flag, "unknown_provenance")
+    if "cp_r_partial" in df.columns:
+        is_part_flag = df["cp_r_partial"].astype(bool)
+        prior_r_source = prior_r_source.where(~is_part_flag, "partial_composition_calculated")
+
+    has_explicit_lit_tag = (prior_r_source == "literature")
+    for sc in ("formulation_r_source", "r_source"):
+        if sc in df.columns:
+            has_explicit_lit_tag = has_explicit_lit_tag | (df[sc].astype(str) == "literature")
+
+    prior_assumed = pd.Series(False, index=df.index, dtype=bool)
+    if "rxn_r_assumed" in df.columns:
+        assumed_num = pd.to_numeric(df["rxn_r_assumed"], errors="coerce").fillna(0.0)
+        prior_assumed = (assumed_num > 0.5)
+    prior_assumed = prior_assumed | (prior_r_source == "assumed_stoichiometric")
+
+    is_prior_assumed = (prior_r_source == "assumed_stoichiometric")
+    is_prior_partial = (prior_r_source == "partial_composition_calculated")
+    is_prior_calculated = (prior_r_source == "calculated_from_mass")
+    is_prior_unknown = (prior_r_source == "unknown_provenance")
+    is_unknown_provenance = is_prior_unknown
+
+    r_source = pd.Series("invalid_chemistry", index=df.index, dtype=object)
+    rxn_r_assumed = pd.Series(0.0, index=df.index, dtype=float)
+
+    # 1. 质量推算 r (必须两端全部具备有效质量与当量)
+    can_derive = (
+        has_mass_r
+        & has_mass_h
+        & (equiv_r > 0)
+        & (equiv_h > 0)
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r_from_mass = np.where(can_derive, equiv_h / equiv_r, np.nan)
+    r_from_mass = pd.Series(r_from_mass, index=df.index)
+    r_from_mass = r_from_mass.where(np.isfinite(r_from_mass) & (r_from_mass > 0))
+
+    # 若输入表曾记录 cp_r_from_mass，且当前无新质量推导，复用历史 cp_r_from_mass
+    if "cp_r_from_mass" in df.columns:
+        hist_rfm = pd.to_numeric(df["cp_r_from_mass"], errors="coerce")
+        hist_rfm = hist_rfm.where(np.isfinite(hist_rfm) & (hist_rfm > 0))
+        r_from_mass = r_from_mass.combine_first(hist_rfm)
+
+    has_valid_chem = (f_r > 0) & (f_h_st > 0)
+
+    # 检查是否为历史质量推导 (P0-3 来源防丢失 & P0-5 显式文献优先):
+    rfm_diff = (r_val - r_from_mass).abs()
+    matches_rfm = (~has_explicit_lit_tag) & r_from_mass.notna() & r_val.notna() & (rfm_diff < 1e-4)
+    is_prior_mass = is_prior_calculated | matches_rfm
+
+    # 真实文献值判定 (P0-1, P0-2, P0-4, P0-5, P1-2):
+    # 显式文献标签只有在有对应数值时才生效 (数值与来源成对判断 P0-1, P0-2):
+    # - formulation_r_source == "literature" 只能为 formulation_r_value 等原始文献列数值 (has_lit_col_val) 背书！
+    # - 仅当原始文献列有数值 (has_lit_col_val)，或者 cp_r_source 本身就是 "literature" 时，显式文献才成立！
+    is_lit_num_paired = (
+        (has_explicit_lit_tag & has_lit_col_val)
+        | ((df["cp_r_source"].astype(str) == "literature") if "cp_r_source" in df.columns else False)
+    )
+
+    is_lit_case = is_lit_num_paired | (
+        prior_r_source.isna()
+        & has_lit_col_val
+        & (~prior_assumed)
+        & (~is_prior_mass)
+    )
+    is_lit_case = is_lit_case & r_val.notna() & (r_val > 0)
+    # 严格禁止任何已有非 literature 标签升级为 literature (P0-1)；但若成对显式指定 literature，文献事实优先！
+    is_lit_case = is_lit_case & (is_lit_num_paired | (~(is_prior_assumed | is_prior_partial | is_prior_calculated | is_prior_unknown)))
+    has_lit_r = is_lit_case
+
+    # 质量计算成功情况 (区分完整质量与部分组成 P0-1, P1-3):
+    has_new_full_mass_calc = (~is_lit_case) & can_derive & (~comp_incomplete)
+    has_new_partial_mass_calc = (~is_lit_case) & can_derive & comp_incomplete
+
+    # A. 真实文献值
+    r_source = r_source.where(~is_lit_case, "literature")
+
+    # B. 完整配方质量计算值 (新计算覆盖或保持历史完整质量计算)
+    has_full_mass_source = (~is_lit_case) & (has_new_full_mass_calc | (is_prior_calculated & (~has_new_partial_mass_calc)))
+    r_val = r_val.where(~has_new_full_mass_calc, r_from_mass)
+    r_source = r_source.where(~has_full_mass_source, "calculated_from_mass")
+
+    # B1. 部分组成质量计算值 (P0-1 保持历史部分组成，或新生成部分组成)
+    has_partial_mass_source = (~is_lit_case) & (~has_full_mass_source) & (has_new_partial_mass_calc | is_prior_partial)
+    if assume_stoichiometric_if_missing:
+        r_val = r_val.where(~has_new_partial_mass_calc, r_from_mass)
+        r_source = r_source.where(~has_partial_mass_source, "partial_composition_calculated")
+    else:
+        # 严格模式下，部分组成不能作为已验证的全配方 r
+        r_val = r_val.where(~has_partial_mass_source, np.nan)
+        r_source = r_source.where(~has_partial_mass_source, "missing_stoichiometry")
+
+    # B2. 明确保持 unknown_provenance 状态 (P0-5 & P1-2)
+    has_unknown_source = (~is_lit_case) & (~has_full_mass_source) & (~has_partial_mass_source) & is_unknown_provenance
+    r_source = r_source.where(~has_unknown_source, "unknown_provenance")
+
+    # C. 人工假设或缺失
+    has_determined_source = is_lit_case | has_full_mass_source | has_partial_mass_source | has_unknown_source
+    if assume_stoichiometric_if_missing:
+        needs_assumption = (~has_determined_source) & has_valid_chem
+        r_val = r_val.where(~needs_assumption, 1.0)
+        r_source = r_source.where(~needs_assumption, "assumed_stoichiometric")
+        rxn_r_assumed = rxn_r_assumed.where(~needs_assumption, 1.0)
+    else:
+        is_missing_stoich = (~has_determined_source) & has_valid_chem
+        r_val = r_val.where(~is_missing_stoich, np.nan)
+        r_source = r_source.where(~is_missing_stoich, "missing_stoichiometry")
+        rxn_r_assumed = rxn_r_assumed.where(~is_missing_stoich, 0.0)
+
+    # 汇总结构与外部声明官能度冲突标记 (P0-2)
+    conflict_cols = [c for c in comp.columns if c.endswith("_struct_func_conflict")]
+    if conflict_cols:
+        any_struct_func_conflict = comp[conflict_cols].any(axis=1)
+        out["structure_functionality_conflict"] = any_struct_func_conflict
+        # 若存在不可调和的结构-官能度冲突，化学反应体系标记为不适用/冲突 (P0-2)
+        r_source = r_source.where(~any_struct_func_conflict, "invalid_chemistry")
+    else:
+        out["structure_functionality_conflict"] = pd.Series(False, index=df.index)
+
+    r_val = r_val.where(np.isfinite(r_val) & (r_val > 0), np.nan)
 
     balance = np.minimum(r_val, 1.0 / r_val)
 
@@ -740,10 +955,36 @@ def compute_formulation_summary(
             mech = mech.where(mech != MECH_UNKNOWN, m)
     mech = mech.fillna(MECH_UNKNOWN)
 
-    f_avg_network = (f_r + r_val * f_h_net) / (1.0 + r_val)
-    f_avg_network = f_avg_network.where(np.isfinite(f_avg_network))
+    # ---- 摩尔平均官能度 f_avg ----
+    # 严密高分子统计网络理论（Flory 摩尔统计平均）：
+    # 总体摩尔平均官能度 = (n_R * f_R + n_H * f_H,net) / (n_R + n_H)
+    # 绝不能使用旧版 (f_r + r * f_h) / (1 + r)，后者错误地将当量比当成了分子摩尔比！
+    # 严格判断真实摩尔数：当且仅当两端质量全部具备时，直接加权 f_avg_direct 真实有效
+    has_real_mols = has_mass_r & has_mass_h & (mol_r > 0) & (mol_h > 0)
 
+    f_avg_direct = (f_r * mol_r + f_h_net * mol_h) / (mol_r + mol_h).replace(0.0, np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = r_val * (f_r / f_h_st.replace(0.0, np.nan))
+        f_avg_from_r = (f_r + ratio * f_h_net) / (1.0 + ratio)
+
+    # 若缺少真实质量但由假设模式得到了 r_val (如 r=1.0)，必须采用严格当量关系推导的 f_avg_from_r！
+    f_avg_network = np.where(has_real_mols, f_avg_direct, f_avg_from_r)
+    f_avg_network = pd.Series(f_avg_network, index=df.index)
+    f_avg_network = f_avg_network.where(np.isfinite(f_avg_network) & (f_avg_network > 0))
+
+    # 保存 r_from_mass 供文献 r 与质量推算 r 冲突核查 (P1-1)
     out["cp_r_value"] = r_val
+    out["cp_r_source"] = r_source
+    out["rxn_r_assumed"] = rxn_r_assumed
+    out["cp_r_from_mass"] = r_from_mass
+    # 冲突标记: 文献有显式 r 且质量推算 r 也存在，且相对差异大于 5%
+    r_diff = (r_val - r_from_mass).abs() / r_val.clip(lower=1e-4)
+    out["cp_r_conflict"] = np.where(has_lit_r & r_from_mass.notna() & (r_diff > 0.05), 1.0, 0.0)
+    out["cp_composition_incomplete"] = comp_incomplete
+    out["cp_ignored_mass_fraction"] = ignored_mass_fraction
+    out["cp_unknown_comp_count"] = unres_r + unres_h
+    out["cp_r_unknown"] = (r_source == "unknown_provenance")
+    out["cp_r_partial"] = (r_source == "partial_composition_calculated")
     out["cp_balance"] = balance
     out["cp_f_r"] = f_r
     out["cp_f_h_stoich"] = f_h_st
@@ -793,9 +1034,10 @@ def compute_formulation_summary(
     out["cp_mol_curer"] = mol_h
 
     # ---- 覆盖等级 ----
+    has_complete_mass = has_mass_r & has_mass_h
     cov = np.where(
-        cov_r & cov_h & np.isfinite(W) & (W > 0), "full",
-        np.where(np.isfinite(epoxy_conc), "partial", "none"),
+        has_complete_mass & cov_r & cov_h & np.isfinite(W) & (W > 0), "full",
+        np.where(cov_r & cov_h & np.isfinite(epoxy_conc), "partial", "none"),
     )
     out["cp_coverage"] = cov
     return out
@@ -808,7 +1050,10 @@ _METADATA_SUFFIXES = (
     "_mw_source", "_ew_source", "_f_source", "_mw_trust",
     "_mechanism",
 )
-_METADATA_EXACT = ("cp_mechanism", "cp_coverage", "cp_eew_source", "cp_ahew_source")
+_METADATA_EXACT = (
+    "cp_mechanism", "cp_coverage", "cp_eew_source", "cp_ahew_source", "cp_r_source",
+    "cp_cache_input_hash", "cp_cache_assume_stoich", "cp_cache_max_components",
+)
 
 
 def is_metadata_column(name: str) -> bool:
@@ -827,6 +1072,7 @@ def enrich_narrow_table(
     max_components: int = 3,
     rho_g_cm3: float = 1.2,
     keep_metadata: bool = False,
+    assume_stoichiometric_if_missing: bool = True,
 ) -> pd.DataFrame:
     """窄表增强入口：逐组分物理量 + 配方级汇总，一次补齐。
 
@@ -836,12 +1082,27 @@ def enrich_narrow_table(
         keep_metadata: 是否保留字符串型元数据列（*_mw_source / *_mechanism /
             cp_coverage 等）。**默认 False**——这些列只用于内部降级决策与
             诊断，不应作为特征写入数据集；需要调试时可置 True。
+        assume_stoichiometric_if_missing: 当质量缺失时是否默认假设 r=1.0（默认 True）。
     """
     if not isinstance(df, pd.DataFrame) or len(df) == 0:
         return df.copy()
-    comp = compute_component_physics(df, max_components=max_components)
-    summary = compute_formulation_summary(df, comp, max_components=max_components, rho_g_cm3=rho_g_cm3)
-    out = pd.concat([df.copy(), comp, summary], axis=1)
+    comp = compute_component_physics(
+        df,
+        max_components=max_components,
+        assume_stoichiometric_if_missing=assume_stoichiometric_if_missing,
+    )
+    summary = compute_formulation_summary(
+        df,
+        comp,
+        max_components=max_components,
+        rho_g_cm3=rho_g_cm3,
+        assume_stoichiometric_if_missing=assume_stoichiometric_if_missing,
+    )
+    out = df.copy()
+    for c in comp.columns:
+        out[c] = comp[c]
+    for c in summary.columns:
+        out[c] = summary[c]
 
     # ---- 当量重去重：把填补结果写回**原表列名**，删掉重复的 cp_ 列 ----
     #
@@ -873,10 +1134,24 @@ def enrich_narrow_table(
         _r_target = next((c for c in _R_ORIG_NAMES if c in out.columns), None)
         if _r_target is None:
             out = out.rename(columns={"cp_r_value": _R_ORIG_NAMES[0]})
+            _r_target = _R_ORIG_NAMES[0]
+            _was_na = pd.Series(True, index=out.index)
         else:
             _r_old = pd.to_numeric(out[_r_target], errors="coerce")
+            _was_na = _r_old.isna()
             out[_r_target] = _r_old.where(_r_old.notna(), _r_filled)
             out = out.drop(columns=["cp_r_value"])
+
+        # 同步来源 (P1 & P0-2):
+        # 当原表 r 字段由 cp_r_value 补齐（_was_na 为 True）时，来源必须同步为真实的 cp_r_source！
+        # 绝不能让填入的计算值/部分组成值继承原表的孤立 literature 标签！
+        if "cp_r_source" in out.columns and _was_na.any():
+            _src_from_cp = out["cp_r_source"].astype(str)
+            for _sc_col in ("formulation_r_source", "r_source", "xl_r_source"):
+                if _sc_col in out.columns:
+                    out[_sc_col] = out[_sc_col].where(~_was_na, _src_from_cp)
+                elif keep_metadata:
+                    out[_sc_col] = _src_from_cp
 
     if not keep_metadata:
         drop = [c for c in out.columns if is_metadata_column(c) and c not in df.columns]

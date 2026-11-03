@@ -206,8 +206,38 @@ SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
         reaction_id="glycidyl_etherification",
         name="羟基缩水甘油醚化 (R01, 酚/脂肪醇通用)",
         target_role="resin",
-        reaction_smarts="[#6:1]-[OX2H:2]>>[#6:1]-OCC1CO1",
+        reaction_smarts="[#6;!$(C=O):1]-[OX2H:2]>>[#6:1]-OCC1CO1",
         description="多元酚/脂肪多元醇 + 环氧氯丙烷生成缩水甘油醚环氧树脂 (DGEBA/氢化双酚A/脂环多元醇醚型)",
+        expected_warhead="环氧缩水甘油醚",
+        chemical_system="epoxy",
+        default_enabled=True,
+    ),
+    SyntheticReaction(
+        reaction_id="glycidyl_etherification_non_carboxyl",
+        name="羟基缩水甘油醚化·排除羧酸 (R01c)",
+        target_role="resin",
+        reaction_smarts="[#6;!$(C=O):1]-[OX2H:2]>>[#6:1]-OCC1CO1",
+        description="酚/脂肪醇缩水甘油醚化，显式排除羧酸（与 R03 分工，供 P1 路线链引用）",
+        expected_warhead="环氧缩水甘油醚",
+        chemical_system="epoxy",
+        default_enabled=True,
+    ),
+    SyntheticReaction(
+        reaction_id="glycidyl_etherification_phenol",
+        name="酚羟基缩水甘油醚化 (R01a)",
+        target_role="resin",
+        reaction_smarts="[c:1]-[OX2H:2]>>[c:1]-OCC1CO1",
+        description="仅酚羟基 + 环氧氯丙烷生成缩水甘油醚",
+        expected_warhead="环氧缩水甘油醚",
+        chemical_system="epoxy",
+        default_enabled=True,
+    ),
+    SyntheticReaction(
+        reaction_id="glycidyl_etherification_aliphatic",
+        name="脂肪醇缩水甘油醚化 (R01b)",
+        target_role="resin",
+        reaction_smarts="[CX4:1]-[OX2H:2]>>[CX4:1]-OCC1CO1",
+        description="仅脂肪醇 + 环氧氯丙烷生成缩水甘油醚",
         expected_warhead="环氧缩水甘油醚",
         chemical_system="epoxy",
         default_enabled=True,
@@ -246,7 +276,11 @@ SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
         reaction_id="olefin_epoxidation",
         name="双键环氧化 (R04, 脂环环氧)",
         target_role="resin",
-        reaction_smarts="[C:1]=[C:2]>>[C:1]1O[C:2]1",
+        reaction_smarts=(
+            "[!$([CX3]=[OX1]);!$([CX4,CX3][CX3]=[OX1]);!$([CX4,CX3][CX2]#[NX1]):1]"
+            "=[!$([CX3]=[OX1]);!$([CX4,CX3][CX3]=[OX1]);!$([CX4,CX3][CX2]#[NX1]):2]"
+            ">>[C:1]1O[C:2]1"
+        ),
         description="过氧酸对脂肪族双键（环己烯/乙烯基/烯丙基侧链）环氧化生成耐候脂环族环氧（局部模板，保留环上取代基）",
         expected_warhead="脂环环氧",
         chemical_system="epoxy",
@@ -366,6 +400,114 @@ SYNTHETIC_REACTION_TEMPLATES: list[SyntheticReaction] = [
 
 
 # ==============================================================================
+# 2b. 路线感知合成路径 (Synthetic Routes)：将扁平反应模板组织为多步反应网络
+# ==============================================================================
+
+@dataclass
+class RouteStep:
+    """合成路线中的单个反应步骤。"""
+    step_index: int
+    reaction_id: str
+    reaction_smarts: str
+    intermediate_label: str = ""           # 中间体的可读标签（仅用于 UI 展示，非 SMILES）
+    requires_reagent: str = ""             # "环氧氯丙烷" / "烯丙基溴" / "过氧酸" / "NaOH" ...
+    hazard_flags: tuple[str, ...] = ()     # ("剧毒", "含氯废水", "强放热")
+
+
+@dataclass
+class SyntheticRoute:
+    """从前驱体到目标单体的完整合成路线。
+
+    steps 顺序执行：step[i] 的产物是 step[i+1] 的底物。
+    中间体的真实 SMILES 由路径执行器在执行时产出（见 _expand_route_chain），
+    不存放在本结构中；step.intermediate_label 仅为 UI 可读标签。
+    """
+    route_id: str
+    name: str
+    chemical_system: str                  # "epoxy" | "amine" | ...
+    target_role: str                      # "resin" | "hardener"
+    steps: list[RouteStep]
+    atom_economy: float = 0.5             # 原子经济性 (0~1)
+    green_score: float = 5.0              # 绿色化学评分 (0~10)
+    default_enabled: bool = True
+
+    @property
+    def n_steps(self) -> int:
+        return len(self.steps)
+
+
+# 羟基环氧化四条真实工业路线（P1-P4），均默认启用
+_P1_SMARTS = "[#6;!$(C=O):1]-[OX2H:2]>>[#6:1]-OCC1CO1"
+
+ROUTE_CHAINS: list[SyntheticRoute] = [
+    SyntheticRoute(
+        route_id="P1_phenol_ech",
+        name="P1 直接ECH醚化 (酚/醇→缩水甘油醚)",
+        chemical_system="epoxy",
+        target_role="resin",
+        steps=[
+            RouteStep(0, "glycidyl_etherification_non_carboxyl", _P1_SMARTS,
+                      requires_reagent="环氧氯丙烷", hazard_flags=("剧毒", "含氯废水")),
+        ],
+        atom_economy=0.42, green_score=4.5,
+    ),
+    SyntheticRoute(
+        route_id="P2_allyl_epoxidation",
+        name="P2 烯丙基化-环氧化 (两步, 绿色无氯)",
+        chemical_system="epoxy",
+        target_role="resin",
+        steps=[
+            RouteStep(0, "allyl_etherification",
+                      "[c:1][OX2H:2]>>[c:1]OCC=C",
+                      requires_reagent="烯丙基溴", hazard_flags=("催泪",)),
+            RouteStep(1, "olefin_epoxidation_selective",
+                      "[!$([CX3]=[OX1]);!$([CX4,CX3][CX3]=[OX1]);!$([CX4,CX3][CX2]#[NX1]):1]"
+                      "=[!$([CX3]=[OX1]);!$([CX4,CX3][CX3]=[OX1]);!$([CX4,CX3][CX2]#[NX1]):2]"
+                      ">>[C:1]1O[C:2]1",
+                      intermediate_label="O-烯丙基醚中间体",
+                      requires_reagent="过氧酸", hazard_flags=("易爆", "强氧化")),
+        ],
+        atom_economy=0.55, green_score=6.0,
+    ),
+    SyntheticRoute(
+        route_id="P3_chlorohydrin",
+        name="P3 氯代醇法闭环 (两步, 机理清晰)",
+        chemical_system="epoxy",
+        target_role="resin",
+        steps=[
+            # 首步 SMARTS 刻意用 ;!$(C=O) 排除羧基碳，避免羧酸被本步消耗（与 R01c 选择性修正一致）。
+            RouteStep(0, "chlorohydrin_ether",
+                      "[#6;!$(C=O):1][OX2H:2]>>[#6:1]OCC(O)CCl",
+                      requires_reagent="环氧氯丙烷", hazard_flags=("剧毒",)),
+            RouteStep(1, "chlorohydrin_closure",
+                      "[OX2:1][CH2:2][CH:3]([OX2H])[CH2:4][Cl:5]>>[OX2:1][CH2:2][CH:3]1[O][CH2:4]1",
+                      intermediate_label="氯代醇中间体",
+                      requires_reagent="NaOH", hazard_flags=("含盐废水",)),
+        ],
+        atom_economy=0.48, green_score=5.0,
+    ),
+    SyntheticRoute(
+        route_id="P4_sharpless",
+        name="P4 Sharpless环氧化 (消旋, 烯丙醇→环氧醇)",
+        chemical_system="epoxy",
+        target_role="resin",
+        steps=[
+            RouteStep(0, "sharpless_epoxidation",
+                      "[CX4:1]([OX2H:2])[CX3:3]=[CX3:4]>>[CX4:1]([OX2H:2])[CX3:3]1[O][CX3:4]1",
+                      intermediate_label="环氧醇",
+                      requires_reagent="Ti(OiPr)4/TBHP", hazard_flags=("重金属", "强氧化")),
+        ],
+        atom_economy=0.60, green_score=5.5,
+    ),
+]
+
+
+def hydroxyl_epoxidation_routes() -> list[SyntheticRoute]:
+    """返回全部'羟基→环氧'转化路径（供 UI 与流水线引用）。"""
+    return [r for r in ROUTE_CHAINS if r.chemical_system == "epoxy"]
+
+
+# ==============================================================================
 # 3. 经典工业前驱体母核库 (Precursor Catalog)
 # ==============================================================================
 
@@ -440,6 +582,72 @@ PRECURSOR_CATALOG: list[PrecursorCore] = [
 # 4. 阶段 1：骨架裂变生成器 (Scaffold Fission & Assembly)
 # ==============================================================================
 
+# 星型/四官能组装用"环臂"模板：(酚臂, 胺臂)。片段第一个原子为与中心核的连接点。
+# 连接点碳必须在片段首位、羟基/氨基在环上其他位置；若写成 Oc1ccc(...)cc1（氧在前），
+# 中心碳会连到氧上形成醚而非 C-C 键（实测 functionality=0）。
+RING_ARM_TEMPLATES: dict[str, tuple[str, str]] = {
+    "benzene":        ("c1ccc(O)cc1",             "c1ccc(N)cc1"),
+    "naphthalene_14": ("c1ccc(O)c2ccccc12",       "c1ccc(N)c2ccccc12"),
+    "naphthalene_26": ("c1ccc2cc(O)ccc2c1",       "c1ccc2cc(N)ccc2c1"),
+    "anthracene":     ("c1ccc2cc3ccccc3cc2c1O",   "c1ccc2cc3ccccc3cc2c1N"),
+    "pyrene":         ("c1cc2ccc3cccc4ccc(O)c1c2c34", "c1cc2ccc3cccc4ccc(N)c1c2c34"),
+    "biphenyl_44":    ("c1ccc(-c2ccc(O)cc2)cc1",  "c1ccc(-c2ccc(N)cc2)cc1"),
+    "terphenyl":      ("c1ccc(-c2ccc(-c3ccc(O)cc3)cc2)cc1", "c1ccc(-c2ccc(-c3ccc(N)cc3)cc2)cc1"),
+    "fluorene":       ("c1ccc2c(c1)Cc1ccc(O)cc12", "c1ccc2c(c1)Cc1ccc(N)cc12"),
+    "xanthene":       ("c1ccc2c(c1)Oc1ccc(O)cc1C2", "c1ccc2c(c1)Oc1ccc(N)cc1C2"),
+    "carbazole":      ("c1ccc2[nH]c3ccc(O)cc3c2c1", "c1ccc2[nH]c3ccc(N)cc3c2c1"),
+    "quinoxaline":    ("c1ccc2nccnc2c1O",          "c1ccc2nccnc2c1N"),
+}
+
+# A2 类别配额表：各生成类别的保底占比（替代先到先得截断，经典母核不占配额）
+_CATEGORY_QUOTA = {
+    "拓扑衍生双酚": 0.18, "拓扑衍生二胺": 0.18,
+    "稠环衍生多酚": 0.12, "稠环衍生多胺": 0.12,
+    "特种空间刚性母核": 0.12,
+    "不对称杂化母核": 0.09,
+    "拓扑星型多酚": 0.04, "拓扑星型多胺": 0.04,
+    "多元羧酸衍生母核": 0.06,
+}
+
+
+def _apply_category_quota(
+    intermediates: list[PrecursorCore], max_total: int
+) -> list[PrecursorCore]:
+    """按类别配额截断：经典母核恒保留；配额内每类先取；剩余名额按存量回填。
+
+    注意：PrecursorCore 是 @dataclass（eq=True 时不可哈希），判重一律用 core_id 集合，
+    严禁 `set(core_mols)`（会 TypeError: unhashable）。
+    """
+    quota_budget = max(0, max_total - len(PRECURSOR_CATALOG))
+    core_ids = {c.core_id for c in PRECURSOR_CATALOG}
+    core_mols = [p for p in intermediates if p.core_id in core_ids]
+    generated = [p for p in intermediates if p.core_id not in core_ids]
+    by_cat: dict[str, list[PrecursorCore]] = {}
+    for p in generated:
+        by_cat.setdefault(p.category, []).append(p)
+    selected: list[PrecursorCore] = []
+    for cat, frac in _CATEGORY_QUOTA.items():
+        pool = by_cat.get(cat, [])
+        take = min(len(pool), int(quota_budget * frac))
+        selected.extend(pool[:take])
+    # 剩余名额按存量回填（类别顺序保持注册表顺序，保证确定性）
+    used = len(selected)
+    remaining = quota_budget - used
+    for cat in _CATEGORY_QUOTA:
+        pool = by_cat.get(cat, [])
+        taken = min(len(pool), int(quota_budget * _CATEGORY_QUOTA[cat]))
+        extra = min(len(pool) - taken, remaining)
+        selected.extend(pool[taken:taken + extra])
+        remaining -= extra
+        if remaining <= 0:
+            break
+    # 未列入配额表的类别（如测试类别）全额保留
+    for cat, pool in by_cat.items():
+        if cat not in _CATEGORY_QUOTA:
+            selected.extend(pool)
+    return core_mols + selected
+
+
 def generate_scaffold_intermediates(
     selected_rings: list[str] | None = None,
     selected_linkers: list[str] | None = None,
@@ -447,7 +655,7 @@ def generate_scaffold_intermediates(
     include_phenols: bool = True,
     include_amines: bool = True,
     include_acids: bool = True,
-    max_intermediates: int = 10000,
+    max_intermediates: int = 50000,
 ) -> list[PrecursorCore]:
     """Combinatorially assemble ring + linker + R-group scaffolds into multi-functional intermediates."""
     if not RDKIT_AVAILABLE:
@@ -489,6 +697,10 @@ def generate_scaffold_intermediates(
         ("biphenyl", "4,4'-联苯", "biphenyl_44", "c1ccc(-c2ccc({link})cc2)cc1", "Oc1ccc(-c2ccc({lk}c3ccc(-c4ccc(O)cc4)cc3)cc2)cc1", "Nc1ccc(-c2ccc({lk}c3ccc(-c4ccc(N)cc4)cc3)cc2)cc1"),
         ("cyclohexyl", "环己基", "cyclohexane", "C1CCC({link})CC1", "OC1CCC({lk}C2CCC(O)CC2)CC1", "NC1CCC({lk}C2CCC(N)CC2)CC1"),
         ("adamantane", "金刚烷基", "adamantane", "C1C2CC3CC1CC({link})(C2)C3", "OC1C2CC3CC1CC({lk}C1C4CC5CC1CC(O)(C4)C5)(C2)C3", "NC1C2CC3CC1CC({lk}C1C4CC5CC1CC(N)(C4)C5)(C2)C3"),
+        ("mesitylene", "均三甲苯基", "mesitylene", "Cc1cc(C)cc({link})c1",
+         "Oc1cc{r}cc(C)c1{lk}c1cc(O)cc(C)c1C", "Nc1cc{r}cc(C)c1{lk}c1cc(N)cc(C)c1C"),
+        ("biphenyl_33", "3,3'-联苯", "biphenyl_33", "c1cccc(-c2cccc({link})c2)c1",
+         "Oc1cccc(-c2cccc({lk}c3cccc(O)c3)c2)c1", "Nc1cccc(-c2cccc({lk}c3cccc(N)c3)c2)c1"),
     ]
 
     for r_name, r_desc, ring_key, ring_base, p_tmpl, a_tmpl in ring_templates:
@@ -498,9 +710,6 @@ def generate_scaffold_intermediates(
             if linker.valency != 2:
                 continue
             for r_grp in r_groups:
-                if len(intermediates) >= max_intermediates:
-                    break
-
                 r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
                 
                 # 确定连接键 SMILES
@@ -536,6 +745,13 @@ def generate_scaffold_intermediates(
                     lk_str = "[Si](C)(C)O[Si](C)(C)"
                 else:
                     lk_str = linker.smiles_pattern if linker.smiles_pattern else "C"
+
+                # 连接桥 SMILES 自带的环闭合编号（如环己基叉 C1(CCCCC1)、二环戊二烯桥
+                # C1CC2CC1C1CCC21）会与模板在 {lk} 拼接点尚未闭合的环编号冲突，
+                # RDKit 会把桥错误稠合到酚环上生成“单酚”假产物（酚羟基数=1，
+                # 环氧化后官能度 1 无法交联）；统一重映射到高位编号——模板拼接点
+                # 最多开放 1-3 号环，6-9 号保证无碰撞，桥拓扑结构不变。
+                lk_str = lk_str.translate(str.maketrans("1234", "6789"))
 
                 # 构建多元酚中间体
                 if include_phenols:
@@ -601,13 +817,15 @@ def generate_scaffold_intermediates(
         ("pyridine", "吡啶环", "pyridine", "Oc1cc(O)c{r}cn1", "Nc1cc(N)c{r}cn1"),
         ("carbazole", "咔唑环", "carbazole", "Oc1cc{r}c2[nH]c3ccc(O)cc3c2c1", "Nc1cc{r}c2[nH]c3ccc(N)cc3c2c1"),
         ("adamantane", "金刚烷", "adamantane", "OC1C2CC3CC1CC(O)(C2)C3", "NC1C2CC3CC1CC(N)(C2)C3"),
+        ("cardo_bpf", "卡基芴", "cardo_bpf",
+         "Oc1ccc2c(c1)C(c1ccccc1)(c1ccccc1)c1cc(O)ccc1-2", "Nc1ccc(C2(c3ccccc3)c3ccccc3-c3ccccc32)cc1"),
+        ("s_triazine", "对称三嗪", "s_triazine",
+         "Oc1nc(O)nc{r}n1", "Nc1nc(N)nc{r}n1"),
     ]
     for c_id, c_name, ring_key, p_tmpl, a_tmpl in poly_cores:
         if not _ring_enabled(ring_key):
             continue
         for r_grp in r_groups:
-            if len(intermediates) >= max_intermediates:
-                break
             r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
             # 固定模板（无 {r} 槽位）只为首个（无取代）R基生成一次，避免重复去重开销
             if "{r}" not in p_tmpl and r_str:
@@ -636,52 +854,59 @@ def generate_scaffold_intermediates(
                 except Exception:
                     pass
 
-    # 2. 三核星型组装模型 (>CH- 次甲基核，由 methine_star 桥联库控制)
-    if _linker_enabled("methine_star") and _ring_enabled("benzene"):
-        for r_grp in r_groups:
-            if len(intermediates) >= max_intermediates:
-                break
-            r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
-            smi_star_p = f"Oc1cc{r_str}c(C(c2ccc(O)cc2)c2ccc(O)cc2)cc1"
-            smi_star_a = f"Nc1cc{r_str}c(C(c2ccc(N)cc2)c2ccc(N)cc2)cc1"
-            for s, cat, role, prefix in [(smi_star_p, "拓扑星型多酚", "resin", "三酚"), (smi_star_a, "拓扑星型多胺", "hardener", "三胺")]:
-                try:
-                    m = Chem.MolFromSmiles(s)
-                    if m:
-                        Chem.SanitizeMol(m)
-                        cs = Chem.MolToSmiles(m, canonical=True)
-                        if cs not in seen_smiles:
-                            seen_smiles.add(cs)
-                            intermediates.append(
-                                PrecursorCore(
+    # 2. 三核星型组装模型 (>CH- 次甲基核)：遍历所有已选环骨架的酚/胺臂
+    if _linker_enabled("methine_star"):
+        for ring_key, (arm_p, arm_a) in RING_ARM_TEMPLATES.items():
+            if not _ring_enabled(ring_key):
+                continue
+            for r_grp in r_groups:
+                # R 基替换：苯臂（benzene）模板含 {r} 槽，其他环臂忽略 R 基
+                if ring_key == "benzene":
+                    r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
+                    arm_p_r = f"c1cc{r_str}c(O)cc1"
+                    arm_a_r = f"c1cc{r_str}c(N)cc1"
+                else:
+                    arm_p_r, arm_a_r = arm_p, arm_a
+                for s, cat, role, prefix in [
+                    (f"C({arm_p_r})({arm_p_r}){arm_p_r}", "拓扑星型多酚", "resin", "三酚"),
+                    (f"C({arm_a_r})({arm_a_r}){arm_a_r}", "拓扑星型多胺", "hardener", "三胺"),
+                ]:
+                    try:
+                        m = Chem.MolFromSmiles(s)
+                        if m:
+                            Chem.SanitizeMol(m)
+                            cs = Chem.MolToSmiles(m, canonical=True)
+                            if cs not in seen_smiles:
+                                seen_smiles.add(cs)
+                                intermediates.append(PrecursorCore(
                                     core_id=f"gen_star_{hashlib.md5(cs.encode()).hexdigest()[:8]}",
-                                    name=f"星型{prefix} ({r_grp.name})",
-                                    category=cat,
-                                    role=role,
-                                    smiles=cs,
-                                    description=f"三官能度星型拓扑核心前驱体",
-                                    default_selected=True,
-                                )
-                            )
-                except Exception:
-                    pass
+                                    name=f"星型{prefix} ({ring_key})",
+                                    category=cat, role=role, smiles=cs,
+                                    description=f"三官能度星型拓扑核心前驱体（{ring_key} 臂）",
+                                    default_selected=True))
+                    except Exception:
+                        pass
 
     # 3. 空间四官能组装模型 (四苯乙烷/四苯甲烷/卡基芴/螺双二氢茚，由对应环系与星型桥联控制)
     for r_grp in r_groups:
-        if len(intermediates) >= max_intermediates:
-            break
         r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
         spatial_candidates = []
-        if _linker_enabled("ethane_tetra") and _ring_enabled("benzene"):
-            spatial_candidates.extend([
-                (f"Oc1cc{r_str}c(C(c2ccc(O)cc2)C(c2ccc(O)cc2)c2ccc(O)cc2)cc1", "四苯乙烷四酚", "resin"),
-                (f"Nc1cc{r_str}c(C(c2ccc(N)cc2)C(c2ccc(N)cc2)c2ccc(N)cc2)cc1", "四苯乙烷四胺", "hardener"),
-            ])
-        if _linker_enabled("quaternary_carbon") and _ring_enabled("benzene"):
-            spatial_candidates.extend([
-                (f"Oc1cc{r_str}c(C(c2ccc(O)cc2)(c2ccc(O)cc2)c2ccc(O)cc2)cc1", "四苯甲烷四酚", "resin"),
-                (f"Nc1cc{r_str}c(C(c2ccc(N)cc2)(c2ccc(N)cc2)c2ccc(N)cc2)cc1", "四苯甲烷四胺", "hardener"),
-            ])
+        if _linker_enabled("ethane_tetra"):
+            for ring_key, (arm_p, arm_a) in RING_ARM_TEMPLATES.items():
+                if not _ring_enabled(ring_key):
+                    continue
+                spatial_candidates.append(
+                    (f"C({arm_p})({arm_p})C({arm_p})({arm_p})", f"四苯乙烷型四酚 ({ring_key})", "resin"))
+                spatial_candidates.append(
+                    (f"C({arm_a})({arm_a})C({arm_a})({arm_a})", f"四苯乙烷型四胺 ({ring_key})", "hardener"))
+        if _linker_enabled("quaternary_carbon"):
+            for ring_key, (arm_p, arm_a) in RING_ARM_TEMPLATES.items():
+                if not _ring_enabled(ring_key):
+                    continue
+                spatial_candidates.append(
+                    (f"C({arm_p})({arm_p})({arm_p}){arm_p}", f"四苯甲烷型四酚 ({ring_key})", "resin"))
+                spatial_candidates.append(
+                    (f"C({arm_a})({arm_a})({arm_a}){arm_a}", f"四苯甲烷型四胺 ({ring_key})", "hardener"))
         if _ring_enabled("fluorene"):
             spatial_candidates.extend([
                 (f"Oc1cc{r_str}c(C2(c3ccccc3-c3ccccc32)c2ccc(O)cc2)cc1", "卡基双酚芴", "resin"),
@@ -727,8 +952,6 @@ def generate_scaffold_intermediates(
             if not _linker_enabled(lk_id):
                 continue
             for r_grp in r_groups:
-                if len(intermediates) >= max_intermediates:
-                    break
                 r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
                 # 苯酚-桥-萘酚
                 smi_hybrid_p = f"Oc1cc{r_str}c({lk_str}c2ccc3ccccc3c2O)cc1"
@@ -757,7 +980,8 @@ def generate_scaffold_intermediates(
 
     # 5. 多元羧酸衍生母核 (include_acids)：缩水甘油酯树脂 + 环状酸酐固化剂双路线
     # 邻位/1,2位二酸可经 R07a/R07b 分子内脱水成环酐，间/对位与全取代型走缩水甘油酯路线
-    if include_acids:
+    # 门控语义：酸母核的模板骨架为苯环系，仅当用户勾选了苯环/萘等芳环时才生成
+    if include_acids and (_ring_enabled("benzene") or _ring_enabled("naphthalene_14") or _ring_enabled("toluene")):
         acid_cores = [
             ("phthalic_gen", "邻苯二甲酸型", "O=C(O)c1cc{r}ccc1C(=O)O"),
             ("isophthalic_gen", "间苯二甲酸型", "O=C(O)c1cc{r}cc(C(=O)O)c1"),
@@ -772,8 +996,6 @@ def generate_scaffold_intermediates(
         ]
         for c_id, c_name, tmpl in acid_cores:
             for r_grp in r_groups:
-                if len(intermediates) >= max_intermediates:
-                    break
                 r_str = f"({r_grp.smiles})" if r_grp.smiles else ""
                 if "{r}" not in tmpl and r_str:
                     continue
@@ -798,6 +1020,9 @@ def generate_scaffold_intermediates(
                             )
                 except Exception:
                     pass
+
+    # 类别配额截断：替代"先到先得"，保证柱后（稠环/星型/酸）类别不被饿死
+    intermediates = _apply_category_quota(intermediates, max_intermediates)
 
     return intermediates
 
@@ -827,6 +1052,25 @@ RETRO_DECONSTRUCTION_TEMPLATES = [
 ]
 
 
+_COMPILED_RETRO_TEMPLATES: list[tuple[str, Any, str]] | None = None
+
+
+def _get_compiled_retro_templates() -> list[tuple[str, Any, str]]:
+    global _COMPILED_RETRO_TEMPLATES
+    if _COMPILED_RETRO_TEMPLATES is None:
+        compiled = []
+        if RDKIT_AVAILABLE:
+            for retro_id, smarts, desc in RETRO_DECONSTRUCTION_TEMPLATES:
+                try:
+                    rxn = rdChemReactions.ReactionFromSmarts(smarts)
+                    if rxn is not None:
+                        compiled.append((retro_id, rxn, desc))
+                except Exception:
+                    pass
+        _COMPILED_RETRO_TEMPLATES = compiled
+    return _COMPILED_RETRO_TEMPLATES
+
+
 def deconstruct_monomer_to_precursor_core(smiles_or_mol: str | Any) -> list[str]:
     """Retrosynthetically deconstruct a monomer (epoxy, BMI, CE, etc.) into its precursor core (phenol, amine, acid)."""
     if not RDKIT_AVAILABLE:
@@ -851,12 +1095,7 @@ def deconstruct_monomer_to_precursor_core(smiles_or_mol: str | Any) -> list[str]
     generated_cores = set()
     current_mols = [mol]
 
-    for retro_id, smarts, desc in RETRO_DECONSTRUCTION_TEMPLATES:
-        try:
-            rxn = rdChemReactions.ReactionFromSmarts(smarts)
-        except Exception:
-            continue
-
+    for retro_id, rxn, desc in _get_compiled_retro_templates():
         next_mols = []
         for m in current_mols:
             try:
@@ -899,6 +1138,11 @@ def parse_and_extract_custom_precursors(
     logs = [f"🔍 启动自建/外部前驱体解析器：处理来自【{source_name}】的输入数据..."]
     extracted_precursors: list[PrecursorCore] = []
     seen_smiles = set()
+
+    # 预编译判别官能团 SMARTS（避免在每个分子/片段解析时反复编译）
+    patt_nh = Chem.MolFromSmarts("[NX3;H2,H1;!$(NC=O)]")
+    patt_phenol = Chem.MolFromSmarts("[cX3][OX2H]")
+    patt_acid = Chem.MolFromSmarts("[CX3](=O)[OX2H1]")
 
     for idx, entry in enumerate(raw_entries):
         if isinstance(entry, dict):
@@ -944,11 +1188,12 @@ def parse_and_extract_custom_precursors(
                 if can_smi in seen_smiles:
                     continue
 
+                # 尺寸与复杂度防爆过滤：母核重原子数 > 100 或分子量 > 1500 的超大聚合物/树枝状大分子直接跳过
+                if mol.GetNumHeavyAtoms() > 100 or Descriptors.MolWt(mol) > 1500.0:
+                    continue
+
                 # 按官能团判别角色（不能用 N/O 元素有无判断：醚键 O 会让 ODA/Jeffamine
                 # 等二胺被误判为树脂）
-                patt_nh = Chem.MolFromSmarts("[NX3;H2,H1;!$(NC=O)]")
-                patt_phenol = Chem.MolFromSmarts("[cX3][OX2H]")
-                patt_acid = Chem.MolFromSmarts("[CX3](=O)[OX2H1]")
                 has_amine = bool(patt_nh and mol.HasSubstructMatch(patt_nh))
                 has_phenol = bool(patt_phenol and mol.HasSubstructMatch(patt_phenol))
                 has_acid = bool(patt_acid and mol.HasSubstructMatch(patt_acid))
@@ -999,6 +1244,11 @@ class CombinatorialProduct:
     rotatable_bonds: int
     aromatic_rings: int
     formula: str
+    route_ids: list[str] = field(default_factory=list)   # 全部可行路线 id
+    route_names: list[str] = field(default_factory=list)  # 全部可行路线名称
+    route_steps_min: int = 1                             # 最短路线步数
+    route_redundancy: int = 1                            # 路线冗余度（可行路线数）
+    green_score_best: float = 0.0                        # 最优绿色评分
 
 
 def _calculate_sascore(mol) -> float:
@@ -1161,15 +1411,126 @@ def _apply_reaction_exhaustively(mol, rxn) -> list:
                     continue
         if not next_mols:
             break
-        current_mols = next_mols
+        # 分支剪枝：单体衍生只需完全取代产物，每轮保留前 24 个代表性分子，阻断多位点组合爆炸
+        current_mols = next_mols[:24]
 
     return current_mols if reacted_ever else []
 
 
-def _precursor_matches_reaction(parent_mol, rxn) -> bool:
-    """用反应物侧 SMARTS 模板实测底物是否真的能反应，替代按类别字符串猜测的预过滤。"""
+_SOUNDNESS_SMARTS_CACHE: dict[str, Any] = {}
+
+
+def _get_soundness_patt(smarts: str):
+    if not RDKIT_AVAILABLE or not smarts:
+        return None
+    if smarts in _SOUNDNESS_SMARTS_CACHE:
+        return _SOUNDNESS_SMARTS_CACHE[smarts]
+    p = Chem.MolFromSmarts(smarts)
+    _SOUNDNESS_SMARTS_CACHE[smarts] = p
+    return p
+
+
+def validate_monomer_chemical_soundness(mol, role: str = "resin") -> tuple[bool, str]:
+    """严格校验单体化学相容性与稳定性（严禁互反应基团共存导致自分子交联聚合）。
+
+    解决用户痛点：「某些分子设计的不合理，比如同一分子里面有环氧和酚羟基」。
+
+    物理化学原则：
+    1. 环氧树脂单体 (role=resin 或含环氧基)：
+       - 严禁游离酚羟基 [c][OX2H]（发生自加成自固化，属于反应不完全或烯烃直接环氧化导致的自交联缺陷结构）；
+       - 严禁游离羧基、强酸基（催化开环失活）；
+       - 严禁未保护的伯/仲胺基（室温自分子固化交联成胶）；
+       - 严禁巯基、环状酸酐基。
+    2. 固化剂单体 (role=hardener)：
+       - 严禁带有环氧基（角色混乱且自分子反应）；
+       - 酸酐固化剂严禁带游离胺基或酚/醇羟基（分子内自开环失效）；
+       - 胺类固化剂严禁带游离羧酸（酸碱盐析中和失效）。
+    3. 通用高危结构：
+       - 严禁过氧键 (-O-O-)、易水解发烟酰卤 (-COX)。
+    """
+    if mol is None:
+        return False, "分子对象为空"
+    if not RDKIT_AVAILABLE:
+        return True, "RDKit不可用，跳过相容性校验"
+
+    role_str = str(role or "resin").strip().lower()
+
+    # 通用高危过滤：过氧键与酰卤
+    p_perox = _get_soundness_patt("[OX2,OX1-][OX2,OX1-]")
+    if p_perox and mol.HasSubstructMatch(p_perox):
+        return False, "含有易分解过氧键 (-O-O-)"
+
+    p_acyl = _get_soundness_patt("[CX3](=[OX1])[F,Cl,Br,I]")
+    if p_acyl and mol.HasSubstructMatch(p_acyl):
+        return False, "含有易水解发烟酰卤基团 (-COX)"
+
+    p_ep = _get_soundness_patt("C1OC1")
+    n_epoxy = len(mol.GetSubstructMatches(p_ep)) if p_ep else 0
+
+    p_ph = _get_soundness_patt("[c][OX2H]")
+    n_phenol = len(mol.GetSubstructMatches(p_ph)) if p_ph else 0
+
+    p_acid = _get_soundness_patt("[CX3](=O)[OX2H]")
+    n_acid = len(mol.GetSubstructMatches(p_acid)) if p_acid else 0
+
+    p_amine = _get_soundness_patt("[NX3;H2,H1;!$(NC=O)]")
+    n_amine = len(mol.GetSubstructMatches(p_amine)) if p_amine else 0
+
+    p_thiol = _get_soundness_patt("[SX2H]")
+    n_thiol = len(mol.GetSubstructMatches(p_thiol)) if p_thiol else 0
+
+    n_anh = count_anhydride_groups(mol)
+
+    # 1. 环氧树脂体系单体（含环氧基或角色为 resin）
+    if n_epoxy > 0 or role_str == "resin":
+        if n_epoxy > 0:
+            if n_phenol > 0:
+                return False, f"分子内同时存在环氧基({n_epoxy})与游离酚羟基({n_phenol})，存在自交联聚合缺陷，无法作为稳定单体存储"
+            if n_acid > 0:
+                return False, f"分子内同时存在环氧基({n_epoxy})与游离羧基({n_acid})，易催化开环自交联"
+            if n_amine > 0:
+                return False, f"分子内同时存在环氧基({n_epoxy})与游离胺基({n_amine})，室温即发生自分子交联"
+            if n_thiol > 0:
+                return False, f"分子内同时存在环氧基({n_epoxy})与巯基({n_thiol})，易发生自加成失效"
+            if n_anh > 0:
+                return False, f"分子内同时存在环氧基({n_epoxy})与酸酐基({n_anh})，属于互反应自固化混合体"
+
+    # 2. 固化剂体系单体
+    if role_str == "hardener":
+        if n_epoxy > 0:
+            return False, f"固化剂角色单体不得含有环氧基({n_epoxy})"
+        if n_anh > 0 and (n_amine > 0 or n_phenol > 0):
+            return False, "酸酐固化剂分子内不得含有游离胺基或酚羟基（分子内自开环失效）"
+        if n_amine > 0 and n_acid > 0:
+            return False, "多元胺固化剂分子内不得含有游离羧基（酸碱盐析中和失效）"
+
+    return True, "化学结构自洽"
+
+
+def _precursor_matches_reaction(parent_mol, rxn_def: SyntheticReaction | None, rxn, r_templates=None) -> bool:
+    """实测底物与反应模板的正交性匹配（避免不合理反应打靶）。"""
+    if parent_mol is None:
+        return False
+
+    rxn_id = str(getattr(rxn_def, "reaction_id", "") or "")
+
+    # [前置正交性约束]
+    # 双键环氧化 (R04) 必须要求底物上没有未反应的游离酚羟基、游离芳胺或羧基。
+    # 否则过氧酸直接氧化烯丙基双键会产生「环氧 + 游离酚羟基」的自交联怪胎！
+    if rxn_id == "olefin_epoxidation":
+        p_ph = _get_soundness_patt("[c][OX2H]")
+        if p_ph and parent_mol.HasSubstructMatch(p_ph):
+            return False
+        p_am = _get_soundness_patt("[c][NX3;H2]")
+        if p_am and parent_mol.HasSubstructMatch(p_am):
+            return False
+        p_acid = _get_soundness_patt("[CX3](=O)[OX2H]")
+        if p_acid and parent_mol.HasSubstructMatch(p_acid):
+            return False
+
+    templates = r_templates if r_templates is not None else (rxn.GetReactants() if rxn is not None else ())
     try:
-        for reactant_template in rxn.GetReactants():
+        for reactant_template in templates:
             if (
                 reactant_template is not None
                 and reactant_template.GetNumAtoms() > 0
@@ -1204,6 +1565,7 @@ def _make_product_record(
     equivalent_weight: float,
     mw: float,
     sa: float,
+    route: SyntheticRoute | None = None,
 ) -> CombinatorialProduct:
     return CombinatorialProduct(
         product_smiles=can_smi,
@@ -1222,7 +1584,266 @@ def _make_product_record(
         rotatable_bonds=int(Descriptors.NumRotatableBonds(mol)),
         aromatic_rings=int(Descriptors.NumAromaticRings(mol)),
         formula=rdMolDescriptors.CalcMolFormula(mol),
+        route_ids=[route.route_id] if route else [],
+        route_names=[route.name] if route else [],
+        route_steps_min=len(route.steps) if route else 1,
+        route_redundancy=1,
+        green_score_best=route.green_score if route else 0.0,
     )
+
+
+_ALLOWED_ELEMENTS_ROUTE = frozenset(('C', 'N', 'O', 'S', 'F', 'Cl', 'Br', 'I', 'P', 'Si'))
+
+
+def _strip_atom_maps(mol):
+    """剥离原子映射编号（仅限内部位点追踪使用，绝不进入产物 SMILES/记录字段）。"""
+    stripped = Chem.RWMol(mol)
+    for atom in stripped.GetAtoms():
+        if atom.GetAtomMapNum():
+            atom.SetAtomMapNum(0)
+    return stripped.GetMol()
+
+
+def _label_step_entry_atoms(mol):
+    """给进入路线步的分子全部原子打上顺序映射编号，用于跨轮追踪"原始位点"。
+
+    编号仅在本步穷举内部存活：产物返回前由 _strip_atom_maps 全部剥离。
+    """
+    labeled = Chem.RWMol(mol)
+    for i, atom in enumerate(labeled.GetAtoms()):
+        atom.SetAtomMapNum(i + 1)
+    return labeled.GetMol()
+
+
+def _consumed_template_positions(rxn, reactant_template) -> tuple[int, ...]:
+    """反应物模板中"被消耗原子"的查询位置：其映射编号不再出现在产物侧模板。
+
+    这些原子正是每次反应应用真正从底物移除的原子（如酚羟基氧/氯代氯），
+    "原始位点"判定只检查它们；模板不消耗原子时（如烯烃环氧化）返回空元组。
+    """
+    try:
+        product_maps = set()
+        for t in rxn.GetProducts():
+            for atom in t.GetAtoms():
+                m = atom.GetAtomMapNum()
+                if m > 0:
+                    product_maps.add(m)
+        return tuple(
+            pos for pos, atom in enumerate(reactant_template.GetAtoms())
+            if atom.GetAtomMapNum() > 0 and atom.GetAtomMapNum() not in product_maps
+        )
+    except Exception:
+        return ()
+
+
+def _count_original_site_matches(mol, reactant_template, consumed_positions) -> int:
+    """统计分子上"原始位点"数：位点匹配中被消耗位置的原子仍带本步进入时的映射编号。
+
+    反应新建的原子不带编号（映射号为 0），据此区分"进入本步时已有的位点"
+    与"本步反应新建的位点"。
+    """
+    if mol is None or reactant_template is None:
+        return 0
+    try:
+        matches = mol.GetSubstructMatches(reactant_template)
+    except Exception:
+        return 0
+    if not consumed_positions:
+        return len(matches)
+    count = 0
+    for match in matches:
+        try:
+            if all(mol.GetAtomWithIdx(match[p]).GetAtomMapNum() > 0 for p in consumed_positions):
+                count += 1
+        except Exception:
+            continue
+    return count
+
+
+def _apply_route_step_exhaustively(mol, rxn) -> list:
+    """路线链单步反应的有界穷举执行器（≤4 轮，语义对齐平铺模板路径）。
+
+    与 _apply_reaction_exhaustively 共用同一套穷举思想（反复应用直至无新产物、
+    canonical 去重、只返回真正反应过的分子、底物不匹配返回空列表），多位点
+    底物（双酚A 的两个酚羟基）由此逐轮到达全取代产物 DGEBA，官能度不再虚低。
+
+    不直接调用 _apply_reaction_exhaustively 的原因：氯代醇等步骤的 SMARTS 产物
+    自身仍带可反应羟基，"无新产物即停"的终止条件永不满足——4 轮内会全部长成
+    过度烷基化自聚副产物，既丢掉真实中间体（氯代醇），又生成官能度虚高的假
+    产物。故本执行器先用 _label_step_entry_atoms 标记进入本步时的既有位点
+    （原始位点），每轮只保留"恰好消耗一个原始位点"的产物：原有位点逐轮全
+    取代，新建位点上的自聚链被拒绝。产物返回前剥离全部映射编号。
+    """
+    reactant_template = None
+    try:
+        for t in rxn.GetReactants():
+            if t is not None and t.GetNumAtoms() > 0:
+                reactant_template = t
+                break
+    except Exception:
+        return []
+    if reactant_template is None:
+        return []
+
+    consumed_positions = _consumed_template_positions(rxn, reactant_template)
+    current_mols = [_label_step_entry_atoms(mol)]
+    seen_in_expansion = set()
+    reacted_ever = False
+
+    for _ in range(4):
+        next_mols = []
+        for m in current_mols:
+            try:
+                observed = rxn.RunReactants((m,))
+            except Exception:
+                continue
+            n_orig = _count_original_site_matches(m, reactant_template, consumed_positions)
+            for prod_tuple in observed:
+                prod = prod_tuple[0]
+                try:
+                    Chem.SanitizeMol(prod)
+                except Exception:
+                    continue
+                # 守卫：只有消耗了一个原始位点的产物才允许进入下一轮/下一步；
+                # 消耗新建位点的过度生长链在此被拒绝（n_orig 不减）。
+                if _count_original_site_matches(prod, reactant_template, consumed_positions) != n_orig - 1:
+                    continue
+                try:
+                    dedup_key = Chem.MolToSmiles(_strip_atom_maps(prod), canonical=True)
+                except Exception:
+                    continue
+                if dedup_key in seen_in_expansion:
+                    continue
+                seen_in_expansion.add(dedup_key)
+                next_mols.append(prod)
+                reacted_ever = True
+        if not next_mols:
+            break
+        # 分支剪枝：每轮保留前 24 个位点反应分子，避免四酚/星型三酚多位点组合膨胀
+        current_mols = next_mols[:24]
+
+    if not reacted_ever:
+        return []
+    return [_strip_atom_maps(m) for m in current_mols]
+
+
+def _expand_route_chain(
+    parent_mol,
+    route: SyntheticRoute,
+    precursor: PrecursorCore,
+    mw_range: tuple[float, float],
+    min_functionality: int = 2,
+    compiled_steps: list[Any] | None = None,
+) -> list[CombinatorialProduct]:
+    """沿多步路线顺序执行 Reaction SMARTS。
+
+    - 每一步均为有界穷举执行（见 _apply_route_step_exhaustively）：多位点底物
+      （如双酚A 两个酚羟基）在每一步内逐轮全取代，与平铺模板路径的
+      _apply_reaction_exhaustively 语义对齐，末产物官能度不再虚低；
+    - 中间步骤产物 → role="intermediate" 入库（无官能度/当量需求，不进配方筛选）；
+    - 最后一步产物 → 以 route.target_role 入库并计算 EEW/AHEW；
+    - SA 分数豁免是刻意设计：完整合成路线本身已证明可合成性；但官能度门禁
+      仍然生效——热固网络物理上要求 ≥2 个可反应基团，单官能产物无法交联；
+    - 任意一步不匹配 → 不再产出末步产物（已完成步骤的中间体仍会入库）；未反应底物绝不冒充终产物。
+    """
+    from .task_manager import is_cancelled
+
+    results: list[CombinatorialProduct] = []
+    if not route.steps:
+        return results
+
+    if compiled_steps is not None and len(compiled_steps) == len(route.steps):
+        compiled = compiled_steps
+    else:
+        compiled = []
+        for step in route.steps:
+            if not step.reaction_smarts:
+                return results
+            try:
+                rxn = rdChemReactions.ReactionFromSmarts(step.reaction_smarts)
+            except Exception:
+                return results
+            if rxn is None:
+                # ReactionFromSmarts 对非法 SMARTS 返回 None 而非抛异常，须在此显式拦截、快速失败
+                return results
+            compiled.append(rxn)
+
+    current_mols = [parent_mol]
+    seen_inter = set()
+
+    for idx, (step, rxn) in enumerate(zip(route.steps, compiled)):
+        if is_cancelled():
+            return results
+        next_mols = []
+        seen_step = set()
+        for m in current_mols:
+            # 单步有界穷举（对齐平铺路径 _apply_reaction_exhaustively 的语义）：
+            # 多位点底物（如双酚A 的两个酚羟基）必须逐轮全取代，否则只能得到
+            # 官能度 1 的单取代产物、被末步门禁整体拒收，路线列永远为空。
+            # 底物不匹配时返回空列表，绝不会让未反应底物冒充产物入库。
+            try:
+                step_products = _apply_route_step_exhaustively(m, rxn)
+            except Exception:
+                continue
+            for prod in step_products:
+                can = Chem.MolToSmiles(prod, canonical=True)
+                if "." in can:
+                    continue
+                if any(atom.GetSymbol() not in _ALLOWED_ELEMENTS_ROUTE for atom in prod.GetAtoms()):
+                    continue
+                if can in seen_step:
+                    continue
+                seen_step.add(can)
+                next_mols.append(prod)
+        if not next_mols:
+            return results          # 断链：路线不成立
+
+        is_last = idx == len(route.steps) - 1
+        for prod in next_mols:
+            can = Chem.MolToSmiles(prod, canonical=True)
+            if is_last:
+                # 末步门槛：官能度门禁与平铺模板路径一致（_min_functionality_for_type 按
+                # resin_type 类型感知放宽）；SA 分数上限豁免保留——完整合成路线本身已
+                # 证明可合成性。官能度非启发式，而是热固网络交联的物理前提，故不可豁免。
+                stoich = calculate_stoichiometry(prod, route.target_role, "环氧")
+                min_req = _min_functionality_for_type(stoich["resin_type"], min_functionality)
+                if stoich["functionality"] < min_req:
+                    continue
+                if not (mw_range[0] <= stoich["mw"] <= mw_range[1]):
+                    continue
+                # [化学相容性门禁] 路线链末步产物必须是官能团自洽的稳定单体
+                is_sound, _ = validate_monomer_chemical_soundness(prod, route.target_role)
+                if not is_sound:
+                    continue
+                results.append(_make_product_record(
+                    prod, can, route.target_role, stoich["resin_type"], precursor,
+                    route.route_id, route.name, stoich["functionality"],
+                    stoich["equivalent_weight"], stoich["mw"],
+                    _calculate_sascore(prod), route=route))
+            else:
+                if can in seen_inter:
+                    continue
+                seen_inter.add(can)
+                results.append(CombinatorialProduct(
+                    product_smiles=can, role="intermediate", resin_type="intermediate",
+                    precursor_id=precursor.core_id, precursor_name=precursor.name,
+                    precursor_smiles=precursor.smiles,
+                    reaction_id=step.reaction_id,
+                    reaction_name=f"{route.route_id} 中间体",
+                    functionality=0, equivalent_weight=0.0,
+                    molecular_weight=float(Descriptors.MolWt(prod)),
+                    sa_score=round(_calculate_sascore(prod), 2),
+                    heavy_atoms=int(prod.GetNumHeavyAtoms()),
+                    rotatable_bonds=int(Descriptors.NumRotatableBonds(prod)),
+                    aromatic_rings=int(Descriptors.NumAromaticRings(prod)),
+                    formula=rdMolDescriptors.CalcMolFormula(prod),
+                    route_ids=[route.route_id], route_names=[route.name],
+                    route_steps_min=idx + 1, route_redundancy=1,
+                    green_score_best=route.green_score,
+                ))
+        current_mols = next_mols[:24]
+
+    return results
 
 
 def _process_single_precursor_reactions(
@@ -1232,6 +1853,9 @@ def _process_single_precursor_reactions(
     min_functionality: int,
     max_sa_score: float,
     mw_range: tuple[float, float],
+    enable_route_chains: bool = True,
+    route_chain_ids: list[str] | None = None,
+    compiled_routes: list[tuple[SyntheticRoute, list[Any]]] | None = None,
 ) -> list[CombinatorialProduct]:
     """Worker function for parallel multi-core reaction expansion with cancellation support."""
     from .task_manager import is_cancelled
@@ -1247,6 +1871,15 @@ def _process_single_precursor_reactions(
             return []
         Chem.SanitizeMol(parent_mol)
     except Exception:
+        return []
+
+    # 前置物理化学可行性过滤：
+    # 1. 若母核分子量已超上限 5% (mw_range[1] * 1.05)，接枝衍生只会更重，绝不可能进入合格区间，直接跳过
+    parent_mw = Descriptors.MolWt(parent_mol)
+    if parent_mw > mw_range[1] * 1.05:
+        return []
+    # 2. 限制超大重原子骨架（>120 个重原子），避免多反应位点下 2^N 级组合爆炸
+    if parent_mol.GetNumHeavyAtoms() > 120:
         return []
 
     # 1. 天然固化剂母核直接继承 (R12) —— 多胺/酸酐/双氰胺/咪唑/硫醇类母核原样入库
@@ -1292,13 +1925,17 @@ def _process_single_precursor_reactions(
                     )
 
     # 3. 遍历多通道合成反应进行衍生
-    for rxn_def, rxn in compiled_reactions:
+    for item in compiled_reactions:
         if is_cancelled():
             break
 
+        rxn_def = item[0]
+        rxn = item[1]
+        r_templates = item[2] if len(item) > 2 else None
+
         # 预过滤：用反应物侧 SMARTS 实测底物能否反应（取代按类别字符串猜测，
         # 避免脂肪胺被芳香模板放行后原样穿透成“假树脂”）
-        if not _precursor_matches_reaction(parent_mol, rxn):
+        if not _precursor_matches_reaction(parent_mol, rxn_def, rxn, r_templates):
             continue
 
         try:
@@ -1334,6 +1971,11 @@ def _process_single_precursor_reactions(
             if not (mw_range[0] <= stoich["mw"] <= mw_range[1]):
                 continue
 
+            # [化学相容性门禁] 严禁互反应基团共存（如环氧-酚羟基、环氧-胺基等自聚合自交联缺陷）
+            is_sound, _ = validate_monomer_chemical_soundness(prod_mol, target_role)
+            if not is_sound:
+                continue
+
             sa = _calculate_sascore(prod_mol)
             if sa > max_sa_score:
                 continue
@@ -1360,12 +2002,100 @@ def _process_single_precursor_reactions(
                 )
             )
 
+    # 4. 路线链多步展开 (P1-P4 羟基环氧化等)：中间体 role=intermediate 入库
+    if enable_route_chains:
+        if compiled_routes is not None:
+            for route, c_steps in compiled_routes:
+                if route_chain_ids is not None and route.route_id not in route_chain_ids:
+                    continue
+                chain_prods = _expand_route_chain(
+                    parent_mol, route, precursor, mw_range, min_functionality, compiled_steps=c_steps
+                )
+                for cp in chain_prods:
+                    local_results.append(cp)
+        else:
+            for route in ROUTE_CHAINS:
+                if route_chain_ids is not None and route.route_id not in route_chain_ids:
+                    continue
+                chain_prods = _expand_route_chain(parent_mol, route, precursor, mw_range, min_functionality)
+                for cp in chain_prods:
+                    # 与单步模板产物撞车也不丢：路线累加由调用方 _merge_product_records 完成
+                    local_results.append(cp)
+
     return local_results
 
 
 # ==============================================================================
 # 6. 全流水线正交展开与配方级高通量衔接引擎 (多核并行加速)
 # ==============================================================================
+
+def _merge_product_records(
+    results: list[CombinatorialProduct],
+    seen_idx: dict[str, int],
+    item: CombinatorialProduct,
+) -> bool:
+    """按 canonical SMILES 合并产物：同产物累加路线，不丢弃先行命中的路线信息。
+    返回 bool 表示是否新增了一个非 intermediate 的可用单体（供 O(1) 实时配额统计）。
+    """
+    key = item.product_smiles
+    idx = seen_idx.get(key)
+    if idx is None:
+        seen_idx[key] = len(results)
+        results.append(item)
+        return item.role != "intermediate"
+    existing = results[idx]
+    for rid in item.route_ids:
+        if rid not in existing.route_ids:
+            existing.route_ids.append(rid)
+    for rn in item.route_names:
+        if rn not in existing.route_names:
+            existing.route_names.append(rn)
+    existing.route_redundancy = max(1, len(existing.route_ids))
+    existing.route_steps_min = min(existing.route_steps_min, item.route_steps_min)
+    existing.green_score_best = max(existing.green_score_best, item.green_score_best)
+    return False
+
+
+def _serialize_route_columns(route_ids, route_names) -> tuple[str, str]:
+    """路线 id/名称成对按 route_id 排序后序列化为分号字符串，保证跨运行字节级可复现。
+
+    并发模式下 _merge_product_records 按线程完成顺序累加路线，到达顺序不可控；
+    序列化时统一按 route_id 排序即可消除该不确定性。id 与名称始终成对排序，
+    绝不破坏 route_ids/route_names 两列的索引对应关系。
+    防御性对齐：id 与名称在合并时独立去重，极端情况下长度可能不一致；
+    此时缺失名称回退为 route_id 本身，避免出现“有 id 无名称”的空档，
+    且对任何输入都不抛异常。
+    """
+    ids = route_ids if isinstance(route_ids, list) else []
+    names = route_names if isinstance(route_names, list) else []
+    pairs = []
+    for i, rid in enumerate(ids):
+        name = names[i] if i < len(names) else None
+        pairs.append((str(rid), str(name) if name else str(rid)))
+    pairs.sort(key=lambda p: p[0])
+    return ";".join(p[0] for p in pairs), ";".join(p[1] for p in pairs)
+
+
+# 产物表路线列及其缺省值（旧 parquet 缓存不含这些列，读取后需回填）
+ROUTE_COLUMN_DEFAULTS: tuple[tuple[str, object], ...] = (
+    ("route_ids", ""),
+    ("route_redundancy", 1),
+    ("route_steps_min", 1),
+    ("green_score_best", 0.0),
+)
+
+
+def ensure_route_columns(df):
+    """为旧产物表回填缺失的路线列（不改动已有列，返回同一个 DataFrame）。
+
+    设计引擎在 Task 4/5 之前持久化的 parquet 不含 route_* 列；
+    UI 读取这些缓存时不能抛 KeyError，故在此统一补齐默认值。
+    """
+    for col, default in ROUTE_COLUMN_DEFAULTS:
+        if col not in df.columns:
+            df[col] = default
+    return df
+
 
 def run_combinatorial_monomer_design(
     selected_precursor_ids: list[str] | None = None,
@@ -1380,18 +2110,26 @@ def run_combinatorial_monomer_design(
     mw_range: tuple[float, float] = (140.0, 1500.0),
     max_total_products: int = 5000,
     n_jobs: int = -1,
+    enable_route_chains: bool = True,
+    route_chain_ids: list[str] | None = None,
+    progress_callback: Any | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Execute full two-stage combinatorial molecule design with multi-core parallel acceleration."""
     if not RDKIT_AVAILABLE:
         return pd.DataFrame(), ["RDKit is not available in the current Python environment."]
 
+    if route_chain_ids is None:
+        route_chain_ids = [r.route_id for r in ROUTE_CHAINS if r.default_enabled]
+
     import os
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
     cpu_count = os.cpu_count() or 4
-    workers = cpu_count if (n_jobs is None or n_jobs < 1) else min(cpu_count, n_jobs)
+    # 在 512 核等超多核 Windows 服务器上，启用 128 个并发 worker，结合滑动窗口实现核心连续打满
+    default_max_workers = min(128, cpu_count)
+    workers = default_max_workers if (n_jobs is None or n_jobs < 1) else min(cpu_count, n_jobs)
 
-    logs = [f"🚀 启动全维度虚拟分子设计流水线（已启用 {workers} 核心多线程并行加速）..."]
+    logs = [f"🚀 启动全维度虚拟分子设计流水线（已启用 {workers} 核心连续流式并行加速）..."]
 
     # 1. 准备前驱体母核库
     if custom_precursors:
@@ -1401,7 +2139,7 @@ def run_combinatorial_monomer_design(
                 selected_rings=selected_rings,
                 selected_linkers=selected_linkers,
                 selected_r_groups=selected_r_groups,
-                max_intermediates=max(500, max_total_products // 2),
+                max_intermediates=max(500, min(100000, max_total_products // 2)),
             )
             precursors.extend(fission_cores)
             logs.append(f"🧬 阶段 1：融合自建母核 ({len(custom_precursors)} 个) 与骨架裂变库 ({len(fission_cores)} 个)，共计 {len(precursors)} 个前驱体")
@@ -1412,7 +2150,7 @@ def run_combinatorial_monomer_design(
             selected_rings=selected_rings,
             selected_linkers=selected_linkers,
             selected_r_groups=selected_r_groups,
-            max_intermediates=max(500, max_total_products // 2),
+            max_intermediates=max(500, min(100000, max_total_products // 2)),
         )
         logs.append(f"🧬 阶段 1：完成全维度拓扑骨架裂变组装，生成 {len(precursors)} 个多元前驱体母核")
     else:
@@ -1440,17 +2178,47 @@ def run_combinatorial_monomer_design(
         except Exception as e:
             logs.append(f"⚠️ 反应模板 {rxn_def.name} 编译失败：{e}")
 
-    results: list[CombinatorialProduct] = []
-    seen_smiles = set()
+    # 预编译多步路线链 SMARTS 反应对象（避免每次进入循环反复解析耗时）
+    compiled_routes = []
+    if enable_route_chains:
+        for route in ROUTE_CHAINS:
+            if route_chain_ids is not None and route.route_id not in route_chain_ids:
+                continue
+            steps_rxns = []
+            for step in route.steps:
+                try:
+                    steps_rxns.append(rdChemReactions.ReactionFromSmarts(step.reaction_smarts))
+                except Exception:
+                    steps_rxns.append(None)
+            compiled_routes.append((route, steps_rxns))
 
-    # 3. 多核并发正交展开
-    # 注意：为保证结果绝对可复现，并发模式下先完整收集全部产物，
-    # 统一按 canonical SMILES 排序后再截断；不允许按线程完成顺序"先到先得"。
+    results: list[CombinatorialProduct] = []
+    seen_idx: dict[str, int] = {}
+    current_usable_count = 0
+
     from .task_manager import is_cancelled
+    completed_precursors = 0
+    total_precursors = len(precursors)
+
+    # 批次粒度并发 + 平滑提前收敛：
+    # 当用户设置了产物上限 max_total_products 时，如果已累计收集到足够多的可用单体
+    # （按目标数 1.15 倍作为安全边际），立即停止投递和等待剩余数千个冗余前驱体，
+    # 彻底解决“卡在阶段2达1小时”的恶性等待，数十秒即可高速收敛产出！
+    target_usable_buffer = int(max_total_products * 1.15) if max_total_products > 0 else 0
+    reached_target_early = False
+
     if workers > 1 and len(precursors) > 10:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [
-                executor.submit(
+            p_iter = iter(precursors)
+            futures: dict[Any, PrecursorCore] = {}
+
+            # 初始填满并发流式管道 (workers * 2 个任务，保持高吞吐且占用极低内存)
+            initial_fill = min(workers * 2, total_precursors)
+            for _ in range(initial_fill):
+                p = next(p_iter, None)
+                if p is None:
+                    break
+                fut = executor.submit(
                     _process_single_precursor_reactions,
                     p,
                     compiled_reactions,
@@ -1458,27 +2226,74 @@ def run_combinatorial_monomer_design(
                     min_functionality,
                     max_sa_score,
                     mw_range,
+                    enable_route_chains=enable_route_chains,
+                    route_chain_ids=route_chain_ids,
+                    compiled_routes=compiled_routes,
                 )
-                for p in precursors
-            ]
-            for fut in as_completed(futures):
+                futures[fut] = p
+
+            # 连续滑动窗口执行：任意一个完成立即填充下一个，杜绝批次屏障等待
+            while futures:
                 if is_cancelled():
                     logs.append("🛑 检测到用户后台终止指令，正在安全退出计算...")
+                    for rem_f in futures:
+                        rem_f.cancel()
                     break
-                try:
-                    p_res = fut.result()
-                    for item in p_res:
-                        if item.product_smiles not in seen_smiles:
-                            seen_smiles.add(item.product_smiles)
-                            results.append(item)
-                except Exception:
-                    pass
+
+                done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    completed_precursors += 1
+                    try:
+                        p_res = fut.result()
+                        for item in p_res:
+                            if _merge_product_records(results, seen_idx, item):
+                                current_usable_count += 1
+                    except Exception:
+                        pass
+                    del futures[fut]
+
+                    # 连续滑动填充：只要完成一个，立即无等待投递下一个母核
+                    if not reached_target_early and not is_cancelled():
+                        next_p = next(p_iter, None)
+                        if next_p is not None:
+                            new_fut = executor.submit(
+                                _process_single_precursor_reactions,
+                                next_p,
+                                compiled_reactions,
+                                reactions,
+                                min_functionality,
+                                max_sa_score,
+                                mw_range,
+                                enable_route_chains=enable_route_chains,
+                                route_chain_ids=route_chain_ids,
+                                compiled_routes=compiled_routes,
+                            )
+                            futures[new_fut] = next_p
+
+                if progress_callback:
+                    try:
+                        progress_callback(
+                            completed_precursors,
+                            total_precursors,
+                            current_usable_count,
+                            f"已处理 {completed_precursors}/{total_precursors} 个母核，实时发现 {current_usable_count:,} 个可用单体..."
+                        )
+                    except Exception:
+                        pass
+
+                # 实时提前平滑收敛检查 (O(1) 无需线性扫描)
+                if target_usable_buffer > 0 and current_usable_count >= target_usable_buffer and not reached_target_early:
+                    reached_target_early = True
+                    logs.append(f"✨ 目标配额达成：已累计提取到 {current_usable_count:,} 个高品质单体（已达预设上限 {max_total_products:,} 个），触发平滑提前收敛")
+                    for remaining_fut in futures:
+                        remaining_fut.cancel()
+                    break
     else:
         # 单核降级执行
         for precursor in precursors:
-            if is_cancelled():
-                logs.append("🛑 检测到用户后台终止指令，正在安全退出计算...")
+            if is_cancelled() or reached_target_early:
                 break
+            completed_precursors += 1
             p_res = _process_single_precursor_reactions(
                 precursor,
                 compiled_reactions,
@@ -1486,23 +2301,102 @@ def run_combinatorial_monomer_design(
                 min_functionality,
                 max_sa_score,
                 mw_range,
+                enable_route_chains=enable_route_chains,
+                route_chain_ids=route_chain_ids,
+                compiled_routes=compiled_routes,
             )
             for item in p_res:
                 if is_cancelled():
                     break
-                if item.product_smiles not in seen_smiles:
-                    seen_smiles.add(item.product_smiles)
-                    results.append(item)
+                if _merge_product_records(results, seen_idx, item):
+                    current_usable_count += 1
+
+            if progress_callback:
+                try:
+                    progress_callback(
+                        completed_precursors,
+                        total_precursors,
+                        current_usable_count,
+                        f"已处理 {completed_precursors}/{total_precursors} 个母核，实时发现 {current_usable_count:,} 个可用单体..."
+                    )
+                except Exception:
+                    pass
+
+            if target_usable_buffer > 0 and current_usable_count >= target_usable_buffer:
+                reached_target_early = True
+                logs.append(f"✨ 目标配额达成：已累计提取到 {current_usable_count:,} 个高品质单体（已达预设上限 {max_total_products:,} 个），触发平滑提前收敛")
+                break
 
     # 确定性排序后再截断：相同输入参数必然得到相同产物集合
     results.sort(key=lambda r: (r.product_smiles, r.reaction_id, r.precursor_id))
-    if len(results) > max_total_products:
-        results = results[:max_total_products]
+    # 截断只作用于可用单体（resin/hardener）：max_total_products 是用户对"单体产物数"的预期，
+    # 中间体（role=intermediate）是路线链的副产物、不进配方筛选，不应挤占该名额。
+    # 否则开启路线链后可用单体会被中间体大幅吃掉（实测 3000 → 1252，-58%）。
+    usable = [r for r in results if r.role != "intermediate"]
+    intermediates_only = [r for r in results if r.role == "intermediate"]
+    if len(usable) > max_total_products:
+        usable = usable[:max_total_products]
+    results = usable + intermediates_only
 
-    logs.append(f"🎉 阶段 3：质量门禁校验完成！成功产出 {len(results):,} 个高性能单体")
+    logs.append(f"🎉 阶段 3：质量门禁校验完成！成功产出 {len(usable):,} 个高性能单体"
+                + (f"（另有 {len(intermediates_only):,} 个路线中间体，不参与配方筛选）" if intermediates_only else ""))
 
     if not results:
         return pd.DataFrame(), logs
 
     df = pd.DataFrame([asdict(r) for r in results])
+    if not df.empty:
+        # 路线 id/名称成对按 route_id 排序后再序列化：与线程完成顺序无关，
+        # 保证 route_ids/route_names 跨运行字节级一致（排序逻辑见 _serialize_route_columns）
+        serialized = [_serialize_route_columns(r.route_ids, r.route_names) for r in results]
+        df["route_ids"] = [s[0] for s in serialized]
+        df["route_names"] = [s[1] for s in serialized]
+        # [规范去重] 产物入库前基于 RDKit Canonical SMILES 做化学等价严格去重，
+        # 杜绝同分异构/不同书写形式在产物库中产生重复分子。
+        df = deduplicate_monomers_canonical(df, smiles_col="product_smiles")
     return df, logs
+
+
+def deduplicate_monomers_canonical(
+    df: pd.DataFrame,
+    smiles_col: str = "product_smiles",
+    *,
+    keep: str = "first",
+) -> pd.DataFrame:
+    """基于 RDKit Canonical SMILES 对单体候选库执行化学等价严格去重。
+
+    解决用户痛点：「候选池最好不要有重复的分子」。
+    单纯依靠字符串 drop_duplicates 会放过书写形式不同但化学等价的同一分子；
+    本函数将每行转换为标准规范 SMILES 后进行唯一性归并；
+    若无法通过 RDKit 解析则退化为清洗后的原始文本去重，绝不静默丢弃候选。
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty or smiles_col not in df.columns:
+        return df
+
+    try:
+        from .smiles_utils import canonicalize_smiles
+    except ImportError:
+        try:
+            from smiles_utils import canonicalize_smiles
+        except ImportError:
+            canonicalize_smiles = None
+
+    unique_raw = df[smiles_col].dropna().unique()
+    canon_map = {}
+    for s in unique_raw:
+        s_clean = str(s).strip()
+        if not s_clean:
+            canon_map[s] = ""
+            continue
+        can = canonicalize_smiles(s_clean) if canonicalize_smiles is not None else None
+        canon_map[s] = can if can is not None else s_clean
+
+    work = df.copy()
+    work["_canonical_key"] = work[smiles_col].map(canon_map).fillna(work[smiles_col].astype(str))
+    work = work[work["_canonical_key"].str.strip().ne("")]
+    deduped = work.drop_duplicates(subset=["_canonical_key"], keep=keep)
+    # 将标准化的 canonical smiles 写回原 smiles 列，保证库内所有分子表示绝对统一规范
+    deduped = deduped.copy()
+    deduped[smiles_col] = deduped["_canonical_key"]
+    return deduped.drop(columns=["_canonical_key"]).reset_index(drop=True)
+

@@ -425,3 +425,73 @@ def test_explicit_non_workflow_features_must_be_supplied():
             contract,
             {'final_feature_names': ['x']},
         )
+
+
+# ---------------------------------------------------------------------------
+# 导入模型回归：配置里 contract=null 时后端仍需可预测（2026-09-22）
+# ---------------------------------------------------------------------------
+
+def test_load_published_model_derives_contract_when_entry_contract_missing():
+    """entry.contract 缺失时必须从 artifact 现场推导，而不是直接报契约无效。
+
+    根因（实测）：``publish_imported_entry`` 只在发布时**校验**推导出的契约、
+    不写回 ``entry.contract``，而 artifact 自身不带 ``extra.prediction_contract``
+    → 配置里 ``contract: null`` → 后端报「发布契约缺少精确 feature_cols」，
+    与 UI 的「未声明任何输入字段」是同一个根因。
+    """
+    import copy
+    from core.portal_prediction import load_published_portal_model
+
+    class _NamedModel:
+        feature_names_in_ = ["a_phr", "resin_1_structure_xtb_gap"]
+        n_features_in_ = 2
+
+    artifact = {
+        "model": _NamedModel(),
+        "pipeline": None,
+        "feature_cols": ["a_phr", "resin_1_structure_xtb_gap"],
+        "target_col": "tg_c",
+        "extra": {"molecular_feature_workflow": {
+            "schema_version": 3,
+            "workflow_hash": "wf-1",
+            "final_feature_names": ["resin_1_structure_xtb_gap"],
+        }},
+    }
+    fixture_path = Path(tempfile.gettempdir()) / "cfrp_portal_derived_contract.joblib"
+    fixture_path.write_bytes(b"portal-derived-contract")
+    entry = {
+        "id": "m1", "enabled": True, "publication_status": "published",
+        "gate_report": {"ok": True, "status": "valid", "errors": []},
+        "target_col": "tg_c", "contract": None, "_artifact": artifact,
+        "artifact_path": str(fixture_path),
+        "artifact_hash": hashlib.sha256(fixture_path.read_bytes()).hexdigest(),
+    }
+    config = {"materials": {"epoxy_resin": {"targets": {"tg": {"models": [entry]}}}}}
+
+    bundle = load_published_portal_model(config, "epoxy_resin", "tg")
+
+    assert bundle["contract_source"] == "derived"
+    assert bundle["contract"]["feature_cols"] == ["a_phr", "resin_1_structure_xtb_gap"]
+    # 推导出的契约仍必须真正满足运行时要求（不得静默丢特征）
+    assert bundle["contract"]["workflow_source_fields"] == []
+
+
+def test_load_published_model_still_rejects_genuinely_broken_contract():
+    """推导不出来时必须维持原有的「契约无效」拒绝语义。"""
+    import pytest as _pytest
+    from core.portal_prediction import load_published_portal_model
+
+    fixture_path = Path(tempfile.gettempdir()) / "cfrp_portal_broken_contract.joblib"
+    fixture_path.write_bytes(b"portal-broken-contract")
+    entry = {
+        "id": "bad", "enabled": True, "publication_status": "published",
+        "gate_report": {"ok": True, "status": "valid", "errors": []},
+        "contract": None,
+        "_artifact": {"model": object(), "pipeline": None, "feature_cols": [], "target_col": "", "extra": {}},
+        "artifact_path": str(fixture_path),
+        "artifact_hash": hashlib.sha256(fixture_path.read_bytes()).hexdigest(),
+    }
+    config = {"materials": {"epoxy_resin": {"targets": {"tg": {"models": [entry]}}}}}
+
+    with _pytest.raises(ValueError, match="契约无效"):
+        load_published_portal_model(config, "epoxy_resin", "tg")

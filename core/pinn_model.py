@@ -59,6 +59,9 @@ from .epoxy_physics import (
     parse_percent_to_fraction,
     alpha_max_from_r_torch,
     dibenedetto_tg_torch,
+    generalized_multimechanism_dibenedetto_tg_torch,
+    fox_tg_torch,
+    fox_loshaek_tg_torch,
     get_filler_props,
     volume_fraction_from_wt_fraction_torch,
     halpin_tsai_torch,
@@ -95,23 +98,44 @@ def _clear_cuda_memory() -> None:
         pass
 
 
-class _MLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, n_layers: int, dropout: float, out_dim: int):
+class _ResBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.0):
         super().__init__()
-        layers: List[nn.Module] = []
-        d = input_dim
-        for _ in range(max(1, int(n_layers))):
-            layers.append(nn.Linear(d, hidden_dim))
-            layers.append(nn.GELU())
-            layers.append(nn.LayerNorm(hidden_dim))
-            if dropout and dropout > 0:
-                layers.append(nn.Dropout(float(dropout)))
-            d = hidden_dim
-        layers.append(nn.Linear(d, out_dim))
-        self.net = nn.Sequential(*layers)
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)) if dropout and dropout > 0 else nn.Identity(),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return x + self.block(x)
+
+
+class _MLP(nn.Module):
+    """带残差直通的物理引导多层感知机（ResMLP）。
+    
+    采用预投射 + 残差块结构，替代破坏外推尺度的后置 LayerNorm，
+    使线性梯度流可直接穿透深层网络，支持真实的高分子物理性能外推。
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, n_layers: int, dropout: float, out_dim: int):
+        super().__init__()
+        self.in_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList([
+            _ResBlock(hidden_dim, dropout=dropout)
+            for _ in range(max(1, int(n_layers)))
+        ])
+        self.out_proj = nn.Linear(hidden_dim, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.in_proj(x)
+        for b in self.blocks:
+            h = b(h)
+        return self.out_proj(h)
 
 
 def _confidence_to_weight(conf: Union[str, float, int, None]) -> float:
@@ -180,23 +204,24 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         optimizer: str = "adamw",
         lr: float = 1e-3,
         weight_decay: float = 1e-5,
-        batch_size: int = 512,  # 增大batch_size提高GPU利用率
-        epochs: int = 500,
-        patience: int = 50,
-        physics_weight: float = 0.01,  # 大幅降低物理约束权重
+        batch_size: int = 128,  # 适度batch_size，保证梯度更新频率
+        epochs: int = 200,      # 降低默认epoch，配合早停防止死等
+        patience: int = 25,     # 25轮无提升早停
+        physics_weight: float = 0.01,
         physics_formula: str = "standard",
         grad_clip: float = 1.0,
         device: str = "auto",
         seed: int = 42,
         verbose: bool = False,
-        missing_value_strategy: str = "bayesian",
-        missing_imputer_max_iter: int = 15,
-        missing_n_imputations: int = 5,
+        missing_value_strategy: str = "median", # 默认中位数插补，避免贝叶斯多次迭代耗时卡住
+        missing_imputer_max_iter: int = 5,
+        missing_n_imputations: int = 1,
         crosslink_physics_weight: float = 0.1,
         nu_column: str = "",
         nu_encoder_path: str = "",
-        use_polymer_physics: bool = True,
+        use_polymer_physics: bool = False,      # 默认关闭重复注入，提速
         polymer_physics_features: str = "",
+        epoch_callback: Optional[Any] = None,   # 允许UI进度条监听更新
     ):
         self.mode = mode
         self.target_name = target_name
@@ -226,6 +251,7 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         # 高分子物理指数（芳香度/sp3/柔性/BDE/内聚能）——从结构 SMILES 零标签计算
         self.use_polymer_physics = bool(use_polymer_physics)
         self.polymer_physics_features = polymer_physics_features
+        self.epoch_callback = epoch_callback
 
         # fitted attrs
         self._mode_: Optional[str] = None
@@ -264,20 +290,37 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
     def _identify_special_columns(self, df: pd.DataFrame):
         cols = list(df.columns)
 
-        # 化学计量比列识别：正则候选覆盖 formulation_r_value / *_equivalent_ratio 等实际命名。
-        # alpha_max_from_r 对 r 与 1/r 对称，因此 equivalent_ratio 类列物理上等价可用。
-        r_candidates: List[Tuple[int, str]] = []
-        for c in cols:
-            cl = str(c).strip().lower()
-            if cl == "r_value" or cl.endswith("_r_value"):
-                r_candidates.append((0, c))  # 显式 r_value 优先
-            elif "equivalent_ratio" in cl:
-                r_candidates.append((1, c))
-            elif "stoich" in cl:
-                r_candidates.append((2, c))
-        if r_candidates:
-            r_candidates.sort(key=lambda t: (t[0], len(t[1])))
-            self._col_r_ = r_candidates[0][1]
+        # 化学计量比列识别：严格优先匹配配方计量比 formulation_r_value 等真实化学计量比。
+        # 坚决排除 cp_r_value（它是组分物理当量重比 AHEW/EEW ≈ 0.35，不是化学计量比 r ≈ 1.0；
+        # 若错误匹配会导致 alpha_max=min(1, r, 1/r) 被腰斩到 0.35，使 DiBenedetto 预测严重锁死在低温区）。
+        r_exact_prio = [
+            "formulation_r_value",
+            "formulation_resin_hardener_equivalent_ratio",
+            "crosslink_stoichiometry_r",
+            "stoichiometric_ratio_r_cleaned",
+            "r_value",
+        ]
+        self._col_r_ = None
+        for col_name in r_exact_prio:
+            if col_name in cols:
+                self._col_r_ = col_name
+                break
+
+        if self._col_r_ is None:
+            r_candidates: List[Tuple[int, str]] = []
+            for c in cols:
+                cl = str(c).strip().lower()
+                if "cp_r_value" in cl:
+                    continue  # 坚决排除
+                if cl == "r_value" or cl.endswith("_r_value"):
+                    r_candidates.append((0, c))
+                elif "equivalent_ratio" in cl:
+                    r_candidates.append((1, c))
+                elif "stoich" in cl:
+                    r_candidates.append((2, c))
+            if r_candidates:
+                r_candidates.sort(key=lambda t: (t[0], -len(t[1])))  # 优先更具体的列名
+                self._col_r_ = r_candidates[0][1]
 
         for c in ["r_confidence", "R_confidence", "stoich_confidence"]:
             if c in cols:
@@ -295,6 +338,14 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         for c in ["is_nanofilled", "is_filled", "filled"]:
             if c in cols:
                 self._col_is_nf_ = c
+                break
+
+        # 固化温度识别
+        self._col_cure_temp_ = None
+        for c in cols:
+            cl = str(c).strip().lower()
+            if any(k in cl for k in ["cure_temp", "curing_temp", "temperature", "t_cure", "t_max", "cure_temperature"]):
+                self._col_cure_temp_ = c
                 break
 
     # 非数值文本列黑名单：结构/标识/测试条件等语义列，绝不允许被 parse_first_number 污染成假数值。
@@ -338,25 +389,27 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             if any(p in cl for p in self._TEXT_COL_BLACKLIST):
                 drop_text_cols.add(c)
                 s = df[c].astype(str)
-                nuniq = int(s.nunique(dropna=True))
-                if 2 <= nuniq <= 12:
-                    if fit_categoricals:
+                if fit_categoricals:
+                    nuniq = int(s.nunique(dropna=True))
+                    if 2 <= nuniq <= 12:
                         levels = sorted(s.dropna().unique().tolist())[:12]
                         cat_levels[c] = levels
                     else:
-                        levels = cat_levels.get(c)
-                        if not levels:
-                            continue
-                    cat_idx = pd.Categorical(
-                        s.where(s.isin(levels), other="__other__"),
-                        categories=list(levels) + ["__other__"],
-                    )
-                    dummies = pd.get_dummies(cat_idx, prefix=c, dtype=float)
-                    # 关键：pd.get_dummies(Categorical) 返回 RangeIndex，必须回填原索引，
-                    # 否则 concat(axis=1) 按索引对齐会导致行膨胀/错位（非连续索引输入时）
-                    dummies.index = df.index
-                    onehot_frames.append(dummies)
-                # 高基数（如 SMILES 结构列）或常数列：直接剔除
+                        continue
+                else:
+                    levels = cat_levels.get(c)
+                    if not levels:
+                        continue
+
+                cat_idx = pd.Categorical(
+                    s.where(s.isin(levels), other="__other__"),
+                    categories=list(levels) + ["__other__"],
+                )
+                dummies = pd.get_dummies(cat_idx, prefix=c, dtype=float)
+                # 关键：pd.get_dummies(Categorical) 返回 RangeIndex，必须回填原索引，
+                # 否则 concat(axis=1) 按索引对齐会导致行膨胀/错位（非连续索引输入时）
+                dummies.index = df.index
+                onehot_frames.append(dummies)
                 continue
 
         if drop_text_cols:
@@ -528,6 +581,20 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         ).astype(np.float32)
         aux["alpha_gel"] = xl["xl_alpha_gel"].to_numpy(dtype=np.float32) if "xl_alpha_gel" in xl.columns else np.full(n, np.nan, dtype=np.float32)
         aux["alpha_max"] = xl["xl_alpha_max"].to_numpy(dtype=np.float32) if "xl_alpha_max" in xl.columns else np.full(n, np.nan, dtype=np.float32)
+        
+        # 实际固化最高温度
+        cure_t = np.full(n, 150.0, dtype=float)
+        if self._col_cure_temp_ is not None and self._col_cure_temp_ in df_raw.columns:
+            cure_t = df_raw[self._col_cure_temp_].apply(parse_first_number).to_numpy(dtype=float)
+            cure_t = np.where(np.isfinite(cure_t) & (cure_t > 0), cure_t, 150.0)
+        aux["cure_temp"] = cure_t.astype(np.float32)
+
+        # 芳香碳/刚性比例
+        rigid_c = np.full(n, 0.65, dtype=float)
+        if "phys_f_ar" in df_raw.columns:
+            rigid_c = df_raw["phys_f_ar"].apply(parse_first_number).to_numpy(dtype=float)
+            rigid_c = np.where(np.isfinite(rigid_c) & (rigid_c >= 0), rigid_c, 0.65)
+        aux["rigid_c"] = np.clip(rigid_c, 0.1, 1.0).astype(np.float32)
 
         df_num = self._build_numeric_features(df_raw)
 
@@ -574,7 +641,7 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         if mode == "tg":
             base = 5  # [0]直接 | [1]Tg0 | [2]ΔTg | [3]λ | [4]α
         elif mode == "mechanics":
-            base = 2  # [0]Em | [1]ξ
+            base = 3  # [0]Em_direct | [1]ξ | [2]Em_rigid_delta
         else:
             base = 1  # [0]直接
         if self._nu_active_:
@@ -684,6 +751,8 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         is_nf_tensor = torch.from_numpy(aux["is_nf"]).view(-1, 1)
         Ef_tensor = torch.from_numpy(aux["Ef"]).view(-1, 1)
         rho_f_tensor = torch.from_numpy(aux["rho_f"]).view(-1, 1)
+        cure_temp_tensor = torch.from_numpy(aux["cure_temp"]).view(-1, 1)
+        rigid_c_tensor = torch.from_numpy(aux["rigid_c"]).view(-1, 1)
 
         self._identify_special_columns(df_raw)
 
@@ -786,6 +855,8 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             _sub(nut_tensor, tr_idx),
             _sub(nuw_tensor, tr_idx),
             _sub(mcb_tensor, tr_idx),
+            _sub(cure_temp_tensor, tr_idx),
+            _sub(rigid_c_tensor, tr_idx),
         ]
         val_tensors = [
             _sub(X_tensor, val_idx),
@@ -801,6 +872,8 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             _sub(nut_tensor, val_idx),
             _sub(nuw_tensor, val_idx),
             _sub(mcb_tensor, val_idx),
+            _sub(cure_temp_tensor, val_idx),
+            _sub(rigid_c_tensor, val_idx),
         ]
 
         # 根据系统类型配置 num_workers
@@ -817,23 +890,16 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             cpu_count = os.cpu_count() or 1
             num_workers = min(4, max(2, cpu_count // 4))  # 更保守的默认值
 
-        # 动态调整 batch_size：优化 GPU 利用率
+        # 动态调整 batch_size：既保证 GPU 吞吐，又避免小数据集批次过大导致每个 epoch 迭代步数过少
         n_samples = X_tensor.shape[0]
-        # 对于 GPU，使用更大的 batch_size 以提高利用率
+        user_bs = int(self.batch_size) if self.batch_size and int(self.batch_size) > 0 else 256
         if device == "cuda":
-            # GPU: 小数据集直接用全部数据，大数据集分批
-            if n_samples <= 512:
-                effective_batch_size = n_samples  # 小数据集用全batch
-            elif n_samples <= 2048:
-                effective_batch_size = min(1024, n_samples)
-            else:
-                effective_batch_size = int(self.batch_size)
+            effective_batch_size = max(16, min(user_bs, n_samples))
         else:
-            # CPU: 使用较小的 batch_size
-            effective_batch_size = min(int(self.batch_size), max(32, n_samples // 8))
+            effective_batch_size = max(16, min(user_bs, max(32, n_samples // 8)))
         
         # 梯度累积：模拟更大batch
-        accumulation_steps = max(1, 1024 // effective_batch_size)
+        accumulation_steps = max(1, 256 // effective_batch_size)
 
         # 小数据集可直接缓存到GPU，减少CPU->GPU拷贝
         data_on_gpu = False
@@ -1057,17 +1123,25 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                 for step_idx, batch in enumerate(batch_iter, start=1):
                     _raise_if_cancelled()
                     if data_on_gpu:
-                        xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb = batch
+                        xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb, cure_tb, rigid_cb = batch
                     else:
                         # 将数据移到GPU（pin_memory会加速这个过程）
-                        xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb = [t.to(device, non_blocking=True) for t in batch]
+                        xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb, cure_tb, rigid_cb = [t.to(device, non_blocking=True) for t in batch]
 
                     # 使用混合精度训练
                     with autocast_ctx():
-                        pred, phys_pen, log_nu_pred = self._forward_with_physics(xb, xmb, rb, confb, nfw, isnf, Ef, rhof, nub, mcb)
+                        pred, phys_pen, log_nu_pred, d_pred, p_pred = self._forward_with_physics(
+                            xb, xmb, rb, confb, nfw, isnf, Ef, rhof, nub, mcb,
+                            cure_tb=cure_tb, rigid_cb=rigid_cb, return_components=True
+                        )
                         # 统一在标准化 y 空间计算 loss：预测与目标同尺度
                         loss_data = huber((pred - y_mean_t) / y_scale_t, (yb - y_mean_t) / y_scale_t)
-                        # tg 分支的 phys_pen 已在内部按 y_scale² 自归一，这里不再重复除
+                        if d_pred is not None and p_pred is not None and (self._mode_ or "generic") in {"tg", "mechanics"}:
+                            loss_d = huber((d_pred - y_mean_t) / y_scale_t, (yb - y_mean_t) / y_scale_t)
+                            loss_p = huber((p_pred - y_mean_t) / y_scale_t, (yb - y_mean_t) / y_scale_t)
+                            loss_consist = huber(d_pred / y_scale_t, p_pred / y_scale_t)
+                            loss_data = 0.5 * loss_data + 0.25 * loss_d + 0.25 * loss_p + 0.05 * loss_consist
+
                         loss = loss_data + phys_w * phys_pen
                         if log_nu_pred is not None:
                             # ν 潜变量辅助监督：实测标签(1.0) / 理论锚(0.3) 加权 Huber（log 空间）
@@ -1119,14 +1193,23 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                         _raise_if_cancelled()
                         # 将数据移到GPU
                         if data_on_gpu:
-                            xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb = batch
+                            xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb, cure_tb, rigid_cb = batch
                         else:
-                            xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb = [t.to(device, non_blocking=True) for t in batch]
+                            xb, xmb, yb, rb, confb, nfw, isnf, Ef, rhof, nub, nut, nuw, mcb, cure_tb, rigid_cb = [t.to(device, non_blocking=True) for t in batch]
                         
                         with autocast_ctx():
-                            pred, phys_pen, log_nu_pred = self._forward_with_physics(xb, xmb, rb, confb, nfw, isnf, Ef, rhof, nub, mcb)
+                            pred, phys_pen, log_nu_pred, d_pred, p_pred = self._forward_with_physics(
+                                xb, xmb, rb, confb, nfw, isnf, Ef, rhof, nub, mcb,
+                                cure_tb=cure_tb, rigid_cb=rigid_cb, return_components=True
+                            )
                             # 同训练循环：标准化 y 空间 loss + ν 辅助监督
                             loss_data = huber((pred - y_mean_t) / y_scale_t, (yb - y_mean_t) / y_scale_t)
+                            if d_pred is not None and p_pred is not None and (self._mode_ or "generic") in {"tg", "mechanics"}:
+                                loss_d = huber((d_pred - y_mean_t) / y_scale_t, (yb - y_mean_t) / y_scale_t)
+                                loss_p = huber((p_pred - y_mean_t) / y_scale_t, (yb - y_mean_t) / y_scale_t)
+                                loss_consist = huber(d_pred / y_scale_t, p_pred / y_scale_t)
+                                loss_data = 0.5 * loss_data + 0.25 * loss_d + 0.25 * loss_p + 0.05 * loss_consist
+
                             loss = loss_data + phys_w * phys_pen
                             if log_nu_pred is not None:
                                 nu_err = F.smooth_l1_loss(log_nu_pred.float(), nut.float(), reduction="none")
@@ -1145,6 +1228,20 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                 if self.verbose:
                     lr_now = optimizer.param_groups[0]["lr"]
                     print(f"[EpoxyPINN] epoch={epoch+1:03d} train={train_loss:.4f} val={val_loss:.4f} lr={lr_now:.2e}")
+
+                if self.epoch_callback is not None:
+                    try:
+                        self.epoch_callback({
+                            "epoch": epoch + 1,
+                            "total_epochs": int(self.epochs),
+                            "train_loss": train_loss,
+                            "val_loss": val_loss,
+                            "progress_ratio": float(epoch + 1) / float(self.epochs),
+                            "patience": int(self.patience),
+                            "stale_epochs": no_improve,
+                        })
+                    except Exception:
+                        pass
 
                 self.train_mse_curve.append(train_mse)
                 self.test_mse_curve.append(val_mse)
@@ -1165,6 +1262,8 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
 
             return self
         finally:
+            # 训练完成后立即解除外部回调函数的引用，避免包含局部闭包函数导致 joblib/pickle 序列化崩溃
+            self.epoch_callback = None
             # 默认将权重移回 CPU，便于 joblib/pickle 保存与跨机器加载
             if self._model_ is not None:
                 try:
@@ -1186,8 +1285,11 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         rhof: torch.Tensor,
         nub: Optional[torch.Tensor] = None,
         mcb: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """返回 (pred, phys_pen, log_nu_pred)。log_nu_pred 仅在 ν 中间层激活时非 None。"""
+        cure_tb: Optional[torch.Tensor] = None,
+        rigid_cb: Optional[torch.Tensor] = None,
+        return_components: bool = False,
+    ) -> Union:
+        """返回 (pred, phys_pen, log_nu_pred [, direct_pred, physics_pred])。log_nu_pred 仅在 ν 中间层激活时非 None。"""
         assert self._model_ is not None
         mode = self._mode_ or "generic"
 
@@ -1208,87 +1310,120 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             # ============================================================
             y_scale = getattr(self, '_y_scale_', 100.0)
             y_mean = getattr(self, '_y_mean_', 0.0)
-            y_min = getattr(self, '_y_min_', -50.0)
-            y_max = getattr(self, '_y_max_', 300.0)
-            y_range = max(y_max - y_min, 100.0)
             
-            # 分支1：直接神经网络预测（标准化输出 → 原始空间）
+            # 分支1：直接神经网络预测（标准化输出 → 原始空间，线性无截断，具备一阶可微外推能力）
             direct_pred = out[:, 0:1] * y_scale + y_mean
             
-            # 分支2：DiBenedetto 物理约束预测（辅助分支）
-            tg0_raw = out[:, 1:2] * y_scale + y_mean
-            tg_delta = F.softplus(out[:, 2:3]) * (y_scale * 1.5) + 10.0
-            tginf = tg0_raw + tg_delta
-            lam = torch.sigmoid(out[:, 3:4]) * 0.8 + 0.1
-            
-            # α: 固化度（独立通道，修复与 λ 共用通道的参数化 bug）
-            has_r_info = (confb > 0.5).float()
+            # ------------------------------------------------------------
+            # 新一代 GMM-DiBenedetto 物理底座 + 神经网络残差修正架构
+            # 真实高分子多机理：使用真实固化温度与骨架刚性
+            # ------------------------------------------------------------
+            t_cure_actual = cure_tb if cure_tb is not None else torch.full_like(direct_pred, 160.0)
+            rigid_c_actual = rigid_cb if rigid_cb is not None else torch.full_like(direct_pred, 0.75)
+            # 交联密度换算: mol/m³ -> mmol/g
+            if nub is not None:
+                nu_mmol_val = torch.clamp(torch.exp(nub) / 1200.0, 1.0, 12.0)
+            else:
+                nu_mmol_val = torch.full_like(direct_pred, 4.5)
+
+            # 从标准化输入中解算或从潜变量构建：
+            kappa_nu = F.softplus(out[:, 1:2]) * 1.5 + 0.5      # [0.5, 2.0]
+            kappa_rigid = F.softplus(out[:, 2:3]) * 1.5 + 0.5   # [0.5, 2.0]
+            gamma_cure = F.softplus(out[:, 3:4]) * 2.0 + 0.5    # [0.5, 2.5]
+            lam = torch.sigmoid(out[:, 4:5]) * 0.5 + 0.25       # [0.25, 0.75]
+
+            # 初始基线 Tg0 (-30°C ~ 40°C)
+            tg0_base = torch.tanh(out[:, 1:2]) * 35.0 + 5.0
+
+            # 理论转化率
             amax = alpha_max_from_r_torch(rb)
-            amax = has_r_info * amax + (1.0 - has_r_info) * 0.999
-            alpha_idx = min(4, out.shape[1] - 1)
-            alpha = amax * torch.sigmoid(out[:, alpha_idx:alpha_idx+1])
+            alpha_act = amax * torch.sigmoid(out[:, 0:1] + 2.0)
+
+            # 调用广义多机理 GMM-DiBenedetto 物理底座
+            physics_base_pred = generalized_multimechanism_dibenedetto_tg_torch(
+                tg0_c=tg0_base,
+                nu_mmol_g=nu_mmol_val,
+                rigid_carbon_ratio=rigid_c_actual,
+                alpha=alpha_act,
+                lam=lam,
+                t_cure_max_c=t_cure_actual,
+                prob_alkyne=torch.full_like(direct_pred, 0.1),
+                delta_e_fwd=torch.full_like(direct_pred, 6.5),
+                kappa_nu=kappa_nu,
+                kappa_rigid=kappa_rigid,
+                gamma_cure=gamma_cure,
+            )
+
+            # 混合预测：以直接神经网络预测为主干，以 GMM-DiBenedetto 为物理锚点
+            phys_mix = min(max(float(self.physics_weight), 0.0), 0.5)
+            tg_pred = (1.0 - phys_mix) * direct_pred + phys_mix * physics_base_pred
             
-            physics_pred = dibenedetto_tg_torch(tg0=tg0_raw, tginf=tginf, lam=lam, alpha=alpha)
+            # 物理合理性软正则化：
+            # 1. 彻底移除 y_max 人工截断二次方惩罚（彻底解封模型的外推天花板，允许冲向 350~450°C）！
+            # 2. 仅保留极端荒谬物理边界防护（Tg < -100°C 或 Tg > 550°C 有机物热分解上限）
+            p_subzero = F.relu(-100.0 - direct_pred)
+            p_hyper = F.relu(direct_pred - 550.0)
+            phys_pen = (p_subzero * p_subzero + p_hyper * p_hyper).mean() / (y_scale ** 2 + 1e-8) * 0.01
 
             formula = str(getattr(self, "physics_formula", "standard")).strip().lower()
             if formula in {"advanced", "enhanced"}:
-                # Fox 公式（以固化度 alpha 近似质量分数）作为额外物理先验
-                tg0_safe = torch.clamp(tg0_raw, min=1e-6)
-                tginf_safe = torch.clamp(tginf, min=tg0_safe + 1e-6)
-                alpha_clip = torch.clamp(alpha, 0.0, 0.999)
-                fox_pred = 1.0 / ((1.0 - alpha_clip) / tg0_safe + alpha_clip / tginf_safe)
-                physics_pred = 0.5 * physics_pred + 0.5 * fox_pred
+                # 物理一致性软损失：促使残差不要过度脱离 GMM-DiBenedetto 底座
+                p_diff = F.relu(torch.abs(direct_pred - physics_base_pred) - y_scale * 1.5)
+                phys_pen = phys_pen + (p_diff * p_diff).mean() / (y_scale ** 2 + 1e-8) * 0.05
 
-            # Fox–Loshaek 交联密度通道：Tg = Tg∞ − K/Mc（ν↑ → Tg↑，单调由参数化保证）
-            if log_nu_pred is not None and mcb is not None:
-                k_raw = out[:, self._nu_param_ch_:self._nu_param_ch_ + 1]
-                k_const = F.softplus(k_raw) * y_scale * 2.0  # °C·kg/mol 量级
-                mc_kg_mol = torch.exp(mcb) / 1000.0
-                fl_pred = tginf - k_const / torch.clamp(mc_kg_mol, min=0.05)
-                physics_pred = 0.5 * physics_pred + 0.5 * fl_pred
-            
-            # 混合预测：以直接预测为主，物理预测为辅
-            # physics_weight 控制物理约束的影响程度（可配置至 60%）
-            phys_mix = min(float(self.physics_weight), 0.6)
-            tg_pred = (1.0 - phys_mix) * direct_pred + phys_mix * physics_pred
-            
-            # 软正则化：鼓励预测在合理范围内
-            penalty_margin = y_range * 0.15
-            p1 = F.relu(y_min - penalty_margin - direct_pred)
-            p2 = F.relu(direct_pred - y_max - penalty_margin)
-            phys_pen = (p1 * p1 + p2 * p2).mean() / (y_scale ** 2 + 1e-8) * 0.1
-
-            if formula in {"advanced", "enhanced"}:
-                # 额外约束：Tg 应在 Tg0 与 Tg∞ 合理范围内
-                lower = torch.minimum(tg0_raw, tginf)
-                upper = torch.maximum(tg0_raw, tginf)
-                p_low = F.relu(lower - tg_pred)
-                p_high = F.relu(tg_pred - upper)
-                phys_pen = phys_pen + (p_low * p_low + p_high * p_high).mean() / (y_scale ** 2 + 1e-8) * 0.05
-
+            if return_components:
+                return tg_pred, phys_pen, log_nu_pred, direct_pred, physics_base_pred
             return tg_pred, phys_pen, log_nu_pred
 
         if mode == "mechanics":
-            Em = F.softplus(out[:, 0:1]) + 1e-6
-            xi = F.softplus(out[:, 1:2]) + 0.1
+            y_scale = getattr(self, '_y_scale_', 1.0)
+            y_mean = getattr(self, '_y_mean_', 0.0)
 
+            # 1. 直接神经网络矩阵模量分支 (以 y_mean 为中心，软平滑正定)
+            direct_pred = out[:, 0:1] * y_scale + y_mean
+            Em_direct = F.softplus(direct_pred - 1e-4) + 1e-4
+
+            # 2. 物理分支: 严格基于高分子本征内聚能刚性 + 交联网络致密化贡献 (Nielsen 固体微观力学)
+            # 刚性项由骨架拓扑与极性内聚能决定，允许连续无上限外推
+            rigid_idx = min(2, out.shape[1] - 1)
+            rigid_term = F.softplus(out[:, rigid_idx:rigid_idx+1]) * (y_scale * 3.0)
+
+            # 交联网络致密化贡献: 玻璃态下化学交联点阻滞链段剪切滑移与次级松弛
+            # 当 log_nu_pred 存在时，根据 Nielsen 固体力学，模量随交联密度单调递增
+            nu_rigidity_term = torch.zeros_like(rigid_term)
+            if log_nu_pred is not None:
+                log_nu_ref = float(getattr(self, '_log_nu_ref_', 7.5))
+                nu_param_idx = min(self._nu_param_ch_, out.shape[1] - 1) if getattr(self, '_nu_param_ch_', -1) >= 0 else rigid_idx
+                c_nu = F.softplus(out[:, nu_param_idx:nu_param_idx+1]) * (y_scale * 0.8)
+                nu_ratio = torch.exp(torch.clamp(0.5 * (log_nu_pred - log_nu_ref), -3.0, 3.0))
+                nu_rigidity_term = c_nu * (nu_ratio - 1.0)
+
+            Em_phys = F.softplus(y_mean - y_scale * 0.5 + rigid_term + nu_rigidity_term) + 1e-4
+
+            # 3. 填料增强复合力学 (Halpin–Tsai 方程)
+            xi = F.softplus(out[:, 1:2]) * 2.0 + 0.1
             vf = volume_fraction_from_wt_fraction_torch(
                 wt_frac=torch.clamp(nfw, 0.0, 0.95),
                 rho_f=rhof,
                 rho_m=1.20,
             )
-
             Ef_t = torch.clamp(Ef, min=1e-6)
-            Ec = halpin_tsai_torch(Em, Ef_t, xi, vf)
+            Ec_direct = halpin_tsai_torch(Em_direct, Ef_t, xi, vf)
+            Ec_phys = halpin_tsai_torch(Em_phys, Ef_t, xi, vf)
 
-            pred = torch.where(isnf > 0.5, Ec, Em)
+            pred_direct = torch.where(isnf > 0.5, Ec_direct, Em_direct)
+            pred_phys = torch.where(isnf > 0.5, Ec_phys, Em_phys)
+
+            pw = min(max(float(self.physics_weight), 0.0), 0.8)
+            pred = (1.0 - pw) * pred_direct + pw * pred_phys
+
             phys_pen = (0.0005 * (xi * xi).mean())
 
             formula = str(getattr(self, "physics_formula", "standard")).strip().lower()
             if formula in {"advanced", "enhanced"}:
                 # Voigt/Reuss 界作为额外物理约束
                 vf_c = torch.clamp(vf, 0.0, 0.95)
-                Em_safe = torch.clamp(Em, min=1e-6)
+                Em_safe = torch.clamp(Em_direct, min=1e-6)
                 Ef_safe = torch.clamp(Ef_t, min=1e-6)
                 e_voigt = Em_safe * (1.0 - vf_c) + Ef_safe * vf_c
                 e_reuss = 1.0 / ((1.0 - vf_c) / Em_safe + vf_c / Ef_safe)
@@ -1298,6 +1433,8 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                 p_high = F.relu(pred - upper)
                 phys_pen = phys_pen + (p_low * p_low + p_high * p_high).mean() * 0.05
 
+            if return_components:
+                return pred, phys_pen, log_nu_pred, pred_direct, pred_phys
             return pred, phys_pen, log_nu_pred
 
         # generic / thermal 模式：纯 MLP 回归（标准化输出 → 原始空间）
@@ -1315,6 +1452,8 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
             pw = min(float(self.physics_weight), 0.6)
             pred = (1.0 - pw) * pred + pw * y_phys
 
+        if return_components:
+            return pred, phys_pen, log_nu_pred, out[:, 0:1] * y_scale + y_mean, pred
         return pred, phys_pen, log_nu_pred
 
     def predict(self, X):
@@ -1361,6 +1500,8 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
         is_nf_tensor = torch.from_numpy(aux["is_nf"]).to(device).view(-1, 1)
         Ef_tensor = torch.from_numpy(aux["Ef"]).to(device).view(-1, 1)
         rho_f_tensor = torch.from_numpy(aux["rho_f"]).to(device).view(-1, 1)
+        cure_temp_tensor = torch.from_numpy(aux["cure_temp"]).to(device).view(-1, 1)
+        rigid_c_tensor = torch.from_numpy(aux["rigid_c"]).to(device).view(-1, 1)
 
         # ν 物理基线（log 空间）：冻结编码器 > 理论公式 > 拟合时参考值
         log_nu_th = aux["log_nu_theory"].astype(float)
@@ -1399,7 +1540,12 @@ class EpoxyPINNRegressor(BaseEstimator, RegressorMixin):
                 rhof = rho_f_tensor[i:i+bs]
                 nub = nub_tensor[i:i+bs]
                 mcb = mcb_tensor[i:i+bs]
-                pred, _, log_nu_pred = self._forward_with_physics(xb, xmb, rb, cb, nfw, isnf, Ef, rhof, nub, mcb)
+                cure_tb = cure_temp_tensor[i:i+bs]
+                rigid_cb = rigid_c_tensor[i:i+bs]
+                pred, _, log_nu_pred = self._forward_with_physics(
+                    xb, xmb, rb, cb, nfw, isnf, Ef, rhof, nub, mcb,
+                    cure_tb=cure_tb, rigid_cb=rigid_cb
+                )
                 preds.append(pred.detach().cpu().numpy())
                 if log_nu_pred is not None:
                     nu_out.append(torch.exp(log_nu_pred).detach().cpu().numpy())

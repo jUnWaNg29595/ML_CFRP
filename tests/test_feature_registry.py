@@ -44,7 +44,7 @@ except ImportError:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PYTHON = Path(r"C:/Users/wangj/anaconda3/envs/CFRP_env/python.exe")
+PYTHON = Path(sys.executable)
 ARTIFACT = ROOT / "prediction_portal/managed_models/epoxy_resin/tg/20260825_200526_model_XGBoost_6.joblib"
 ARTIFACT_2 = ROOT / "prediction_portal/managed_models/epoxy_resin/tg/20260825_200532_model_XGBoost_6.joblib"
 

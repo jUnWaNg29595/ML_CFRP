@@ -22,7 +22,14 @@ import pandas as pd
 import streamlit as st
 
 from core.model_io import load_model_artifact_bytes
-from core.portal_prediction import load_published_portal_model, run_confirmed_prediction, validate_publication_artifact
+from core.molecular_feature_workflow import is_auxiliary_component_column
+from core.portal_prediction import (
+    is_auxiliary_phr_column,
+    load_published_portal_model,
+    publication_blocking_errors,
+    run_confirmed_prediction,
+    validate_publication_artifact,
+)
 from core.prediction_portal import activate_publication
 from core.portal_ai import PortalAIClient, PortalAIError
 from core.portal_ai_config import AIServiceConfig, load_ai_config, redacted_ai_config
@@ -281,6 +288,63 @@ def _ai_service_dataclass(service: Dict[str, Any]) -> AIServiceConfig:
     return AIServiceConfig(**{key: value for key, value in service.items() if key in allowed})
 
 
+@st.cache_resource(show_spinner=False, max_entries=8)
+def _load_artifact_cached(path_str: str, size: int, digest: str) -> Dict[str, Any] | None:
+    """按 (路径, 文件大小, artifact_hash) 缓存已发布 artifact 的加载结果。
+
+    发布 artifact 可达数百 MB（反序列化十几秒），而每次 Streamlit 重跑都会
+    重建契约。缓存键含 artifact_hash 与文件大小：文件被替换即不会命中旧对象。
+    用 ``cache_resource``（不 pickle）因为 artifact 内含 torch/tabpfn 对象。
+    """
+    try:
+        path = Path(path_str)
+        if not path.is_file() or path.stat().st_size != int(size):
+            return None
+        artifact = load_model_artifact_bytes(path.read_bytes())
+        return artifact if isinstance(artifact, dict) else None
+    except Exception:
+        return None
+
+
+def _derived_contract_for_model(model: Dict[str, Any]) -> Dict[str, Any]:
+    """从已发布 artifact 现场推导 prediction_contract（与发布时同口径）。
+
+    训练平台导入的 artifact 自身不带 ``extra.prediction_contract``，而
+    ``publish_imported_entry`` 只在发布时校验推导出的契约、**不写回**
+    ``entry.contract`` → 发布成功的模型在配置里仍是 ``contract: null``。
+    若不推导，预测页会报「当前模型契约未声明任何输入字段，无法手动预测」。
+
+    与 ``core.portal_prediction._derive_contract_from_artifact`` 使用同一入口
+    ``build_prediction_contract``，因此推导结果仍受发布门禁语义约束。
+    任何失败返回 ``{}``，由调用方回退到原有提示。
+    """
+    try:
+        path = resolve_model_path(model)
+        if not path.is_file():
+            return {}
+        artifact = _load_artifact_cached(
+            str(path), path.stat().st_size, str(model.get("artifact_hash") or "").lower()
+        )
+        if not isinstance(artifact, dict):
+            return {}
+        from core.prediction_portal import build_prediction_contract
+
+        extra = artifact.get("extra") if isinstance(artifact.get("extra"), dict) else {}
+        workflow = (
+            extra.get("molecular_feature_workflow")
+            or extra.get("molecular_feature_config")
+            or extra.get("feature_process")
+        )
+        return build_prediction_contract(
+            artifact=artifact,
+            feature_cols=model.get("feature_cols") or artifact.get("feature_cols") or [],
+            target_col=str(model.get("target_col") or artifact.get("target_col") or ""),
+            workflow=workflow,
+        )
+    except Exception:
+        return {}
+
+
 def _model_contract(model: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     artifact = model.get("_artifact") if isinstance(model, dict) else None
     extra = artifact.get("extra") if isinstance(artifact, dict) else {}
@@ -290,7 +354,16 @@ def _model_contract(model: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, An
     snapshot = model.get("registry_snapshot") if isinstance(model, dict) else None
     if not isinstance(snapshot, dict) and isinstance(extra, dict):
         snapshot = extra.get("registry_snapshot")
-    return (dict(contract) if isinstance(contract, dict) else {}, dict(snapshot) if isinstance(snapshot, dict) else {})
+    contract_dict = dict(contract) if isinstance(contract, dict) else {}
+    # 导入型模型：配置里 contract 为空时从 artifact 现场推导（否则 UI 无输入字段）
+    if not contract_dict.get("feature_cols"):
+        derived = _derived_contract_for_model(model) if isinstance(model, dict) else {}
+        if derived:
+            contract_dict = derived
+            if not isinstance(snapshot, dict) or not snapshot:
+                embedded = derived.get("registry_snapshot")
+                snapshot = embedded if isinstance(embedded, dict) else snapshot
+    return contract_dict, dict(snapshot) if isinstance(snapshot, dict) else {}
 
 
 def _is_publishable_ui_model(model: Dict[str, Any]) -> bool:
@@ -327,7 +400,9 @@ def _is_publishable_ui_model(model: Dict[str, Any]) -> bool:
             registry_snapshot=snapshot,
             dataset_manifest=artifact.get("extra", {}).get("dataset_manifest") if isinstance(artifact.get("extra"), dict) else None,
         )
-        if report.get("ok") is not True or str(report.get("status") or "").lower() != "valid":
+        # 与发布时（publish_imported_entry）同口径：legacy 契约的审计提示不阻断，
+        # 只有特征不匹配等真正阻断性错误才拒绝。
+        if publication_blocking_errors(report, contract):
             return False
     return True
 
@@ -910,15 +985,97 @@ def _contract_feature_definitions(contract: Dict[str, Any], registry_snapshot: D
     return definitions
 
 
+def _legacy_editable_feature_names(contract: Dict[str, Any]) -> List[str]:
+    """legacy(schema-1) 契约的人工输入列清单（纯函数）。
+
+    训练平台导出的 artifact 不带 v2 注册表快照，因此契约没有
+    ``manual_input_feature_cols``，但有 ``feature_cols`` 与 workflow 产出清单。
+
+    口径与 ``core.portal_prediction._explicit_model_feature_names`` 保持一致：
+    ``feature_cols − workflow.final_feature_names`` —— 即运行时**确实要求用户
+    显式提供**的那些列（缺一即抛「模型需要显式工艺/实验特征」）。
+
+    两者必须同口径，否则会出现「UI 让用户填 A，后端却要 B」的错配。
+    """
+    contract = contract if isinstance(contract, dict) else {}
+    declared = [
+        str(name) for name in contract.get("manual_input_feature_cols") or [] if str(name).strip()
+    ]
+    if declared:
+        return declared
+    if contract.get("schema_version") == 2:
+        # v2 契约未声明人工分区 = 确实无人工输入，不得猜。
+        return []
+    workflow_names = {
+        str(name) for name in contract.get("workflow_final_feature_names") or [] if str(name).strip()
+    }
+    return [
+        str(name)
+        for name in contract.get("feature_cols") or []
+        if str(name).strip() and str(name) not in workflow_names
+    ]
+
+
+#: legacy 契约下按文本展示的列（含取值范围枚举而非数值）
+_LEGACY_TEXT_TOKENS = ("_method", "_atmosphere", "canonical", "organization")
+
+#: legacy 契约下按整数展示的列
+_LEGACY_INTEGER_TOKENS = ("_count", "_present", "_has_")
+
+
+def _legacy_input_field(name: str) -> Dict[str, Any]:
+    """为 legacy 契约的人工输入列合成一个可编辑字段定义。
+
+    legacy 契约不带 ``feature_definitions``，无法得知 data_type / enum。
+
+    **关键**：不能因为列名含 ``_method`` / ``_atmosphere`` 就当字符串。实测
+    （反推 scaler 参数）这些列在训练时已被**整数编码**（``tg_c_test_method``
+    取值 ``0,1,2,4,5,6,7``），而后端 ``_validate_numeric_frame`` 要求契约内
+    **全部**特征为有限数值 —— 发字符串会被判为「必须是有限数值」。
+    因此这里统一按数值处理，仅对计数/布尔类使用整数控件。
+    """
+    lowered = str(name).lower()
+    kind = "integer" if any(token in lowered for token in _LEGACY_INTEGER_TOKENS) else "number"
+    is_aux = is_auxiliary_phr_column(name)
+    required = False if is_aux else True
+    nullable = True if is_aux else False
+    default_val = 0.0 if is_aux else None
+    label_txt = f"{name}（可选副组分配比，无则填0）" if is_aux else str(name)
+    return {
+        "name": str(name),
+        "label": label_txt,
+        "kind": kind,
+        "data_type": "int" if kind == "integer" else "float",
+        "required": required,
+        "nullable": nullable,
+        "default": default_val,
+        "placeholder": "0.0" if is_aux else "",
+        "help": (
+            "导入模型的 legacy 契约未提供字段定义（未经过注册表审核）。"
+            "训练时该列已整数编码，请填写对应编码值（文本取值需自行查表）。"
+            if any(token in lowered for token in _LEGACY_TEXT_TOKENS)
+            else "导入模型的 legacy 契约未提供字段定义（未经过注册表审核），仅可填写数值。"
+        ),
+        "options": [],
+        "source_type": "manual_input",
+        "untyped_legacy": True,
+        "categorical_encoded": any(token in lowered for token in _LEGACY_TEXT_TOKENS),
+    }
+
+
 def build_manual_input_fields(contract: Dict[str, Any], registry_snapshot: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     """Build editable fields only from the contract's approved manual partition."""
     contract = contract if isinstance(contract, dict) else {}
     registry_snapshot = registry_snapshot if isinstance(registry_snapshot, dict) else {}
     definitions = _contract_feature_definitions(contract, registry_snapshot)
-    names = [str(name) for name in contract.get("manual_input_feature_cols") or [] if str(name).strip()]
+    names = _legacy_editable_feature_names(contract)
     fields: List[Dict[str, Any]] = []
     for name in names:
         definition = definitions.get(name, {})
+        if not definitions:
+            # legacy 契约无注册表定义：合成字段，否则一个输入框都不渲染。
+            fields.append(_legacy_input_field(name))
+            continue
         if (
             definition.get("source_type") != "manual_input"
             or definition.get("status") != "approved"
@@ -927,18 +1084,67 @@ def build_manual_input_fields(contract: Dict[str, Any], registry_snapshot: Dict[
             continue
         data_type = str(definition.get("data_type") or "float").lower()
         kind = "integer" if data_type in {"integer", "int"} else "number" if data_type in {"float", "number"} else "select" if definition.get("enum_values") or definition.get("options") else "text"
+        is_aux = is_auxiliary_phr_column(name)
+        required = False if is_aux else bool(definition.get("required_for_prediction", True))
+        nullable = True if is_aux else bool(definition.get("nullable", False))
+        default_val = 0.0 if is_aux else None
+        base_label = definition.get("label") or definition.get("display_name") or name
+        label_txt = f"{base_label}（可选副组分配比，无则填0）" if is_aux else base_label
         fields.append({
             "name": name,
-            "label": definition.get("label") or definition.get("display_name") or name,
+            "label": label_txt,
             "unit": definition.get("unit"),
             "data_type": definition.get("data_type") or "float",
             "kind": kind,
-            "required": bool(definition.get("required_for_prediction", True)),
-            "nullable": bool(definition.get("nullable", False)),
-            "default": None,
+            "required": required,
+            "nullable": nullable,
+            "default": default_val,
             "valid_range": definition.get("valid_range"),
             "options": list(definition.get("enum_values") or definition.get("options") or []),
             "source_type": "manual_input",
+        })
+    return fields
+
+
+def _legacy_workflow_source_fields(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """legacy(schema-1) 契约的分子结构源字段（纯函数）。
+
+    legacy 契约的 ``workflow_source_fields`` 与 ``source_columns`` 均由
+    ``build_prediction_contract`` 从 workflow 写入，可直接渲染。
+
+    不依赖 registry_snapshot：从训练平台导入的 artifact 本身就不带快照，
+    而运行时（``core.portal_prediction`` 的 ``_source_columns``）**确实**会
+    要求这些源列（缺失即报「缺少分子源列」）。此处不渲染等于让用户无法预测。
+    """
+    contract = contract if isinstance(contract, dict) else {}
+    declared = contract.get("workflow_source_fields") or contract.get("source_columns") or []
+    if not isinstance(declared, list):
+        return []
+    fields: List[Dict[str, Any]] = []
+    for item in declared:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("column") or item.get("name") or "").strip()
+        if not name:
+            continue
+        roles = item.get("roles") or item.get("source_roles") or []
+        if isinstance(roles, str):
+            roles = [roles]
+        is_aux = is_auxiliary_component_column(name)
+        required = False if is_aux else bool(item.get("required", not bool(item.get("nullable", False))))
+        nullable = True if is_aux else bool(item.get("nullable", False))
+        base_label = item.get("label") or name
+        label_txt = f"{base_label}（可选副组分）" if is_aux else base_label
+        fields.append({
+            "name": name,
+            "label": label_txt,
+            "roles": [str(role) for role in roles],
+            "required": required,
+            "nullable": nullable,
+            "default": None,
+            # 训练侧列名多为 ``*_structure`` 而非 ``*_smiles``：两者都要走 SMILES 输入控件。
+            "kind": "smiles" if ("smiles" in name.lower() or "structure" in name.lower()) else "text",
+            "source_type": "workflow",
         })
     return fields
 
@@ -947,8 +1153,13 @@ def build_workflow_source_fields(contract: Dict[str, Any], registry_snapshot: Di
     """Build read-only workflow source slots declared by the prediction contract."""
     contract = contract if isinstance(contract, dict) else {}
     registry_snapshot = registry_snapshot if isinstance(registry_snapshot, dict) else {}
+    if contract.get("schema_version") != 2:
+        # legacy(schema-1) 契约没有注册表快照，但分子源列仍需渲染，
+        # 否则用户无法提供运行时（_source_columns）明确要求的源列。
+        return _legacy_workflow_source_fields(contract)
+    # v2 契约：保持注册表审核的严格语义（快照缺失/未批准则不得渲染）。
     profile = registry_snapshot.get("model_profile")
-    if contract.get("schema_version") != 2 or not registry_snapshot or not isinstance(profile, dict) or profile.get("status") != "approved":
+    if not registry_snapshot or not isinstance(profile, dict) or profile.get("status") != "approved":
         return []
     if any(not isinstance(item, dict) or item.get("status") != "approved" for item in registry_snapshot.get("features") or []):
         return []
@@ -1782,13 +1993,24 @@ def init_smiles_field_state(state_key: str, default: str = "") -> None:
 
 
 def _recipe_value_for_field(field: Dict[str, Any], recipe: Dict[str, Any]) -> Any:
-    """将配方值按字段名/标签模糊匹配到对应输入项；无匹配返回 None。"""
+    """将配方值按字段名/标签模糊匹配到对应输入项；无匹配返回 None。
+
+    匹配必须**先按字段类型收窄**：``resin_1_amount_phr`` 同时含 "resin" 与
+    "phr"，若先匹 "resin" 就会把 SMILES 字符串填进数值框，
+    ``default_number`` 再静默回退成 0.0 —— 属于静默的预测错误。
+    因此 SMILES 类字段只接结构值，其余字段才按 phr/温度/时间匹配。
+    """
     name = str(field.get("name") or "").lower()
     label = str(field.get("label") or "")
-    if "resin" in name or "树脂" in label:
-        return recipe.get("resin_smiles")
-    if "hardener" in name or "curing_agent" in name or "固化剂" in label:
-        return recipe.get("hardener_smiles")
+    kind = str(field.get("kind") or "text").strip().lower()
+    if kind == "smiles":
+        # 只有结构字段才接受 SMILES；固化剂结构优先于树脂结构
+        if "curing_agent" in name or "hardener" in name or "固化剂" in label:
+            return recipe.get("hardener_smiles")
+        if "resin" in name or "树脂" in label:
+            return recipe.get("resin_smiles")
+        return None
+    # 非结构字段：绝不返回 SMILES，只返回数值类配方值
     if "phr" in name or "份数" in label:
         return recipe.get("phr")
     if "temp" in name or "温度" in label:
@@ -2115,6 +2337,74 @@ def _portal_default_audit_detail(record: Dict[str, Any] | None) -> str:
     return "全表统计：" + "，".join(parts) if parts else "全表统计默认值"
 
 
+def _coerce_default_for_kind(value: Any, kind: str) -> Tuple[Any, str | None]:
+    """把统计默认值转成控件可用的类型（纯函数）。
+
+    返回 ``(可用值, 降级原因)``；无法转换时返回 ``(None, 原因)``。
+
+    实测问题：内置默认值来自原始表的**文本取值**（如 ``tg_c_test_method="DMA"``、
+    ``tg_c_test_atmosphere="N2"``），但训练时这些列已被**整数编码**，后端
+    ``_validate_numeric_frame`` 要求有限数值。若直接把 ``"DMA"`` 交给
+    ``st.number_input`` 的预填逻辑，``default_number`` 会静默回退到 ``0.0``
+    ——用户看到「已自动填充 DMA」但实际提交的是 0，属于静默的预测错误。
+
+    因此这里显式拒绝：不转换、不预填，并把原因回报给 UI。
+    """
+    if value is None or value == "":
+        return None, None
+    if kind in {"number", "integer"}:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None, (
+                f"统计默认值为文本「{value}」，而该列在训练时已整数编码，"
+                "已忽略默认值，请手工填写编码值。"
+            )
+        if numeric != numeric:  # NaN
+            return None, None
+        return (int(numeric) if kind == "integer" else numeric), None
+    return value, None
+
+
+#: 文本取值 → 整数编码 的映射（键 = 不带目标前缀的字段名）
+#:
+#: 训练侧用 ``pd.Categorical(series).codes`` 编码分类型测试条件列，其分类顺序是
+#: **字典序**。实测校验（反推 scaler 参数）：
+#:   tg_c_test_method  codes = 0..7  ↔ ['DMA','DSC','TMA','compression',
+#:                                    'dielectric','flexural','other','tensile']
+#:   tg_c_test_atmosphere codes = 0..6 ↔ ['N2','air','argon','helium','inert',
+#:                                    'other','vacuum']
+#: 两者逐位吻合，因此可以安全地把统计默认值（如 "DMA"）还原为编码值。
+_CATEGORICAL_CODE_VALUES: Dict[str, Tuple[str, ...]] = {
+    "test_method": (
+        "DMA", "DSC", "TMA", "compression", "dielectric", "flexural", "other", "tensile",
+    ),
+    "test_atmosphere": (
+        "N2", "air", "argon", "helium", "inert", "other", "vacuum",
+    ),
+}
+
+
+def _categorical_code_for(field_name: str, value: Any) -> int | None:
+    """把分类型测试条件的文本取值转为训练时的整数编码（纯函数）。
+
+    字段名形如 ``tg_c_test_method``：去掉目标前缀后匹配 ``test_method`` /
+    ``test_atmosphere``。未知取值（不在受控词表内）返回 ``None``，由调用方
+    降级为「不预填 + 提示」，不猜编码。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    lowered = str(field_name or "").lower()
+    for key, categories in _CATEGORICAL_CODE_VALUES.items():
+        if lowered.endswith(key):
+            for index, label in enumerate(categories):
+                if label.lower() == text.lower():
+                    return index
+            return None
+    return None
+
+
 def render_parameter_inputs(
     parameters: List[Dict[str, Any]],
     scope_key: str,
@@ -2167,21 +2457,43 @@ def render_parameter_inputs(
             display_label = f"{label}{unit_suffix}" if not label.endswith(")") else label
 
             recipe_value = _recipe_value_for_field(field, recipe) if recipe is not None else None
-            # 配方库优先；无配方时用全表统计默认值预填（仅 manual_input 分区）
+            # 配方库优先；无配方时用全表统计默认值预填（仅 manual_input 分区）；辅助 phr 列缺省为 0.0
             default_record = None
             if recipe_value is None:
                 default_record = _portal_default_for_field(field, target_col=target_col)
             portal_default = _portal_default_display_value(default_record)
-            effective_default = recipe_value if recipe_value is not None else portal_default
+            if recipe_value is not None:
+                effective_default = recipe_value
+            elif portal_default is not None:
+                effective_default = portal_default
+            elif is_auxiliary_phr_column(field["name"]):
+                effective_default = 0.0
+            else:
+                effective_default = None
+            # 统计默认值是原始表的文本取值，而控件是数值控件：不能静默回退成 0。
+            # 分类型测试条件（如 DMA / N2）先还原为训练时的整数编码。
+            default_warning: str | None = None
             if effective_default is not None:
+                effective_default, default_warning = _coerce_default_for_kind(effective_default, kind)
+                if effective_default is None and default_warning:
+                    code = _categorical_code_for(field["name"], portal_default)
+                    if code is not None:
+                        effective_default, default_warning = code, None
+            if default_warning:
+                errors.append(f"【{display_label}】{default_warning}")
+            if effective_default is not None:
+                autofill_detail = (
+                    "配方库预填" if recipe_value is not None
+                    else _portal_default_audit_detail(default_record)
+                )
+                # 文本取值还原为整数编码时，必须让用户看得见映射关系
+                if portal_default is not None and str(portal_default) != str(effective_default):
+                    autofill_detail += f"；文本「{portal_default}」→ 编码 {effective_default}"
                 field.setdefault("_autofill", []).append({
                     "feature": field["name"],
                     "value": effective_default,
                     "origin": "recipe" if recipe_value is not None else "default",
-                    "detail": (
-                        "配方库预填" if recipe_value is not None
-                        else _portal_default_audit_detail(default_record)
-                    ),
+                    "detail": autofill_detail,
                 })
 
             with columns[index % 2]:
@@ -2269,6 +2581,24 @@ def reset_user_selection() -> None:
     st.session_state["predict_selected_material"] = ""
     st.session_state["predict_selected_target"] = ""
     st.session_state.pop("predict_tab_intent", None)
+
+
+def _value_is_filled(value: Any) -> bool:
+    """判断合并后的输入值是否已填写（纯函数）。
+
+    合并帧来自 pandas，缺值可能是 ``None`` 也可能是 ``NaN``；而 ``str(nan)``
+    是 ``'nan'``（非空字符串），用朴素空串判定会把未填字段误判为就绪。
+    """
+    if value is None:
+        return False
+    if isinstance(value, float) and value != value:  # NaN
+        return False
+    try:
+        if value is pd.NaT:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip() != ""
 
 
 def render_user_home(config: Dict[str, Any]) -> None:
@@ -2571,6 +2901,10 @@ def render_user_page(config: Dict[str, Any]) -> None:
 
         # 分子/结构输入块（workflow source）：不属于 5 个可编辑分区，
         # 它是 workflow 的原始输入（SMILES），单独置于配方区之前。
+        #
+        # 只在这里渲染一次：下方「已自动填充」之后曾有第二段重复渲染，
+        # 导致同一批字段拿到同一个 Streamlit key，报
+        # StreamlitDuplicateElementKey（导入模型场景必现）。
         if workflow_fields:
             st.markdown("#### 分子结构输入")
             st.caption("树脂/固化剂 SMILES 等原始结构；由当前模型 workflow 消费。")
@@ -2579,6 +2913,9 @@ def render_user_page(config: Dict[str, Any]) -> None:
                 f"manual_{selected_material}_{selected_target}_molecular",
                 recipe=active_recipe,
             )
+            all_input_fields.append(source_df)
+            for err in source_errors:
+                st.warning(err)
 
         for section in partition_plan:
             # ① 配方 / ② 固化制度 / ③ 高级测试条件：可编辑
@@ -2629,15 +2966,6 @@ def render_user_page(config: Dict[str, Any]) -> None:
         autofill_entries: List[Dict[str, Any]] = []
         for field in manual_fields:
             autofill_entries.extend(field.get("_autofill") or [])
-        if workflow_fields:
-            source_df, source_errors = render_parameter_inputs(
-                workflow_fields,
-                f"manual_{selected_material}_{selected_target}_molecular",
-                recipe=active_recipe,
-            )
-            all_input_fields.append(source_df)
-            for err in source_errors:
-                st.warning(err)
         autofill_summary = build_autofilled_summary(autofill_entries)
         if autofill_summary["count"]:
             with st.expander(f"📋 {autofill_summary['title']}（点击查看依据）", expanded=False):
@@ -2673,13 +3001,13 @@ def render_user_page(config: Dict[str, Any]) -> None:
         st.markdown("##### 🩺 预测输入就绪检查")
         check_cols = st.columns(3)
         with check_cols[0]:
-            mol_ready = all(str(merged_values.get(f["name"], "")).strip() != "" for f in workflow_fields if f.get("required"))
+            mol_ready = all(_value_is_filled(merged_values.get(f["name"])) for f in workflow_fields if f.get("required"))
             if mol_ready:
                 st.markdown("✅ **分子结构**：就绪")
             else:
                 st.markdown("⚠️ **分子结构**：待完善必填项")
         with check_cols[1]:
-            proc_ready = all(merged_values.get(f["name"]) is not None and str(merged_values.get(f["name"])).strip() != "" for f in manual_fields if f.get("required"))
+            proc_ready = all(_value_is_filled(merged_values.get(f["name"])) for f in manual_fields if f.get("required"))
             if proc_ready:
                 st.markdown("✅ **配方/工艺**：就绪")
             else:

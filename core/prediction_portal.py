@@ -976,6 +976,19 @@ def publish_imported_entry(
         version = f"v{int(time.time())}"
         entry["version"] = version
 
+    # 把发布时校验过的契约回写到 entry：否则配置里始终是 contract=null，
+    # UI 与后端每次都要重新反序列化数百 MB 的 artifact 才能拿到输入契约
+    # （实测 TabPFN 模型单次加载 ~16s）。回写内容与已校验的契约逐字一致，
+    # 不引入新的可信边界。
+    entry["contract"] = copy.deepcopy(dict(contract))
+    artifact_extra = artifact.get("extra") if isinstance(artifact.get("extra"), Mapping) else {}
+    snapshot = artifact_extra.get("registry_snapshot")
+    if isinstance(snapshot, Mapping):
+        entry["registry_snapshot"] = copy.deepcopy(dict(snapshot))
+    manifest = artifact_extra.get("dataset_manifest")
+    if isinstance(manifest, Mapping):
+        entry["dataset_manifest"] = copy.deepcopy(dict(manifest))
+
     gate = dict(report)
     gate["ok"] = True
     if str(gate.get("status") or "").strip().lower() != "valid":

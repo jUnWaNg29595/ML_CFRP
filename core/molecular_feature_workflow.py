@@ -322,11 +322,26 @@ def find_duplicate_feature_names(names: Sequence[Any] | None) -> list[str]:
     return [str(name) for name in duplicates]
 
 
+def is_auxiliary_component_column(column: Any) -> bool:
+    """Return whether a source column represents an auxiliary/secondary component slot."""
+    text = str(column or "").strip().lower()
+    if not text:
+        return False
+    if re.search(r"(?:resin|hardener|curing_agent|curing|curer)[_ ]*(?:smiles|structure)?[_ ]*([2-9]|\d{2,})", text):
+        return True
+    if re.search(r"(?:resin|hardener|curing_agent|curing|curer)[_ ]*([2-9]|\d{2,})[_ ]*(?:smiles|structure)", text):
+        return True
+    if any(token in text for token in ("small_additive", "additive", "accelerator", "catalyst", "initiator", "reactive_diluent", "reactive_toughener", "filler", "other")):
+        return True
+    return False
+
+
 def materialize_workflow_source_columns(
     candidate_df: pd.DataFrame,
     *,
     resin_columns: Sequence[str] | str | None = None,
     hardener_columns: Sequence[str] | str | None = None,
+    auxiliary_columns: Sequence[str] | str | None = None,
 ) -> pd.DataFrame:
     """Expand canonical formulation strings into declared workflow source columns.
 
@@ -351,9 +366,12 @@ def materialize_workflow_source_columns(
             if str(column).strip()
         ]
 
-    def _expand(canonical_column: str, declared_columns: Sequence[str] | str | None) -> None:
+    def _expand(canonical_candidates: Sequence[str], declared_columns: Sequence[str] | str | None) -> None:
         columns = _as_columns(declared_columns)
-        if not columns or canonical_column not in out.columns:
+        if not columns:
+            return
+        canonical_column = next((c for c in canonical_candidates if c in out.columns), None)
+        if not canonical_column:
             return
 
         from .smiles_utils import split_smiles_cell
@@ -368,8 +386,13 @@ def materialize_workflow_source_columns(
                 )
             )
 
-    _expand("resin_smiles", resin_columns)
-    _expand("hardener_smiles", hardener_columns)
+    _expand(("resin_smiles", "resin_structure", "resin_1_structure", "smiles"), resin_columns)
+    _expand(("hardener_smiles", "curing_agent_smiles", "curing_agent_structure", "hardener_structure"), hardener_columns)
+
+    for aux_col in _as_columns(auxiliary_columns):
+        if aux_col not in out.columns:
+            out[aux_col] = None
+
     return out
 
 
@@ -1135,10 +1158,19 @@ def prepare_step_inputs(
     source_columns = list(step.get("source_columns") or [])
     optional_columns = set(step.get("optional_source_columns") or [])
     missing_columns = [column for column in source_columns if column not in data.columns and column not in optional_columns]
-    if missing_columns:
+
+    # [组分自适应] 若缺失列是辅助槽位（如 resin_2_structure, small_additive 等），
+    # 自动标记为可选辅助列，允许单组分或少组分配方平滑运行，不因空槽位抛错阻断。
+    unresolvable_missing = []
+    for col in missing_columns:
+        if is_auxiliary_component_column(col):
+            optional_columns.add(col)
+        else:
+            unresolvable_missing.append(col)
+    if unresolvable_missing:
         raise KeyError(
             "workflow step requires missing source columns: "
-            + ", ".join(map(str, missing_columns))
+            + ", ".join(map(str, unresolvable_missing))
         )
 
     try:
@@ -1149,6 +1181,20 @@ def prepare_step_inputs(
     params = _step_parameters(step)
     prepared: list[str | None] = []
     present_columns = [column for column in source_columns if column in data.columns]
+
+    if not present_columns:
+        prepared = [None] * len(data)
+        metadata = {
+            "source_columns": source_columns,
+            "source_values": {c: [None] * len(data) for c in source_columns},
+            "component_values": [[] for _ in range(len(data))],
+            "source_components": [{} for _ in range(len(data))],
+            "resin_smiles": [None] * len(data),
+            "hardener_smiles": [None] * len(data),
+            "prepared_indices": [],
+        }
+        return prepared, [], metadata
+
     source_values = {column: [] for column in present_columns}
     component_values: list[list[str]] = []
     source_components: list[dict[Any, list[str]]] = []
@@ -1508,10 +1554,29 @@ def execute_molecular_feature_workflow(
         required = [str(name) for name in (step.get("feature_names") or []) if str(name)]
         missing = [name for name in required if name not in restored.columns]
         if missing:
-            # 自动补齐因常量过滤/预处理剔除的特征为 0.0，避免在虚拟分子筛选阶段中断执行
-            for m_name in missing:
-                restored[m_name] = 0.0
-            step_warnings.append(f"已自动兼容补齐 {len(missing)} 个常量特征列（如 {missing[0]} 等）为 0.0")
+            # 只有当 step 声明了 allow_missing 或处于特定模式时才补 0，默认抛出 missing 异常
+            if step.get("allow_missing_features") or step.get("lenient"):
+                for m_name in missing:
+                    restored[m_name] = 0.0
+                step_warnings.append(f"已自动兼容补齐 {len(missing)} 个常量特征列（如 {missing[0]} 等）为 0.0")
+            else:
+                raise ValueError(
+                    f"workflow step {step_id} is missing declared feature columns: "
+                    + ", ".join(map(str, missing))
+                )
+
+        # [组分自适应] 针对辅助组分槽位：若当前步的部分或全部样本为空（未配比该副组分），
+        # 安全将缺失特征填补为 0.0，避免 NaN 穿透到模型矩阵或导致有效行判定被误杀。
+        if len(valid_indices) < len(data.index):
+            step_sources = [str(c).lower() for c in (step.get("source_columns") or [])]
+            step_prefix = str(step.get("prefix") or "").lower()
+            is_aux_step = (
+                any(is_auxiliary_component_column(c) for c in step_sources)
+                or any(tok in step_prefix for tok in ("_2", "_3", "_4", "additive", "diluent", "toughener", "accelerator", "catalyst", "initiator"))
+            )
+            if is_aux_step:
+                restored = restored.fillna(0.0)
+
         frames.append(restored)
         valid_row_indices[step_id] = valid_indices
         warnings.extend(f"{step_id}: {warning}" for warning in step_warnings)
@@ -1547,8 +1612,18 @@ def execute_molecular_feature_workflow(
             for name in remaining_missing:
                 merged[name] = 0.0
             warnings.append(f"已对 {len(remaining_missing)} 个非分子结构特征（如工艺/配方参数）自动注入默认基准值")
+    out_features = merged.reindex(columns=final_feature_names)
+    # [组分自适应] 针对辅助组分特征列（未提供副树脂/副固化剂时），确保缺失值为 0.0，避免阻断矩阵校验
+    aux_cols = [
+        c
+        for c in out_features.columns
+        if is_auxiliary_component_column(c)
+        or any(tok in c.lower() for tok in ("_2", "_3", "_4", "additive", "diluent", "toughener"))
+    ]
+    if aux_cols:
+        out_features.loc[:, aux_cols] = out_features[aux_cols].fillna(0.0)
     return WorkflowExecutionResult(
-        features=merged.reindex(columns=final_feature_names),
+        features=out_features,
         step_trace=step_trace,
         warnings=warnings,
         workflow_hash=normalized["workflow_hash"],

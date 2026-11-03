@@ -209,12 +209,19 @@ def test_benzoxazine_route():
         min_functionality=2,
         max_total_products=50,
         n_jobs=1,
+        enable_route_chains=False,   # 本测试只验证 R10 模板本身，不引入路线链产物
     )
     assert not df.empty
     boz_patt = Chem.MolFromSmarts("[OX2]1[CX4][NX3][CX4][c]2[c]1cccc2")
-    top = df.sort_values("functionality", ascending=False).iloc[0]
+    # 按子结构选行，而非"官能度最高"：官能度并列时后者会取到无关产物
+    boz_rows = df[
+        df["product_smiles"].map(
+            lambda s: (lambda m: m is not None and m.HasSubstructMatch(boz_patt))(Chem.MolFromSmiles(s))
+        )
+    ]
+    assert not boz_rows.empty, f"未生成苯并噁嗪产物: {df['product_smiles'].tolist()}"
+    top = boz_rows.sort_values("functionality", ascending=False).iloc[0]
     assert top["functionality"] == 2
-    assert Chem.MolFromSmiles(top["product_smiles"]).HasSubstructMatch(boz_patt)
 
 
 def test_anhydride_route_produces_cyclic_anhydrides():

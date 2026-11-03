@@ -23,6 +23,7 @@ reaction_simulator.py
 from __future__ import annotations
 
 import re
+import math
 import warnings
 from typing import List, Dict, Tuple, Optional, Union
 from dataclasses import dataclass, field
@@ -1994,20 +1995,54 @@ class EpoxyReactionSimulator:
         target_conversion: float
     ) -> Dict[str, any]:
         """
-        方案2：组合反应法
+        方案2：组合反应法（升级版：活化能自适应加权与优势通道剪枝）
 
-        模拟所有可能的反应对，按概率加权
+        模拟所有优势反应对，融入量子动力学活化能 (Delta E) 权重调制竞争反应
         """
         products = []
         total_prob = 0.0
 
-        for resin_smi, resin_weight in resin_components:
-            for curer_smi, curer_weight in curer_components:
-                # 反应概率 = resin_weight × curer_weight
-                prob = resin_weight * curer_weight
+        # 获取机理引擎以获取量子/电荷前线轨道代理值
+        mech_engine = getattr(self, "_mechanism_engine", None)
+        if mech_engine is None:
+            try:
+                from core.epoxy_mechanism_features import EpoxyMechanismEngine
+                mech_engine = EpoxyMechanismEngine(verbose=False)
+                self._mechanism_engine = mech_engine
+            except Exception:
+                mech_engine = None
 
-                if prob < 0.01:  # 忽略概率太小的组合
+        for resin_smi, resin_weight in resin_components:
+            # 提取树脂 LUMO 代理
+            lumo_r = -1.5
+            if mech_engine is not None:
+                try:
+                    p_r = mech_engine.calc_single_molecule_properties(resin_smi, is_resin=True)
+                    lumo_r = p_r.get("lumo_proxy", -1.5)
+                except Exception:
+                    pass
+
+            for curer_smi, curer_weight in curer_components:
+                # 统计基础碰撞概率
+                stat_prob = float(resin_weight * curer_weight)
+                if stat_prob < 0.005:  # 剪枝极微量组合 (从0.01调优为0.005防错失促进剂)
                     continue
+
+                # 提取固化剂 HOMO 代理并计算本对前向开环能差 Delta E
+                homo_c = -7.5
+                if mech_engine is not None:
+                    try:
+                        p_c = mech_engine.calc_single_molecule_properties(curer_smi, is_resin=False)
+                        homo_c = p_c.get("homo_proxy", -7.5)
+                    except Exception:
+                        pass
+                delta_e_ij = abs(float(lumo_r) - float(homo_c))
+
+                # 量子化学活化能动力学调制因子: 能垒越低(如小分子促进剂)，反应竞争速率越高
+                # 采用玻尔兹曼/费米概率因子调制
+                kinetic_factor = float(1.0 / (1.0 + math.exp(np.clip((delta_e_ij - 7.0) / 1.2, -15.0, 15.0))))
+                # 动态活化能调制后的真实成键概率
+                prob = stat_prob * (0.3 + 0.7 * kinetic_factor)
 
                 # 计算该组合的化学计量比
                 epoxy_func = self.identify_functional_groups(resin_smi).get('epoxide', 0)
@@ -2041,7 +2076,8 @@ class EpoxyReactionSimulator:
                         'probability': prob,
                         'product_representation': product_repr,
                         'product_smiles': product_repr.get('smiles'),
-                        'product_bigsmiles': product_repr.get('bigsmiles')
+                        'product_bigsmiles': product_repr.get('bigsmiles'),
+                        'delta_e': delta_e_ij,
                     })
 
                     total_prob += prob

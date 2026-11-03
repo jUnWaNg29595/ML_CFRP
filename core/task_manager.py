@@ -104,7 +104,7 @@ _CANCEL_EVENT_LOCAL = threading.Event()
 _EMERGENCY_STOP_SERVER = None
 _EMERGENCY_STOP_THREAD = None
 _EMERGENCY_STOP_PORT = None
-_EMERGENCY_STOP_HOST = "127.0.0.1"
+_EMERGENCY_STOP_HOST = "0.0.0.0"
 _EMERGENCY_STOP_TOKEN = secrets.token_urlsafe(24)
 
 
@@ -171,7 +171,9 @@ class _EmergencyStopRequestHandler(BaseHTTPRequestHandler):
 
     def end_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         super().end_headers()
 
     def do_OPTIONS(self) -> None:  # noqa: N802
@@ -210,7 +212,33 @@ class _EmergencyStopRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = cancel_all_background_tasks(force=False)
+            # 1. 强力终止所有计算任务和进程池
+            result = cancel_all_background_tasks(force=True)
+            # 2. 清理 CUDA GPU 显存
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            # 3. 强制清理 joblib/loky 并行 worker
+            try:
+                from joblib.externals import loky
+                loky.get_reusable_executor().shutdown(wait=False, kill_workers=True)
+            except Exception:
+                pass
+            # 4. 强制杀死任何残留的计算子进程
+            extra_killed = 0
+            try:
+                children = _list_child_processes()
+                for child in children:
+                    pid = child.get("pid")
+                    if pid is not None:
+                        if _terminate_pid(int(pid), force=True):
+                            extra_killed += 1
+            except Exception:
+                pass
+            result["terminated_processes"] = int(result.get("terminated_processes", 0)) + extra_killed
             self.send_response(200)
             self.end_headers()
             payload = (

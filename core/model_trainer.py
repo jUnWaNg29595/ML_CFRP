@@ -99,6 +99,14 @@ except Exception:
     PINN_AVAILABLE = False
     EpoxyPINNRegressor = None
 
+# [新增] Epoxy PINM (Physics-Informed Machine Learning / Numerical) 模型
+try:
+    from .pinm_model import EpoxyPINMRegressor
+    PINM_AVAILABLE = True
+except Exception:
+    PINM_AVAILABLE = False
+    EpoxyPINMRegressor = None
+
 # [新增] TabNet模型
 try:
     from .tabnet_model import TabNetRegressor
@@ -162,6 +170,53 @@ XGBRegressor, XGBOOST_AVAILABLE = _safe_import('xgboost', 'XGBRegressor')
 XGBClassifier, _XGB_CLASSIFIER_AVAILABLE = _safe_import('xgboost', 'XGBClassifier')
 LGBMRegressor, LIGHTGBM_AVAILABLE = _safe_import('lightgbm', 'LGBMRegressor')
 LGBMClassifier, _LGBM_CLASSIFIER_AVAILABLE = _safe_import('lightgbm', 'LGBMClassifier')
+
+# [新增] 为 LightGBM 打上 OpenCL 缺失自动降级自愈补丁，避免 No OpenCL device found 中断训练
+def _patch_lgbm_classes_for_opencl_fallback():
+    for cls in (LGBMRegressor, LGBMClassifier):
+        if cls is None:
+            continue
+        orig_fit = getattr(cls, "_orig_fit_unpatched", None)
+        if orig_fit is None:
+            orig_fit = cls.fit
+            cls._orig_fit_unpatched = orig_fit
+
+            def _make_safe_fit(original_fit_func):
+                def safe_fit(self, X, y=None, **kwargs):
+                    try:
+                        return original_fit_func(self, X, y=y, **kwargs)
+                    except Exception as exc:
+                        exc_msg = str(exc)
+                        if any(token in exc_msg for token in ("OpenCL", "No OpenCL device found", "CUDA Tree Learner was not enabled", "GPU")):
+                            import os
+                            print(f"[LightGBM 自动降级] 捕获到硬件加速异常: {exc_msg}，正在平滑回退至多核 CPU 训练...")
+                            cpu_params = {
+                                "device": "cpu",
+                                "n_jobs": min(16, os.cpu_count() or 16),
+                                "verbose": -1,
+                            }
+                            if hasattr(self, "device_type"):
+                                cpu_params["device_type"] = "cpu"
+                            if hasattr(self, "gpu_platform_id"):
+                                cpu_params["gpu_platform_id"] = -1
+                            if hasattr(self, "gpu_device_id"):
+                                cpu_params["gpu_device_id"] = -1
+                            try:
+                                self.set_params(**cpu_params)
+                            except Exception:
+                                pass
+                            for k, v in cpu_params.items():
+                                try:
+                                    setattr(self, k, v)
+                                except Exception:
+                                    pass
+                            return original_fit_func(self, X, y=y, **kwargs)
+                        raise
+                return safe_fit
+
+            cls.fit = _make_safe_fit(orig_fit)
+
+_patch_lgbm_classes_for_opencl_fallback()
 CatBoostRegressor, CATBOOST_AVAILABLE = _safe_import('catboost', 'CatBoostRegressor')
 CatBoostClassifier, _CATBOOST_CLASSIFIER_AVAILABLE = _safe_import('catboost', 'CatBoostClassifier')
 TabPFNRegressor, TABPFN_AVAILABLE = _safe_import('tabpfn', 'TabPFNRegressor')
@@ -188,6 +243,52 @@ except Exception:
     ATTENTIVEFP_AVAILABLE = False
     DMPNN_AVAILABLE = False
 
+try:
+    from .task_manager import is_cancelled
+except Exception:
+    try:
+        from core.task_manager import is_cancelled
+    except Exception:
+        def is_cancelled() -> bool:
+            return False
+
+
+def _check_cancellation() -> None:
+    if is_cancelled():
+        raise RuntimeError("用户取消")
+
+
+def _build_xgb_cancel_callback():
+    if not XGBOOST_AVAILABLE:
+        return None
+    try:
+        import xgboost as xgb
+        if hasattr(xgb, "callback") and hasattr(xgb.callback, "TrainingCallback"):
+            class _XGBStopCallback(xgb.callback.TrainingCallback):
+                def after_iteration(self, model, epoch, evals_log):
+                    if is_cancelled():
+                        return True
+            return _XGBStopCallback()
+    except Exception:
+        pass
+    return None
+
+
+def _build_lgbm_cancel_callback():
+    if not LIGHTGBM_AVAILABLE:
+        return None
+    try:
+        from lightgbm.basic import EarlyStopException
+        def _lgbm_callback(env):
+            if is_cancelled():
+                raise EarlyStopException(env.iteration, [("cancelled", 0.0, True)])
+        _lgbm_callback.order = 100
+        return _lgbm_callback
+    except Exception:
+        pass
+    return None
+
+
 GRAPH_MODEL_NAMES = {
     "AttentiveFP",
     "GAT",
@@ -211,6 +312,7 @@ RAW_FRAME_MODELS_WITH_SMILES = {
 
 TARGET_NAME_MODEL_NAMES = {
     "Epoxy PINN (Physics-Informed)",
+    "Epoxy PINM (Physics-Informed ML)",
     "Transformer + PINN",
 }
 
@@ -684,16 +786,38 @@ def apply_feature_mask(X, feature_mask):
 
 
 def _make_y_bins(y: np.ndarray, n_bins: int = 10):
-    """把连续 y 分箱用于"回归分层划分"。
-
-    返回:
-        bins (np.ndarray[int]) 或 None（表示无法分箱，需回退随机划分）
-    """
+    """把连续 y 分箱用于回归分层划分（已升级：自动兼顾等频与高值长尾等宽细化）。"""
     y = np.asarray(y).ravel()
     if len(y) < 3:
         return None
 
     n_bins = int(max(2, n_bins))
+    try:
+        q80 = float(np.percentile(y, 80))
+        y_max = float(np.max(y))
+        y_min = float(np.min(y))
+        # 若最大值显著高于 80 分位数（存在明显的长尾稀疏高值区），对长尾区域做等宽细分
+        if (y_max - q80) > 1.2 * (q80 - y_min + 1e-6) and np.sum(y > q80) >= 3:
+            head_mask = y <= q80
+            tail_mask = ~head_mask
+            bins = np.zeros(len(y), dtype=int)
+            head_bins = max(2, n_bins // 2)
+            tail_bins = max(2, n_bins - head_bins)
+            try:
+                head_b = pd.qcut(pd.Series(y[head_mask]), q=head_bins, labels=False, duplicates='drop')
+                bins[head_mask] = np.asarray(head_b)
+            except Exception:
+                bins[head_mask] = 0
+            try:
+                tail_b = pd.cut(pd.Series(y[tail_mask]), bins=tail_bins, labels=False, include_lowest=True)
+                bins[tail_mask] = head_bins + np.nan_to_num(np.asarray(tail_b), nan=0).astype(int)
+            except Exception:
+                bins[tail_mask] = head_bins
+            if np.unique(bins).size >= 2:
+                return bins
+    except Exception:
+        pass
+
     try:
         bins = pd.qcut(pd.Series(y), q=n_bins, labels=False, duplicates='drop')
         bins = np.asarray(bins)
@@ -713,6 +837,152 @@ def _make_y_bins(y: np.ndarray, n_bins: int = 10):
             return bins
         except Exception:
             return None
+
+
+def _tail_balanced_split(
+    y: np.ndarray,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    n_bins: int = 8,
+    tail_test_quota: float = 0.35,
+):
+    """
+    长尾均衡切分（Tail-Balanced Split）：
+    专门解决“目标区间1-3极多、4-10极少导致测试集采不到高值样本无法验证泛化”的问题。
+    
+    核心机制：
+    1. 自适应分箱识别密集区间（如 1-3）与稀疏/高值长尾区间（如 4-10）；
+    2. 对稀疏高值区间提升测试集抽样配额（默认保底抽 30%~40%），确保测试集拥有充足的高值样本用于泛化评估；
+    3. 严格约束：每个稀疏区间为训练集保留至少 50% 样本，杜绝训练集失去代表性；
+    4. 密集区间按常规微调比例抽样，保证全局测试集比例严格逼近目标 test_size。
+    """
+    y = np.asarray(y, dtype=np.float64).ravel()
+    n = len(y)
+    idx = np.arange(n)
+    
+    if n < 6:
+        tr, te = train_test_split(idx, test_size=test_size, random_state=random_state)
+        return np.array(tr), np.array(te)
+        
+    rng = np.random.RandomState(random_state)
+    bins = _make_y_bins(y, n_bins=n_bins)
+    if bins is None:
+        tr, te = train_test_split(idx, test_size=test_size, random_state=random_state)
+        return np.array(tr), np.array(te)
+
+    unique_bins, bin_counts = np.unique(bins, return_counts=True)
+    avg_count = n / max(1, len(unique_bins))
+    
+    target_test_n = int(np.round(n * float(test_size)))
+    target_test_n = max(1, min(n - 1, target_test_n))
+    
+    test_indices = []
+    train_indices = []
+    max_bin = unique_bins.max()
+    
+    for b in unique_bins:
+        b_idx = idx[bins == b]
+        b_n = len(b_idx)
+        shuffled_b = rng.permutation(b_idx)
+        
+        is_tail_or_rare = (b_n < avg_count * 0.7) or (b == max_bin)
+        
+        if is_tail_or_rare:
+            desired_te_n = int(np.round(b_n * float(tail_test_quota)))
+            te_n = max(1, min(desired_te_n, b_n // 2 if b_n > 1 else 0))
+            if te_n == 0 and b_n == 1:
+                te_n = 0
+        else:
+            te_n = int(np.round(b_n * float(test_size)))
+            te_n = max(0, min(te_n, b_n - 1))
+            
+        test_indices.extend(shuffled_b[:te_n])
+        train_indices.extend(shuffled_b[te_n:])
+        
+    test_indices = np.array(test_indices, dtype=int)
+    train_indices = np.array(train_indices, dtype=int)
+    
+    # 全局微调：密集区间微调平衡
+    curr_te_len = len(test_indices)
+    diff = curr_te_len - target_test_n
+    
+    if abs(diff) > 2 and len(train_indices) > 2:
+        dense_bins = [b for b, c in zip(unique_bins, bin_counts) if c >= avg_count * 0.7 and b != max_bin]
+        if diff > 0:
+            dense_te_mask = np.isin(bins[test_indices], dense_bins)
+            candidates = test_indices[dense_te_mask]
+            move_n = min(diff, len(candidates) // 2)
+            if move_n > 0:
+                to_move = rng.choice(candidates, size=move_n, replace=False)
+                test_indices = np.setdiff1d(test_indices, to_move)
+                train_indices = np.concatenate([train_indices, to_move])
+        elif diff < 0:
+            dense_tr_mask = np.isin(bins[train_indices], dense_bins)
+            candidates = train_indices[dense_tr_mask]
+            move_n = min(-diff, len(candidates) // 2)
+            if move_n > 0:
+                to_move = rng.choice(candidates, size=move_n, replace=False)
+                train_indices = np.setdiff1d(train_indices, to_move)
+                test_indices = np.concatenate([test_indices, to_move])
+                
+    return np.sort(train_indices), np.sort(test_indices)
+
+
+def _extrapolation_split(y: np.ndarray, test_size: float = 0.2, random_state: int = 42):
+    """
+    高值外推泛化划分（Extrapolation Split）：
+    将目标值最高的前 15%~20% 样本专门作为测试集，评估模型对未见高值区间的物理外推能力。
+    """
+    y = np.asarray(y, dtype=np.float64).ravel()
+    n = len(y)
+    test_size = float(np.clip(test_size, 0.05, 0.4))
+    cutoff_n = max(1, int(np.round(n * test_size)))
+    sorted_indices = np.argsort(y)
+    train_idx = sorted_indices[:-cutoff_n]
+    test_idx = sorted_indices[-cutoff_n:]
+    return np.sort(train_idx), np.sort(test_idx)
+
+
+def analyze_split_target_distribution(y: np.ndarray, train_idx: np.ndarray, test_idx: np.ndarray, n_bins: int = 5):
+    """统计并诊断目标变量在训练集与测试集各区间的覆盖情况，生成结构化报表。"""
+    y = np.asarray(y, dtype=np.float64).ravel()
+    y_tr = y[train_idx]
+    y_te = y[test_idx]
+    y_min, y_max = float(np.min(y)), float(np.max(y))
+    edges = np.linspace(y_min, y_max, n_bins + 1)
+    
+    intervals = []
+    for i in range(n_bins):
+        low, high = edges[i], edges[i + 1]
+        if i == n_bins - 1:
+            tr_c = int(np.sum((y_tr >= low) & (y_tr <= high)))
+            te_c = int(np.sum((y_te >= low) & (y_te <= high)))
+            label = f"[{low:.1f}, {high:.1f}]"
+        else:
+            tr_c = int(np.sum((y_tr >= low) & (y_tr < high)))
+            te_c = int(np.sum((y_te >= low) & (y_te < high)))
+            label = f"[{low:.1f}, {high:.1f})"
+            
+        tot = tr_c + te_c
+        te_rate = (te_c / tot * 100.0) if tot > 0 else 0.0
+        intervals.append({
+            "interval": label,
+            "low": round(low, 2),
+            "high": round(high, 2),
+            "total_count": tot,
+            "train_count": tr_c,
+            "test_count": te_c,
+            "test_ratio_pct": round(te_rate, 1),
+            "is_sparse": tot < (len(y) / n_bins * 0.6),
+        })
+        
+    return {
+        "intervals": intervals,
+        "n_train": len(train_idx),
+        "n_test": len(test_idx),
+        "y_min": round(y_min, 2),
+        "y_max": round(y_max, 2),
+    }
 
 
 VALIDATION_MODE_AUTO = "auto"      # 沿用历史默认：训练样本 >= 20 时切 15%
@@ -1505,6 +1775,11 @@ class TPOTWrapper(BaseEstimator, RegressorMixin):
         if not TPOT_AVAILABLE or TPOTRegressor is None:
             raise ImportError("TPOT 未安装，请运行: pip install tpot")
         max_time, max_eval, generations, population_size = self._resolve_search_budget(X)
+        extra_kwargs = dict(self.kwargs or {})
+        if "verbosity" in extra_kwargs and "verbose" not in extra_kwargs:
+            extra_kwargs["verbose"] = extra_kwargs.pop("verbosity")
+        elif "verbosity" in extra_kwargs and "verbose" in extra_kwargs:
+            extra_kwargs.pop("verbosity")
         self.model = TPOTRegressor(
             max_time_mins=float(max_time),
             max_eval_time_mins=float(max_eval),
@@ -1512,7 +1787,7 @@ class TPOTWrapper(BaseEstimator, RegressorMixin):
             population_size=int(population_size),
             n_jobs=self.n_jobs,
             random_state=self.random_state,
-            **(self.kwargs or {}),
+            **extra_kwargs,
         )
         self.model.fit(X, y)
         return self
@@ -1895,12 +2170,45 @@ def _detect_gpu_availability():
     except Exception:
         pass
     
-    # LightGBM GPU支持
+    # LightGBM GPU支持真实探针检测
     try:
         import lightgbm as lgb
-        gpu_info['lgb_gpu'] = gpu_info['cuda_available']
+        lgb_gpu_available = False
+        lgb_device_type = None
+        if gpu_info.get('cuda_available'):
+            import os, sys
+            # 静默探针：暂时重定向底层 C 级 stderr，避免 C++ 输出 [LightGBM] [Fatal]
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            old_stderr_fd = os.dup(2)
+            try:
+                os.dup2(devnull_fd, 2)
+                import numpy as _np
+                _probe_X = _np.array([[1.0, 2.0], [3.0, 4.0]], dtype=_np.float32)
+                _probe_y = _np.array([1.0, 2.0], dtype=_np.float32)
+                raw_fit = getattr(lgb.LGBMRegressor, "_orig_fit_unpatched", lgb.LGBMRegressor.fit)
+                # 尝试测试 cuda (使用底层原始 fit 探针)
+                try:
+                    _probe_m = lgb.LGBMRegressor(device="cuda", n_estimators=1, verbose=-1)
+                    raw_fit(_probe_m, _probe_X, _probe_y)
+                    lgb_gpu_available = True
+                    lgb_device_type = "cuda"
+                except Exception:
+                    # 尝试测试 gpu (OpenCL)
+                    _probe_m = lgb.LGBMRegressor(device="gpu", n_estimators=1, verbose=-1)
+                    raw_fit(_probe_m, _probe_X, _probe_y)
+                    lgb_gpu_available = True
+                    lgb_device_type = "gpu"
+            except Exception:
+                lgb_gpu_available = False
+            finally:
+                os.dup2(old_stderr_fd, 2)
+                os.close(old_stderr_fd)
+                os.close(devnull_fd)
+        gpu_info['lgb_gpu'] = lgb_gpu_available
+        gpu_info['lgb_device_type'] = lgb_device_type
     except Exception:
-        pass
+        gpu_info['lgb_gpu'] = False
+        gpu_info['lgb_device_type'] = None
     
     # CatBoost GPU支持
     try:
@@ -2057,15 +2365,21 @@ def _apply_parallel_settings(model_name: str, model_params: dict, train_n_jobs: 
 
         # === GPU 加速 ===
         if gpu_info.get('lgb_gpu') and use_gpu:
+            device_type = gpu_info.get('lgb_device_type') or "gpu"
             gpu_device_id = model_params.pop('gpu_device_id', None)
-            model_params.setdefault("device", "gpu")
-            model_params.setdefault("gpu_platform_id", 0)
+            model_params.setdefault("device", device_type)
+            if device_type == "gpu":
+                model_params.setdefault("gpu_platform_id", 0)
             if gpu_device_id is not None:
                 model_params["gpu_device_id"] = gpu_device_id
-                print(f"✓ LightGBM 将使用 GPU {gpu_device_id}")
+                print(f"✓ LightGBM 将使用 GPU ({device_type}) {gpu_device_id}")
             else:
                 model_params.setdefault("gpu_device_id", 0)
-                print(f"✓ LightGBM 将使用默认 GPU")
+                print(f"✓ LightGBM 将使用默认 GPU ({device_type})")
+        else:
+            # 环境无可用 OpenCL/CUDA 设备，清理任何残留的 GPU 参数，确保使用 CPU 安全训练
+            for _k in ("device", "device_type", "gpu_platform_id", "gpu_device_id"):
+                model_params.pop(_k, None)
 
         # === 额外性能优化参数 ===
         model_params.setdefault("verbose", -1)
@@ -2297,6 +2611,12 @@ class EnhancedModelTrainer:
         catalog["Epoxy PINN (Physics-Informed)"] = {
             "available": bool(PINN_AVAILABLE),
             "reason": "" if PINN_AVAILABLE else "未安装 torch 或 PINN 模块不可用（需要 torch>=2.1.0）",
+        }
+
+        # Epoxy PINM (Physics-Informed Machine Learning)
+        catalog["Epoxy PINM (Physics-Informed ML)"] = {
+            "available": bool(PINM_AVAILABLE),
+            "reason": "" if PINM_AVAILABLE else "PINM 模块不可用",
         }
 
         catalog["Transformer + PINN"] = {
@@ -2573,6 +2893,10 @@ class EnhancedModelTrainer:
             if not (LIGHTGBM_AVAILABLE and _LGBM_CLASSIFIER_AVAILABLE):
                 raise ImportError("LightGBM 分类模型不可用，请安装 lightgbm")
             params_clean.setdefault('verbose', -1)
+            # 安全检查：如果环境缺少可用的 OpenCL/CUDA 设备，清理任何可能残留的 GPU 参数
+            if not get_gpu_info().get('lgb_gpu', False):
+                for _k in ("device", "device_type", "gpu_platform_id", "gpu_device_id"):
+                    params_clean.pop(_k, None)
             n_jobs = params_clean.pop("n_jobs", -1)
             return LGBMClassifier(random_state=random_state, n_jobs=n_jobs, **params_clean)
 
@@ -2621,6 +2945,10 @@ class EnhancedModelTrainer:
             if not LIGHTGBM_AVAILABLE:
                 raise ImportError("LightGBM 未安装，请运行: pip install lightgbm")
             params_clean.setdefault('verbose', -1)
+            # 安全检查：如果环境缺少可用的 OpenCL/CUDA 设备，清理任何可能残留的 GPU 参数
+            if not get_gpu_info().get('lgb_gpu', False):
+                for _k in ("device", "device_type", "gpu_platform_id", "gpu_device_id"):
+                    params_clean.pop(_k, None)
             n_jobs = params_clean.pop("n_jobs", -1)
             return LGBMRegressor(random_state=random_state, n_jobs=n_jobs, **params_clean)
 
@@ -2677,25 +3005,27 @@ class EnhancedModelTrainer:
             return TransformerBNNRegressor(random_state=random_state, **params_clean)
 
         elif model_name == "Epoxy PINN (Physics-Informed)":
-
             if not PINN_AVAILABLE:
-
                 raise ImportError("Epoxy PINN 不可用（需要安装 torch>=2.1.0）")
-
-            # 将 random_state 映射为 PINN 的 seed（保持与其它模型一致）
-
             if "seed" not in params_clean:
-
                 params_clean["seed"] = int(random_state)
-
-            # external_preprocess 对 PINN 不适用（模型内部已完成解析/归一化）
-
             params_clean.pop("external_preprocess", None)
-            
-            # 移除PINN不支持的参数
             params_clean.pop("use_gpu", None)
-
             return EpoxyPINNRegressor(**params_clean)
+
+        elif model_name == "Epoxy PINM (Physics-Informed ML)":
+            if not PINM_AVAILABLE:
+                raise ImportError("Epoxy PINM 不可用")
+            # 兼容 seed 与 random_state
+            if "seed" in params_clean and "random_state" not in params_clean:
+                params_clean["random_state"] = params_clean.pop("seed")
+            elif "seed" in params_clean:
+                params_clean.pop("seed")
+            if "random_state" not in params_clean:
+                params_clean["random_state"] = int(random_state)
+            params_clean.pop("external_preprocess", None)
+            params_clean.pop("use_gpu", None)
+            return EpoxyPINMRegressor(**params_clean)
 
         elif model_name == "Transformer + PINN":
 
@@ -2793,6 +3123,7 @@ class EnhancedModelTrainer:
             if not curr_mp or curr_mp in ["auto", "v3", "default"]:
                 local_candidates = [
                     os.path.expanduser(r"~\AppData\Roaming\tabpfn\tabpfn-v3-regressor-v3_default.ckpt"),
+                    "/mnt/c/Users/wangj/AppData/Roaming/tabpfn/tabpfn-v3-regressor-v3_default.ckpt",
                     os.path.expanduser(r"~/.cache/tabpfn/tabpfn-v3-regressor-v3_default.ckpt"),
                     os.path.expanduser(r"~/.cache/huggingface/hub/models--Prior-Labs--tabpfn_3/snapshots/24a16a89d245878b846555110985634aa2e656d7/tabpfn-v3-regressor-v3_default.ckpt"),
                 ]
@@ -2884,6 +3215,14 @@ class EnhancedModelTrainer:
 
         split_strategy = (split_strategy or 'random').lower()
 
+        # 1. 目标长尾均衡分层划分（稀有/高值区间保底配额采样）
+        if any(k in split_strategy for k in ['tail_balanced', '长尾', 'tail', 'rare_balanced']):
+            return _tail_balanced_split(y, test_size=test_size, random_state=random_state, n_bins=n_bins)
+
+        # 2. 高值外推泛化划分（顶端样本专属测试集）
+        if any(k in split_strategy for k in ['extrapolation', '外推']):
+            return _extrapolation_split(y, test_size=test_size, random_state=random_state)
+
         if split_strategy in ['random', '随机', 'random_split']:
             tr, te = train_test_split(idx, test_size=test_size, random_state=random_state)
             return np.array(tr), np.array(te)
@@ -2945,6 +3284,7 @@ class EnhancedModelTrainer:
 
         """Epoxy PINN 专用训练分支：允许输入包含带单位字符串列（如 nanofiller_content），由模型内部解析。"""
 
+        _check_cancellation()
         if isinstance(X, pd.DataFrame):
 
             X_df = X.copy()
@@ -2954,20 +3294,28 @@ class EnhancedModelTrainer:
         else:
 
             X_arr = np.asarray(X)
-
             feature_names = [f"feat_{i}" for i in range(X_arr.shape[1])]
-
             X_df = pd.DataFrame(X_arr, columns=feature_names)
 
-
+        orig_indices = np.asarray(X.index) if isinstance(X, (pd.DataFrame, pd.Series)) else (np.asarray(y.index) if isinstance(y, (pd.DataFrame, pd.Series)) else np.arange(len(X_df)))
         y_arr = pd.to_numeric(np.asarray(y).ravel(), errors="coerce").astype(float)
 
-
         mask = np.isfinite(y_arr)
-
+        valid_orig_indices = orig_indices[mask]
         X_df = X_df.loc[mask].reset_index(drop=True)
-
         y_arr = y_arr[mask]
+
+        # [防御性清洗] 将数值列中的 inf / -inf 及超出安全范围的超大数置为 np.nan，防止任何底层模型 (如 XGBoost) 抛出 inf/value too large
+        for _c in X_df.columns:
+            try:
+                if pd.api.types.is_numeric_dtype(X_df[_c]):
+                    _col_vals = pd.to_numeric(X_df[_c], errors="coerce").to_numpy(dtype=np.float64, copy=True)
+                    _bad_mask = (~np.isfinite(_col_vals)) | (np.abs(_col_vals) > 1e30)
+                    if np.any(_bad_mask):
+                        _col_vals[_bad_mask] = np.nan
+                        X_df[_c] = _col_vals
+            except Exception:
+                pass
 
         if groups is not None:
 
@@ -3031,7 +3379,14 @@ class EnhancedModelTrainer:
         fit_kwargs = {}
         if fit_data["sample_weight"] is not None:
             fit_kwargs["sample_weight"] = fit_data["sample_weight"]
+        _check_cancellation()
         model.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
+        _check_cancellation()
+        if hasattr(model, "epoch_callback"):
+            try:
+                model.epoch_callback = None
+            except Exception:
+                pass
 
         train_time = time.time() - start_time
 
@@ -3091,16 +3446,40 @@ class EnhancedModelTrainer:
         )
 
 
+        # 供 UI/分析使用：返回与普通模型一致的“数值化+标准化”特征矩阵（来自 PINN/PINM 内部预处理）
+        if hasattr(model, "_transform"):
+            try:
+                X_tr_arr, _ = model._transform(X_train_raw)
+                X_te_arr, _ = model._transform(X_test_raw)
+                cols = getattr(getattr(model, "_prep_", None), "feature_names", None) \
+                       or getattr(model, "feature_names_", None) \
+                       or [f"feat_{i}" for i in range(X_tr_arr.shape[1])]
+                X_train_transformed = pd.DataFrame(X_tr_arr, columns=cols)
+                X_test_transformed = pd.DataFrame(X_te_arr, columns=cols)
+            except Exception:
+                X_train_transformed = X_train_raw
+                X_test_transformed = X_test_raw
+        else:
+            X_train_transformed = X_train_raw
+            X_test_transformed = X_test_raw
+
+        # 提取物理信息模型的参数摘要（用于前端直接展示公式与拟合参数）
+        physics_summary = None
+        if hasattr(model, "get_physics_summary"):
+            try:
+                physics_summary = model.get_physics_summary(X_test_raw)
+            except Exception:
+                physics_summary = None
+
         return {
             'model': model,
             'pipeline': pipeline,
             'scaler': None,
             'imputer': None,
-            # 供 UI/分析使用：返回与普通模型一致的“数值化+标准化”特征矩阵（来自 PINN 内部预处理）
-            'X_train': pd.DataFrame(model._transform(X_train_raw)[0], columns=getattr(getattr(model, "_prep_", None), "feature_names", None)
-                                    or [f"feat_{i}" for i in range(model._transform(X_train_raw)[0].shape[1])]),
-            'X_test': pd.DataFrame(model._transform(X_test_raw)[0], columns=getattr(getattr(model, "_prep_", None), "feature_names", None)
-                                   or [f"feat_{i}" for i in range(model._transform(X_test_raw)[0].shape[1])]),
+            'physics_summary': physics_summary,
+            # 供 UI/分析使用：返回与普通模型一致的“数值化+标准化”特征矩阵
+            'X_train': X_train_transformed,
+            'X_test': X_test_transformed,
             # 原始数据（含字符串列）保留，供 PINN 预测/解析使用
             'X_train_raw': X_train_raw,
             'X_test_raw': X_test_raw,
@@ -3116,12 +3495,13 @@ class EnhancedModelTrainer:
             'train_time': float(train_time),
             'split_strategy': split_strategy,
             'n_bins': int(n_bins),
-            'train_indices': train_idx,
-            'test_indices': test_idx,
+            'train_indices': valid_orig_indices[train_idx],
+            'test_indices': valid_orig_indices[test_idx],
             'training_history': training_history,
             'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
             'target_balance': balance_result,
             'test_bin_metrics': test_bin_metrics,
+            'split_diagnostics': analyze_split_target_distribution(y_arr, train_idx, test_idx),
 
 
         }
@@ -3291,6 +3671,7 @@ class EnhancedModelTrainer:
         val_size=_VALIDATION_DEFAULT_SIZE,
         **params,
     ):
+        _check_cancellation()
         if isinstance(X, pd.DataFrame):
             X_df = X.copy()
         else:
@@ -3398,7 +3779,9 @@ class EnhancedModelTrainer:
         fit_kwargs = {}
         if fit_data["sample_weight"] is not None:
             fit_kwargs["sample_weight"] = fit_data["sample_weight"]
+        _check_cancellation()
         model.fit(fit_data["X"], fit_data["y"], **fit_kwargs)
+        _check_cancellation()
         train_time = time.time() - start_time
 
         pipeline = Pipeline(steps=pipeline_steps + [("model", model)])
@@ -4027,11 +4410,12 @@ class EnhancedModelTrainer:
             是否剔除物理上不可能的极端目标值（见 TARGET_SANE_RANGE）。
             这是解决 R² 被少数异常值主导的**根本手段**。
         """
+        _check_cancellation()
         if feature_contract_context is not None:
             from .training_contract import assert_training_context
             assert_training_context(feature_contract_context, getattr(X, "columns", []))
-        # Epoxy PINN 专用分支：允许原始字符串列，由模型内部解析（用于 Tg / 力学等物理约束）
-        if str(model_name) == "Epoxy PINN (Physics-Informed)":
+        # Epoxy PINN / PINM 专用分支：允许原始字符串列，由模型内部解析（用于 Tg / 力学等物理约束）
+        if str(model_name) in {"Epoxy PINN (Physics-Informed)", "Epoxy PINM (Physics-Informed ML)"}:
             return self._train_pinn_special(
                 X=X,
                 y=y,
@@ -4143,9 +4527,12 @@ class EnhancedModelTrainer:
         else:
             y_arr = np.asarray(y).ravel()
 
+        orig_row_indices = np.asarray(X.index) if isinstance(X, (pd.DataFrame, pd.Series)) else (np.asarray(y.index) if isinstance(y, (pd.DataFrame, pd.Series)) else np.arange(len(y_arr)))
+
         # 目标强制转数值
         y_arr = pd.to_numeric(pd.Series(y_arr), errors='coerce').values
         mask = (~np.isnan(y_arr)) & (~np.isinf(y_arr))
+        orig_row_indices = orig_row_indices[mask]
 
         if np.sum(~mask) > 0:
             X_arr = X_arr[mask]
@@ -4184,6 +4571,7 @@ class EnhancedModelTrainer:
                     target_outlier_removed = 0
                 else:
                     y_arr = y_arr[sane]
+                    orig_row_indices = orig_row_indices[sane]
                     if X_df is not None:
                         X_df = X_df.loc[sane].reset_index(drop=True)
                         X_arr = X_df.values
@@ -4709,6 +5097,14 @@ class EnhancedModelTrainer:
                     if eval_sets:
                         print(f"[WARNING] 无法检测XGBoost版本: {e}, 使用传统方式")
                         fit_kwargs["early_stopping_rounds"] = early_stop_rounds
+                xgb_stop_cb = _build_xgb_cancel_callback()
+                if xgb_stop_cb is not None:
+                    try:
+                        existing_cbs = list(getattr(base_model, "callbacks", None) or [])
+                        existing_cbs.append(xgb_stop_cb)
+                        base_model.set_params(callbacks=existing_cbs)
+                    except Exception:
+                        pass
                 if sample_weight is not None:
                     fit_kwargs["sample_weight"] = sample_weight
             elif model_name == "LightGBM" and LIGHTGBM_AVAILABLE:
@@ -4728,6 +5124,9 @@ class EnhancedModelTrainer:
                     except ImportError:
                         fit_kwargs["early_stopping_rounds"] = 50
                         fit_kwargs["verbose"] = 10
+                lgb_stop_cb = _build_lgbm_cancel_callback()
+                if lgb_stop_cb is not None:
+                    fit_kwargs.setdefault("callbacks", []).append(lgb_stop_cb)
                 if sample_weight is not None:
                     fit_kwargs["sample_weight"] = sample_weight
             elif model_name == "CatBoost" and CATBOOST_AVAILABLE:
@@ -4778,6 +5177,7 @@ class EnhancedModelTrainer:
             # 直接调用fit,不使用_safe_xgb_fit(它会过滤掉early_stopping)
             try:
                 # 方法1: 直接传入所有参数
+                _check_cancellation()
                 base_model.fit(X_model_fit, y_model_fit, **fit_kwargs)
                 print("[DEBUG] ✓ XGBoost训练成功(方法1: 直接fit)")
             except TypeError as e:
@@ -5248,8 +5648,8 @@ class EnhancedModelTrainer:
             'best_score': best_score,
             'split_strategy': split_strategy,
             'n_bins': int(n_bins),
-            'train_indices': train_idx,
-            'test_indices': test_idx,
+            'train_indices': orig_row_indices[train_idx],
+            'test_indices': orig_row_indices[test_idx],
              'training_history': training_history,
              'training_history_df': history_to_frame(training_history) if training_history else pd.DataFrame(),
              'target_balance': balance_result,
@@ -5259,6 +5659,7 @@ class EnhancedModelTrainer:
                  best_iteration=best_iteration,
              ),
              'test_bin_metrics': test_bin_metrics,
+             'split_diagnostics': analyze_split_target_distribution(y_arr, train_idx, test_idx),
              '_xgb_temp_model_path': temp_model_path,  # XGBoost临时文件路径
         }
 
@@ -5862,11 +6263,12 @@ class EnhancedModelTrainer:
         target_transform / target_outlier_filter: 语义与 train_model 完全一致，
             保证 CV 分数与最终测试集分数在同一口径下可比。
         """
+        _check_cancellation()
         if feature_contract_context is not None:
             from .training_contract import assert_training_context
             assert_training_context(feature_contract_context, getattr(X, "columns", []))
-        # Epoxy PINN 专用分支：允许原始字符串列，由模型内部解析（用于 Tg / 力学等物理约束）
-        if str(model_name) == "Epoxy PINN (Physics-Informed)":
+        # Epoxy PINN / PINM 专用分支：允许原始字符串列，由模型内部解析（用于 Tg / 力学等物理约束）
+        if str(model_name) in {"Epoxy PINN (Physics-Informed)", "Epoxy PINM (Physics-Informed ML)"}:
             return self._cross_validate_pinn_special(
                 X=X,
                 y=y,
@@ -6221,6 +6623,7 @@ class EnhancedModelTrainer:
         else:
             # 串行训练（原有逻辑）
             for fold_i, (tr_idx, va_idx) in enumerate(split_iter):
+                _check_cancellation()
                 base_model = self._get_model(model_name, **model_params)
                 if _tgt_tf != TARGET_TRANSFORM_NONE:
                     base_model = TargetLogTransformer(estimator=base_model, transform=_tgt_tf)
